@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://github.com/abundant-ai/SWE-gen-Go">
-    <img src="assets/swegen-go-banner.jpg" style="height: 20" alt="SWE-gen Go banner" />
+    <img src="assets/swegen-go-banner.jpg" style="height: 20em" alt="SWE-gen Go banner" />
   </a>
 </p>
 
