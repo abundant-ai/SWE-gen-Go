@@ -1,0 +1,227 @@
+diff --git a/clientconn.go b/clientconn.go
+index cd3eaf8d..d2717fba 100644
+--- a/clientconn.go
++++ b/clientconn.go
+@@ -208,7 +208,7 @@ func NewClient(target string, opts ...DialOption) (conn *ClientConn, err error)
+ 	channelz.Infof(logger, cc.channelz, "Channel authority set to %q", cc.authority)
+ 
+ 	cc.csMgr = newConnectivityStateManager(cc.ctx, cc.channelz)
+-	cc.pickerWrapper = newPickerWrapper(cc.dopts.copts.StatsHandlers)
++	cc.pickerWrapper = newPickerWrapper()
+ 
+ 	cc.metricsRecorderList = stats.NewMetricsRecorderList(cc.dopts.copts.StatsHandlers)
+ 
+@@ -1076,13 +1076,6 @@ func (cc *ClientConn) healthCheckConfig() *healthCheckConfig {
+ 	return cc.sc.healthCheckConfig
+ }
+ 
+-func (cc *ClientConn) getTransport(ctx context.Context, failfast bool, method string) (transport.ClientTransport, balancer.PickResult, error) {
+-	return cc.pickerWrapper.pick(ctx, failfast, balancer.PickInfo{
+-		Ctx:            ctx,
+-		FullMethodName: method,
+-	})
+-}
+-
+ func (cc *ClientConn) applyServiceConfigAndBalancer(sc *ServiceConfig, configSelector iresolver.ConfigSelector) {
+ 	if sc == nil {
+ 		// should never reach here.
+diff --git a/picker_wrapper.go b/picker_wrapper.go
+index a2d2a798..aa52bfe9 100644
+--- a/picker_wrapper.go
++++ b/picker_wrapper.go
+@@ -29,7 +29,6 @@ import (
+ 	"google.golang.org/grpc/internal/channelz"
+ 	istatus "google.golang.org/grpc/internal/status"
+ 	"google.golang.org/grpc/internal/transport"
+-	"google.golang.org/grpc/stats"
+ 	"google.golang.org/grpc/status"
+ )
+ 
+@@ -48,14 +47,11 @@ type pickerGeneration struct {
+ // actions and unblock when there's a picker update.
+ type pickerWrapper struct {
+ 	// If pickerGen holds a nil pointer, the pickerWrapper is closed.
+-	pickerGen     atomic.Pointer[pickerGeneration]
+-	statsHandlers []stats.Handler // to record blocking picker calls
++	pickerGen atomic.Pointer[pickerGeneration]
+ }
+ 
+-func newPickerWrapper(statsHandlers []stats.Handler) *pickerWrapper {
+-	pw := &pickerWrapper{
+-		statsHandlers: statsHandlers,
+-	}
++func newPickerWrapper() *pickerWrapper {
++	pw := &pickerWrapper{}
+ 	pw.pickerGen.Store(&pickerGeneration{
+ 		blockingCh: make(chan struct{}),
+ 	})
+@@ -93,6 +89,12 @@ func doneChannelzWrapper(acbw *acBalancerWrapper, result *balancer.PickResult) {
+ 	}
+ }
+ 
++type pick struct {
++	transport transport.ClientTransport // the selected transport
++	result    balancer.PickResult       // the contents of the pick from the LB policy
++	blocked   bool                      // set if a picker call queued for a new picker
++}
++
+ // pick returns the transport that will be used for the RPC.
+ // It may block in the following cases:
+ // - there's no picker
+@@ -100,15 +102,16 @@ func doneChannelzWrapper(acbw *acBalancerWrapper, result *balancer.PickResult) {
+ // - the current picker returns other errors and failfast is false.
+ // - the subConn returned by the current picker is not READY
+ // When one of these situations happens, pick blocks until the picker gets updated.
+-func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.PickInfo) (transport.ClientTransport, balancer.PickResult, error) {
++func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.PickInfo) (pick, error) {
+ 	var ch chan struct{}
+ 
+ 	var lastPickErr error
++	pickBlocked := false
+ 
+ 	for {
+ 		pg := pw.pickerGen.Load()
+ 		if pg == nil {
+-			return nil, balancer.PickResult{}, ErrClientConnClosing
++			return pick{}, ErrClientConnClosing
+ 		}
+ 		if pg.picker == nil {
+ 			ch = pg.blockingCh
+@@ -127,9 +130,9 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
+ 				}
+ 				switch ctx.Err() {
+ 				case context.DeadlineExceeded:
+-					return nil, balancer.PickResult{}, status.Error(codes.DeadlineExceeded, errStr)
++					return pick{}, status.Error(codes.DeadlineExceeded, errStr)
+ 				case context.Canceled:
+-					return nil, balancer.PickResult{}, status.Error(codes.Canceled, errStr)
++					return pick{}, status.Error(codes.Canceled, errStr)
+ 				}
+ 			case <-ch:
+ 			}
+@@ -145,9 +148,7 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
+ 		// In the second case, the only way it will get to this conditional is
+ 		// if there is a new picker.
+ 		if ch != nil {
+-			for _, sh := range pw.statsHandlers {
+-				sh.HandleRPC(ctx, &stats.PickerUpdated{})
+-			}
++			pickBlocked = true
+ 		}
+ 
+ 		ch = pg.blockingCh
+@@ -164,7 +165,7 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
+ 				if istatus.IsRestrictedControlPlaneCode(st) {
+ 					err = status.Errorf(codes.Internal, "received picker error with illegal status: %v", err)
+ 				}
+-				return nil, balancer.PickResult{}, dropError{error: err}
++				return pick{}, dropError{error: err}
+ 			}
+ 			// For all other errors, wait for ready RPCs should block and other
+ 			// RPCs should fail with unavailable.
+@@ -172,7 +173,7 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
+ 				lastPickErr = err
+ 				continue
+ 			}
+-			return nil, balancer.PickResult{}, status.Error(codes.Unavailable, err.Error())
++			return pick{}, status.Error(codes.Unavailable, err.Error())
+ 		}
+ 
+ 		acbw, ok := pickResult.SubConn.(*acBalancerWrapper)
+@@ -183,9 +184,8 @@ func (pw *pickerWrapper) pick(ctx context.Context, failfast bool, info balancer.
+ 		if t := acbw.ac.getReadyTransport(); t != nil {
+ 			if channelz.IsOn() {
+ 				doneChannelzWrapper(acbw, &pickResult)
+-				return t, pickResult, nil
+ 			}
+-			return t, pickResult, nil
++			return pick{transport: t, result: pickResult, blocked: pickBlocked}, nil
+ 		}
+ 		if pickResult.Done != nil {
+ 			// Calling done with nil error, no bytes sent and no bytes received.
+diff --git a/scripts/vet.sh b/scripts/vet.sh
+index e3b77dd0..18c4085f 100755
+--- a/scripts/vet.sh
++++ b/scripts/vet.sh
+@@ -179,6 +179,7 @@ NewSubConn is deprecated:
+ OverrideServerName is deprecated:
+ RemoveSubConn is deprecated:
+ SecurityVersion is deprecated:
++stats.PickerUpdated is deprecated:
+ Target is deprecated: Use the Target field in the BuildOptions instead.
+ UpdateAddresses is deprecated:
+ UpdateSubConnState is deprecated:
+diff --git a/stats/opentelemetry/trace.go b/stats/opentelemetry/trace.go
+index efafdd07..40ac7a1b 100644
+--- a/stats/opentelemetry/trace.go
++++ b/stats/opentelemetry/trace.go
+@@ -52,7 +52,7 @@ func populateSpan(rs stats.RPCStats, ai *attemptInfo) {
+ 		)
+ 		// increment previous rpc attempts applicable for next attempt
+ 		atomic.AddUint32(&ai.previousRPCAttempts, 1)
+-	case *stats.PickerUpdated:
++	case *stats.DelayedPickComplete:
+ 		span.AddEvent("Delayed LB pick complete")
+ 	case *stats.InPayload:
+ 		// message id - "must be calculated as two different counters starting
+diff --git a/stats/stats.go b/stats/stats.go
+index baf7740e..10bf998a 100644
+--- a/stats/stats.go
++++ b/stats/stats.go
+@@ -64,15 +64,21 @@ func (s *Begin) IsClient() bool { return s.Client }
+ 
+ func (s *Begin) isRPCStats() {}
+ 
+-// PickerUpdated indicates that the LB policy provided a new picker while the
+-// RPC was waiting for one.
+-type PickerUpdated struct{}
++// DelayedPickComplete indicates that the RPC is unblocked following a delay in
++// selecting a connection for the call.
++type DelayedPickComplete struct{}
+ 
+-// IsClient indicates if the stats information is from client side. Only Client
+-// Side interfaces with a Picker, thus always returns true.
+-func (*PickerUpdated) IsClient() bool { return true }
++// IsClient indicates DelayedPickComplete is available on the client.
++func (*DelayedPickComplete) IsClient() bool { return true }
+ 
+-func (*PickerUpdated) isRPCStats() {}
++func (*DelayedPickComplete) isRPCStats() {}
++
++// PickerUpdated indicates that the RPC is unblocked following a delay in
++// selecting a connection for the call.
++//
++// Deprecated: will be removed in a future release; use DelayedPickComplete
++// instead.
++type PickerUpdated = DelayedPickComplete
+ 
+ // InPayload contains stats about an incoming payload.
+ type InPayload struct {
+diff --git a/stream.go b/stream.go
+index ca694892..5e7df5ff 100644
+--- a/stream.go
++++ b/stream.go
+@@ -469,8 +469,9 @@ func (cs *clientStream) newAttemptLocked(isTransparent bool) (*csAttempt, error)
+ func (a *csAttempt) getTransport() error {
+ 	cs := a.cs
+ 
+-	var err error
+-	a.transport, a.pickResult, err = cs.cc.getTransport(a.ctx, cs.callInfo.failFast, cs.callHdr.Method)
++	pickInfo := balancer.PickInfo{Ctx: a.ctx, FullMethodName: cs.callHdr.Method}
++	pick, err := cs.cc.pickerWrapper.pick(a.ctx, cs.callInfo.failFast, pickInfo)
++	a.transport, a.pickResult = pick.transport, pick.result
+ 	if err != nil {
+ 		if de, ok := err.(dropError); ok {
+ 			err = de.error
+@@ -481,6 +482,11 @@ func (a *csAttempt) getTransport() error {
+ 	if a.trInfo != nil {
+ 		a.trInfo.firstLine.SetRemoteAddr(a.transport.RemoteAddr())
+ 	}
++	if pick.blocked {
++		for _, sh := range a.statsHandlers {
++			sh.HandleRPC(a.ctx, &stats.DelayedPickComplete{})
++		}
++	}
+ 	return nil
+ }
+ 

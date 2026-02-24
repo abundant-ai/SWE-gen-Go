@@ -1,0 +1,192 @@
+diff --git a/mux.go b/mux.go
+index fb69196..aa19597 100644
+--- a/mux.go
++++ b/mux.go
+@@ -13,10 +13,6 @@ import (
+ 	"strings"
+ )
+ 
+-var (
+-	ErrMethodMismatch = errors.New("method is not allowed")
+-)
+-
+ // NewRouter returns a new router instance.
+ func NewRouter() *Router {
+ 	return &Router{namedRoutes: make(map[string]*Route), KeepContext: false}
+@@ -43,10 +39,6 @@ func NewRouter() *Router {
+ type Router struct {
+ 	// Configurable Handler to be used when no route matches.
+ 	NotFoundHandler http.Handler
+-
+-	// Configurable Handler to be used when the request method does not match the route.
+-	MethodNotAllowedHandler http.Handler
+-
+ 	// Parent route, if this is a subrouter.
+ 	parent parentRoute
+ 	// Routes to be matched, in order.
+@@ -73,11 +65,6 @@ func (r *Router) Match(req *http.Request, match *RouteMatch) bool {
+ 		}
+ 	}
+ 
+-	if match.MatchErr == ErrMethodMismatch && r.MethodNotAllowedHandler != nil {
+-		match.Handler = r.MethodNotAllowedHandler
+-		return true
+-	}
+-
+ 	// Closest match for a router (includes sub-routers)
+ 	if r.NotFoundHandler != nil {
+ 		match.Handler = r.NotFoundHandler
+@@ -118,15 +105,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+ 		req = setVars(req, match.Vars)
+ 		req = setCurrentRoute(req, match.Route)
+ 	}
+-
+-	if handler == nil && match.MatchErr == ErrMethodMismatch {
+-		handler = methodNotAllowedHandler()
+-	}
+-
+ 	if handler == nil {
+ 		handler = http.NotFoundHandler()
+ 	}
+-
+ 	if !r.KeepContext {
+ 		defer contextClear(req)
+ 	}
+@@ -363,11 +344,6 @@ type RouteMatch struct {
+ 	Route   *Route
+ 	Handler http.Handler
+ 	Vars    map[string]string
+-
+-	// MatchErr is set to appropriate matching error
+-	// It is set to ErrMethodMismatch if there is a mismatch in
+-	// the request method and route method
+-	MatchErr error
+ }
+ 
+ type contextKey int
+@@ -569,12 +545,3 @@ func matchMapWithRegex(toCheck map[string]*regexp.Regexp, toMatch map[string][]s
+ 	}
+ 	return true
+ }
+-
+-// methodNotAllowed replies to the request with an HTTP status code 405.
+-func methodNotAllowed(w http.ResponseWriter, r *http.Request) {
+-	w.WriteHeader(http.StatusMethodNotAllowed)
+-}
+-
+-// methodNotAllowedHandler returns a simple request handler
+-// that replies to each request with a status code 405.
+-func methodNotAllowedHandler() http.Handler { return http.HandlerFunc(methodNotAllowed) }
+diff --git a/mux_test.go b/mux_test.go
+index 413f13f..f6cfb44 100644
+--- a/mux_test.go
++++ b/mux_test.go
+@@ -1871,42 +1871,3 @@ func newRequest(method, url string) *http.Request {
+ 	}
+ 	return req
+ }
+-
+-func TestNoMatchMethodErrorHandler(t *testing.T) {
+-	func1 := func(w http.ResponseWriter, r *http.Request) {}
+-
+-	r := NewRouter()
+-	r.HandleFunc("/", func1).Methods("GET", "POST")
+-
+-	req, _ := http.NewRequest("PUT", "http://localhost/", nil)
+-	match := new(RouteMatch)
+-	matched := r.Match(req, match)
+-
+-	if matched {
+-		t.Error("Should not have matched route for methods")
+-	}
+-
+-	if match.MatchErr != ErrMethodMismatch {
+-		t.Error("Should get ErrMethodMismatch error")
+-	}
+-
+-	resp := NewRecorder()
+-	r.ServeHTTP(resp, req)
+-	if resp.Code != 405 {
+-		t.Errorf("Expecting code %v", 405)
+-	}
+-
+-	//Add matching route now
+-	r.HandleFunc("/", func1).Methods("PUT")
+-
+-	match = new(RouteMatch)
+-	matched = r.Match(req, match)
+-
+-	if !matched {
+-		t.Error("Should have matched route for methods")
+-	}
+-
+-	if match.MatchErr != nil {
+-		t.Error("Should not have any matching error. Found:", match.MatchErr)
+-	}
+-}
+diff --git a/old_test.go b/old_test.go
+index 3751e47..9bdc5e5 100644
+--- a/old_test.go
++++ b/old_test.go
+@@ -121,7 +121,12 @@ func TestRouteMatchers(t *testing.T) {
+ 		var routeMatch RouteMatch
+ 		matched := router.Match(request, &routeMatch)
+ 		if matched != shouldMatch {
+-			t.Errorf("Expected: %v\nGot: %v\nRequest: %v %v", shouldMatch, matched, request.Method, url)
++			// Need better messages. :)
++			if matched {
++				t.Errorf("Should match.")
++			} else {
++				t.Errorf("Should not match.")
++			}
+ 		}
+ 
+ 		if matched {
+@@ -183,6 +188,7 @@ func TestRouteMatchers(t *testing.T) {
+ 	match(true)
+ 
+ 	// 2nd route --------------------------------------------------------------
++
+ 	// Everything match.
+ 	reset2()
+ 	match(true)
+diff --git a/route.go b/route.go
+index 6863adb..6d4a07a 100644
+--- a/route.go
++++ b/route.go
+@@ -52,27 +52,12 @@ func (r *Route) Match(req *http.Request, match *RouteMatch) bool {
+ 	if r.buildOnly || r.err != nil {
+ 		return false
+ 	}
+-
+-	var matchErr error
+-
+ 	// Match everything.
+ 	for _, m := range r.matchers {
+ 		if matched := m.Match(req, match); !matched {
+-			if _, ok := m.(methodMatcher); ok {
+-				matchErr = ErrMethodMismatch
+-				continue
+-			}
+-			matchErr = nil
+ 			return false
+ 		}
+ 	}
+-
+-	if matchErr != nil {
+-		match.MatchErr = matchErr
+-		return false
+-	}
+-
+-	match.MatchErr = nil
+ 	// Yay, we have a match. Let's collect some info about it.
+ 	if match.Route == nil {
+ 		match.Route = r
+@@ -83,7 +68,6 @@ func (r *Route) Match(req *http.Request, match *RouteMatch) bool {
+ 	if match.Vars == nil {
+ 		match.Vars = make(map[string]string)
+ 	}
+-
+ 	// Set variables.
+ 	if r.regexp != nil {
+ 		r.regexp.setMatch(req, match, r)

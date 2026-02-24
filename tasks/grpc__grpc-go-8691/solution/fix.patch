@@ -1,0 +1,498 @@
+diff --git a/internal/envconfig/xds.go b/internal/envconfig/xds.go
+index b1f883bc..7685d08b 100644
+--- a/internal/envconfig/xds.go
++++ b/internal/envconfig/xds.go
+@@ -74,4 +74,9 @@ var (
+ 	// For more details, see:
+ 	// https://github.com/grpc/proposal/blob/master/A86-xds-http-connect.md
+ 	XDSHTTPConnectEnabled = boolFromEnv("GRPC_EXPERIMENTAL_XDS_HTTP_CONNECT", false)
++
++	// XDSBootstrapCallCredsEnabled controls if call credentials can be used in
++	// xDS bootstrap configuration via the `call_creds` field. For more details,
++	// see: https://github.com/grpc/proposal/blob/master/A97-xds-jwt-call-creds.md
++	XDSBootstrapCallCredsEnabled = boolFromEnv("GRPC_EXPERIMENTAL_XDS_BOOTSTRAP_CALL_CREDS", false)
+ )
+diff --git a/internal/xds/bootstrap/bootstrap.go b/internal/xds/bootstrap/bootstrap.go
+index 4278702e..f3960def 100644
+--- a/internal/xds/bootstrap/bootstrap.go
++++ b/internal/xds/bootstrap/bootstrap.go
+@@ -31,6 +31,7 @@ import (
+ 	"strings"
+ 
+ 	"google.golang.org/grpc"
++	"google.golang.org/grpc/credentials"
+ 	"google.golang.org/grpc/credentials/tls/certprovider"
+ 	"google.golang.org/grpc/internal"
+ 	"google.golang.org/grpc/internal/envconfig"
+@@ -83,6 +84,41 @@ func (cc ChannelCreds) String() string {
+ 	return cc.Type + "-" + string(b)
+ }
+ 
++// CallCredsConfig contains the call credentials configuration to be used on
++// RPCs to the management server.
++type CallCredsConfig struct {
++	// Type contains a name identifying the call credentials type.
++	Type string `json:"type,omitempty"`
++	// Config contains the JSON configuration for this call credentials.
++	// Optional as per gRFC A97.
++	Config json.RawMessage `json:"config,omitempty"`
++}
++
++// Equal reports whether cc and other are considered equal.
++func (cc CallCredsConfig) Equal(other CallCredsConfig) bool {
++	return cc.Type == other.Type && bytes.Equal(cc.Config, other.Config)
++}
++
++func (cc CallCredsConfig) String() string {
++	if len(cc.Config) == 0 {
++		return cc.Type
++	}
++	// We do not expect the Marshal call to fail since we wrote to cc.Config.
++	b, _ := json.Marshal(cc.Config)
++	return cc.Type + "-" + string(b)
++}
++
++// CallCredsConfigs represents a collection of call credentials configurations.
++type CallCredsConfigs []CallCredsConfig
++
++func (ccs CallCredsConfigs) String() string {
++	var creds []string
++	for _, cc := range ccs {
++		creds = append(creds, cc.String())
++	}
++	return strings.Join(creds, ",")
++}
++
+ // ServerConfigs represents a collection of server configurations.
+ type ServerConfigs []*ServerConfig
+ 
+@@ -163,16 +199,20 @@ func (a *Authority) Equal(other *Authority) bool {
+ 
+ // ServerConfig contains the configuration to connect to a server.
+ type ServerConfig struct {
+-	serverURI      string
+-	channelCreds   []ChannelCreds
+-	serverFeatures []string
++	serverURI string
++	// TODO: rename ChannelCreds to ChannelCredsConfigs for consistency with
++	// CallCredsConfigs.
++	channelCreds     []ChannelCreds
++	callCredsConfigs []CallCredsConfig
++	serverFeatures   []string
+ 
+ 	// As part of unmarshalling the JSON config into this struct, we ensure that
+ 	// the credentials config is valid by building an instance of the specified
+ 	// credentials and store it here for easy access.
+-	selectedCreds    ChannelCreds
+-	credsDialOption  grpc.DialOption
+-	extraDialOptions []grpc.DialOption
++	selectedChannelCreds ChannelCreds
++	selectedCallCreds    []credentials.PerRPCCredentials
++	credsDialOption      grpc.DialOption
++	extraDialOptions     []grpc.DialOption
+ 
+ 	cleanups []func()
+ }
+@@ -194,6 +234,11 @@ func (sc *ServerConfig) ServerFeatures() []string {
+ 	return sc.serverFeatures
+ }
+ 
++// CallCredsConfigs returns the call credentials configuration for this server.
++func (sc *ServerConfig) CallCredsConfigs() CallCredsConfigs {
++	return sc.callCredsConfigs
++}
++
+ // ServerFeaturesIgnoreResourceDeletion returns true if this server supports a
+ // feature where the xDS client can ignore resource deletions from this server,
+ // as described in gRFC A53.
+@@ -211,10 +256,10 @@ func (sc *ServerConfig) ServerFeaturesIgnoreResourceDeletion() bool {
+ 	return false
+ }
+ 
+-// SelectedCreds returns the selected credentials configuration for
++// SelectedChannelCreds returns the selected credentials configuration for
+ // communicating with this server.
+-func (sc *ServerConfig) SelectedCreds() ChannelCreds {
+-	return sc.selectedCreds
++func (sc *ServerConfig) SelectedChannelCreds() ChannelCreds {
++	return sc.selectedChannelCreds
+ }
+ 
+ // DialOptions returns a slice of all the configured dial options for this
+@@ -245,9 +290,9 @@ func (sc *ServerConfig) Equal(other *ServerConfig) bool {
+ 		return false
+ 	case !slices.EqualFunc(sc.channelCreds, other.channelCreds, func(a, b ChannelCreds) bool { return a.Equal(b) }):
+ 		return false
+-	case !slices.Equal(sc.serverFeatures, other.serverFeatures):
++	case !slices.EqualFunc(sc.callCredsConfigs, other.callCredsConfigs, func(a, b CallCredsConfig) bool { return a.Equal(b) }):
+ 		return false
+-	case !sc.selectedCreds.Equal(other.selectedCreds):
++	case !slices.Equal(sc.serverFeatures, other.serverFeatures):
+ 		return false
+ 	}
+ 	return true
+@@ -256,25 +301,27 @@ func (sc *ServerConfig) Equal(other *ServerConfig) bool {
+ // String returns the string representation of the ServerConfig.
+ func (sc *ServerConfig) String() string {
+ 	if len(sc.serverFeatures) == 0 {
+-		return fmt.Sprintf("%s-%s", sc.serverURI, sc.selectedCreds.String())
++		return strings.Join([]string{sc.serverURI, sc.selectedChannelCreds.String(), sc.CallCredsConfigs().String()}, "-")
+ 	}
+ 	features := strings.Join(sc.serverFeatures, "-")
+-	return strings.Join([]string{sc.serverURI, sc.selectedCreds.String(), features}, "-")
++	return strings.Join([]string{sc.serverURI, sc.selectedChannelCreds.String(), features, sc.CallCredsConfigs().String()}, "-")
+ }
+ 
+ // The following fields correspond 1:1 with the JSON schema for ServerConfig.
+ type serverConfigJSON struct {
+-	ServerURI      string         `json:"server_uri,omitempty"`
+-	ChannelCreds   []ChannelCreds `json:"channel_creds,omitempty"`
+-	ServerFeatures []string       `json:"server_features,omitempty"`
++	ServerURI        string            `json:"server_uri,omitempty"`
++	ChannelCreds     []ChannelCreds    `json:"channel_creds,omitempty"`
++	CallCredsConfigs []CallCredsConfig `json:"call_creds,omitempty"`
++	ServerFeatures   []string          `json:"server_features,omitempty"`
+ }
+ 
+ // MarshalJSON returns marshaled JSON bytes corresponding to this server config.
+ func (sc *ServerConfig) MarshalJSON() ([]byte, error) {
+ 	server := &serverConfigJSON{
+-		ServerURI:      sc.serverURI,
+-		ChannelCreds:   sc.channelCreds,
+-		ServerFeatures: sc.serverFeatures,
++		ServerURI:        sc.serverURI,
++		ChannelCreds:     sc.channelCreds,
++		CallCredsConfigs: sc.callCredsConfigs,
++		ServerFeatures:   sc.serverFeatures,
+ 	}
+ 	return json.Marshal(server)
+ }
+@@ -294,11 +341,12 @@ func (sc *ServerConfig) UnmarshalJSON(data []byte) error {
+ 
+ 	sc.serverURI = server.ServerURI
+ 	sc.channelCreds = server.ChannelCreds
++	sc.callCredsConfigs = server.CallCredsConfigs
+ 	sc.serverFeatures = server.ServerFeatures
+ 
+ 	for _, cc := range server.ChannelCreds {
+ 		// We stop at the first credential type that we support.
+-		c := bootstrap.GetCredentials(cc.Type)
++		c := bootstrap.GetChannelCredentials(cc.Type)
+ 		if c == nil {
+ 			continue
+ 		}
+@@ -306,7 +354,7 @@ func (sc *ServerConfig) UnmarshalJSON(data []byte) error {
+ 		if err != nil {
+ 			return fmt.Errorf("failed to build credentials bundle from bootstrap for %q: %v", cc.Type, err)
+ 		}
+-		sc.selectedCreds = cc
++		sc.selectedChannelCreds = cc
+ 		sc.credsDialOption = grpc.WithCredentialsBundle(bundle)
+ 		if d, ok := bundle.(extraDialOptions); ok {
+ 			sc.extraDialOptions = d.DialOptions()
+@@ -314,6 +362,27 @@ func (sc *ServerConfig) UnmarshalJSON(data []byte) error {
+ 		sc.cleanups = append(sc.cleanups, cancel)
+ 		break
+ 	}
++
++	if envconfig.XDSBootstrapCallCredsEnabled {
++		// Process call credentials - unlike channel creds, we use ALL supported
++		// types. Also, call credentials are optional as per gRFC A97.
++		for _, cfg := range server.CallCredsConfigs {
++			c := bootstrap.GetCallCredentials(cfg.Type)
++			if c == nil {
++				// Skip unsupported call credential types (don't fail bootstrap).
++				continue
++			}
++			callCreds, cancel, err := c.Build(cfg.Config)
++			if err != nil {
++				// Call credential validation failed - this should fail bootstrap.
++				return fmt.Errorf("failed to build call credentials from bootstrap for %q: %v", cfg.Type, err)
++			}
++			sc.selectedCallCreds = append(sc.selectedCallCreds, callCreds)
++			sc.extraDialOptions = append(sc.extraDialOptions, grpc.WithPerRPCCredentials(callCreds))
++			sc.cleanups = append(sc.cleanups, cancel)
++		}
++	}
++
+ 	if sc.serverURI == "" {
+ 		return fmt.Errorf("xds: `server_uri` field in server config cannot be empty: %s", string(data))
+ 	}
+@@ -333,6 +402,9 @@ type ServerConfigTestingOptions struct {
+ 	// ChannelCreds contains a list of channel credentials to use when talking
+ 	// to this server. If unspecified, `insecure` credentials will be used.
+ 	ChannelCreds []ChannelCreds
++	// CallCredsConfigs contains a list of call credentials to use for individual RPCs
++	// to this server. Optional.
++	CallCredsConfigs []CallCredsConfig
+ 	// ServerFeatures represents the list of features supported by this server.
+ 	ServerFeatures []string
+ }
+@@ -347,9 +419,10 @@ func ServerConfigForTesting(opts ServerConfigTestingOptions) (*ServerConfig, err
+ 		cc = []ChannelCreds{{Type: "insecure"}}
+ 	}
+ 	scInternal := &serverConfigJSON{
+-		ServerURI:      opts.URI,
+-		ChannelCreds:   cc,
+-		ServerFeatures: opts.ServerFeatures,
++		ServerURI:        opts.URI,
++		ChannelCreds:     cc,
++		CallCredsConfigs: opts.CallCredsConfigs,
++		ServerFeatures:   opts.ServerFeatures,
+ 	}
+ 	scJSON, err := json.Marshal(scInternal)
+ 	if err != nil {
+diff --git a/internal/xds/bootstrap/jwtcreds/call_creds.go b/internal/xds/bootstrap/jwtcreds/call_creds.go
+new file mode 100644
+index 00000000..f4b4c7d1
+--- /dev/null
++++ b/internal/xds/bootstrap/jwtcreds/call_creds.go
+@@ -0,0 +1,54 @@
++/*
++ *
++ * Copyright 2025 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++// Package jwtcreds implements JWT CallCredentials for XDS, configured via xDS
++// Bootstrap File. For more details, see gRFC A97:
++// https://github.com/grpc/proposal/blob/master/A97-xds-jwt-call-creds.md
++package jwtcreds
++
++import (
++	"encoding/json"
++	"fmt"
++
++	"google.golang.org/grpc/credentials"
++	"google.golang.org/grpc/credentials/jwt"
++)
++
++// NewCallCredentials returns a new JWT token based call credentials. The input
++// config must match the structure specified in gRFC A97.
++//
++// The caller is expected to invoke the cancel function when they are done using
++// the returned call creds. This cancel function is idempotent.
++func NewCallCredentials(configJSON json.RawMessage) (c credentials.PerRPCCredentials, cancel func(), err error) {
++	var cfg struct {
++		JWTTokenFile string `json:"jwt_token_file"`
++	}
++	emptyFn := func() {}
++
++	if err := json.Unmarshal(configJSON, &cfg); err != nil {
++		return nil, emptyFn, fmt.Errorf("failed to unmarshal JWT call credentials config: %v", err)
++	}
++	if cfg.JWTTokenFile == "" {
++		return nil, emptyFn, fmt.Errorf("jwt_token_file is required in JWT call credentials config")
++	}
++	callCreds, err := jwt.NewTokenFileCallCredentials(cfg.JWTTokenFile)
++	if err != nil {
++		return nil, emptyFn, fmt.Errorf("failed to create JWT call credentials: %v", err)
++	}
++	return callCreds, emptyFn, nil
++}
+diff --git a/internal/xds/xdsclient/clientimpl.go b/internal/xds/xdsclient/clientimpl.go
+index b1f79799..f2325e0e 100644
+--- a/internal/xds/xdsclient/clientimpl.go
++++ b/internal/xds/xdsclient/clientimpl.go
+@@ -181,7 +181,7 @@ func buildXDSClientConfig(config *bootstrap.Config, metricsRecorder estats.Metri
+ 				return xdsclient.Config{}, err
+ 			}
+ 			gsc := xdsclient.ServerConfig{
+-				ServerIdentifier:       clients.ServerIdentifier{ServerURI: sc.ServerURI(), Extensions: grpctransport.ServerIdentifierExtension{ConfigName: sc.SelectedCreds().Type}},
++				ServerIdentifier:       clients.ServerIdentifier{ServerURI: sc.ServerURI(), Extensions: grpctransport.ServerIdentifierExtension{ConfigName: sc.SelectedChannelCreds().Type}},
+ 				IgnoreResourceDeletion: sc.ServerFeaturesIgnoreResourceDeletion()}
+ 			gServerCfg = append(gServerCfg, gsc)
+ 			gServerCfgMap[gsc] = sc
+@@ -195,7 +195,7 @@ func buildXDSClientConfig(config *bootstrap.Config, metricsRecorder estats.Metri
+ 			return xdsclient.Config{}, err
+ 		}
+ 		gsc := xdsclient.ServerConfig{
+-			ServerIdentifier:       clients.ServerIdentifier{ServerURI: sc.ServerURI(), Extensions: grpctransport.ServerIdentifierExtension{ConfigName: sc.SelectedCreds().Type}},
++			ServerIdentifier:       clients.ServerIdentifier{ServerURI: sc.ServerURI(), Extensions: grpctransport.ServerIdentifierExtension{ConfigName: sc.SelectedChannelCreds().Type}},
+ 			IgnoreResourceDeletion: sc.ServerFeaturesIgnoreResourceDeletion()}
+ 		gServerCfgs = append(gServerCfgs, gsc)
+ 		gServerCfgMap[gsc] = sc
+@@ -233,7 +233,7 @@ func buildXDSClientConfig(config *bootstrap.Config, metricsRecorder estats.Metri
+ // and populates the grpctransport.Config map.
+ func populateGRPCTransportConfigsFromServerConfig(sc *bootstrap.ServerConfig, grpcTransportConfigs map[string]grpctransport.Config) error {
+ 	for _, cc := range sc.ChannelCreds() {
+-		c := xdsbootstrap.GetCredentials(cc.Type)
++		c := xdsbootstrap.GetChannelCredentials(cc.Type)
+ 		if c == nil {
+ 			continue
+ 		}
+diff --git a/internal/xds/xdsclient/clientimpl_loadreport.go b/internal/xds/xdsclient/clientimpl_loadreport.go
+index ffd0c90b..023f3021 100644
+--- a/internal/xds/xdsclient/clientimpl_loadreport.go
++++ b/internal/xds/xdsclient/clientimpl_loadreport.go
+@@ -35,7 +35,7 @@ func (c *clientImpl) ReportLoad(server *bootstrap.ServerConfig) (*lrsclient.Load
+ 	load, err := c.lrsClient.ReportLoad(clients.ServerIdentifier{
+ 		ServerURI: server.ServerURI(),
+ 		Extensions: grpctransport.ServerIdentifierExtension{
+-			ConfigName: server.SelectedCreds().Type,
++			ConfigName: server.SelectedChannelCreds().Type,
+ 		},
+ 	})
+ 	if err != nil {
+diff --git a/xds/bootstrap/bootstrap.go b/xds/bootstrap/bootstrap.go
+index ef55ff0c..3b7d1e9b 100644
+--- a/xds/bootstrap/bootstrap.go
++++ b/xds/bootstrap/bootstrap.go
+@@ -31,34 +31,70 @@ import (
+ 	"google.golang.org/grpc/credentials"
+ )
+ 
+-// registry is a map from credential type name to Credential builder.
+-var registry = make(map[string]Credentials)
++// channelCredsRegistry is a map from channel credential type name to
++// ChannelCredential builder.
++var channelCredsRegistry = make(map[string]ChannelCredentials)
+ 
+-// Credentials interface encapsulates a credentials.Bundle builder
++// callCredsRegistry is a map from call credential type name to
++// ChannelCredential builder.
++var callCredsRegistry = make(map[string]CallCredentials)
++
++// ChannelCredentials interface encapsulates a credentials.Bundle builder
+ // that can be used for communicating with the xDS Management server.
+-type Credentials interface {
+-	// Build returns a credential bundle associated with this credential, and
+-	// a function to cleans up additional resources associated with this bundle
++type ChannelCredentials interface {
++	// Build returns a credential bundle associated with this credential, and a
++	// function to clean up any additional resources associated with this bundle
+ 	// when it is no longer needed.
+ 	Build(config json.RawMessage) (credentials.Bundle, func(), error)
+ 	// Name returns the credential name associated with this credential.
+ 	Name() string
+ }
+ 
+-// RegisterCredentials registers Credentials used for connecting to the xds
+-// management server.
++// RegisterChannelCredentials registers ChannelCredentials used for connecting
++// to the xDS management server.
++//
++// NOTE: this function must only be called during initialization time (i.e. in
++// an init() function), and is not thread-safe. If multiple credentials are
++// registered with the same name, the one registered last will take effect.
++func RegisterChannelCredentials(c ChannelCredentials) {
++	channelCredsRegistry[c.Name()] = c
++}
++
++// GetChannelCredentials returns the credentials associated with a given name.
++// If no credentials are registered with the name, nil will be returned.
++func GetChannelCredentials(name string) ChannelCredentials {
++	if c, ok := channelCredsRegistry[name]; ok {
++		return c
++	}
++
++	return nil
++}
++
++// CallCredentials interface encapsulates a credentials.PerRPCCredentials
++// builder that can be used for communicating with the xDS Management server.
++type CallCredentials interface {
++	// Build returns a PerRPCCredentials created from the provided
++	// configuration, and a function to clean up any additional resources
++	// associated with them when they are no longer needed.
++	Build(config json.RawMessage) (credentials.PerRPCCredentials, func(), error)
++	// Name returns the credential name associated with this credential.
++	Name() string
++}
++
++// RegisterCallCredentials registers CallCredentials used for connecting
++// to the xDS management server.
+ //
+ // NOTE: this function must only be called during initialization time (i.e. in
+ // an init() function), and is not thread-safe. If multiple credentials are
+ // registered with the same name, the one registered last will take effect.
+-func RegisterCredentials(c Credentials) {
+-	registry[c.Name()] = c
++func RegisterCallCredentials(c CallCredentials) {
++	callCredsRegistry[c.Name()] = c
+ }
+ 
+-// GetCredentials returns the credentials associated with a given name.
++// GetCallCredentials returns the credentials associated with a given name.
+ // If no credentials are registered with the name, nil will be returned.
+-func GetCredentials(name string) Credentials {
+-	if c, ok := registry[name]; ok {
++func GetCallCredentials(name string) CallCredentials {
++	if c, ok := callCredsRegistry[name]; ok {
+ 		return c
+ 	}
+ 
+diff --git a/xds/bootstrap/credentials.go b/xds/bootstrap/credentials.go
+index 578e1278..25477594 100644
+--- a/xds/bootstrap/credentials.go
++++ b/xds/bootstrap/credentials.go
+@@ -24,16 +24,19 @@ import (
+ 	"google.golang.org/grpc/credentials"
+ 	"google.golang.org/grpc/credentials/google"
+ 	"google.golang.org/grpc/credentials/insecure"
++	"google.golang.org/grpc/internal/xds/bootstrap/jwtcreds"
+ 	"google.golang.org/grpc/internal/xds/bootstrap/tlscreds"
+ )
+ 
+ func init() {
+-	RegisterCredentials(&insecureCredsBuilder{})
+-	RegisterCredentials(&googleDefaultCredsBuilder{})
+-	RegisterCredentials(&tlsCredsBuilder{})
++	RegisterChannelCredentials(&insecureCredsBuilder{})
++	RegisterChannelCredentials(&googleDefaultCredsBuilder{})
++	RegisterChannelCredentials(&tlsCredsBuilder{})
++
++	RegisterCallCredentials(&jwtCallCredsBuilder{})
+ }
+ 
+-// insecureCredsBuilder implements the `Credentials` interface defined in
++// insecureCredsBuilder implements the `ChannelCredentials` interface defined in
+ // package `xds/bootstrap` and encapsulates an insecure credential.
+ type insecureCredsBuilder struct{}
+ 
+@@ -45,7 +48,7 @@ func (i *insecureCredsBuilder) Name() string {
+ 	return "insecure"
+ }
+ 
+-// tlsCredsBuilder implements the `Credentials` interface defined in
++// tlsCredsBuilder implements the `ChannelCredentials` interface defined in
+ // package `xds/bootstrap` and encapsulates a TLS credential.
+ type tlsCredsBuilder struct{}
+ 
+@@ -57,7 +60,7 @@ func (t *tlsCredsBuilder) Name() string {
+ 	return "tls"
+ }
+ 
+-// googleDefaultCredsBuilder implements the `Credentials` interface defined in
++// googleDefaultCredsBuilder implements the `ChannelCredentials` interface defined in
+ // package `xds/bootstrap` and encapsulates a Google Default credential.
+ type googleDefaultCredsBuilder struct{}
+ 
+@@ -68,3 +71,15 @@ func (d *googleDefaultCredsBuilder) Build(json.RawMessage) (credentials.Bundle,
+ func (d *googleDefaultCredsBuilder) Name() string {
+ 	return "google_default"
+ }
++
++// jwtCallCredsBuilder implements the `CallCredentials` interface defined in
++// package `xds/bootstrap` and encapsulates JWT call credentials.
++type jwtCallCredsBuilder struct{}
++
++func (j *jwtCallCredsBuilder) Build(configJSON json.RawMessage) (credentials.PerRPCCredentials, func(), error) {
++	return jwtcreds.NewCallCredentials(configJSON)
++}
++
++func (j *jwtCallCredsBuilder) Name() string {
++	return "jwt_token_file"
++}

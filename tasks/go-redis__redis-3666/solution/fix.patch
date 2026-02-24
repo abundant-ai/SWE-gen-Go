@@ -1,0 +1,272 @@
+diff --git a/internal/pool/pool.go b/internal/pool/pool.go
+index c13c7b17..ed589781 100644
+--- a/internal/pool/pool.go
++++ b/internal/pool/pool.go
+@@ -10,6 +10,7 @@ import (
+ 
+ 	"github.com/redis/go-redis/v9/internal"
+ 	"github.com/redis/go-redis/v9/internal/proto"
++	"github.com/redis/go-redis/v9/internal/rand"
+ )
+ 
+ var (
+@@ -109,6 +110,7 @@ type Options struct {
+ 	MaxActiveConns           int32
+ 	ConnMaxIdleTime          time.Duration
+ 	ConnMaxLifetime          time.Duration
++	ConnMaxLifetimeJitter    time.Duration
+ 	PushNotificationsEnabled bool
+ 
+ 	// DialerRetries is the maximum number of retry attempts when dialing fails.
+@@ -412,11 +414,7 @@ func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
+ 		// Success - create connection
+ 		cn := NewConnWithBufferSize(netConn, p.cfg.ReadBufferSize, p.cfg.WriteBufferSize)
+ 		cn.pooled = pooled
+-		if p.cfg.ConnMaxLifetime > 0 {
+-			cn.expiresAt = time.Now().Add(p.cfg.ConnMaxLifetime)
+-		} else {
+-			cn.expiresAt = noExpiration
+-		}
++		cn.expiresAt = p.calcConnExpiresAt()
+ 
+ 		return cn, nil
+ 	}
+@@ -430,6 +428,25 @@ func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
+ 	return nil, lastErr
+ }
+ 
++// calcConnExpiresAt calculates the expiration time for a connection.
++// It applies random jitter to prevent all connections from expiring simultaneously,
++// avoiding the "thundering herd" problem where all connections expire at once.
++// Returns noExpiration if ConnMaxLifetime is not set.
++func (p *ConnPool) calcConnExpiresAt() time.Time {
++	if p.cfg.ConnMaxLifetime <= 0 {
++		return noExpiration
++	}
++
++	if p.cfg.ConnMaxLifetimeJitter <= 0 {
++		return time.Now().Add(p.cfg.ConnMaxLifetime)
++	}
++
++	jitter := p.cfg.ConnMaxLifetimeJitter
++	jitterRange := jitter.Nanoseconds() * 2
++	jitterNs := rand.Int63n(jitterRange) - jitter.Nanoseconds()
++	return time.Now().Add(p.cfg.ConnMaxLifetime + time.Duration(jitterNs))
++}
++
+ func (p *ConnPool) tryDial() {
+ 	for {
+ 		if p.closed() {
+diff --git a/options.go b/options.go
+index 9773e86f..4c03a0e7 100644
+--- a/options.go
++++ b/options.go
+@@ -220,6 +220,19 @@ type Options struct {
+ 	// default: 0
+ 	ConnMaxLifetime time.Duration
+ 
++	// ConnMaxLifetimeJitter is the absolute jitter duration applied to ConnMaxLifetime
++	// to prevent all connections from expiring simultaneously.
++	//
++	// The jitter is applied as a random offset in the range [-jitter, +jitter].
++	// For example, if ConnMaxLifetime is 1 hour and ConnMaxLifetimeJitter is 6 minutes,
++	// connections will expire between 54 minutes and 66 minutes.
++	//
++	// If <= 0, no jitter is applied.
++	// If > ConnMaxLifetime, it will be capped at ConnMaxLifetime.
++	//
++	// default: 0
++	ConnMaxLifetimeJitter time.Duration
++
+ 	// TLSConfig to use. When set, TLS will be negotiated.
+ 	TLSConfig *tls.Config
+ 
+@@ -336,6 +349,8 @@ func (opt *Options) init() {
+ 		opt.ConnMaxIdleTime = 30 * time.Minute
+ 	}
+ 
++	opt.ConnMaxLifetimeJitter = min(opt.ConnMaxLifetimeJitter, opt.ConnMaxLifetime)
++	
+ 	switch opt.MaxRetries {
+ 	case -1:
+ 		opt.MaxRetries = 0
+@@ -645,6 +660,9 @@ func setupConnParams(u *url.URL, o *Options) (*Options, error) {
+ 	} else {
+ 		o.ConnMaxLifetime = q.duration("max_conn_age")
+ 	}
++	if q.has("conn_max_lifetime_jitter") {
++		o.ConnMaxLifetimeJitter = min(q.duration("conn_max_lifetime_jitter"), o.ConnMaxLifetime)
++	}
+ 	if q.err != nil {
+ 		return nil, q.err
+ 	}
+@@ -711,6 +729,7 @@ func newConnPool(
+ 		MaxActiveConns:           maxActiveConns,
+ 		ConnMaxIdleTime:          opt.ConnMaxIdleTime,
+ 		ConnMaxLifetime:          opt.ConnMaxLifetime,
++		ConnMaxLifetimeJitter:    opt.ConnMaxLifetimeJitter,
+ 		ReadBufferSize:           opt.ReadBufferSize,
+ 		WriteBufferSize:          opt.WriteBufferSize,
+ 		PushNotificationsEnabled: opt.Protocol == 3,
+@@ -752,6 +771,7 @@ func newPubSubPool(opt *Options, dialer func(ctx context.Context, network, addr
+ 		MaxActiveConns:           maxActiveConns,
+ 		ConnMaxIdleTime:          opt.ConnMaxIdleTime,
+ 		ConnMaxLifetime:          opt.ConnMaxLifetime,
++		ConnMaxLifetimeJitter:    opt.ConnMaxLifetimeJitter,
+ 		ReadBufferSize:           32 * 1024,
+ 		WriteBufferSize:          32 * 1024,
+ 		PushNotificationsEnabled: opt.Protocol == 3,
+diff --git a/osscluster.go b/osscluster.go
+index 6994ae83..1df04dda 100644
+--- a/osscluster.go
++++ b/osscluster.go
+@@ -102,8 +102,9 @@ type ClusterOptions struct {
+ 	MinIdleConns    int
+ 	MaxIdleConns    int
+ 	MaxActiveConns  int // applies per cluster node and not for the whole cluster
+-	ConnMaxIdleTime time.Duration
+-	ConnMaxLifetime time.Duration
++	ConnMaxIdleTime       time.Duration
++	ConnMaxLifetime       time.Duration
++	ConnMaxLifetimeJitter time.Duration
+ 
+ 	// ReadBufferSize is the size of the bufio.Reader buffer for each connection.
+ 	// Larger buffers can improve performance for commands that return large responses.
+@@ -329,6 +330,9 @@ func setupClusterQueryParams(u *url.URL, o *ClusterOptions) (*ClusterOptions, er
+ 	o.MaxActiveConns = q.int("max_active_conns")
+ 	o.PoolTimeout = q.duration("pool_timeout")
+ 	o.ConnMaxLifetime = q.duration("conn_max_lifetime")
++	if q.has("conn_max_lifetime_jitter") {
++		o.ConnMaxLifetimeJitter = min(q.duration("conn_max_lifetime_jitter"), o.ConnMaxLifetime)
++	}
+ 	o.ConnMaxIdleTime = q.duration("conn_max_idle_time")
+ 	o.FailingTimeoutSeconds = q.int("failing_timeout_seconds")
+ 
+@@ -392,6 +396,7 @@ func (opt *ClusterOptions) clientOptions() *Options {
+ 		MaxActiveConns:        opt.MaxActiveConns,
+ 		ConnMaxIdleTime:       opt.ConnMaxIdleTime,
+ 		ConnMaxLifetime:       opt.ConnMaxLifetime,
++		ConnMaxLifetimeJitter: opt.ConnMaxLifetimeJitter,
+ 		ReadBufferSize:        opt.ReadBufferSize,
+ 		WriteBufferSize:       opt.WriteBufferSize,
+ 		DisableIdentity:       opt.DisableIdentity,
+diff --git a/ring.go b/ring.go
+index 3381460a..8aea4dcf 100644
+--- a/ring.go
++++ b/ring.go
+@@ -121,8 +121,9 @@ type RingOptions struct {
+ 	MinIdleConns    int
+ 	MaxIdleConns    int
+ 	MaxActiveConns  int
+-	ConnMaxIdleTime time.Duration
+-	ConnMaxLifetime time.Duration
++	ConnMaxIdleTime       time.Duration
++	ConnMaxLifetime       time.Duration
++	ConnMaxLifetimeJitter time.Duration
+ 
+ 	// ReadBufferSize is the size of the bufio.Reader buffer for each connection.
+ 	// Larger buffers can improve performance for commands that return large responses.
+@@ -229,9 +230,10 @@ func (opt *RingOptions) clientOptions() *Options {
+ 		MinIdleConns:    opt.MinIdleConns,
+ 		MaxIdleConns:    opt.MaxIdleConns,
+ 		MaxActiveConns:  opt.MaxActiveConns,
+-		ConnMaxIdleTime: opt.ConnMaxIdleTime,
+-		ConnMaxLifetime: opt.ConnMaxLifetime,
+-		ReadBufferSize:  opt.ReadBufferSize,
++		ConnMaxIdleTime:       opt.ConnMaxIdleTime,
++		ConnMaxLifetime:       opt.ConnMaxLifetime,
++		ConnMaxLifetimeJitter: opt.ConnMaxLifetimeJitter,
++		ReadBufferSize:        opt.ReadBufferSize,
+ 		WriteBufferSize: opt.WriteBufferSize,
+ 
+ 		TLSConfig: opt.TLSConfig,
+diff --git a/sentinel.go b/sentinel.go
+index 663f7b1a..44d46275 100644
+--- a/sentinel.go
++++ b/sentinel.go
+@@ -115,8 +115,9 @@ type FailoverOptions struct {
+ 	MinIdleConns    int
+ 	MaxIdleConns    int
+ 	MaxActiveConns  int
+-	ConnMaxIdleTime time.Duration
+-	ConnMaxLifetime time.Duration
++	ConnMaxIdleTime       time.Duration
++	ConnMaxLifetime       time.Duration
++	ConnMaxLifetimeJitter time.Duration
+ 
+ 	TLSConfig *tls.Config
+ 
+@@ -185,8 +186,9 @@ func (opt *FailoverOptions) clientOptions() *Options {
+ 		MinIdleConns:    opt.MinIdleConns,
+ 		MaxIdleConns:    opt.MaxIdleConns,
+ 		MaxActiveConns:  opt.MaxActiveConns,
+-		ConnMaxIdleTime: opt.ConnMaxIdleTime,
+-		ConnMaxLifetime: opt.ConnMaxLifetime,
++		ConnMaxIdleTime:       opt.ConnMaxIdleTime,
++		ConnMaxLifetime:       opt.ConnMaxLifetime,
++		ConnMaxLifetimeJitter: opt.ConnMaxLifetimeJitter,
+ 
+ 		TLSConfig: opt.TLSConfig,
+ 
+@@ -233,8 +235,9 @@ func (opt *FailoverOptions) sentinelOptions(addr string) *Options {
+ 		MinIdleConns:    opt.MinIdleConns,
+ 		MaxIdleConns:    opt.MaxIdleConns,
+ 		MaxActiveConns:  opt.MaxActiveConns,
+-		ConnMaxIdleTime: opt.ConnMaxIdleTime,
+-		ConnMaxLifetime: opt.ConnMaxLifetime,
++		ConnMaxIdleTime:       opt.ConnMaxIdleTime,
++		ConnMaxLifetime:       opt.ConnMaxLifetime,
++		ConnMaxLifetimeJitter: opt.ConnMaxLifetimeJitter,
+ 
+ 		TLSConfig: opt.TLSConfig,
+ 
+@@ -408,6 +411,9 @@ func setupFailoverConnParams(u *url.URL, o *FailoverOptions) (*FailoverOptions,
+ 	o.MaxIdleConns = q.int("max_idle_conns")
+ 	o.MaxActiveConns = q.int("max_active_conns")
+ 	o.ConnMaxLifetime = q.duration("conn_max_lifetime")
++	if q.has("conn_max_lifetime_jitter") {
++		o.ConnMaxLifetimeJitter = min(q.duration("conn_max_lifetime_jitter"), o.ConnMaxLifetime)
++	}
+ 	o.ConnMaxIdleTime = q.duration("conn_max_idle_time")
+ 	o.PoolTimeout = q.duration("pool_timeout")
+ 	o.DisableIdentity = q.bool("disableIdentity")
+diff --git a/universal.go b/universal.go
+index 1dc9764d..c5951366 100644
+--- a/universal.go
++++ b/universal.go
+@@ -84,8 +84,9 @@ type UniversalOptions struct {
+ 	MinIdleConns    int
+ 	MaxIdleConns    int
+ 	MaxActiveConns  int
+-	ConnMaxIdleTime time.Duration
+-	ConnMaxLifetime time.Duration
++	ConnMaxIdleTime       time.Duration
++	ConnMaxLifetime       time.Duration
++	ConnMaxLifetimeJitter time.Duration
+ 
+ 	TLSConfig *tls.Config
+ 
+@@ -171,8 +172,9 @@ func (o *UniversalOptions) Cluster() *ClusterOptions {
+ 		MinIdleConns:    o.MinIdleConns,
+ 		MaxIdleConns:    o.MaxIdleConns,
+ 		MaxActiveConns:  o.MaxActiveConns,
+-		ConnMaxIdleTime: o.ConnMaxIdleTime,
+-		ConnMaxLifetime: o.ConnMaxLifetime,
++		ConnMaxIdleTime:       o.ConnMaxIdleTime,
++		ConnMaxLifetime:       o.ConnMaxLifetime,
++		ConnMaxLifetimeJitter: o.ConnMaxLifetimeJitter,
+ 
+ 		TLSConfig: o.TLSConfig,
+ 
+@@ -231,8 +233,9 @@ func (o *UniversalOptions) Failover() *FailoverOptions {
+ 		MinIdleConns:    o.MinIdleConns,
+ 		MaxIdleConns:    o.MaxIdleConns,
+ 		MaxActiveConns:  o.MaxActiveConns,
+-		ConnMaxIdleTime: o.ConnMaxIdleTime,
+-		ConnMaxLifetime: o.ConnMaxLifetime,
++		ConnMaxIdleTime:       o.ConnMaxIdleTime,
++		ConnMaxLifetime:       o.ConnMaxLifetime,
++		ConnMaxLifetimeJitter: o.ConnMaxLifetimeJitter,
+ 
+ 		TLSConfig: o.TLSConfig,
+ 

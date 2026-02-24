@@ -1,0 +1,215 @@
+diff --git a/command.go b/command.go
+index 1623ab97..c3ed6e1d 100644
+--- a/command.go
++++ b/command.go
+@@ -3794,83 +3794,6 @@ func (cmd *SlowLogCmd) readReply(rd *proto.Reader) error {
+ 
+ //-----------------------------------------------------------------------
+ 
+-type Latency struct {
+-	Name   string
+-	Time   time.Time
+-	Latest time.Duration
+-	Max    time.Duration
+-}
+-
+-type LatencyCmd struct {
+-	baseCmd
+-	val []Latency
+-}
+-
+-var _ Cmder = (*LatencyCmd)(nil)
+-
+-func NewLatencyCmd(ctx context.Context, args ...interface{}) *LatencyCmd {
+-	return &LatencyCmd{
+-		baseCmd: baseCmd{
+-			ctx:  ctx,
+-			args: args,
+-		},
+-	}
+-}
+-
+-func (cmd *LatencyCmd) SetVal(val []Latency) {
+-	cmd.val = val
+-}
+-
+-func (cmd *LatencyCmd) Val() []Latency {
+-	return cmd.val
+-}
+-
+-func (cmd *LatencyCmd) Result() ([]Latency, error) {
+-	return cmd.val, cmd.err
+-}
+-
+-func (cmd *LatencyCmd) String() string {
+-	return cmdString(cmd, cmd.val)
+-}
+-
+-func (cmd *LatencyCmd) readReply(rd *proto.Reader) error {
+-	n, err := rd.ReadArrayLen()
+-	if err != nil {
+-		return err
+-	}
+-	cmd.val = make([]Latency, n)
+-	for i := 0; i < len(cmd.val); i++ {
+-		nn, err := rd.ReadArrayLen()
+-		if err != nil {
+-			return err
+-		}
+-		if nn < 3 {
+-			return fmt.Errorf("redis: got %d elements in latency get, expected at least 3", nn)
+-		}
+-		if cmd.val[i].Name, err = rd.ReadString(); err != nil {
+-			return err
+-		}
+-		createdAt, err := rd.ReadInt()
+-		if err != nil {
+-			return err
+-		}
+-		cmd.val[i].Time = time.Unix(createdAt, 0)
+-		latest, err := rd.ReadInt()
+-		if err != nil {
+-			return err
+-		}
+-		cmd.val[i].Latest = time.Duration(latest) * time.Millisecond
+-		maximum, err := rd.ReadInt()
+-		if err != nil {
+-			return err
+-		}
+-		cmd.val[i].Max = time.Duration(maximum) * time.Millisecond
+-	}
+-	return nil
+-}
+-
+-//-----------------------------------------------------------------------
+-
+ type MapStringInterfaceCmd struct {
+ 	baseCmd
+ 
+diff --git a/commands.go b/commands.go
+index 3692847a..f313728d 100644
+--- a/commands.go
++++ b/commands.go
+@@ -214,8 +214,6 @@ type Cmdable interface {
+ 	Time(ctx context.Context) *TimeCmd
+ 	DebugObject(ctx context.Context, key string) *StringCmd
+ 	MemoryUsage(ctx context.Context, key string, samples ...int) *IntCmd
+-	Latency(ctx context.Context) *LatencyCmd
+-	LatencyReset(ctx context.Context, events ...interface{}) *StatusCmd
+ 
+ 	ModuleLoadex(ctx context.Context, conf *ModuleLoadexConfig) *StringCmd
+ 
+@@ -675,22 +673,6 @@ func (c cmdable) SlowLogGet(ctx context.Context, num int64) *SlowLogCmd {
+ 	return cmd
+ }
+ 
+-func (c cmdable) Latency(ctx context.Context) *LatencyCmd {
+-	cmd := NewLatencyCmd(ctx, "latency", "latest")
+-	_ = c(ctx, cmd)
+-	return cmd
+-}
+-
+-func (c cmdable) LatencyReset(ctx context.Context, events ...interface{}) *StatusCmd {
+-	args := make([]interface{}, 2+len(events))
+-	args[0] = "latency"
+-	args[1] = "reset"
+-	copy(args[2:], events)
+-	cmd := NewStatusCmd(ctx, args...)
+-	_ = c(ctx, cmd)
+-	return cmd
+-}
+-
+ func (c cmdable) Sync(_ context.Context) {
+ 	panic("not implemented")
+ }
+diff --git a/commands_test.go b/commands_test.go
+index c91a0ce2..c72bd732 100644
+--- a/commands_test.go
++++ b/commands_test.go
+@@ -8312,86 +8312,6 @@ var _ = Describe("Commands", func() {
+ 			Expect(len(result)).NotTo(BeZero())
+ 		})
+ 	})
+-
+-	Describe("Latency", Label("NonRedisEnterprise"), func() {
+-		It("returns latencies", func() {
+-			const key = "latency-monitor-threshold"
+-
+-			old := client.ConfigGet(ctx, key).Val()
+-			client.ConfigSet(ctx, key, "1")
+-			defer client.ConfigSet(ctx, key, old[key])
+-
+-			err := client.Do(ctx, "DEBUG", "SLEEP", 0.01).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			result, err := client.Latency(ctx).Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(len(result)).NotTo(BeZero())
+-		})
+-
+-		It("reset all latencies", func() {
+-			const key = "latency-monitor-threshold"
+-
+-			result, err := client.Latency(ctx).Result()
+-			// reset all latencies
+-			err = client.LatencyReset(ctx).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			old := client.ConfigGet(ctx, key).Val()
+-			client.ConfigSet(ctx, key, "1")
+-			defer client.ConfigSet(ctx, key, old[key])
+-
+-			// get latency after reset
+-			result, err = client.Latency(ctx).Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(len(result)).Should(Equal(0))
+-
+-			// create a new latency
+-			err = client.Do(ctx, "DEBUG", "SLEEP", 0.01).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// get latency after create a new latency
+-			result, err = client.Latency(ctx).Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(len(result)).Should(Equal(1))
+-
+-			// reset all latencies again
+-			err = client.LatencyReset(ctx).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// get latency after reset again
+-			result, err = client.Latency(ctx).Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(len(result)).Should(Equal(0))
+-		})
+-
+-		It("reset latencies by add event name args", func() {
+-			const key = "latency-monitor-threshold"
+-
+-			old := client.ConfigGet(ctx, key).Val()
+-			client.ConfigSet(ctx, key, "1")
+-			defer client.ConfigSet(ctx, key, old[key])
+-
+-			result, err := client.Latency(ctx).Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(len(result)).Should(Equal(0))
+-
+-			err = client.Do(ctx, "DEBUG", "SLEEP", 0.01).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			result, err = client.Latency(ctx).Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(len(result)).Should(Equal(1))
+-
+-			// reset latency by event name
+-			err = client.LatencyReset(ctx, result[0].Name).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			result, err = client.Latency(ctx).Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(len(result)).Should(Equal(0))
+-		})
+-	})
+ })
+ 
+ type numberStruct struct {

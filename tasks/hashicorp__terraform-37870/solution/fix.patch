@@ -1,0 +1,149 @@
+diff --git a/.changes/v1.14/BUG FIXES-20251103-112034.yaml b/.changes/v1.14/BUG FIXES-20251103-112034.yaml
+new file mode 100644
+index 0000000000..abe076ad3b
+--- /dev/null
++++ b/.changes/v1.14/BUG FIXES-20251103-112034.yaml	
+@@ -0,0 +1,5 @@
++kind: BUG FIXES
++body: Allow filesystem functions to return inconsistent results when evaluated within provider configuration
++time: 2025-11-03T11:20:34.913068-05:00
++custom:
++    Issue: "37854"
+diff --git a/internal/command/testdata/changed-file-func-apply/data b/internal/command/testdata/changed-file-func-apply/data
+new file mode 100644
+index 0000000000..095d8985b6
+--- /dev/null
++++ b/internal/command/testdata/changed-file-func-apply/data
+@@ -0,0 +1 @@
++apply
+diff --git a/internal/command/testdata/changed-file-func-apply/main.tf b/internal/command/testdata/changed-file-func-apply/main.tf
+new file mode 100644
+index 0000000000..ee50704596
+--- /dev/null
++++ b/internal/command/testdata/changed-file-func-apply/main.tf
+@@ -0,0 +1,6 @@
++provider "test" {
++    foo = file("./data")
++}
++
++resource "test_instance" "foo" {
++}
+diff --git a/internal/command/testdata/changed-file-func-plan/data b/internal/command/testdata/changed-file-func-plan/data
+new file mode 100644
+index 0000000000..856cc8f41a
+--- /dev/null
++++ b/internal/command/testdata/changed-file-func-plan/data
+@@ -0,0 +1 @@
++plan
+diff --git a/internal/command/testdata/changed-file-func-plan/main.tf b/internal/command/testdata/changed-file-func-plan/main.tf
+new file mode 100644
+index 0000000000..ee50704596
+--- /dev/null
++++ b/internal/command/testdata/changed-file-func-plan/main.tf
+@@ -0,0 +1,6 @@
++provider "test" {
++    foo = file("./data")
++}
++
++resource "test_instance" "foo" {
++}
+diff --git a/internal/lang/functions.go b/internal/lang/functions.go
+index 7f944a32a6..fba6bef2a0 100644
+--- a/internal/lang/functions.go
++++ b/internal/lang/functions.go
+@@ -52,6 +52,17 @@ var templateFunctions = collections.NewSetCmp[string](
+ // Functions returns the set of functions that should be used to when evaluating
+ // expressions in the receiving scope.
+ func (s *Scope) Functions() map[string]function.Function {
++	// For backwards compatibility, filesystem functions are allowed to return
++	// inconsistent results when called from within a provider configuration, so
++	// here we override the checks with a noop wrapper. This misbehavior was
++	// found to be used by a number of configurations, which took advantage of
++	// it to create the equivalent of ephemeral values before they formally
++	// existed in the language.
++	immutableResults := immutableResults
++	if s.ForProvider {
++		immutableResults = filesystemNoopWrapper
++	}
++
+ 	s.funcsLock.Lock()
+ 	if s.funcs == nil {
+ 		s.funcs = baseFunctions(s.BaseDir)
+@@ -468,6 +479,10 @@ func immutableResults(name string, priorResults *FunctionResults) func(fn functi
+ 	}
+ }
+ 
++func filesystemNoopWrapper(name string, priorResults *FunctionResults) func(fn function.ImplFunc) function.ImplFunc {
++	return noopWrapper
++}
++
+ func noopWrapper(fn function.ImplFunc) function.ImplFunc {
+ 	return fn
+ }
+diff --git a/internal/lang/scope.go b/internal/lang/scope.go
+index 9c7cb4666a..aa16ce71d7 100644
+--- a/internal/lang/scope.go
++++ b/internal/lang/scope.go
+@@ -78,6 +78,12 @@ type Scope struct {
+ 	// PlanTimestamp is a timestamp representing when the plan was made. It will
+ 	// either have been generated during this operation or read from the plan.
+ 	PlanTimestamp time.Time
++
++	// ForProvider indicates a special case where a provider configuration is
++	// being evaluated and can tolerate inconsistent results which are not
++	// marked as ephemeral.
++	// FIXME: plan to officially deprecate this workaround.
++	ForProvider bool
+ }
+ 
+ // SetActiveExperiments allows a caller to declare that a set of experiments
+diff --git a/internal/terraform/eval_context_builtin.go b/internal/terraform/eval_context_builtin.go
+index 8ed9322400..2cfeb216e1 100644
+--- a/internal/terraform/eval_context_builtin.go
++++ b/internal/terraform/eval_context_builtin.go
+@@ -329,6 +329,23 @@ func (ctx *BuiltinEvalContext) EvaluateBlock(body hcl.Body, schema *configschema
+ 	return val, body, diags
+ }
+ 
++// EvaluateBlockForProvider is a workaround to allow providers to access a more
++// ephemeral context, where filesystem functions can return inconsistent
++// results. Prior to ephemeral values, some configurations were using this
++// loophole to inject different credentials between plan and apply. This
++// exception is not added to the EvalContext interface, so in order to access
++// this workaround the context type must be asserted as BuiltinEvalContext.
++func (ctx *BuiltinEvalContext) EvaluateBlockForProvider(body hcl.Body, schema *configschema.Block, self addrs.Referenceable, keyData InstanceKeyEvalData) (cty.Value, hcl.Body, tfdiags.Diagnostics) {
++	var diags tfdiags.Diagnostics
++	scope := ctx.EvaluationScope(self, nil, keyData)
++	scope.ForProvider = true
++	body, evalDiags := scope.ExpandBlock(body, schema)
++	diags = diags.Append(evalDiags)
++	val, evalDiags := scope.EvalBlock(body, schema)
++	diags = diags.Append(evalDiags)
++	return val, body, diags
++}
++
+ func (ctx *BuiltinEvalContext) EvaluateExpr(expr hcl.Expression, wantType cty.Type, self addrs.Referenceable) (cty.Value, tfdiags.Diagnostics) {
+ 	scope := ctx.EvaluationScope(self, nil, EvalDataForNoInstanceKey)
+ 	return scope.EvalExpr(expr, wantType)
+diff --git a/internal/terraform/node_provider.go b/internal/terraform/node_provider.go
+index 85f5b8eda6..e691451c46 100644
+--- a/internal/terraform/node_provider.go
++++ b/internal/terraform/node_provider.go
+@@ -111,8 +111,16 @@ func (n *NodeApplyableProvider) ConfigureProvider(ctx EvalContext, provider prov
+ 		return diags
+ 	}
+ 
++	// BuiltinEvalContext contains a workaround for providers to allow
++	// inconsistent filesystem function results, which can be accepted due to
++	// the ephemeral nature of a provider configuration.
++	eval := ctx.EvaluateBlock
++	if ctx, ok := ctx.(*BuiltinEvalContext); ok {
++		eval = ctx.EvaluateBlockForProvider
++	}
++
+ 	configSchema := resp.Provider.Body
+-	configVal, configBody, evalDiags := ctx.EvaluateBlock(configBody, configSchema, nil, EvalDataForNoInstanceKey)
++	configVal, configBody, evalDiags := eval(configBody, configSchema, nil, EvalDataForNoInstanceKey)
+ 	diags = diags.Append(evalDiags)
+ 	if evalDiags.HasErrors() {
+ 		if config == nil {

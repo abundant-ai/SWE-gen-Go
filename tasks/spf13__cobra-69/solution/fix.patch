@@ -1,0 +1,530 @@
+diff --git a/README.md b/README.md
+index f340f6f..a0d07f9 100644
+--- a/README.md
++++ b/README.md
+@@ -348,6 +348,9 @@ Like help the function and template are over ridable through public methods.
+ 
+     command.SetUsageTemplate(s string)
+ 
++## Generating bash completions for your command
++
++Cobra can generate a bash completions file. If you add more information to your command these completions can be amazingly powerful and flexible.  Read more about [Bash Completions](bash_completions.md)
+ 
+ ## Debugging
+ 
+diff --git a/bash_completions.go b/bash_completions.go
+new file mode 100644
+index 0000000..1c56407
+--- /dev/null
++++ b/bash_completions.go
+@@ -0,0 +1,343 @@
++package cobra
++
++import (
++	"bytes"
++	"fmt"
++	"os"
++	"strings"
++
++	"github.com/spf13/pflag"
++)
++
++const (
++	BashCompFilenameExt     = "cobra_annotation_bash_completion_filename_extentions"
++	BashCompOneRequiredFlag = "cobra_annotation_bash_completion_one_required_flag"
++)
++
++func preamble(out *bytes.Buffer) {
++	fmt.Fprintf(out, `#!/bin/bash
++
++
++__debug()
++{
++    if [[ -n ${BASH_COMP_DEBUG_FILE} ]]; then
++        echo "$*" >> ${BASH_COMP_DEBUG_FILE}
++    fi
++}
++
++__index_of_word()
++{
++    local w word=$1
++    shift
++    index=0
++    for w in "$@"; do
++        [[ $w = "$word" ]] && return
++        index=$((index+1))
++    done
++    index=-1
++}
++
++__contains_word()
++{
++    local w word=$1; shift
++    for w in "$@"; do
++        [[ $w = "$word" ]] && return
++    done
++    return 1
++}
++
++__handle_reply()
++{
++    __debug "${FUNCNAME}"
++    case $cur in
++        -*)
++            compopt -o nospace
++            local allflags
++            if [ ${#must_have_one_flag[@]} -ne 0 ]; then
++                allflags=("${must_have_one_flag[@]}")
++            else
++                allflags=("${flags[*]} ${two_word_flags[*]}")
++            fi
++            COMPREPLY=( $(compgen -W "${allflags[*]}" -- "$cur") )
++            [[ $COMPREPLY == *= ]] || compopt +o nospace
++            return 0;
++            ;;
++    esac
++
++    # check if we are handling a flag with special work handling
++    local index
++    __index_of_word "${prev}" "${flags_with_completion[@]}"
++    if [[ ${index} -ge 0 ]]; then
++        ${flags_completion[${index}]}
++        return
++    fi
++
++    # we are parsing a flag and don't have a special handler, no completion
++    if [[ ${cur} != "${words[cword]}" ]]; then
++        return
++    fi
++
++    local completions
++    if [[ ${#must_have_one_flag[@]} -ne 0 ]]; then
++        completions=("${must_have_one_flag[@]}")
++    elif [[ ${#must_have_one_noun[@]} -ne 0 ]]; then
++        completions=("${must_have_one_noun[@]}")
++    else
++        completions=("${commands[@]}")
++    fi
++    COMPREPLY=( $(compgen -W "${completions[*]}" -- "$cur") )
++
++    if [[ ${#COMPREPLY[@]} -eq 0 ]]; then
++        declare -F __custom_func >/dev/null && __custom_func
++    fi
++}
++
++__handle_flag()
++{
++    __debug "${FUNCNAME}: c is $c words[c] is ${words[c]}"
++
++    # if a command required a flag, and we found it, unset must_have_one_flag()
++    local flagname=${words[c]}
++    # if the word contained an =
++    if [[ ${words[c]} == *"="* ]]; then
++        flagname=${flagname%%=*} # strip everything after the =
++        flagname="${flagname}=" # but put the = back
++    fi
++    __debug "${FUNCNAME}: looking for ${flagname}"
++    if __contains_word "${flagname}" "${must_have_one_flag[@]}"; then
++        must_have_one_flag=()
++    fi
++
++    # skip the argument to a two word flag
++    if __contains_word "${words[c]}" "${two_word_flags[@]}"; then
++        c=$((c+1))
++        # if we are looking for a flags value, don't show commands
++        if [[ $c -eq $cword ]]; then
++            commands=()
++        fi
++    fi
++
++    # skip the flag itself
++    c=$((c+1))
++
++}
++
++__handle_noun()
++{
++    __debug "${FUNCNAME}: c is $c words[c] is ${words[c]}"
++
++    if __contains_word "${words[c]}" "${must_have_one_noun[@]}"; then
++        must_have_one_noun=()
++    fi
++
++    nouns+=("${words[c]}")
++    c=$((c+1))
++}
++
++__handle_command()
++{
++    __debug "${FUNCNAME}: c is $c words[c] is ${words[c]}"
++
++    local next_command
++    if [[ -n ${last_command} ]]; then
++        next_command="_${last_command}_${words[c]}"
++    else
++        next_command="_${words[c]}"
++    fi
++    c=$((c+1))
++    __debug "${FUNCNAME}: looking for ${next_command}"
++    declare -F $next_command >/dev/null && $next_command
++}
++
++__handle_word()
++{
++    if [[ $c -ge $cword ]]; then
++        __handle_reply
++	return
++    fi
++    __debug "${FUNCNAME}: c is $c words[c] is ${words[c]}"
++    if [[ "${words[c]}" == -* ]]; then
++	__handle_flag
++    elif __contains_word "${words[c]}" "${commands[@]}"; then
++        __handle_command
++    else
++        __handle_noun
++    fi
++    __handle_word
++}
++
++`)
++}
++
++func postscript(out *bytes.Buffer, name string) {
++	fmt.Fprintf(out, "__start_%s()\n", name)
++	fmt.Fprintf(out, `{
++    local cur prev words cword split
++    _init_completion -s || return
++
++    local completions_func
++    local c=0
++    local flags=()
++    local two_word_flags=()
++    local flags_with_completion=()
++    local flags_completion=()
++    local commands=("%s")
++    local must_have_one_flag=()
++    local must_have_one_noun=()
++    local last_command
++    local nouns=()
++
++    __handle_word
++}
++
++`, name)
++	fmt.Fprintf(out, "complete -F __start_%s %s\n", name, name)
++	fmt.Fprintf(out, "# ex: ts=4 sw=4 et filetype=sh\n")
++}
++
++func writeCommands(cmd *Command, out *bytes.Buffer) {
++	fmt.Fprintf(out, "    commands=()\n")
++	for _, c := range cmd.Commands() {
++		fmt.Fprintf(out, "    commands+=(%q)\n", c.Name())
++	}
++	fmt.Fprintf(out, "\n")
++}
++
++func writeFlagHandler(name string, annotations map[string][]string, out *bytes.Buffer) {
++	for key, value := range annotations {
++		switch key {
++		case BashCompFilenameExt:
++			fmt.Fprintf(out, "    flags_with_completion+=(%q)\n", name)
++
++			ext := strings.Join(value, "|")
++			ext = "_filedir '@(" + ext + ")'"
++			fmt.Fprintf(out, "    flags_completion+=(%q)\n", ext)
++		}
++	}
++}
++
++func writeShortFlag(flag *pflag.Flag, out *bytes.Buffer) {
++	b := (flag.Value.Type() == "bool")
++	name := flag.Shorthand
++	format := "    "
++	if !b {
++		format += "two_word_"
++	}
++	format += "flags+=(\"-%s\")\n"
++	fmt.Fprintf(out, format, name)
++	writeFlagHandler("-"+name, flag.Annotations, out)
++}
++
++func writeFlag(flag *pflag.Flag, out *bytes.Buffer) {
++	b := (flag.Value.Type() == "bool")
++	name := flag.Name
++	format := "    flags+=(\"--%s"
++	if !b {
++		format += "="
++	}
++	format += "\")\n"
++	fmt.Fprintf(out, format, name)
++	writeFlagHandler("--"+name, flag.Annotations, out)
++}
++
++func writeFlags(cmd *Command, out *bytes.Buffer) {
++	fmt.Fprintf(out, `    flags=()
++    two_word_flags=()
++    flags_with_completion=()
++    flags_completion=()
++
++`)
++	cmd.NonInheritedFlags().VisitAll(func(flag *pflag.Flag) {
++		writeFlag(flag, out)
++		if len(flag.Shorthand) > 0 {
++			writeShortFlag(flag, out)
++		}
++	})
++
++	fmt.Fprintf(out, "\n")
++}
++
++func writeRequiredFlag(cmd *Command, out *bytes.Buffer) {
++	fmt.Fprintf(out, "    must_have_one_flag=()\n")
++	flags := cmd.NonInheritedFlags()
++	flags.VisitAll(func(flag *pflag.Flag) {
++		for key, _ := range flag.Annotations {
++			switch key {
++			case BashCompOneRequiredFlag:
++				format := "    must_have_one_flag+=(\"--%s"
++				b := (flag.Value.Type() == "bool")
++				if !b {
++					format += "="
++				}
++				format += "\")\n"
++				fmt.Fprintf(out, format, flag.Name)
++
++				if len(flag.Shorthand) > 0 {
++					fmt.Fprintf(out, "    must_have_one_flag+=(\"-%s\")\n", flag.Shorthand)
++				}
++			}
++		}
++	})
++}
++
++func writeRequiredNoun(cmd *Command, out *bytes.Buffer) {
++	fmt.Fprintf(out, "    must_have_one_noun=()\n")
++	for _, value := range cmd.ValidArgs {
++		fmt.Fprintf(out, "    must_have_one_noun+=(%q)\n", value)
++	}
++}
++
++func gen(cmd *Command, out *bytes.Buffer) {
++	for _, c := range cmd.Commands() {
++		gen(c, out)
++	}
++	commandName := cmd.CommandPath()
++	commandName = strings.Replace(commandName, " ", "_", -1)
++	fmt.Fprintf(out, "_%s()\n{\n", commandName)
++	fmt.Fprintf(out, "    last_command=%q\n", commandName)
++	writeCommands(cmd, out)
++	writeFlags(cmd, out)
++	writeRequiredFlag(cmd, out)
++	writeRequiredNoun(cmd, out)
++	fmt.Fprintf(out, "}\n\n")
++}
++
++func (cmd *Command) GenBashCompletion(out *bytes.Buffer) {
++	preamble(out)
++	if len(cmd.BashCompletionFunction) > 0 {
++		fmt.Fprintf(out, "%s\n", cmd.BashCompletionFunction)
++	}
++	gen(cmd, out)
++	postscript(out, cmd.Name())
++}
++
++func (cmd *Command) GenBashCompletionFile(filename string) error {
++	out := new(bytes.Buffer)
++
++	cmd.GenBashCompletion(out)
++
++	outFile, err := os.Create(filename)
++	if err != nil {
++		return err
++	}
++	defer outFile.Close()
++
++	_, err = outFile.Write(out.Bytes())
++	if err != nil {
++		return err
++	}
++	return nil
++}
++
++func (cmd *Command) MarkFlagRequired(name string) {
++	flag := cmd.Flags().Lookup(name)
++	if flag == nil {
++		return
++	}
++	if flag.Annotations == nil {
++		flag.Annotations = make(map[string][]string)
++	}
++	annotation := make([]string, 1)
++	annotation[0] = "true"
++	flag.Annotations[BashCompOneRequiredFlag] = annotation
++}
+diff --git a/bash_completions.md b/bash_completions.md
+new file mode 100644
+index 0000000..e1a5d56
+--- /dev/null
++++ b/bash_completions.md
+@@ -0,0 +1,146 @@
++# Generating Bash Completions For Your Own cobra.Command
++
++Generating bash completions from a cobra command is incredibly easy. An actual program which does so for the kubernetes kubectl binary is as follows:
++
++```go
++package main
++
++import (
++        "io/ioutil"
++        "os"
++
++        "github.com/GoogleCloudPlatform/kubernetes/pkg/kubectl/cmd"
++)
++
++func main() {
++        kubectl := cmd.NewFactory(nil).NewKubectlCommand(os.Stdin, ioutil.Discard, ioutil.Discard)
++        kubectl.GenBashCompletionFile("out.sh")
++}
++```
++
++That will get you completions of subcommands and flags. If you make additional annotations to your code, you can get even more intelligent and flexible behavior.
++
++## Creating your own custom functions
++
++Some more actual code that works in kubernetes:
++
++```bash
++const (
++        bash_completion_func = `__kubectl_parse_get()
++{
++    local kubectl_output out
++    if kubectl_output=$(kubectl get --no-headers "$1" 2>/dev/null); then
++        out=($(echo "${kubectl_output}" | awk '{print $1}'))
++        COMPREPLY=( $( compgen -W "${out[*]}" -- "$cur" ) )
++    fi
++}
++
++__kubectl_get_resource()
++{
++    if [[ ${#nouns[@]} -eq 0 ]]; then
++        return 1
++    fi
++    __kubectl_parse_get ${nouns[${#nouns[@]} -1]}
++    if [[ $? -eq 0 ]]; then
++        return 0
++    fi
++}
++
++__custom_func() {
++    case ${last_command} in
++        kubectl_get | kubectl_describe | kubectl_delete | kubectl_stop)
++            __kubectl_get_resource
++            return
++            ;;
++        *)
++            ;;
++    esac
++}
++`)
++```
++
++And then I set that in my command definition:
++
++```go
++cmds := &cobra.Command{
++	Use:   "kubectl",
++	Short: "kubectl controls the Kubernetes cluster manager",
++	Long: `kubectl controls the Kubernetes cluster manager.
++
++Find more information at https://github.com/GoogleCloudPlatform/kubernetes.`,
++	Run: runHelp,
++	BashCompletionFunction: bash_completion_func,
++}
++```
++
++The `BashCompletionFunction` option is really only valid/useful on the root command. Doing the above will cause `__custom_func()` to be called when the built in processor was unable to find a solution. In the case of kubernetes a valid command might look something like `kubectl get pod [mypod]`. If you type `kubectl get pod [tab][tab]` the `__customc_func()` will run because the cobra.Command only understood "kubectl" and "get." `__custom_func()` will see that the cobra.Command is "kubectl_get" and will thus call another helper `__kubectl_get_resource()`.  `__kubectl_get_resource` will look at the 'nouns' collected. In our example the only noun will be `pod`.  So it will call `__kubectl_parse_get pod`.  `__kubectl_parse_get` will actually call out to kubernetes and get any pods.  It will then set `COMPREPLY` to valid pods!
++
++## Have the completions code complete your 'nouns'
++
++In the above example "pod" was assumed to already be typed. But if you want `kubectl get [tab][tab]` to show a list of valid "nouns" you have to set them. Simplified code from `kubectl get` looks like:
++
++```go
++validArgs []string = { "pods", "nodes", "services", "replicationControllers" }
++
++cmd := &cobra.Command{
++	Use:     "get [(-o|--output=)json|yaml|template|...] (RESOURCE [NAME] | RESOURCE/NAME ...)",
++	Short:   "Display one or many resources",
++	Long:    get_long,
++	Example: get_example,
++	Run: func(cmd *cobra.Command, args []string) {
++		err := RunGet(f, out, cmd, args)
++		util.CheckErr(err)
++	},
++	ValidArgs: validArgs,
++}
++```
++
++Notice we put the "ValidArgs" on the "get" subcommand. Doing so will give results like
++
++```bash
++# kubectl get [tab][tab]
++nodes                 pods                    replicationControllers  services
++```
++
++## Mark flags as required
++
++Most of the time completions will only show subcommands. But if a flag is required to make a subcommand work, you probably want it to show up when the user types [tab][tab].  Marking a flag as 'Required' is incredibly easy.
++
++```go
++cmd.MarkFlagRequired("pod")
++cmd.MarkFlagRequired("container")
++```
++
++and you'll get something like
++
++```bash
++# kubectl exec [tab][tab][tab]
++-c            --container=  -p            --pod=  
++```
++
++# Specify valid filename extentions for flags that take a filename
++
++In this example we use --filename= and expect to get a json or yaml file as the argument. To make this easier we annotate the --filename flag with valid filename extensions.
++
++```go
++	annotations := make([]string, 3)
++	annotations[0] = "json"
++	annotations[1] = "yaml"
++	annotations[2] = "yml"
++
++	annotation := make(map[string][]string)
++	annotation[cobra.BashCompFilenameExt] = annotations
++
++	flag := &pflag.Flag{"filename", "f", usage, value, value.String(), false, annotation}
++	cmd.Flags().AddFlag(flag)
++```
++
++Now when you run a command with this filename flag you'll get something like
++
++```bash
++# kubectl create -f 
++test/                         example/                      rpmbuild/
++hello.yml                     test.json
++```
++
++So while there are many other files in the CWD it only shows me subdirs and those with valid extensions.
+diff --git a/command.go b/command.go
+index fddc203..7b8891a 100644
+--- a/command.go
++++ b/command.go
+@@ -44,6 +44,10 @@ type Command struct {
+ 	Long string
+ 	// Examples of how to use the command
+ 	Example string
++	// List of all valid non-flag arguments, used for bash completions *TODO* actually validate these
++	ValidArgs []string
++	// Custom functions used by the bash autocompletion generator
++	BashCompletionFunction string
+ 	// Full set of flags
+ 	flags *flag.FlagSet
+ 	// Set of flags childrens of this command will inherit

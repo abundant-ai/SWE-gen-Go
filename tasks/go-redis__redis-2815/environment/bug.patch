@@ -1,0 +1,134 @@
+diff --git a/bench_decode_test.go b/bench_decode_test.go
+index 16bdf2cd..50e33908 100644
+--- a/bench_decode_test.go
++++ b/bench_decode_test.go
+@@ -59,6 +59,14 @@ func NewClusterClientStub(resp []byte) *ClientStub {
+ 		},
+ 	})
+ 
++	// init command.
++	tmpClient := NewClient(&Options{Addr: ":6379"})
++	cmdsInfo, err := tmpClient.Command(ctx).Result()
++	_ = tmpClient.Close()
++	client.cmdsInfoCache = newCmdsInfoCache(func(_ context.Context) (map[string]*CommandInfo, error) {
++		return cmdsInfo, err
++	})
++
+ 	stub.Cmdable = client
+ 	return stub
+ }
+diff --git a/command.go b/command.go
+index 1a33cb32..3dd475fa 100644
+--- a/command.go
++++ b/command.go
+@@ -75,7 +75,7 @@ func writeCmd(wr *proto.Writer, cmd Cmder) error {
+ 	return wr.WriteArgs(cmd.Args())
+ }
+ 
+-func cmdFirstKeyPos(cmd Cmder) int {
++func cmdFirstKeyPos(cmd Cmder, info *CommandInfo) int {
+ 	if pos := cmd.firstKeyPos(); pos != 0 {
+ 		return int(pos)
+ 	}
+@@ -95,6 +95,10 @@ func cmdFirstKeyPos(cmd Cmder) int {
+ 			return 2
+ 		}
+ 	}
++
++	if info != nil {
++		return int(info.FirstKeyPos)
++	}
+ 	return 1
+ }
+ 
+diff --git a/osscluster.go b/osscluster.go
+index b8a82d9b..93e0eef1 100644
+--- a/osscluster.go
++++ b/osscluster.go
+@@ -907,6 +907,7 @@ func (c *ClusterClient) Process(ctx context.Context, cmd Cmder) error {
+ }
+ 
+ func (c *ClusterClient) process(ctx context.Context, cmd Cmder) error {
++	cmdInfo := c.cmdInfo(ctx, cmd.Name())
+ 	slot := c.cmdSlot(ctx, cmd)
+ 	var node *clusterNode
+ 	var ask bool
+@@ -920,7 +921,7 @@ func (c *ClusterClient) process(ctx context.Context, cmd Cmder) error {
+ 
+ 		if node == nil {
+ 			var err error
+-			node, err = c.cmdNode(ctx, cmd.Name(), slot)
++			node, err = c.cmdNode(ctx, cmdInfo, slot)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -1782,7 +1783,8 @@ func (c *ClusterClient) cmdSlot(ctx context.Context, cmd Cmder) int {
+ 		return args[2].(int)
+ 	}
+ 
+-	return cmdSlot(cmd, cmdFirstKeyPos(cmd))
++	cmdInfo := c.cmdInfo(ctx, cmd.Name())
++	return cmdSlot(cmd, cmdFirstKeyPos(cmd, cmdInfo))
+ }
+ 
+ func cmdSlot(cmd Cmder, pos int) int {
+@@ -1795,7 +1797,7 @@ func cmdSlot(cmd Cmder, pos int) int {
+ 
+ func (c *ClusterClient) cmdNode(
+ 	ctx context.Context,
+-	cmdName string,
++	cmdInfo *CommandInfo,
+ 	slot int,
+ ) (*clusterNode, error) {
+ 	state, err := c.state.Get(ctx)
+@@ -1803,11 +1805,8 @@ func (c *ClusterClient) cmdNode(
+ 		return nil, err
+ 	}
+ 
+-	if c.opt.ReadOnly {
+-		cmdInfo := c.cmdInfo(ctx, cmdName)
+-		if cmdInfo != nil && cmdInfo.ReadOnly {
+-			return c.slotReadOnlyNode(state, slot)
+-		}
++	if c.opt.ReadOnly && cmdInfo != nil && cmdInfo.ReadOnly {
++		return c.slotReadOnlyNode(state, slot)
+ 	}
+ 	return state.slotMasterNode(slot)
+ }
+diff --git a/ring.go b/ring.go
+index 0c031b5a..367a542e 100644
+--- a/ring.go
++++ b/ring.go
+@@ -678,8 +678,21 @@ func (c *Ring) cmdsInfo(ctx context.Context) (map[string]*CommandInfo, error) {
+ 	return nil, firstErr
+ }
+ 
++func (c *Ring) cmdInfo(ctx context.Context, name string) *CommandInfo {
++	cmdsInfo, err := c.cmdsInfoCache.Get(ctx)
++	if err != nil {
++		return nil
++	}
++	info := cmdsInfo[name]
++	if info == nil {
++		internal.Logger.Printf(ctx, "info for cmd=%s not found", name)
++	}
++	return info
++}
++
+ func (c *Ring) cmdShard(ctx context.Context, cmd Cmder) (*ringShard, error) {
+-	pos := cmdFirstKeyPos(cmd)
++	cmdInfo := c.cmdInfo(ctx, cmd.Name())
++	pos := cmdFirstKeyPos(cmd, cmdInfo)
+ 	if pos == 0 {
+ 		return c.sharding.Random()
+ 	}
+@@ -747,7 +760,8 @@ func (c *Ring) generalProcessPipeline(
+ 	cmdsMap := make(map[string][]Cmder)
+ 
+ 	for _, cmd := range cmds {
+-		hash := cmd.stringArg(cmdFirstKeyPos(cmd))
++		cmdInfo := c.cmdInfo(ctx, cmd.Name())
++		hash := cmd.stringArg(cmdFirstKeyPos(cmd, cmdInfo))
+ 		if hash != "" {
+ 			hash = c.sharding.Hash(hash)
+ 		}

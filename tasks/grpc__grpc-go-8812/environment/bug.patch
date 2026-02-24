@@ -1,0 +1,591 @@
+diff --git a/internal/resolver/dns/dns_resolver.go b/internal/resolver/dns/dns_resolver.go
+index 70b89e4d..ada5251c 100644
+--- a/internal/resolver/dns/dns_resolver.go
++++ b/internal/resolver/dns/dns_resolver.go
+@@ -125,10 +125,7 @@ func (b *dnsBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts
+ 	// IP address.
+ 	if ipAddr, err := formatIP(host); err == nil {
+ 		addr := []resolver.Address{{Addr: ipAddr + ":" + port}}
+-		cc.UpdateState(resolver.State{
+-			Addresses: addr,
+-			Endpoints: []resolver.Endpoint{{Addresses: addr}},
+-		})
++		cc.UpdateState(resolver.State{Addresses: addr})
+ 		return deadResolver{}, nil
+ 	}
+ 
+@@ -345,15 +342,7 @@ func (d *dnsResolver) lookup() (*resolver.State, error) {
+ 		return nil, hostErr
+ 	}
+ 
+-	eps := make([]resolver.Endpoint, 0, len(addrs))
+-	for _, addr := range addrs {
+-		eps = append(eps, resolver.Endpoint{Addresses: []resolver.Address{addr}})
+-	}
+-
+-	state := resolver.State{
+-		Addresses: addrs,
+-		Endpoints: eps,
+-	}
++	state := resolver.State{Addresses: addrs}
+ 	if len(srv) > 0 {
+ 		state = grpclbstate.Set(state, &grpclbstate.State{BalancerAddresses: srv})
+ 	}
+diff --git a/internal/resolver/dns/dns_resolver_test.go b/internal/resolver/dns/dns_resolver_test.go
+index ce04cda7..f0d4dbad 100644
+--- a/internal/resolver/dns/dns_resolver_test.go
++++ b/internal/resolver/dns/dns_resolver_test.go
+@@ -30,7 +30,6 @@ import (
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/google/go-cmp/cmp/cmpopts"
+-	"google.golang.org/grpc/attributes"
+ 	"google.golang.org/grpc/balancer"
+ 	grpclbstate "google.golang.org/grpc/balancer/grpclb/state"
+ 	"google.golang.org/grpc/internal"
+@@ -167,16 +166,11 @@ func buildResolverWithTestClientConn(t *testing.T, target string) (resolver.Reso
+ 	return r, stateCh, errCh
+ }
+ 
+-// resolverUpdate holds required components of a resolver state for validation.
+-type resolverUpdate struct {
+-	addrs         []resolver.Address
+-	endpoints     []resolver.Endpoint
+-	balancerAddrs []resolver.Address // list of grpclb addresses
+-	serviceConfig serviceconfig.Config
+-}
+-
+-// Waits for a state update from the DNS resolver.
+-func verifyUpdateFromResolver(ctx context.Context, t *testing.T, stateCh chan resolver.State, want resolverUpdate) {
++// Waits for a state update from the DNS resolver and verifies the following:
++// - wantAddrs matches the list of addresses in the update
++// - wantBalancerAddrs matches the list of grpclb addresses in the update
++// - wantSC matches the service config in the update
++func verifyUpdateFromResolver(ctx context.Context, t *testing.T, stateCh chan resolver.State, wantAddrs, wantBalancerAddrs []resolver.Address, wantSC string) {
+ 	t.Helper()
+ 
+ 	var state resolver.State
+@@ -186,43 +180,28 @@ func verifyUpdateFromResolver(ctx context.Context, t *testing.T, stateCh chan re
+ 	case state = <-stateCh:
+ 	}
+ 
+-	wantResolverState := resolver.State{
+-		Addresses: want.addrs,
+-		Endpoints: want.endpoints,
+-		ServiceConfig: &serviceconfig.ParseResult{
+-			Config: want.serviceConfig,
+-		},
+-	}
+-	if len(want.balancerAddrs) > 0 {
+-		wantResolverState = grpclbstate.Set(wantResolverState, &grpclbstate.State{
+-			BalancerAddresses: want.balancerAddrs,
+-		})
++	if !cmp.Equal(state.Addresses, wantAddrs, cmpopts.EquateEmpty()) {
++		t.Fatalf("Got addresses: %+v, want: %+v", state.Addresses, wantAddrs)
+ 	}
+-
+-	scComparer := cmp.Comparer(func(a, b *serviceconfig.ParseResult) bool {
+-		var scA serviceconfig.Config
+-		var scB serviceconfig.Config
+-		if a != nil {
+-			scA = a.Config
++	if gs := grpclbstate.Get(state); gs == nil {
++		if len(wantBalancerAddrs) > 0 {
++			t.Fatalf("Got no grpclb addresses. Want %d", len(wantBalancerAddrs))
+ 		}
+-		if b != nil {
+-			scB = b.Config
++	} else {
++		if !cmp.Equal(gs.BalancerAddresses, wantBalancerAddrs) {
++			t.Fatalf("Got grpclb addresses %+v, want %+v", gs.BalancerAddresses, wantBalancerAddrs)
+ 		}
+-		return internal.EqualServiceConfigForTesting(scA, scB)
+-	})
+-	attrComparer := cmp.Comparer(func(a, b *attributes.Attributes) bool {
+-		if a == nil && b == nil {
+-			return true
++	}
++	if wantSC == "{}" {
++		if state.ServiceConfig != nil && state.ServiceConfig.Config != nil {
++			t.Fatalf("Got service config:\n%s \nWant service config: {}", cmp.Diff(nil, state.ServiceConfig.Config))
+ 		}
+-		if a == nil || b == nil {
+-			return false
++
++	} else if wantSC != "" {
++		wantSCParsed := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(wantSC)
++		if !internal.EqualServiceConfigForTesting(state.ServiceConfig.Config, wantSCParsed.Config) {
++			t.Fatalf("Got service config:\n%s \nWant service config:\n%s", cmp.Diff(nil, state.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
+ 		}
+-		gA := grpclbstate.Get(resolver.State{Attributes: a})
+-		gB := grpclbstate.Get(resolver.State{Attributes: b})
+-		return cmp.Equal(gA.BalancerAddresses, gB.BalancerAddresses)
+-	})
+-	if diff := cmp.Diff(wantResolverState, state, cmpopts.EquateEmpty(), scComparer, attrComparer); diff != "" {
+-		t.Fatalf("Got unexpected resolver.State (-want +got):\n%s", diff)
+ 	}
+ }
+ 
+@@ -426,12 +405,14 @@ const txtRecordNonMatching = `
+ // the expected update is pushed to the channel.
+ func (s) TestDNSResolver_Basic(t *testing.T) {
+ 	tests := []struct {
+-		name            string
+-		target          string
+-		hostLookupTable map[string][]string
+-		srvLookupTable  map[string][]*net.SRV
+-		txtLookupTable  map[string][]string
+-		want            resolverUpdate
++		name              string
++		target            string
++		hostLookupTable   map[string][]string
++		srvLookupTable    map[string][]*net.SRV
++		txtLookupTable    map[string][]string
++		wantAddrs         []resolver.Address
++		wantBalancerAddrs []resolver.Address
++		wantSC            string
+ 	}{
+ 		{
+ 			name:   "default_port",
+@@ -442,14 +423,9 @@ func (s) TestDNSResolver_Basic(t *testing.T) {
+ 			txtLookupTable: map[string][]string{
+ 				"_grpc_config.foo.bar.com": txtRecordServiceConfig(txtRecordGood),
+ 			},
+-			want: resolverUpdate{
+-				addrs: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}},
+-				endpoints: []resolver.Endpoint{
+-					{Addresses: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}}},
+-					{Addresses: []resolver.Address{{Addr: "5.6.7.8" + colonDefaultPort}}},
+-				},
+-				serviceConfig: mustParseServiceConfig(t, scJSON),
+-			},
++			wantAddrs:         []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}},
++			wantBalancerAddrs: nil,
++			wantSC:            scJSON,
+ 		},
+ 		{
+ 			name:   "specified_port",
+@@ -460,14 +436,9 @@ func (s) TestDNSResolver_Basic(t *testing.T) {
+ 			txtLookupTable: map[string][]string{
+ 				"_grpc_config.foo.bar.com": txtRecordServiceConfig(txtRecordGood),
+ 			},
+-			want: resolverUpdate{
+-				addrs: []resolver.Address{{Addr: "1.2.3.4:1234"}, {Addr: "5.6.7.8:1234"}},
+-				endpoints: []resolver.Endpoint{
+-					{Addresses: []resolver.Address{{Addr: "1.2.3.4:1234"}}},
+-					{Addresses: []resolver.Address{{Addr: "5.6.7.8:1234"}}},
+-				},
+-				serviceConfig: mustParseServiceConfig(t, scJSON),
+-			},
++			wantAddrs:         []resolver.Address{{Addr: "1.2.3.4:1234"}, {Addr: "5.6.7.8:1234"}},
++			wantBalancerAddrs: nil,
++			wantSC:            scJSON,
+ 		},
+ 		{
+ 			name:   "ipv4_with_SRV_and_single_grpclb_address",
+@@ -482,12 +453,9 @@ func (s) TestDNSResolver_Basic(t *testing.T) {
+ 			txtLookupTable: map[string][]string{
+ 				"_grpc_config.srv.ipv4.single.fake": txtRecordServiceConfig(txtRecordGood),
+ 			},
+-			want: resolverUpdate{
+-				addrs:         []resolver.Address{{Addr: "2.4.6.8" + colonDefaultPort}},
+-				endpoints:     []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "2.4.6.8" + colonDefaultPort}}}},
+-				balancerAddrs: []resolver.Address{{Addr: "1.2.3.4:1234", ServerName: "ipv4.single.fake"}},
+-				serviceConfig: mustParseServiceConfig(t, scJSON),
+-			},
++			wantAddrs:         []resolver.Address{{Addr: "2.4.6.8" + colonDefaultPort}},
++			wantBalancerAddrs: []resolver.Address{{Addr: "1.2.3.4:1234", ServerName: "ipv4.single.fake"}},
++			wantSC:            scJSON,
+ 		},
+ 		{
+ 			name:   "ipv4_with_SRV_and_multiple_grpclb_address",
+@@ -501,14 +469,13 @@ func (s) TestDNSResolver_Basic(t *testing.T) {
+ 			txtLookupTable: map[string][]string{
+ 				"_grpc_config.srv.ipv4.multi.fake": txtRecordServiceConfig(txtRecordGood),
+ 			},
+-			want: resolverUpdate{
+-				balancerAddrs: []resolver.Address{
+-					{Addr: "1.2.3.4:1234", ServerName: "ipv4.multi.fake"},
+-					{Addr: "5.6.7.8:1234", ServerName: "ipv4.multi.fake"},
+-					{Addr: "9.10.11.12:1234", ServerName: "ipv4.multi.fake"},
+-				},
+-				serviceConfig: mustParseServiceConfig(t, scJSON),
++			wantAddrs: nil,
++			wantBalancerAddrs: []resolver.Address{
++				{Addr: "1.2.3.4:1234", ServerName: "ipv4.multi.fake"},
++				{Addr: "5.6.7.8:1234", ServerName: "ipv4.multi.fake"},
++				{Addr: "9.10.11.12:1234", ServerName: "ipv4.multi.fake"},
+ 			},
++			wantSC: scJSON,
+ 		},
+ 		{
+ 			name:   "ipv6_with_SRV_and_single_grpclb_address",
+@@ -523,9 +490,9 @@ func (s) TestDNSResolver_Basic(t *testing.T) {
+ 			txtLookupTable: map[string][]string{
+ 				"_grpc_config.srv.ipv6.single.fake": txtRecordServiceConfig(txtRecordNonMatching),
+ 			},
+-			want: resolverUpdate{
+-				balancerAddrs: []resolver.Address{{Addr: "[2607:f8b0:400a:801::1001]:1234", ServerName: "ipv6.single.fake"}},
+-			},
++			wantAddrs:         nil,
++			wantBalancerAddrs: []resolver.Address{{Addr: "[2607:f8b0:400a:801::1001]:1234", ServerName: "ipv6.single.fake"}},
++			wantSC:            "{}",
+ 		},
+ 		{
+ 			name:   "ipv6_with_SRV_and_multiple_grpclb_address",
+@@ -540,13 +507,13 @@ func (s) TestDNSResolver_Basic(t *testing.T) {
+ 			txtLookupTable: map[string][]string{
+ 				"_grpc_config.srv.ipv6.multi.fake": txtRecordServiceConfig(txtRecordNonMatching),
+ 			},
+-			want: resolverUpdate{
+-				balancerAddrs: []resolver.Address{
+-					{Addr: "[2607:f8b0:400a:801::1001]:1234", ServerName: "ipv6.multi.fake"},
+-					{Addr: "[2607:f8b0:400a:801::1002]:1234", ServerName: "ipv6.multi.fake"},
+-					{Addr: "[2607:f8b0:400a:801::1003]:1234", ServerName: "ipv6.multi.fake"},
+-				},
++			wantAddrs: nil,
++			wantBalancerAddrs: []resolver.Address{
++				{Addr: "[2607:f8b0:400a:801::1001]:1234", ServerName: "ipv6.multi.fake"},
++				{Addr: "[2607:f8b0:400a:801::1002]:1234", ServerName: "ipv6.multi.fake"},
++				{Addr: "[2607:f8b0:400a:801::1003]:1234", ServerName: "ipv6.multi.fake"},
+ 			},
++			wantSC: "{}",
+ 		},
+ 	}
+ 
+@@ -563,7 +530,7 @@ func (s) TestDNSResolver_Basic(t *testing.T) {
+ 
+ 			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 			defer cancel()
+-			verifyUpdateFromResolver(ctx, t, stateCh, test.want)
++			verifyUpdateFromResolver(ctx, t, stateCh, test.wantAddrs, test.wantBalancerAddrs, test.wantSC)
+ 		})
+ 	}
+ }
+@@ -703,17 +670,10 @@ func (s) TestDNSResolver_ResolveNow(t *testing.T) {
+ 
+ 	// Verify that the first update pushed by the resolver matches expectations.
+ 	wantAddrs := []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}}
+-	wantSC := mustParseServiceConfig(t, scJSON)
++	wantSC := scJSON
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+-	verifyUpdateFromResolver(ctx, t, stateCh, resolverUpdate{
+-		addrs: wantAddrs,
+-		endpoints: []resolver.Endpoint{
+-			{Addresses: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}}},
+-			{Addresses: []resolver.Address{{Addr: "5.6.7.8" + colonDefaultPort}}},
+-		},
+-		serviceConfig: wantSC,
+-	})
++	verifyUpdateFromResolver(ctx, t, stateCh, wantAddrs, nil, wantSC)
+ 
+ 	// Update state in the fake net.Resolver to return only one address and a
+ 	// new service config.
+@@ -726,12 +686,8 @@ func (s) TestDNSResolver_ResolveNow(t *testing.T) {
+ 	// expectations.
+ 	r.ResolveNow(resolver.ResolveNowOptions{})
+ 	wantAddrs = []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}}
+-	wantSC = mustParseServiceConfig(t, `{"loadBalancingPolicy": "grpclb"}`)
+-	verifyUpdateFromResolver(ctx, t, stateCh, resolverUpdate{
+-		addrs:         wantAddrs,
+-		endpoints:     []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}}}},
+-		serviceConfig: wantSC,
+-	})
++	wantSC = `{"loadBalancingPolicy": "grpclb"}`
++	verifyUpdateFromResolver(ctx, t, stateCh, wantAddrs, nil, wantSC)
+ 
+ 	// Update state in the fake resolver to return no addresses and the same
+ 	// service config as before.
+@@ -740,100 +696,71 @@ func (s) TestDNSResolver_ResolveNow(t *testing.T) {
+ 	// Ask the resolver to re-resolve and verify that the new update matches
+ 	// expectations.
+ 	r.ResolveNow(resolver.ResolveNowOptions{})
+-	verifyUpdateFromResolver(ctx, t, stateCh, resolverUpdate{serviceConfig: wantSC})
++	verifyUpdateFromResolver(ctx, t, stateCh, nil, nil, wantSC)
+ }
+ 
+ // Tests the case where the given name is an IP address and verifies that the
+ // update pushed by the DNS resolver meets expectations.
+ func (s) TestIPResolver(t *testing.T) {
+ 	tests := []struct {
+-		name   string
+-		target string
+-		want   resolverUpdate
++		name     string
++		target   string
++		wantAddr []resolver.Address
+ 	}{
+ 		{
+-			name:   "localhost ipv4 default port",
+-			target: "127.0.0.1",
+-			want:   resolverUpdate{addrs: []resolver.Address{{Addr: "127.0.0.1:443"}}, endpoints: []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "127.0.0.1:443"}}}}},
++			name:     "localhost ipv4 default port",
++			target:   "127.0.0.1",
++			wantAddr: []resolver.Address{{Addr: "127.0.0.1:443"}},
+ 		},
+ 		{
+-			name:   "localhost ipv4 non-default port",
+-			target: "127.0.0.1:12345",
+-			want: resolverUpdate{
+-				addrs:     []resolver.Address{{Addr: "127.0.0.1:12345"}},
+-				endpoints: []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "127.0.0.1:12345"}}}},
+-			},
++			name:     "localhost ipv4 non-default port",
++			target:   "127.0.0.1:12345",
++			wantAddr: []resolver.Address{{Addr: "127.0.0.1:12345"}},
+ 		},
+ 		{
+-			name:   "localhost ipv6 default port no brackets",
+-			target: "::1",
+-			want: resolverUpdate{
+-				addrs:     []resolver.Address{{Addr: "[::1]:443"}},
+-				endpoints: []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "[::1]:443"}}}},
+-			},
++			name:     "localhost ipv6 default port no brackets",
++			target:   "::1",
++			wantAddr: []resolver.Address{{Addr: "[::1]:443"}},
+ 		},
+ 		{
+-			name:   "localhost ipv6 default port with brackets",
+-			target: "[::1]",
+-			want: resolverUpdate{
+-				addrs:     []resolver.Address{{Addr: "[::1]:443"}},
+-				endpoints: []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "[::1]:443"}}}},
+-			},
++			name:     "localhost ipv6 default port with brackets",
++			target:   "[::1]",
++			wantAddr: []resolver.Address{{Addr: "[::1]:443"}},
+ 		},
+ 		{
+-			name:   "localhost ipv6 non-default port",
+-			target: "[::1]:12345",
+-			want: resolverUpdate{
+-				addrs:     []resolver.Address{{Addr: "[::1]:12345"}},
+-				endpoints: []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "[::1]:12345"}}}},
+-			},
++			name:     "localhost ipv6 non-default port",
++			target:   "[::1]:12345",
++			wantAddr: []resolver.Address{{Addr: "[::1]:12345"}},
+ 		},
+ 		{
+-			name:   "ipv6 default port no brackets",
+-			target: "2001:db8:85a3::8a2e:370:7334",
+-			want: resolverUpdate{
+-				addrs:     []resolver.Address{{Addr: "[2001:db8:85a3::8a2e:370:7334]:443"}},
+-				endpoints: []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "[2001:db8:85a3::8a2e:370:7334]:443"}}}},
+-			},
++			name:     "ipv6 default port no brackets",
++			target:   "2001:db8:85a3::8a2e:370:7334",
++			wantAddr: []resolver.Address{{Addr: "[2001:db8:85a3::8a2e:370:7334]:443"}},
+ 		},
+ 		{
+-			name:   "ipv6 default port with brackets",
+-			target: "[2001:db8:85a3::8a2e:370:7334]",
+-			want: resolverUpdate{
+-				addrs:     []resolver.Address{{Addr: "[2001:db8:85a3::8a2e:370:7334]:443"}},
+-				endpoints: []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "[2001:db8:85a3::8a2e:370:7334]:443"}}}},
+-			},
++			name:     "ipv6 default port with brackets",
++			target:   "[2001:db8:85a3::8a2e:370:7334]",
++			wantAddr: []resolver.Address{{Addr: "[2001:db8:85a3::8a2e:370:7334]:443"}},
+ 		},
+ 		{
+-			name:   "ipv6 non-default port with brackets",
+-			target: "[2001:db8:85a3::8a2e:370:7334]:12345",
+-			want: resolverUpdate{
+-				addrs:     []resolver.Address{{Addr: "[2001:db8:85a3::8a2e:370:7334]:12345"}},
+-				endpoints: []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "[2001:db8:85a3::8a2e:370:7334]:12345"}}}},
+-			},
++			name:     "ipv6 non-default port with brackets",
++			target:   "[2001:db8:85a3::8a2e:370:7334]:12345",
++			wantAddr: []resolver.Address{{Addr: "[2001:db8:85a3::8a2e:370:7334]:12345"}},
+ 		},
+ 		{
+-			name:   "abbreviated ipv6 address",
+-			target: "[2001:db8::1]:http",
+-			want: resolverUpdate{
+-				addrs:     []resolver.Address{{Addr: "[2001:db8::1]:http"}},
+-				endpoints: []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "[2001:db8::1]:http"}}}},
+-			},
++			name:     "abbreviated ipv6 address",
++			target:   "[2001:db8::1]:http",
++			wantAddr: []resolver.Address{{Addr: "[2001:db8::1]:http"}},
+ 		},
+ 		{
+-			name:   "ipv6 with zone and port",
+-			target: "[fe80::1%25eth0]:1234",
+-			want: resolverUpdate{
+-				addrs:     []resolver.Address{{Addr: "[fe80::1%eth0]:1234"}},
+-				endpoints: []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "[fe80::1%eth0]:1234"}}}},
+-			},
++			name:     "ipv6 with zone and port",
++			target:   "[fe80::1%25eth0]:1234",
++			wantAddr: []resolver.Address{{Addr: "[fe80::1%eth0]:1234"}},
+ 		},
+ 		{
+-			name:   "ipv6 with zone and default port",
+-			target: "fe80::1%25eth0",
+-			want: resolverUpdate{addrs: []resolver.Address{{Addr: "[fe80::1%eth0]:443"}},
+-				endpoints: []resolver.Endpoint{{Addresses: []resolver.Address{{Addr: "[fe80::1%eth0]:443"}}}},
+-			},
++			name:     "ipv6 with zone and default port",
++			target:   "fe80::1%25eth0",
++			wantAddr: []resolver.Address{{Addr: "[fe80::1%eth0]:443"}},
+ 		},
+ 	}
+ 
+@@ -845,7 +772,7 @@ func (s) TestIPResolver(t *testing.T) {
+ 
+ 			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 			defer cancel()
+-			verifyUpdateFromResolver(ctx, t, stateCh, test.want)
++			verifyUpdateFromResolver(ctx, t, stateCh, test.wantAddr, nil, "")
+ 
+ 			// Attempt to re-resolve should not result in a state update.
+ 			r.ResolveNow(resolver.ResolveNowOptions{})
+@@ -953,7 +880,7 @@ func (s) TestResolverBuild(t *testing.T) {
+ 				}
+ 				return
+ 			}
+-			if test.wantErr != "" {
++			if err == nil && test.wantErr != "" {
+ 				t.Fatalf("DNS resolver build for target %q succeeded when expected to fail with error: %s", test.target, test.wantErr)
+ 			}
+ 			r.Close()
+@@ -971,7 +898,8 @@ func (s) TestDisableServiceConfig(t *testing.T) {
+ 		txtLookupTable       map[string][]string
+ 		txtLookupsEnabled    bool
+ 		disableServiceConfig bool
+-		want                 resolverUpdate
++		wantAddrs            []resolver.Address
++		wantSC               string
+ 	}{
+ 		{
+ 			name:            "not disabled in BuildOptions; enabled globally",
+@@ -982,14 +910,8 @@ func (s) TestDisableServiceConfig(t *testing.T) {
+ 			},
+ 			txtLookupsEnabled:    true,
+ 			disableServiceConfig: false,
+-			want: resolverUpdate{
+-				addrs: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}},
+-				endpoints: []resolver.Endpoint{
+-					{Addresses: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}}},
+-					{Addresses: []resolver.Address{{Addr: "5.6.7.8" + colonDefaultPort}}},
+-				},
+-				serviceConfig: mustParseServiceConfig(t, scJSON),
+-			},
++			wantAddrs:            []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}},
++			wantSC:               scJSON,
+ 		},
+ 		{
+ 			name:            "disabled in BuildOptions; enabled globally",
+@@ -1000,13 +922,8 @@ func (s) TestDisableServiceConfig(t *testing.T) {
+ 			},
+ 			txtLookupsEnabled:    true,
+ 			disableServiceConfig: true,
+-			want: resolverUpdate{
+-				addrs: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}},
+-				endpoints: []resolver.Endpoint{
+-					{Addresses: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}}},
+-					{Addresses: []resolver.Address{{Addr: "5.6.7.8" + colonDefaultPort}}},
+-				},
+-			},
++			wantAddrs:            []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}},
++			wantSC:               "{}",
+ 		},
+ 		{
+ 			name:            "not disabled in BuildOptions; disabled globally",
+@@ -1017,13 +934,8 @@ func (s) TestDisableServiceConfig(t *testing.T) {
+ 			},
+ 			txtLookupsEnabled:    false,
+ 			disableServiceConfig: false,
+-			want: resolverUpdate{
+-				addrs: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}},
+-				endpoints: []resolver.Endpoint{
+-					{Addresses: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}}},
+-					{Addresses: []resolver.Address{{Addr: "5.6.7.8" + colonDefaultPort}}},
+-				},
+-			},
++			wantAddrs:            []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}},
++			wantSC:               "{}",
+ 		},
+ 		{
+ 			name:            "disabled in BuildOptions; disabled globally",
+@@ -1034,13 +946,8 @@ func (s) TestDisableServiceConfig(t *testing.T) {
+ 			},
+ 			txtLookupsEnabled:    false,
+ 			disableServiceConfig: true,
+-			want: resolverUpdate{
+-				addrs: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}},
+-				endpoints: []resolver.Endpoint{
+-					{Addresses: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}}},
+-					{Addresses: []resolver.Address{{Addr: "5.6.7.8" + colonDefaultPort}}},
+-				},
+-			},
++			wantAddrs:            []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}},
++			wantSC:               "{}",
+ 		},
+ 	}
+ 
+@@ -1076,7 +983,7 @@ func (s) TestDisableServiceConfig(t *testing.T) {
+ 
+ 			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 			defer cancel()
+-			verifyUpdateFromResolver(ctx, t, stateCh, test.want)
++			verifyUpdateFromResolver(ctx, t, stateCh, test.wantAddrs, nil, test.wantSC)
+ 		})
+ 	}
+ }
+@@ -1425,7 +1332,7 @@ func (s) TestMinResolutionInterval(t *testing.T) {
+ 	r, stateCh, _ := buildResolverWithTestClientConn(t, target)
+ 
+ 	wantAddrs := []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}}
+-	wantSC := mustParseServiceConfig(t, scJSON)
++	wantSC := scJSON
+ 
+ 	for i := 0; i < 5; i++ {
+ 		// set context timeout slightly higher than the min resolution interval to make sure resolutions
+@@ -1433,13 +1340,7 @@ func (s) TestMinResolutionInterval(t *testing.T) {
+ 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+ 		defer cancel()
+ 
+-		verifyUpdateFromResolver(ctx, t, stateCh, resolverUpdate{
+-			addrs: wantAddrs,
+-			endpoints: []resolver.Endpoint{
+-				{Addresses: []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}}},
+-				{Addresses: []resolver.Address{{Addr: "5.6.7.8" + colonDefaultPort}}},
+-			},
+-			serviceConfig: wantSC})
++		verifyUpdateFromResolver(ctx, t, stateCh, wantAddrs, nil, wantSC)
+ 		r.ResolveNow(resolver.ResolveNowOptions{})
+ 	}
+ }
+@@ -1500,12 +1401,3 @@ func (s) TestMinResolutionInterval_NoExtraDelay(t *testing.T) {
+ 	case <-stateCh:
+ 	}
+ }
+-
+-func mustParseServiceConfig(t *testing.T, scJSON string) serviceconfig.Config {
+-	t.Helper()
+-	sc := internal.ParseServiceConfig.(func(string) *serviceconfig.ParseResult)(scJSON)
+-	if sc.Err != nil {
+-		t.Fatalf("Failed to parse service config %q: %v", scJSON, sc.Err)
+-	}
+-	return sc.Config
+-}
+diff --git a/internal/xds/xdsdepmgr/xds_dependency_manager.go b/internal/xds/xdsdepmgr/xds_dependency_manager.go
+index f4d95677..c84b199e 100644
+--- a/internal/xds/xdsdepmgr/xds_dependency_manager.go
++++ b/internal/xds/xdsdepmgr/xds_dependency_manager.go
+@@ -758,8 +758,8 @@ func (m *DependencyManager) onDNSUpdate(resourceName string, update *resolver.St
+ 	if m.logger.V(2) {
+ 		m.logger.Infof("Received update from DNS resolver for resource %q: %+v", resourceName, update)
+ 	}
+-	endpoints := update.Endpoints
+-	if len(endpoints) == 0 {
++	var endpoints []resolver.Endpoint
++	if len(update.Endpoints) == 0 {
+ 		endpoints = make([]resolver.Endpoint, len(update.Addresses))
+ 		for i, a := range update.Addresses {
+ 			endpoints[i] = resolver.Endpoint{Addresses: []resolver.Address{a}}

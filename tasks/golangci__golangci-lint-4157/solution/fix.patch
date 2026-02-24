@@ -1,0 +1,149 @@
+diff --git a/.golangci.reference.yml b/.golangci.reference.yml
+index 8e882375..02546f7c 100644
+--- a/.golangci.reference.yml
++++ b/.golangci.reference.yml
+@@ -1378,6 +1378,11 @@ linters-settings:
+     # Default: false
+     ignore-missing-subtests: true
+ 
++  perfsprint:
++    # Optimizes even if it requires an int or uint type cast.
++    # Default: true
++    int-conversion: false
++
+   prealloc:
+     # IMPORTANT: we don't recommend using this linter before doing performance profiling.
+     # For most programs usage of prealloc will be a premature optimization.
+diff --git a/go.mod b/go.mod
+index 6414f87e..7f2a4308 100644
+--- a/go.mod
++++ b/go.mod
+@@ -27,7 +27,7 @@ require (
+ 	github.com/breml/errchkjson v0.3.6
+ 	github.com/butuzov/ireturn v0.2.1
+ 	github.com/butuzov/mirror v1.1.0
+-	github.com/catenacyber/perfsprint v0.2.0
++	github.com/catenacyber/perfsprint v0.3.0
+ 	github.com/charithe/durationcheck v0.0.10
+ 	github.com/curioswitch/go-reassign v0.2.0
+ 	github.com/daixiang0/gci v0.11.2
+diff --git a/go.sum b/go.sum
+index b77b953f..89b95910 100644
+--- a/go.sum
++++ b/go.sum
+@@ -102,8 +102,8 @@ github.com/butuzov/ireturn v0.2.1 h1:w5Ks4tnfeFDZskGJ2x1GAkx5gaQV+kdU3NKNr3NEBzY
+ github.com/butuzov/ireturn v0.2.1/go.mod h1:RfGHUvvAuFFxoHKf4Z8Yxuh6OjlCw1KvR2zM1NFHeBk=
+ github.com/butuzov/mirror v1.1.0 h1:ZqX54gBVMXu78QLoiqdwpl2mgmoOJTk7s4p4o+0avZI=
+ github.com/butuzov/mirror v1.1.0/go.mod h1:8Q0BdQU6rC6WILDiBM60DBfvV78OLJmMmixe7GF45AE=
+-github.com/catenacyber/perfsprint v0.2.0 h1:azOocHLscPjqXVJ7Mf14Zjlkn4uNua0+Hcg1wTR6vUo=
+-github.com/catenacyber/perfsprint v0.2.0/go.mod h1:/wclWYompEyjUD2FuIIDVKNkqz7IgBIWXIH3V0Zol50=
++github.com/catenacyber/perfsprint v0.3.0 h1:xMciPd+OYZd2oWJhoqBlnu4Vfe284ktxDZHQkmdjNrU=
++github.com/catenacyber/perfsprint v0.3.0/go.mod h1:/wclWYompEyjUD2FuIIDVKNkqz7IgBIWXIH3V0Zol50=
+ github.com/ccojocar/zxcvbn-go v1.0.1 h1:+sxrANSCj6CdadkcMnvde/GWU1vZiiXRbqYSCalV4/4=
+ github.com/ccojocar/zxcvbn-go v1.0.1/go.mod h1:g1qkXtUSvHP8lhHp5GrSmTz6uWALGRMQdw6Qnz/hi60=
+ github.com/census-instrumentation/opencensus-proto v0.2.1/go.mod h1:f6KPmirojxKA12rnyqOA5BBL4O983OfeGPqjHWSTneU=
+diff --git a/pkg/config/linters_settings.go b/pkg/config/linters_settings.go
+index 0fee9f81..54807c6b 100644
+--- a/pkg/config/linters_settings.go
++++ b/pkg/config/linters_settings.go
+@@ -104,6 +104,9 @@ var defaultLintersSettings = LintersSettings{
+ 		RequireSpecific:    false,
+ 		AllowUnused:        false,
+ 	},
++	PerfSprint: PerfSprintSettings{
++		IntConversion: true,
++	},
+ 	Prealloc: PreallocSettings{
+ 		Simple:     true,
+ 		RangeLoops: true,
+@@ -222,6 +225,7 @@ type LintersSettings struct {
+ 	NoLintLint       NoLintLintSettings
+ 	NoNamedReturns   NoNamedReturnsSettings
+ 	ParallelTest     ParallelTestSettings
++	PerfSprint       PerfSprintSettings
+ 	Prealloc         PreallocSettings
+ 	Predeclared      PredeclaredSettings
+ 	Promlinter       PromlinterSettings
+@@ -675,11 +679,16 @@ type NoLintLintSettings struct {
+ type NoNamedReturnsSettings struct {
+ 	ReportErrorInDefer bool `mapstructure:"report-error-in-defer"`
+ }
++
+ type ParallelTestSettings struct {
+ 	IgnoreMissing         bool `mapstructure:"ignore-missing"`
+ 	IgnoreMissingSubtests bool `mapstructure:"ignore-missing-subtests"`
+ }
+ 
++type PerfSprintSettings struct {
++	IntConversion bool `mapstructure:"int-conversion"`
++}
++
+ type PreallocSettings struct {
+ 	Simple     bool
+ 	RangeLoops bool `mapstructure:"range-loops"`
+diff --git a/pkg/golinters/perfsprint.go b/pkg/golinters/perfsprint.go
+index fb248a85..4549501c 100644
+--- a/pkg/golinters/perfsprint.go
++++ b/pkg/golinters/perfsprint.go
+@@ -4,16 +4,26 @@ import (
+ 	"github.com/catenacyber/perfsprint/analyzer"
+ 	"golang.org/x/tools/go/analysis"
+ 
++	"github.com/golangci/golangci-lint/pkg/config"
+ 	"github.com/golangci/golangci-lint/pkg/golinters/goanalysis"
+ )
+ 
+-func NewPerfSprint() *goanalysis.Linter {
+-	a := analyzer.Analyzer
++func NewPerfSprint(settings *config.PerfSprintSettings) *goanalysis.Linter {
++	a := analyzer.New()
++
++	var cfg map[string]map[string]any
++	if settings != nil {
++		cfg = map[string]map[string]any{
++			a.Name: {
++				"int-conversion": settings.IntConversion,
++			},
++		}
++	}
+ 
+ 	return goanalysis.NewLinter(
+ 		a.Name,
+ 		a.Doc,
+ 		[]*analysis.Analyzer{a},
+-		nil,
++		cfg,
+ 	).WithLoadMode(goanalysis.LoadModeTypesInfo)
+ }
+diff --git a/pkg/lint/lintersdb/manager.go b/pkg/lint/lintersdb/manager.go
+index fd329ce5..97ed0c15 100644
+--- a/pkg/lint/lintersdb/manager.go
++++ b/pkg/lint/lintersdb/manager.go
+@@ -121,6 +121,7 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
+ 		noLintLintCfg       *config.NoLintLintSettings
+ 		noNamedReturnsCfg   *config.NoNamedReturnsSettings
+ 		parallelTestCfg     *config.ParallelTestSettings
++		perfSprintCfg       *config.PerfSprintSettings
+ 		preallocCfg         *config.PreallocSettings
+ 		predeclaredCfg      *config.PredeclaredSettings
+ 		promlinterCfg       *config.PromlinterSettings
+@@ -202,8 +203,9 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
+ 		nlreturnCfg = &m.cfg.LintersSettings.Nlreturn
+ 		noLintLintCfg = &m.cfg.LintersSettings.NoLintLint
+ 		noNamedReturnsCfg = &m.cfg.LintersSettings.NoNamedReturns
+-		preallocCfg = &m.cfg.LintersSettings.Prealloc
+ 		parallelTestCfg = &m.cfg.LintersSettings.ParallelTest
++		perfSprintCfg = &m.cfg.LintersSettings.PerfSprint
++		preallocCfg = &m.cfg.LintersSettings.Prealloc
+ 		predeclaredCfg = &m.cfg.LintersSettings.Predeclared
+ 		promlinterCfg = &m.cfg.LintersSettings.Promlinter
+ 		reassignCfg = &m.cfg.LintersSettings.Reassign
+@@ -712,7 +714,7 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
+ 			WithPresets(linter.PresetStyle, linter.PresetTest).
+ 			WithURL("https://github.com/kunwardeep/paralleltest"),
+ 
+-		linter.NewConfig(golinters.NewPerfSprint()).
++		linter.NewConfig(golinters.NewPerfSprint(perfSprintCfg)).
+ 			WithSince("v1.55.0").
+ 			WithLoadForGoAnalysis().
+ 			WithPresets(linter.PresetPerformance).

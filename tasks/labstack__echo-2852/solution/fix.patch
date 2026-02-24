@@ -1,0 +1,403 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1d4fa25..28b2652 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,118 @@
+ # Changelog
+ 
++## v4.15.0 - TBD
++
++**DEPRECATION NOTICE** Timeout Middleware Deprecated - Use ContextTimeout Instead
++
++The `middleware.Timeout` middleware has been **deprecated** due to fundamental architectural issues that cause
++data races. Use `middleware.ContextTimeout` or `middleware.ContextTimeoutWithConfig` instead.
++
++**Why is this being deprecated?**
++
++The Timeout middleware manipulates response writers across goroutine boundaries, which causes data races that
++cannot be reliably fixed without a complete architectural redesign. The middleware:
++
++- Swaps the response writer using `http.TimeoutHandler`
++- Must be the first middleware in the chain (fragile constraint)
++- Can cause races with other middleware (Logger, metrics, custom middleware)
++- Has been the source of multiple race condition fixes over the years
++
++**What should you use instead?**
++
++The `ContextTimeout` middleware (available since v4.12.0) provides timeout functionality using Go's standard
++context mechanism. It is:
++
++- Race-free by design
++- Can be placed anywhere in the middleware chain
++- Simpler and more maintainable
++- Compatible with all other middleware
++
++**Migration Guide:**
++
++```go
++// Before (deprecated):
++e.Use(middleware.Timeout())
++
++// After (recommended):
++e.Use(middleware.ContextTimeout(30 * time.Second))
++```
++
++With configuration:
++```go
++// Before (deprecated):
++e.Use(middleware.TimeoutWithConfig(middleware.TimeoutConfig{
++    Timeout: 30 * time.Second,
++    Skipper: func(c echo.Context) bool {
++        return c.Path() == "/health"
++    },
++}))
++
++// After (recommended):
++e.Use(middleware.ContextTimeoutWithConfig(middleware.ContextTimeoutConfig{
++    Timeout: 30 * time.Second,
++    Skipper: func(c echo.Context) bool {
++        return c.Path() == "/health"
++    },
++}))
++```
++
++**Important Behavioral Differences:**
++
++1. **Handler cooperation required**: With ContextTimeout, your handlers must check `context.Done()` for cooperative
++   cancellation. The old Timeout middleware would send a 503 response regardless of handler cooperation, but had
++   data race issues.
++
++2. **Error handling**: ContextTimeout returns errors through the standard error handling flow. Handlers that receive
++   `context.DeadlineExceeded` should handle it appropriately:
++
++```go
++e.GET("/long-task", func(c echo.Context) error {
++    ctx := c.Request().Context()
++
++    // Example: database query with context
++    result, err := db.QueryContext(ctx, "SELECT * FROM large_table")
++    if err != nil {
++        if errors.Is(err, context.DeadlineExceeded) {
++            // Handle timeout
++            return echo.NewHTTPError(http.StatusServiceUnavailable, "Request timeout")
++        }
++        return err
++    }
++
++    return c.JSON(http.StatusOK, result)
++})
++```
++
++3. **Background tasks**: For long-running background tasks, use goroutines with context:
++
++```go
++e.GET("/async-task", func(c echo.Context) error {
++    ctx := c.Request().Context()
++
++    resultCh := make(chan Result, 1)
++    errCh := make(chan error, 1)
++
++    go func() {
++        result, err := performLongTask(ctx)
++        if err != nil {
++            errCh <- err
++            return
++        }
++        resultCh <- result
++    }()
++
++    select {
++    case result := <-resultCh:
++        return c.JSON(http.StatusOK, result)
++    case err := <-errCh:
++        return err
++    case <-ctx.Done():
++        return echo.NewHTTPError(http.StatusServiceUnavailable, "Request timeout")
++    }
++})
++```
++
++
+ ## v4.14.0 - 2025-12-11
+ 
+ `middleware.Logger` has been deprecated. For request logging, use `middleware.RequestLogger` or
+diff --git a/middleware/body_dump.go b/middleware/body_dump.go
+index e4119ec..add778d 100644
+--- a/middleware/body_dump.go
++++ b/middleware/body_dump.go
+@@ -66,8 +66,12 @@ func BodyDumpWithConfig(config BodyDumpConfig) echo.MiddlewareFunc {
+ 
+ 			// Request
+ 			reqBody := []byte{}
+-			if c.Request().Body != nil { // Read
+-				reqBody, _ = io.ReadAll(c.Request().Body)
++			if c.Request().Body != nil {
++				var readErr error
++				reqBody, readErr = io.ReadAll(c.Request().Body)
++				if readErr != nil {
++					return readErr
++				}
+ 			}
+ 			c.Request().Body = io.NopCloser(bytes.NewBuffer(reqBody)) // Reset
+ 
+diff --git a/middleware/body_limit.go b/middleware/body_limit.go
+index 7d3c665..d13ad2c 100644
+--- a/middleware/body_limit.go
++++ b/middleware/body_limit.go
+@@ -6,6 +6,7 @@ package middleware
+ import (
+ 	"fmt"
+ 	"io"
++	"net/http"
+ 	"sync"
+ 
+ 	"github.com/labstack/echo/v4"
+@@ -77,7 +78,10 @@ func BodyLimitWithConfig(config BodyLimitConfig) echo.MiddlewareFunc {
+ 			}
+ 
+ 			// Based on content read
+-			r := pool.Get().(*limitedReader)
++			r, ok := pool.Get().(*limitedReader)
++			if !ok {
++				return echo.NewHTTPError(http.StatusInternalServerError, "invalid pool object")
++			}
+ 			r.Reset(req.Body)
+ 			defer pool.Put(r)
+ 			req.Body = r
+diff --git a/middleware/compress.go b/middleware/compress.go
+index 012b76b..48ccc98 100644
+--- a/middleware/compress.go
++++ b/middleware/compress.go
+@@ -96,7 +96,7 @@ func GzipWithConfig(config GzipConfig) echo.MiddlewareFunc {
+ 				i := pool.Get()
+ 				w, ok := i.(*gzip.Writer)
+ 				if !ok {
+-					return echo.NewHTTPError(http.StatusInternalServerError, i.(error).Error())
++					return echo.NewHTTPError(http.StatusInternalServerError, "invalid pool object")
+ 				}
+ 				rw := res.Writer
+ 				w.Reset(rw)
+@@ -189,7 +189,9 @@ func (w *gzipResponseWriter) Flush() {
+ 		w.Writer.Write(w.buffer.Bytes())
+ 	}
+ 
+-	w.Writer.(*gzip.Writer).Flush()
++	if gw, ok := w.Writer.(*gzip.Writer); ok {
++		gw.Flush()
++	}
+ 	_ = http.NewResponseController(w.ResponseWriter).Flush()
+ }
+ 
+diff --git a/middleware/context_timeout.go b/middleware/context_timeout.go
+index 02bd6d1..5d9ae97 100644
+--- a/middleware/context_timeout.go
++++ b/middleware/context_timeout.go
+@@ -11,6 +11,39 @@ import (
+ 	"github.com/labstack/echo/v4"
+ )
+ 
++// ContextTimeout Middleware
++//
++// ContextTimeout provides request timeout functionality using Go's context mechanism.
++// It is the recommended replacement for the deprecated Timeout middleware.
++//
++//
++// Basic Usage:
++//
++//	e.Use(middleware.ContextTimeout(30 * time.Second))
++//
++// With Configuration:
++//
++//	e.Use(middleware.ContextTimeoutWithConfig(middleware.ContextTimeoutConfig{
++//	    Timeout: 30 * time.Second,
++//	    Skipper: middleware.DefaultSkipper,
++//	}))
++//
++// Handler Example:
++//
++//	e.GET("/task", func(c echo.Context) error {
++//	    ctx := c.Request().Context()
++//
++//	    result, err := performTaskWithContext(ctx)
++//	    if err != nil {
++//	        if errors.Is(err, context.DeadlineExceeded) {
++//	            return echo.NewHTTPError(http.StatusServiceUnavailable, "timeout")
++//	        }
++//	        return err
++//	    }
++//
++//	    return c.JSON(http.StatusOK, result)
++//	})
++
+ // ContextTimeoutConfig defines the config for ContextTimeout middleware.
+ type ContextTimeoutConfig struct {
+ 	// Skipper defines a function to skip middleware.
+diff --git a/middleware/logger.go b/middleware/logger.go
+index c800a8a..5902095 100644
+--- a/middleware/logger.go
++++ b/middleware/logger.go
+@@ -5,7 +5,6 @@ package middleware
+ 
+ import (
+ 	"bytes"
+-	"encoding/json"
+ 	"io"
+ 	"strconv"
+ 	"strings"
+@@ -375,10 +374,7 @@ func LoggerWithConfig(config LoggerConfig) echo.MiddlewareFunc {
+ 					return buf.WriteString(s)
+ 				case "error":
+ 					if err != nil {
+-						// Error may contain invalid JSON e.g. `"`
+-						b, _ := json.Marshal(err.Error())
+-						b = b[1 : len(b)-1]
+-						return buf.Write(b)
++						return writeJSONSafeString(buf, err.Error())
+ 					}
+ 				case "latency":
+ 					l := stop.Sub(start)
+diff --git a/middleware/proxy.go b/middleware/proxy.go
+index 050c59d..f268700 100644
+--- a/middleware/proxy.go
++++ b/middleware/proxy.go
+@@ -169,15 +169,21 @@ func proxyRaw(t *ProxyTarget, c echo.Context, config ProxyConfig) http.Handler {
+ 
+ 		errCh := make(chan error, 2)
+ 		cp := func(dst io.Writer, src io.Reader) {
+-			_, err = io.Copy(dst, src)
+-			errCh <- err
++			_, copyErr := io.Copy(dst, src)
++			errCh <- copyErr
+ 		}
+ 
+ 		go cp(out, in)
+ 		go cp(in, out)
+-		err = <-errCh
+-		if err != nil && err != io.EOF {
+-			c.Set("_error", fmt.Errorf("proxy raw, copy body error=%w, url=%s", err, t.URL))
++
++		// Wait for BOTH goroutines to complete
++		err1 := <-errCh
++		err2 := <-errCh
++
++		if err1 != nil && err1 != io.EOF {
++			c.Set("_error", fmt.Errorf("proxy raw, copy body error=%w, url=%s", err1, t.URL))
++		} else if err2 != nil && err2 != io.EOF {
++			c.Set("_error", fmt.Errorf("proxy raw, copy body error=%w, url=%s", err2, t.URL))
+ 		}
+ 	})
+ }
+diff --git a/middleware/rate_limiter.go b/middleware/rate_limiter.go
+index 70b89b0..2746a3d 100644
+--- a/middleware/rate_limiter.go
++++ b/middleware/rate_limiter.go
+@@ -4,6 +4,7 @@
+ package middleware
+ 
+ import (
++	"math"
+ 	"net/http"
+ 	"sync"
+ 	"time"
+@@ -215,7 +216,7 @@ func NewRateLimiterMemoryStoreWithConfig(config RateLimiterMemoryStoreConfig) (s
+ 		store.expiresIn = DefaultRateLimiterMemoryStoreConfig.ExpiresIn
+ 	}
+ 	if config.Burst == 0 {
+-		store.burst = int(config.Rate)
++		store.burst = int(math.Max(1, math.Ceil(float64(config.Rate))))
+ 	}
+ 	store.visitors = make(map[string]*Visitor)
+ 	store.timeNow = time.Now
+@@ -249,8 +250,9 @@ func (store *RateLimiterMemoryStore) Allow(identifier string) (bool, error) {
+ 	if now.Sub(store.lastCleanup) > store.expiresIn {
+ 		store.cleanupStaleVisitors()
+ 	}
++	allowed := limiter.AllowN(now, 1)
+ 	store.mutex.Unlock()
+-	return limiter.AllowN(store.timeNow(), 1), nil
++	return allowed, nil
+ }
+ 
+ /*
+diff --git a/middleware/static.go b/middleware/static.go
+index 1016f1b..2d946c1 100644
+--- a/middleware/static.go
++++ b/middleware/static.go
+@@ -174,6 +174,12 @@ func StaticWithConfig(config StaticConfig) echo.MiddlewareFunc {
+ 			if err != nil {
+ 				return
+ 			}
++			// Security: We use path.Clean() (not filepath.Clean()) because:
++			// 1. HTTP URLs always use forward slashes, regardless of server OS
++			// 2. path.Clean() provides platform-independent behavior for URL paths
++			// 3. The "/" prefix forces absolute path interpretation, removing ".." components
++			// 4. Backslashes are treated as literal characters (not path separators), preventing traversal
++			// See static_windows.go for Go 1.20+ filepath.Clean compatibility notes
+ 			name := path.Join(config.Root, path.Clean("/"+p)) // "/"+ for security
+ 
+ 			if config.IgnoreBase {
+diff --git a/middleware/timeout.go b/middleware/timeout.go
+index c2aebef..c0a77a4 100644
+--- a/middleware/timeout.go
++++ b/middleware/timeout.go
+@@ -59,6 +59,12 @@ import (
+ //
+ 
+ // TimeoutConfig defines the config for Timeout middleware.
++//
++// Deprecated: Use ContextTimeoutConfig with ContextTimeout or ContextTimeoutWithConfig instead.
++// The Timeout middleware has architectural issues that cause data races due to response writer
++// manipulation across goroutines. It must be the first middleware in the chain, making it fragile.
++// The ContextTimeout middleware provides timeout functionality using Go's context mechanism,
++// which is race-free and can be placed anywhere in the middleware chain.
+ type TimeoutConfig struct {
+ 	// Skipper defines a function to skip middleware.
+ 	Skipper Skipper
+@@ -89,11 +95,38 @@ var DefaultTimeoutConfig = TimeoutConfig{
+ 
+ // Timeout returns a middleware which returns error (503 Service Unavailable error) to client immediately when handler
+ // call runs for longer than its time limit. NB: timeout does not stop handler execution.
++//
++// Deprecated: Use ContextTimeout instead. This middleware has known data race issues due to response writer
++// manipulation. See https://github.com/labstack/echo/blob/master/middleware/context_timeout.go for the
++// recommended alternative.
++//
++// Example migration:
++//
++//	// Before:
++//	e.Use(middleware.Timeout())
++//
++//	// After:
++//	e.Use(middleware.ContextTimeout(30 * time.Second))
+ func Timeout() echo.MiddlewareFunc {
+ 	return TimeoutWithConfig(DefaultTimeoutConfig)
+ }
+ 
+ // TimeoutWithConfig returns a Timeout middleware with config or panics on invalid configuration.
++//
++// Deprecated: Use ContextTimeoutWithConfig instead. This middleware has architectural data race issues.
++// See the ContextTimeout middleware for a race-free alternative that uses Go's context mechanism.
++//
++// Example migration:
++//
++//	// Before:
++//	e.Use(middleware.TimeoutWithConfig(middleware.TimeoutConfig{
++//		Timeout: 30 * time.Second,
++//	}))
++//
++//	// After:
++//	e.Use(middleware.ContextTimeoutWithConfig(middleware.ContextTimeoutConfig{
++//		Timeout: 30 * time.Second,
++//	}))
+ func TimeoutWithConfig(config TimeoutConfig) echo.MiddlewareFunc {
+ 	mw, err := config.ToMiddleware()
+ 	if err != nil {
+@@ -103,6 +136,8 @@ func TimeoutWithConfig(config TimeoutConfig) echo.MiddlewareFunc {
+ }
+ 
+ // ToMiddleware converts Config to middleware or returns an error for invalid configuration
++//
++// Deprecated: Use ContextTimeoutConfig.ToMiddleware instead.
+ func (config TimeoutConfig) ToMiddleware() (echo.MiddlewareFunc, error) {
+ 	if config.Skipper == nil {
+ 		config.Skipper = DefaultTimeoutConfig.Skipper

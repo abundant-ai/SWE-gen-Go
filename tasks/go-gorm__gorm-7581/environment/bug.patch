@@ -1,0 +1,1824 @@
+diff --git a/association.go b/association.go
+index f210ca0..e3f51d1 100644
+--- a/association.go
++++ b/association.go
+@@ -19,10 +19,10 @@ type Association struct {
+ }
+ 
+ func (db *DB) Association(column string) *Association {
+-	association := &Association{DB: db, Unscope: db.Statement.Unscoped}
++	association := &Association{DB: db}
+ 	table := db.Statement.Table
+ 
+-	if association.Error = db.Statement.Parse(db.Statement.Model); association.Error == nil {
++	if err := db.Statement.Parse(db.Statement.Model); err == nil {
+ 		db.Statement.Table = table
+ 		association.Relationship = db.Statement.Schema.Relationships.Relations[column]
+ 
+@@ -34,6 +34,8 @@ func (db *DB) Association(column string) *Association {
+ 		for db.Statement.ReflectValue.Kind() == reflect.Ptr {
+ 			db.Statement.ReflectValue = db.Statement.ReflectValue.Elem()
+ 		}
++	} else {
++		association.Error = err
+ 	}
+ 
+ 	return association
+@@ -56,8 +58,6 @@ func (association *Association) Find(out interface{}, conds ...interface{}) erro
+ }
+ 
+ func (association *Association) Append(values ...interface{}) error {
+-	values = expandValues(values)
+-
+ 	if association.Error == nil {
+ 		switch association.Relationship.Type {
+ 		case schema.HasOne, schema.BelongsTo:
+@@ -73,8 +73,6 @@ func (association *Association) Append(values ...interface{}) error {
+ }
+ 
+ func (association *Association) Replace(values ...interface{}) error {
+-	values = expandValues(values)
+-
+ 	if association.Error == nil {
+ 		reflectValue := association.DB.Statement.ReflectValue
+ 		rel := association.Relationship
+@@ -197,8 +195,6 @@ func (association *Association) Replace(values ...interface{}) error {
+ }
+ 
+ func (association *Association) Delete(values ...interface{}) error {
+-	values = expandValues(values)
+-
+ 	if association.Error == nil {
+ 		var (
+ 			reflectValue  = association.DB.Statement.ReflectValue
+@@ -435,49 +431,10 @@ func (association *Association) saveAssociation(clear bool, values ...interface{
+ 				}
+ 			}
+ 
+-			processMap := func(mapv reflect.Value) {
+-				child := reflect.New(association.Relationship.FieldSchema.ModelType)
+-
+-				switch association.Relationship.Type {
+-				case schema.HasMany:
+-					for _, ref := range association.Relationship.References {
+-						key := reflect.ValueOf(ref.ForeignKey.DBName)
+-						if ref.OwnPrimaryKey {
+-							v := ref.PrimaryKey.ReflectValueOf(association.DB.Statement.Context, source)
+-							mapv.SetMapIndex(key, v)
+-						} else if ref.PrimaryValue != "" {
+-							mapv.SetMapIndex(key, reflect.ValueOf(ref.PrimaryValue))
+-						}
+-					}
+-					association.Error = association.DB.Session(&Session{
+-						NewDB: true,
+-					}).Model(child.Interface()).Create(mapv.Interface()).Error
+-				case schema.Many2Many:
+-					association.Error = association.DB.Session(&Session{
+-						NewDB: true,
+-					}).Model(child.Interface()).Create(mapv.Interface()).Error
+-
+-					for _, key := range mapv.MapKeys() {
+-						k := strings.ToLower(key.String())
+-						if f, ok := association.Relationship.FieldSchema.FieldsByDBName[k]; ok {
+-							_ = f.Set(association.DB.Statement.Context, child, mapv.MapIndex(key).Interface())
+-						}
+-					}
+-					appendToFieldValues(child)
+-				}
+-			}
+-
+ 			switch rv.Kind() {
+-			case reflect.Map:
+-				processMap(rv)
+ 			case reflect.Slice, reflect.Array:
+ 				for i := 0; i < rv.Len(); i++ {
+-					elem := reflect.Indirect(rv.Index(i))
+-					if elem.Kind() == reflect.Map {
+-						processMap(elem)
+-						continue
+-					}
+-					appendToFieldValues(elem.Addr())
++					appendToFieldValues(reflect.Indirect(rv.Index(i)).Addr())
+ 				}
+ 			case reflect.Struct:
+ 				if !rv.CanAddr() {
+@@ -634,32 +591,3 @@ func (association *Association) buildCondition() *DB {
+ 
+ 	return tx
+ }
+-
+-func expandValues(values ...any) (results []any) {
+-	appendToResult := func(rv reflect.Value) {
+-		// unwrap interface
+-		if rv.IsValid() && rv.Kind() == reflect.Interface {
+-			rv = rv.Elem()
+-		}
+-		if rv.IsValid() && rv.Kind() == reflect.Struct {
+-			p := reflect.New(rv.Type())
+-			p.Elem().Set(rv)
+-			results = append(results, p.Interface())
+-		} else if rv.IsValid() {
+-			results = append(results, rv.Interface())
+-		}
+-	}
+-
+-	// Process each argument; if an argument is a slice/array, expand its elements
+-	for _, value := range values {
+-		rv := reflect.ValueOf(value)
+-		if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
+-			for i := 0; i < rv.Len(); i++ {
+-				appendToResult(rv.Index(i))
+-			}
+-		} else {
+-			appendToResult(rv)
+-		}
+-	}
+-	return
+-}
+diff --git a/clause/association.go b/clause/association.go
+deleted file mode 100644
+index a853d7c..0000000
+--- a/clause/association.go
++++ /dev/null
+@@ -1,37 +0,0 @@
+-package clause
+-
+-// AssociationOpType represents association operation types
+-type AssociationOpType int
+-
+-const (
+-	OpUnlink       AssociationOpType = iota // Unlink association
+-	OpDelete                                // Delete association records
+-	OpUpdate                                // Update association records
+-	OpCreate                                // Create association records with assignments
+-	OpCreateValues                          // Create association records with model object
+-)
+-
+-// Association represents an association operation
+-type Association struct {
+-	Association string            // Association name
+-	Type        AssociationOpType // Operation type
+-	Conditions  []Expression      // Filter conditions
+-	Set         []Assignment      // Assignment operations (for Update and Create)
+-	Model       interface{}       // Model object (for Create object)
+-	Values      []interface{}     // Values for Create operation
+-}
+-
+-// AssociationAssigner is an interface for association operation providers
+-type AssociationAssigner interface {
+-	AssociationAssignments() []Association
+-}
+-
+-// Assignments implements the Assigner interface so that AssociationOperation can be used as a Set method parameter
+-func (ao Association) Assignments() []Assignment {
+-	return []Assignment{}
+-}
+-
+-// AssociationAssignments implements the AssociationAssigner interface
+-func (ao Association) AssociationAssignments() []Association {
+-	return []Association{ao}
+-}
+diff --git a/generics.go b/generics.go
+index 67737e4..971bdb6 100644
+--- a/generics.go
++++ b/generics.go
+@@ -3,15 +3,12 @@ package gorm
+ import (
+ 	"context"
+ 	"database/sql"
+-	"errors"
+ 	"fmt"
+-	"reflect"
+ 	"sort"
+ 	"strings"
+ 
+ 	"gorm.io/gorm/clause"
+ 	"gorm.io/gorm/logger"
+-	"gorm.io/gorm/schema"
+ )
+ 
+ type result struct {
+@@ -204,7 +201,7 @@ func (c createG[T]) Table(name string, args ...interface{}) CreateInterface[T] {
+ }
+ 
+ func (c createG[T]) Set(assignments ...clause.Assigner) SetCreateOrUpdateInterface[T] {
+-	return c.processSet(assignments...)
++	return setCreateOrUpdateG[T]{c: c.chainG, assigns: toAssignments(assignments...)}
+ }
+ 
+ func (c createG[T]) Create(ctx context.Context, r *T) error {
+@@ -435,7 +432,7 @@ func (c chainG[T]) MapColumns(m map[string]string) ChainInterface[T] {
+ }
+ 
+ func (c chainG[T]) Set(assignments ...clause.Assigner) SetUpdateOnlyInterface[T] {
+-	return c.processSet(assignments...)
++	return setCreateOrUpdateG[T]{c: c, assigns: toAssignments(assignments...)}
+ }
+ 
+ func (c chainG[T]) Distinct(args ...interface{}) ChainInterface[T] {
+@@ -605,6 +602,36 @@ func (c chainG[T]) Build(builder clause.Builder) {
+ 	}
+ }
+ 
++type setCreateOrUpdateG[T any] struct {
++	c       chainG[T]
++	assigns []clause.Assignment
++}
++
++// toAssignments converts various supported types into []clause.Assignment.
++// Supported inputs implement clause.Assigner.
++func toAssignments(items ...clause.Assigner) []clause.Assignment {
++	out := make([]clause.Assignment, 0, len(items))
++	for _, it := range items {
++		out = append(out, it.Assignments()...)
++	}
++	return out
++}
++
++func (s setCreateOrUpdateG[T]) Update(ctx context.Context) (rowsAffected int, err error) {
++	var r T
++	res := s.c.g.apply(ctx).Model(r).Clauses(clause.Set(s.assigns)).Updates(map[string]interface{}{})
++	return int(res.RowsAffected), res.Error
++}
++
++func (s setCreateOrUpdateG[T]) Create(ctx context.Context) error {
++	var r T
++	data := make(map[string]interface{}, len(s.assigns))
++	for _, a := range s.assigns {
++		data[a.Column.Name] = a.Value
++	}
++	return s.c.g.apply(ctx).Model(r).Create(data).Error
++}
++
+ type execG[T any] struct {
+ 	g *g[T]
+ }
+@@ -653,244 +680,3 @@ func (g execG[T]) Row(ctx context.Context) *sql.Row {
+ func (g execG[T]) Rows(ctx context.Context) (*sql.Rows, error) {
+ 	return g.g.apply(ctx).Rows()
+ }
+-
+-func (c chainG[T]) processSet(items ...clause.Assigner) setCreateOrUpdateG[T] {
+-	var (
+-		assigns  []clause.Assignment
+-		assocOps []clause.Association
+-	)
+-
+-	for _, item := range items {
+-		// Check if it's an AssociationAssigner
+-		if assocAssigner, ok := item.(clause.AssociationAssigner); ok {
+-			assocOps = append(assocOps, assocAssigner.AssociationAssignments()...)
+-		} else {
+-			assigns = append(assigns, item.Assignments()...)
+-		}
+-	}
+-
+-	return setCreateOrUpdateG[T]{
+-		c:        c,
+-		assigns:  assigns,
+-		assocOps: assocOps,
+-	}
+-}
+-
+-// setCreateOrUpdateG[T] is a struct that holds operations to be executed in a batch.
+-// It supports regular assignments and association operations.
+-type setCreateOrUpdateG[T any] struct {
+-	c        chainG[T]
+-	assigns  []clause.Assignment
+-	assocOps []clause.Association
+-}
+-
+-func (s setCreateOrUpdateG[T]) Update(ctx context.Context) (rowsAffected int, err error) {
+-	// Execute association operations
+-	for _, assocOp := range s.assocOps {
+-		if err := s.executeAssociationOperation(ctx, assocOp); err != nil {
+-			return 0, err
+-		}
+-	}
+-
+-	// Execute assignment operations
+-	if len(s.assigns) > 0 {
+-		var r T
+-		res := s.c.g.apply(ctx).Model(r).Clauses(clause.Set(s.assigns)).Updates(map[string]interface{}{})
+-		return int(res.RowsAffected), res.Error
+-	}
+-
+-	return 0, nil
+-}
+-
+-func (s setCreateOrUpdateG[T]) Create(ctx context.Context) error {
+-	// Execute association operations
+-	for _, assocOp := range s.assocOps {
+-		if err := s.executeAssociationOperation(ctx, assocOp); err != nil {
+-			return err
+-		}
+-	}
+-
+-	// Execute assignment operations
+-	if len(s.assigns) > 0 {
+-		data := make(map[string]interface{}, len(s.assigns))
+-		for _, a := range s.assigns {
+-			data[a.Column.Name] = a.Value
+-		}
+-		var r T
+-		return s.c.g.apply(ctx).Model(r).Create(data).Error
+-	}
+-
+-	return nil
+-}
+-
+-// executeAssociationOperation executes an association operation
+-func (s setCreateOrUpdateG[T]) executeAssociationOperation(ctx context.Context, op clause.Association) error {
+-	var r T
+-	base := s.c.g.apply(ctx).Model(r)
+-
+-	switch op.Type {
+-	case clause.OpCreate:
+-		return s.handleAssociationCreate(ctx, base, op)
+-	case clause.OpCreateValues:
+-		return s.handleAssociationCreateValues(ctx, base, op)
+-	case clause.OpUnlink, clause.OpDelete, clause.OpUpdate:
+-		return s.handleAssociation(ctx, base, op)
+-	default:
+-		return fmt.Errorf("unknown association operation type: %v", op.Type)
+-	}
+-}
+-
+-func (s setCreateOrUpdateG[T]) handleAssociationCreate(ctx context.Context, base *DB, op clause.Association) error {
+-	return s.handleAssociationForOwners(base, ctx, func(owner T, assoc *Association) error {
+-		data := make(map[string]interface{}, len(op.Set))
+-		for _, a := range op.Set {
+-			data[a.Column.Name] = a.Value
+-		}
+-		return assoc.Append(data)
+-	}, op.Association)
+-}
+-
+-func (s setCreateOrUpdateG[T]) handleAssociationCreateValues(ctx context.Context, base *DB, op clause.Association) error {
+-	return s.handleAssociationForOwners(base, ctx, func(owner T, assoc *Association) error {
+-		return assoc.Append(op.Values...)
+-	}, op.Association)
+-}
+-
+-// handleAssociationForOwners is a helper function that handles associations for all owners
+-func (s setCreateOrUpdateG[T]) handleAssociationForOwners(base *DB, ctx context.Context, handler func(owner T, association *Association) error, associationName string) error {
+-	var owners []T
+-	if err := base.Find(&owners).Error; err != nil {
+-		return err
+-	}
+-
+-	for _, owner := range owners {
+-		assoc := base.Session(&Session{NewDB: true, Context: ctx}).Model(&owner).Association(associationName)
+-		if assoc.Error != nil {
+-			return assoc.Error
+-		}
+-
+-		if err := handler(owner, assoc); err != nil {
+-			return err
+-		}
+-	}
+-	return nil
+-}
+-
+-func (s setCreateOrUpdateG[T]) handleAssociation(ctx context.Context, base *DB, op clause.Association) error {
+-	assoc := base.Association(op.Association)
+-	if assoc.Error != nil {
+-		return assoc.Error
+-	}
+-
+-	var (
+-		rel            = assoc.Relationship
+-		assocModel     = reflect.New(rel.FieldSchema.ModelType).Interface()
+-		fkNil          = map[string]any{}
+-		setMap         = make(map[string]any, len(op.Set))
+-		ownerPKNames   []string
+-		ownerFKNames   []string
+-		primaryColumns []any
+-		foreignColumns []any
+-	)
+-
+-	for _, a := range op.Set {
+-		setMap[a.Column.Name] = a.Value
+-	}
+-
+-	for _, ref := range rel.References {
+-		fkNil[ref.ForeignKey.DBName] = nil
+-
+-		if ref.OwnPrimaryKey && ref.PrimaryKey != nil {
+-			ownerPKNames = append(ownerPKNames, ref.PrimaryKey.DBName)
+-			primaryColumns = append(primaryColumns, clause.Column{Name: ref.PrimaryKey.DBName})
+-			foreignColumns = append(foreignColumns, clause.Column{Name: ref.ForeignKey.DBName})
+-		} else if !ref.OwnPrimaryKey && ref.PrimaryKey != nil {
+-			ownerFKNames = append(ownerFKNames, ref.ForeignKey.DBName)
+-			primaryColumns = append(primaryColumns, clause.Column{Name: ref.PrimaryKey.DBName})
+-		}
+-	}
+-
+-	assocDB := s.c.g.db.Session(&Session{NewDB: true, Context: ctx}).Model(assocModel).Where(op.Conditions)
+-
+-	switch rel.Type {
+-	case schema.HasOne, schema.HasMany:
+-		assocDB = assocDB.Where("? IN (?)", foreignColumns, base.Select(ownerPKNames))
+-		switch op.Type {
+-		case clause.OpUnlink:
+-			return assocDB.Updates(fkNil).Error
+-		case clause.OpDelete:
+-			return assocDB.Delete(assocModel).Error
+-		case clause.OpUpdate:
+-			return assocDB.Updates(setMap).Error
+-		}
+-	case schema.BelongsTo:
+-		switch op.Type {
+-		case clause.OpDelete:
+-			return base.Transaction(func(tx *DB) error {
+-				assocDB.Statement.ConnPool = tx.Statement.ConnPool
+-				base.Statement.ConnPool = tx.Statement.ConnPool
+-
+-				if err := assocDB.Where("? IN (?)", primaryColumns, base.Select(ownerFKNames)).Delete(assocModel).Error; err != nil {
+-					return err
+-				}
+-				return base.Updates(fkNil).Error
+-			})
+-		case clause.OpUnlink:
+-			return base.Updates(fkNil).Error
+-		case clause.OpUpdate:
+-			return assocDB.Where("? IN (?)", primaryColumns, base.Select(ownerFKNames)).Updates(setMap).Error
+-		}
+-	case schema.Many2Many:
+-		joinModel := reflect.New(rel.JoinTable.ModelType).Interface()
+-		joinDB := base.Session(&Session{NewDB: true, Context: ctx}).Model(joinModel)
+-
+-		// EXISTS owners: owners.pk = join.owner_fk for all owner refs
+-		ownersExists := base.Session(&Session{NewDB: true, Context: ctx}).Table(rel.Schema.Table).Select("1")
+-		for _, ref := range rel.References {
+-			if ref.OwnPrimaryKey && ref.PrimaryKey != nil {
+-				ownersExists = ownersExists.Where(clause.Eq{
+-					Column: clause.Column{Table: rel.Schema.Table, Name: ref.PrimaryKey.DBName},
+-					Value:  clause.Column{Table: rel.JoinTable.Table, Name: ref.ForeignKey.DBName},
+-				})
+-			}
+-		}
+-
+-		// EXISTS related: related.pk = join.rel_fk for all related refs, plus optional conditions
+-		relatedExists := base.Session(&Session{NewDB: true, Context: ctx}).Table(rel.FieldSchema.Table).Select("1")
+-		for _, ref := range rel.References {
+-			if !ref.OwnPrimaryKey && ref.PrimaryKey != nil {
+-				relatedExists = relatedExists.Where(clause.Eq{
+-					Column: clause.Column{Table: rel.FieldSchema.Table, Name: ref.PrimaryKey.DBName},
+-					Value:  clause.Column{Table: rel.JoinTable.Table, Name: ref.ForeignKey.DBName},
+-				})
+-			}
+-		}
+-		relatedExists = relatedExists.Where(op.Conditions)
+-
+-		switch op.Type {
+-		case clause.OpUnlink, clause.OpDelete:
+-			joinDB = joinDB.Where("EXISTS (?)", ownersExists)
+-			if len(op.Conditions) > 0 {
+-				joinDB = joinDB.Where("EXISTS (?)", relatedExists)
+-			}
+-			return joinDB.Delete(nil).Error
+-		case clause.OpUpdate:
+-			// Update related table rows that have join rows matching owners
+-			relatedDB := base.Session(&Session{NewDB: true, Context: ctx}).Table(rel.FieldSchema.Table).Where(op.Conditions)
+-
+-			// correlated join subquery: join.rel_fk = related.pk AND EXISTS owners
+-			joinSub := base.Session(&Session{NewDB: true, Context: ctx}).Table(rel.JoinTable.Table).Select("1")
+-			for _, ref := range rel.References {
+-				if !ref.OwnPrimaryKey && ref.PrimaryKey != nil {
+-					joinSub = joinSub.Where(clause.Eq{
+-						Column: clause.Column{Table: rel.JoinTable.Table, Name: ref.ForeignKey.DBName},
+-						Value:  clause.Column{Table: rel.FieldSchema.Table, Name: ref.PrimaryKey.DBName},
+-					})
+-				}
+-			}
+-			joinSub = joinSub.Where("EXISTS (?)", ownersExists)
+-			return relatedDB.Where("EXISTS (?)", joinSub).Updates(setMap).Error
+-		}
+-	}
+-	return errors.New("unsupported relationship")
+-}
+diff --git a/go.mod b/go.mod
+index 695e872..3060fc8 100644
+--- a/go.mod
++++ b/go.mod
+@@ -7,8 +7,3 @@ require (
+ 	github.com/jinzhu/now v1.1.5
+ 	golang.org/x/text v0.20.0
+ )
+-
+-require (
+-	github.com/mattn/go-sqlite3 v1.14.22 // indirect
+-	gorm.io/driver/sqlite v1.6.0 // indirect
+-)
+diff --git a/go.sum b/go.sum
+index 09922ec..9af1157 100644
+--- a/go.sum
++++ b/go.sum
+@@ -2,9 +2,5 @@ github.com/jinzhu/inflection v1.0.0 h1:K317FqzuhWc8YvSVlFMCCUb36O/S9MCKRDI7QkRKD
+ github.com/jinzhu/inflection v1.0.0/go.mod h1:h+uFLlag+Qp1Va5pdKtLDYj+kHp5pxUVkryuEj+Srlc=
+ github.com/jinzhu/now v1.1.5 h1:/o9tlHleP7gOFmsnYNz3RGnqzefHA47wQpKrrdTIwXQ=
+ github.com/jinzhu/now v1.1.5/go.mod h1:d3SSVoowX0Lcu0IBviAWJpolVfI5UJVZZ7cO71lE/z8=
+-github.com/mattn/go-sqlite3 v1.14.22 h1:2gZY6PC6kBnID23Tichd1K+Z0oS6nE/XwU+Vz/5o4kU=
+-github.com/mattn/go-sqlite3 v1.14.22/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
+ golang.org/x/text v0.20.0 h1:gK/Kv2otX8gz+wn7Rmb3vT96ZwuoxnQlY+HlJVj7Qug=
+ golang.org/x/text v0.20.0/go.mod h1:D4IsuqiFMhST5bX19pQ9ikHC2GsaKyk/oF+pn3ducp4=
+-gorm.io/driver/sqlite v1.6.0 h1:WHRRrIiulaPiPFmDcod6prc4l2VGVWHz80KspNsxSfQ=
+-gorm.io/driver/sqlite v1.6.0/go.mod h1:AO9V1qIQddBESngQUKWL9yoH93HIeA1X6V633rBwyT8=
+diff --git a/schema/utils.go b/schema/utils.go
+index d4fe252..fa1c65d 100644
+--- a/schema/utils.go
++++ b/schema/utils.go
+@@ -121,17 +121,6 @@ func GetIdentityFieldValuesMap(ctx context.Context, reflectValue reflect.Value,
+ 	}
+ 
+ 	switch reflectValue.Kind() {
+-	case reflect.Map:
+-		results = [][]interface{}{make([]interface{}, len(fields))}
+-		for idx, field := range fields {
+-			mapValue := reflectValue.MapIndex(reflect.ValueOf(field.DBName))
+-			if mapValue.IsZero() {
+-				mapValue = reflectValue.MapIndex(reflect.ValueOf(field.Name))
+-			}
+-			results[0][idx] = mapValue.Interface()
+-		}
+-
+-		dataResults[utils.ToStringKey(results[0]...)] = []reflect.Value{reflectValue}
+ 	case reflect.Struct:
+ 		results = [][]interface{}{make([]interface{}, len(fields))}
+ 
+diff --git a/statement.go b/statement.go
+index 736087d..cd7369e 100644
+--- a/statement.go
++++ b/statement.go
+@@ -336,8 +336,6 @@ func (stmt *Statement) BuildCondition(query interface{}, args ...interface{}) []
+ 		switch v := arg.(type) {
+ 		case clause.Expression:
+ 			conds = append(conds, v)
+-		case []clause.Expression:
+-			conds = append(conds, v...)
+ 		case *DB:
+ 			v.executeScopes()
+ 
+diff --git a/tests/association_generics_test.go b/tests/association_generics_test.go
+deleted file mode 100644
+index 3ab8fe6..0000000
+--- a/tests/association_generics_test.go
++++ /dev/null
+@@ -1,1042 +0,0 @@
+-package tests_test
+-
+-import (
+-	"context"
+-	"testing"
+-
+-	"gorm.io/gorm"
+-	"gorm.io/gorm/clause"
+-	. "gorm.io/gorm/utils/tests"
+-)
+-
+-// BelongsToCompany and BelongsToUser models for belongs to tests - using existing User and Company models
+-
+-// Test Set + Create with Association OpCreate operation using real database
+-func TestClauseAssociationSetCreateWithOpCreate(t *testing.T) {
+-	ctx := context.Background()
+-
+-	// First create a user with Set + Create
+-	err := gorm.G[User](DB).Set(
+-		clause.Assignment{Column: clause.Column{Name: "name"}, Value: "TestClauseAssociationSetCreateWithOpCreate"},
+-		clause.Assignment{Column: clause.Column{Name: "age"}, Value: 25},
+-	).Create(ctx)
+-	if err != nil {
+-		t.Fatalf("Set Create failed: %v", err)
+-	}
+-
+-	// Find the created user
+-	var user User
+-	if err := DB.Where("name = ?", "TestClauseAssociationSetCreateWithOpCreate").First(&user).Error; err != nil {
+-		t.Fatalf("failed to find created user: %v", err)
+-	}
+-
+-	// Test Set + Update with Association OpCreate
+-	assocOp := clause.Association{
+-		Association: "Pets",
+-		Type:        clause.OpCreate,
+-		Set: []clause.Assignment{
+-			{Column: clause.Column{Name: "name"}, Value: "test-pet"},
+-		},
+-	}
+-
+-	rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx)
+-	if err != nil {
+-		t.Fatalf("Set Update with association failed: %v", err)
+-	}
+-	// Only association operations were executed; no row update is expected
+-	if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	// Verify the association was created using real database query
+-	AssertAssociationCount(t, &user, "Pets", 1, "after Set Update with association")
+-}
+-
+-// Test Set + Update with Association OpCreate operation using real database
+-func TestClauseAssociationSetUpdateWithOpCreate(t *testing.T) {
+-	ctx := context.Background()
+-
+-	// Create a user with a pet first using real database
+-	user := User{Name: "TestClauseAssociationSetUpdateWithOpCreate", Age: 25}
+-	user.Pets = []*Pet{{Name: "original-pet"}}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("failed to create user with pet: %v", err)
+-	}
+-
+-	// Verify initial state using real database query
+-	AssertAssociationCount(t, user, "Pets", 1, "before update")
+-
+-	// Test Set + Update with Association OpCreate
+-	assocOp := clause.Association{
+-		Association: "Pets",
+-		Type:        clause.OpCreate,
+-		Set: []clause.Assignment{
+-			{Column: clause.Column{Name: "name"}, Value: "new-pet"},
+-		},
+-	}
+-
+-	rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx)
+-	if err != nil {
+-		t.Fatalf("Set Update with association failed: %v", err)
+-	}
+-	// Only association operations were executed; no row update is expected
+-	if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	// Verify the association was updated using real database query
+-	var updatedUser User
+-	if err := DB.Preload("Pets").Where("id = ?", user.ID).First(&updatedUser).Error; err != nil {
+-		t.Fatalf("failed to find updated user: %v", err)
+-	}
+-
+-	if len(updatedUser.Pets) != 2 {
+-		t.Fatalf("expected 2 pets, got %d", len(updatedUser.Pets))
+-	}
+-
+-	petNames := make(map[string]bool)
+-	for _, pet := range updatedUser.Pets {
+-		petNames[pet.Name] = true
+-	}
+-
+-	if !petNames["original-pet"] {
+-		t.Error("original pet not found")
+-	}
+-
+-	if !petNames["new-pet"] {
+-		t.Error("new pet not found")
+-	}
+-}
+-
+-// Test Set + Create with multiple associations using real database
+-func TestClauseAssociationSetCreateWithMultipleAssociations(t *testing.T) {
+-	ctx := context.Background()
+-
+-	// First create a user with Set + Create using real database
+-	err := gorm.G[User](DB).Set(
+-		clause.Assignment{Column: clause.Column{Name: "name"}, Value: "TestClauseAssociationSetCreateWithMultipleAssociations"},
+-		clause.Assignment{Column: clause.Column{Name: "age"}, Value: 25},
+-	).Create(ctx)
+-	if err != nil {
+-		t.Fatalf("Set Create failed: %v", err)
+-	}
+-
+-	// Find the created user using real database query
+-	var user User
+-	if err := DB.Where("name = ?", "TestClauseAssociationSetCreateWithMultipleAssociations").First(&user).Error; err != nil {
+-		t.Fatalf("failed to find created user: %v", err)
+-	}
+-
+-	// Test Set + Update with multiple association operations
+-	assocOp1 := clause.Association{
+-		Association: "Pets",
+-		Type:        clause.OpCreate,
+-		Set: []clause.Assignment{
+-			{Column: clause.Column{Name: "name"}, Value: "test-pet-1"},
+-		},
+-	}
+-
+-	assocOp2 := clause.Association{
+-		Association: "Toys",
+-		Type:        clause.OpCreate,
+-		Set: []clause.Assignment{
+-			{Column: clause.Column{Name: "name"}, Value: "test-toy-1"},
+-		},
+-	}
+-
+-	rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp1, assocOp2).Update(ctx)
+-	if err != nil {
+-		t.Fatalf("Set Update with multiple associations failed: %v", err)
+-	}
+-	// Only association operations were executed; no row update is expected
+-	if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	// Verify both associations were created using real database queries
+-	AssertAssociationCount(t, &user, "Pets", 1, "after Set Update with multiple associations")
+-	AssertAssociationCount(t, &user, "Toys", 1, "after Set Update with multiple associations")
+-}
+-
+-// Test Set + Update with multiple associations using real database
+-func TestClauseAssociationSetUpdateWithMultipleAssociations(t *testing.T) {
+-	ctx := context.Background()
+-
+-	// Create a user with initial associations using real database
+-	user := User{Name: "TestClauseAssociationSetUpdateWithMultipleAssociations", Age: 25}
+-	user.Pets = []*Pet{{Name: "original-pet"}}
+-	user.Toys = []Toy{{Name: "original-toy"}}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("failed to create user with associations: %v", err)
+-	}
+-
+-	// Verify initial state using real database queries
+-	AssertAssociationCount(t, user, "Pets", 1, "before update")
+-	AssertAssociationCount(t, user, "Toys", 1, "before update")
+-
+-	// Test Set + Update with multiple association operations
+-	assocOp1 := clause.Association{
+-		Association: "Pets",
+-		Type:        clause.OpCreate,
+-		Set: []clause.Assignment{
+-			{Column: clause.Column{Name: "name"}, Value: "new-pet"},
+-		},
+-	}
+-
+-	assocOp2 := clause.Association{
+-		Association: "Toys",
+-		Type:        clause.OpCreate,
+-		Set: []clause.Assignment{
+-			{Column: clause.Column{Name: "name"}, Value: "new-toy"},
+-		},
+-	}
+-
+-	rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp1, assocOp2).Update(ctx)
+-	if err != nil {
+-		t.Fatalf("Set Update with multiple associations failed: %v", err)
+-	}
+-	// Only association operations were executed; no row update is expected
+-	if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	// Verify both associations were updated using real database queries
+-	var updatedUser User
+-	if err := DB.Preload("Pets").Preload("Toys").Where("id = ?", user.ID).First(&updatedUser).Error; err != nil {
+-		t.Fatalf("failed to find updated user: %v", err)
+-	}
+-
+-	if len(updatedUser.Pets) != 2 {
+-		t.Fatalf("expected 2 pets, got %d", len(updatedUser.Pets))
+-	}
+-
+-	if len(updatedUser.Toys) != 2 {
+-		t.Fatalf("expected 2 toys, got %d", len(updatedUser.Toys))
+-	}
+-}
+-
+-// Test Set + Update with Association OpUnlink operation using real database
+-func TestClauseAssociationSetUpdateWithOpUnlink(t *testing.T) {
+-	ctx := context.Background()
+-
+-	// Create a user with pets using real database
+-	user := User{Name: "TestClauseAssociationSetUpdateWithOpUnlink", Age: 25}
+-	user.Pets = []*Pet{{Name: "pet-to-unlink"}, {Name: "pet-to-keep"}}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("failed to create user with pets: %v", err)
+-	}
+-
+-	// Verify initial state using real database query
+-	AssertAssociationCount(t, user, "Pets", 2, "before unlink")
+-
+-	// Get the pet to unlink using real database query
+-	var petToUnlink Pet
+-	if err := DB.Where("name = ?", "pet-to-unlink").First(&petToUnlink).Error; err != nil {
+-		t.Fatalf("failed to find pet to unlink: %v", err)
+-	}
+-
+-	// Test Set + Update with Association OpUnlink
+-	assocOp := clause.Association{
+-		Association: "Pets",
+-		Type:        clause.OpUnlink,
+-		Conditions: []clause.Expression{
+-			clause.Eq{Column: clause.Column{Name: "id"}, Value: petToUnlink.ID},
+-		},
+-	}
+-
+-	rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx)
+-	if err != nil {
+-		t.Fatalf("Set Update with association unlink failed: %v", err)
+-	}
+-	// Only association operations were executed; no row update is expected
+-	if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	// Verify only one pet remains using real database query
+-	var updatedUser User
+-	if err := DB.Preload("Pets").Where("id = ?", user.ID).First(&updatedUser).Error; err != nil {
+-		t.Fatalf("failed to find updated user: %v", err)
+-	}
+-
+-	if len(updatedUser.Pets) != 1 {
+-		t.Fatalf("expected 1 pet after unlink, got %d", len(updatedUser.Pets))
+-	}
+-
+-	if updatedUser.Pets[0].Name != "pet-to-keep" {
+-		t.Errorf("expected pet-to-keep, got %s", updatedUser.Pets[0].Name)
+-	}
+-
+-	// Verify the unlinked pet still exists in the database using real database query
+-	var count int64
+-	if err := DB.Model(&Pet{}).Where("id = ?", petToUnlink.ID).Count(&count).Error; err != nil {
+-		t.Fatalf("failed to count pet: %v", err)
+-	}
+-	if count != 1 {
+-		t.Error("unlinked pet should still exist in database")
+-	}
+-}
+-
+-// Test Set + Update with Association OpCreateValues operation using real database
+-func TestClauseAssociationSetUpdateWithOpCreateValues(t *testing.T) {
+-	ctx := context.Background()
+-
+-	// Create a user first using real database
+-	user := User{Name: "TestClauseAssociationSetUpdateWithOpCreateValues", Age: 25}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("failed to create user: %v", err)
+-	}
+-
+-	// Create a pet object
+-	newPet := Pet{Name: "created-pet"}
+-
+-	// Test Set + Update with Association OpCreateValues
+-	assocOp := clause.Association{
+-		Association: "Pets",
+-		Type:        clause.OpCreateValues,
+-		Values:      []interface{}{&newPet},
+-	}
+-
+-	rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx)
+-	if err != nil {
+-		t.Fatalf("Set Update with association create values failed: %v", err)
+-	}
+-	// Only association operations were executed; no row update is expected
+-	if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	// Verify the pet was created and associated using real database query
+-	var updatedUser User
+-	if err := DB.Preload("Pets").Where("id = ?", user.ID).First(&updatedUser).Error; err != nil {
+-		t.Fatalf("failed to find updated user: %v", err)
+-	}
+-
+-	if len(updatedUser.Pets) != 1 {
+-		t.Fatalf("expected 1 pet, got %d", len(updatedUser.Pets))
+-	}
+-
+-	if updatedUser.Pets[0].Name != "created-pet" {
+-		t.Errorf("expected created-pet, got %s", updatedUser.Pets[0].Name)
+-	}
+-}
+-
+-// Test Set + Create with many-to-many associations using real database
+-func TestClauseAssociationSetCreateWithManyToMany(t *testing.T) {
+-	ctx := context.Background()
+-
+-	// Create a user first using real database
+-	user := User{Name: "TestClauseAssociationSetCreateWithManyToMany", Age: 25}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("failed to create user: %v", err)
+-	}
+-
+-	// Create languages using real database
+-	langs := []Language{
+-		{Code: "en", Name: "English"},
+-		{Code: "fr", Name: "French"},
+-	}
+-	for _, lang := range langs {
+-		DB.FirstOrCreate(&lang, "code = ?", lang.Code)
+-	}
+-
+-	// Test Set + Update with many-to-many association
+-	assocOp := clause.Association{
+-		Association: "Languages",
+-		Type:        clause.OpCreateValues,
+-		Values:      []interface{}{langs[0], langs[1]},
+-	}
+-
+-	rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx)
+-	if err != nil {
+-		t.Fatalf("Set Update with many-to-many association failed: %v", err)
+-	}
+-	// Only association operations were executed; no row update is expected
+-	if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	// Verify the languages were associated using real database query
+-	var updatedUser User
+-	if err := DB.Preload("Languages").Where("id = ?", user.ID).First(&updatedUser).Error; err != nil {
+-		t.Fatalf("failed to find updated user: %v", err)
+-	}
+-
+-	if len(updatedUser.Languages) != 2 {
+-		t.Fatalf("expected 2 languages, got %d", len(updatedUser.Languages))
+-	}
+-}
+-
+-// Test Set + Create with belongs-to associations using real database
+-func TestClauseAssociationSetCreateWithBelongsTo(t *testing.T) {
+-	ctx := context.Background()
+-
+-	// Create a company first using real database
+-	company := Company{Name: "Test Company"}
+-	if err := DB.Create(&company).Error; err != nil {
+-		t.Fatalf("failed to create company: %v", err)
+-	}
+-
+-	// Test Set + Create with belongs-to association using field assignment
+-	err := gorm.G[User](DB).Set(
+-		clause.Assignment{Column: clause.Column{Name: "name"}, Value: "TestClauseAssociationSetCreateWithBelongsTo"},
+-		clause.Assignment{Column: clause.Column{Name: "age"}, Value: 25},
+-		clause.Assignment{Column: clause.Column{Name: "company_id"}, Value: company.ID},
+-	).Create(ctx)
+-	if err != nil {
+-		t.Fatalf("Set Create with belongs-to association failed: %v", err)
+-	}
+-
+-	// Verify the user was created with company association using real database query
+-	var newUser User
+-	if err := DB.Preload("Company").Where("name = ?", "TestClauseAssociationSetCreateWithBelongsTo").First(&newUser).Error; err != nil {
+-		t.Fatalf("failed to find created user: %v", err)
+-	}
+-
+-	if newUser.Company.ID != company.ID {
+-		t.Errorf("expected company ID %d, got %d", company.ID, newUser.Company.ID)
+-	}
+-
+-	if newUser.Company.Name != company.Name {
+-		t.Errorf("expected company name %s, got %s", company.Name, newUser.Company.Name)
+-	}
+-}
+-
+-// BelongsTo: create and assign company via OpCreateValues
+-func TestClauseAssociationSetUpdateBelongsToCreateValues(t *testing.T) {
+-	ctx := context.Background()
+-
+-	user := User{Name: "TestClauseAssociationSetUpdateBelongsToCreateValues", Age: 26}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("failed to create user: %v", err)
+-	}
+-
+-	assocOp := clause.Association{Association: "Company", Type: clause.OpCreateValues, Values: []interface{}{Company{Name: "Belongs-To-Co"}}}
+-	if rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx); err != nil {
+-		t.Fatalf("Set Update belongs-to create values failed: %v", err)
+-	} else if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	var got User
+-	if err := DB.Preload("Company").First(&got, user.ID).Error; err != nil {
+-		t.Fatalf("failed preload company: %v", err)
+-	}
+-	if got.Company.ID == 0 || got.Company.Name != "Belongs-To-Co" {
+-		t.Fatalf("expected Company assigned, got %+v", got.Company)
+-	}
+-}
+-
+-// Mixed fields + association: update Age and create a pet together
+-func TestClauseAssociationSetUpdateMixedFieldAndAssociation(t *testing.T) {
+-	ctx := context.Background()
+-	user := User{Name: "TestClauseAssociationSetUpdateMixed", Age: 20}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create user: %v", err)
+-	}
+-
+-	assocOp := clause.Association{Association: "Pets", Type: clause.OpCreate, Set: []clause.Assignment{{Column: clause.Column{Name: "name"}, Value: "mix-pet"}}}
+-	rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(
+-		assocOp,
+-		clause.Assignment{Column: clause.Column{Name: "age"}, Value: 30},
+-	).Update(ctx)
+-	if err != nil {
+-		t.Fatalf("Set Update mixed failed: %v", err)
+-	}
+-	if rows != 1 {
+-		t.Fatalf("expected 1 row affected for field update, got %d", rows)
+-	}
+-
+-	var got User
+-	if err := DB.Preload("Pets").First(&got, user.ID).Error; err != nil {
+-		t.Fatalf("load user: %v", err)
+-	}
+-	if got.Age != 30 {
+-		t.Fatalf("expected age 30, got %d", got.Age)
+-	}
+-	if len(got.Pets) != 1 || got.Pets[0].Name != "mix-pet" {
+-		t.Fatalf("expected pet created, got %+v", got.Pets)
+-	}
+-}
+-
+-// HasOne unlink clears NamedPet
+-func TestClauseAssociationSetUpdateHasOneUnlink(t *testing.T) {
+-	ctx := context.Background()
+-	user := User{Name: "TestClauseAssociationSetUpdateHasOneUnlink", Age: 25}
+-	user.NamedPet = &Pet{Name: "np"}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create: %v", err)
+-	}
+-
+-	assocOp := clause.Association{Association: "NamedPet", Type: clause.OpUnlink}
+-	if rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx); err != nil {
+-		t.Fatalf("Set Update has-one unlink failed: %v", err)
+-	} else if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	var got User
+-	if err := DB.Preload("NamedPet").First(&got, user.ID).Error; err != nil {
+-		t.Fatalf("load user: %v", err)
+-	}
+-	if got.NamedPet != nil {
+-		t.Fatalf("expected NamedPet cleared, got %+v", got.NamedPet)
+-	}
+-}
+-
+-// Many-to-Many create with Set
+-func TestClauseAssociationSetUpdateManyToManyCreateWithSet(t *testing.T) {
+-	ctx := context.Background()
+-	user := User{Name: "TestClauseAssociationSetUpdateMany2ManyCreateWithSet", Age: 25}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create user: %v", err)
+-	}
+-
+-	assocOp := clause.Association{
+-		Association: "Languages", Type: clause.OpCreate,
+-		Set: []clause.Assignment{{Column: clause.Column{Name: "code"}, Value: "it"}, {Column: clause.Column{Name: "name"}, Value: "Italian"}},
+-	}
+-	if rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx); err != nil {
+-		t.Fatalf("Set Update many2many create with set failed: %v", err)
+-	} else if rows != 0 {
+-		t.Fatalf("expected 0 rows affected, got %d", rows)
+-	}
+-
+-	AssertAssociationCount(t, user, "Languages", 1, "after create language")
+-}
+-
+-// Many-to-Many clear
+-func TestClauseAssociationSetUpdateManyToManyClear(t *testing.T) {
+-	ctx := context.Background()
+-	user := User{Name: "TestClauseAssociationSetUpdateMany2ManyClear", Age: 25}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create user: %v", err)
+-	}
+-	langs := []Language{{Code: "pt", Name: "Portuguese"}, {Code: "ru", Name: "Russian"}}
+-	for _, l := range langs {
+-		DB.FirstOrCreate(&l, "code = ?", l.Code)
+-	}
+-	if err := DB.Model(&user).Association("Languages").Append(&langs); err != nil {
+-		t.Fatalf("append: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Languages", 2, "before clear")
+-
+-	assocOp := clause.Association{Association: "Languages", Type: clause.OpUnlink}
+-	if rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx); err != nil {
+-		t.Fatalf("Set Update many2many clear failed: %v", err)
+-	} else if rows != 0 {
+-		t.Fatalf("expected 0 rows affected, got %d", rows)
+-	}
+-	AssertAssociationCount(t, user, "Languages", 0, "after clear")
+-}
+-
+-// Polymorphic Tools create and unlink
+-func TestClauseAssociationSetUpdatePolymorphicTools(t *testing.T) {
+-	ctx := context.Background()
+-	user := User{Name: "TestClauseAssociationSetUpdatePolymorphicTools", Age: 25}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create user: %v", err)
+-	}
+-
+-	createOp := clause.Association{Association: "Tools", Type: clause.OpCreateValues, Values: []interface{}{Tools{Name: "wrench"}}}
+-	if rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(createOp).Update(ctx); err != nil {
+-		t.Fatalf("create tools: %v", err)
+-	} else if rows != 0 {
+-		t.Fatalf("rows %d", rows)
+-	}
+-	AssertAssociationCount(t, user, "Tools", 1, "after create tool")
+-
+-	unlinkOp := clause.Association{Association: "Tools", Type: clause.OpUnlink}
+-	if rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(unlinkOp).Update(ctx); err != nil {
+-		t.Fatalf("unlink tools: %v", err)
+-	} else if rows != 0 {
+-		t.Fatalf("rows %d", rows)
+-	}
+-	AssertAssociationCount(t, user, "Tools", 0, "after clear tools")
+-}
+-
+-// Invalid association should return error
+-func TestClauseAssociationSetUpdateInvalidAssociation(t *testing.T) {
+-	ctx := context.Background()
+-	user := User{Name: "TestClauseAssociationSetUpdateInvalidAssociation", Age: 25}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create user: %v", err)
+-	}
+-
+-	assocOp := clause.Association{Association: "Invalid", Type: clause.OpCreate}
+-	if _, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx); err == nil {
+-		t.Fatalf("expected error for invalid association, got nil")
+-	}
+-}
+-
+-// No owner matched; should be no-op
+-func TestClauseAssociationSetUpdateNoOwnerMatch(t *testing.T) {
+-	ctx := context.Background()
+-	assocOp := clause.Association{Association: "Pets", Type: clause.OpCreate, Set: []clause.Assignment{{Column: clause.Column{Name: "name"}, Value: "won't-create"}}}
+-	if rows, err := gorm.G[User](DB).Where("id = ?", -1).Set(assocOp).Update(ctx); err != nil {
+-		t.Fatalf("unexpected error: %v", err)
+-	} else if rows != 0 {
+-		t.Fatalf("expected 0 rows, got %d", rows)
+-	}
+-}
+-
+-// OpDelete/OpUpdate should work for associations
+-func TestClauseAssociationSetUpdateAndDelete(t *testing.T) {
+-	ctx := context.Background()
+-	user := User{Name: "TestClauseAssociationSetUpdateAndDelete", Age: 25}
+-	user.Pets = []*Pet{{Name: "before"}}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create user: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Pets", 1, "before update/delete")
+-
+-	// Update pet name via OpUpdate
+-	updOp := clause.Association{Association: "Pets", Type: clause.OpUpdate, Set: []clause.Assignment{{Column: clause.Column{Name: "name"}, Value: "x"}}}
+-	if _, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(updOp).Update(ctx); err != nil {
+-		t.Fatalf("OpUpdate failed: %v", err)
+-	}
+-	var got User
+-	if err := DB.Preload("Pets").First(&got, user.ID).Error; err != nil {
+-		t.Fatalf("load user: %v", err)
+-	}
+-	if len(got.Pets) != 1 || got.Pets[0].Name != "x" {
+-		t.Fatalf("expected updated pet name, got %+v", got.Pets)
+-	}
+-
+-	// Delete pets via OpDelete
+-	delOp := clause.Association{Association: "Pets", Type: clause.OpDelete}
+-	if _, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(delOp).Update(ctx); err != nil {
+-		t.Fatalf("OpDelete failed: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Pets", 0, "after delete")
+-}
+-
+-// HasOne: update and delete NamedPet via OpUpdate/OpDelete
+-func TestClauseAssociationSetUpdateAndDeleteHasOne(t *testing.T) {
+-	ctx := context.Background()
+-	user := User{Name: "TestClauseAssociationSetUpdateAndDeleteHasOne", Age: 25}
+-	user.NamedPet = &Pet{Name: "np-before"}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create user: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "NamedPet", 1, "before")
+-
+-	upd := clause.Association{Association: "NamedPet", Type: clause.OpUpdate, Set: []clause.Assignment{{Column: clause.Column{Name: "name"}, Value: "np-after"}}}
+-	if _, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(upd).Update(ctx); err != nil {
+-		t.Fatalf("OpUpdate has-one failed: %v", err)
+-	}
+-	var u1 User
+-	if err := DB.Preload("NamedPet").First(&u1, user.ID).Error; err != nil {
+-		t.Fatalf("load: %v", err)
+-	}
+-	if u1.NamedPet == nil || u1.NamedPet.Name != "np-after" {
+-		t.Fatalf("expected name updated, got %+v", u1.NamedPet)
+-	}
+-
+-	del := clause.Association{Association: "NamedPet", Type: clause.OpDelete}
+-	if _, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(del).Update(ctx); err != nil {
+-		t.Fatalf("OpDelete has-one failed: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "NamedPet", 0, "after delete")
+-}
+-
+-// Many2Many append with map using Association API (regression for map support)
+-func TestAssociationMany2ManyAppendMap_GenericFile(t *testing.T) {
+-	user := User{Name: "AssocM2MAppendMapGeneric", Age: 28}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create user: %v", err)
+-	}
+-
+-	if err := DB.Model(&user).Association("Languages").Append(map[string]interface{}{
+-		"code": "gm2m_map_1", "name": "GMap1",
+-	}); err != nil {
+-		t.Fatalf("append map: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Languages", 1, "after append 1 map (generic file)")
+-
+-	// Append more maps individually
+-	if err := DB.Model(&user).Association("Languages").Append(map[string]interface{}{"code": "gm2m_map_2", "name": "GMap2"}); err != nil {
+-		t.Fatalf("append map 2: %v", err)
+-	}
+-	if err := DB.Model(&user).Association("Languages").Append(map[string]interface{}{"code": "gm2m_map_3", "name": "GMap3"}); err != nil {
+-		t.Fatalf("append map 3: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Languages", 3, "after append 3 maps total (generic file)")
+-}
+-
+-// BelongsTo: update and delete Company via OpUpdate/OpDelete
+-func TestClauseAssociationSetUpdateAndDeleteBelongsTo(t *testing.T) {
+-	ctx := context.Background()
+-
+-	// Create company and user with company
+-	company := Company{Name: "Electronics"}
+-	if err := DB.Create(&company).Error; err != nil {
+-		t.Fatalf("create company: %v", err)
+-	}
+-
+-	user := User{Name: "John", Age: 25, CompanyID: &company.ID}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create user: %v", err)
+-	}
+-
+-	// Verify association exists
+-	AssertAssociationCount(t, &user, "Company", 1, "before")
+-
+-	// Update company name via OpUpdate
+-	upd := clause.Association{Association: "Company", Type: clause.OpUpdate, Set: []clause.Assignment{{Column: clause.Column{Name: "name"}, Value: "Electronics-New"}}}
+-	if _, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(upd).Update(ctx); err != nil {
+-		t.Fatalf("OpUpdate belongs-to failed: %v", err)
+-	}
+-
+-	var u1 User
+-	if err := DB.Preload("Company").First(&u1, user.ID).Error; err != nil {
+-		t.Fatalf("load: %v", err)
+-	}
+-
+-	if u1.Company.ID == 0 || u1.Company.Name != "Electronics-New" {
+-		t.Fatalf("expected company updated, got %+v", u1.Company)
+-	}
+-
+-	// Unlink company association via OpUnlink (instead of OpDelete which would try to delete the company record)
+-	unlink := clause.Association{Association: "Company", Type: clause.OpUnlink}
+-	if _, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(unlink).Update(ctx); err != nil {
+-		t.Fatalf("OpUnlink belongs-to failed: %v", err)
+-	}
+-
+-	var u2 User
+-	if err := DB.Preload("Company").First(&u2, user.ID).Error; err != nil {
+-		t.Fatalf("load: %v", err)
+-	}
+-
+-	if u2.Company.ID != 0 {
+-		t.Fatalf("expected company association cleared due to unlink, got %+v", u2.Company)
+-	}
+-}
+-
+-// Many2Many: update and delete via Set
+-func TestClauseAssociationSetUpdateAndDeleteMany2Many(t *testing.T) {
+-	ctx := context.Background()
+-	user := User{Name: "TestClauseAssociationSetUpdateAndDeleteMany2Many", Age: 25}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create user: %v", err)
+-	}
+-	langs := []Language{{Code: "es", Name: "Spanish"}, {Code: "de", Name: "German"}}
+-	for _, l := range langs {
+-		DB.FirstOrCreate(&l, "code = ?", l.Code)
+-	}
+-	if err := DB.Model(&user).Association("Languages").Append(&langs); err != nil {
+-		t.Fatalf("append: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Languages", 2, "before")
+-
+-	upd := clause.Association{Association: "Languages", Type: clause.OpUpdate, Set: []clause.Assignment{{Column: clause.Column{Name: "name"}, Value: "Espanol"}}, Conditions: []clause.Expression{clause.Eq{Column: clause.Column{Name: "code"}, Value: "es"}}}
+-	if _, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(upd).Update(ctx); err != nil {
+-		t.Fatalf("OpUpdate m2m failed: %v", err)
+-	}
+-	var es Language
+-	if err := DB.First(&es, "code = ?", "es").Error; err != nil {
+-		t.Fatalf("load lang: %v", err)
+-	}
+-	if es.Name != "Espanol" {
+-		t.Fatalf("expected updated language name, got %s", es.Name)
+-	}
+-
+-	del := clause.Association{Association: "Languages", Type: clause.OpDelete, Conditions: []clause.Expression{clause.Eq{Column: clause.Column{Name: "code"}, Value: "es"}}}
+-	if _, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(del).Update(ctx); err != nil {
+-		t.Fatalf("OpDelete m2m failed: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Languages", 1, "after delete one")
+-	// language row remains
+-	var count int64
+-	if err := DB.Model(&Language{}).Where("code = ?", "es").Count(&count).Error; err != nil {
+-		t.Fatalf("count lang: %v", err)
+-	}
+-	if count != 1 {
+-		t.Fatalf("expected language row still exists, got %d", count)
+-	}
+-}
+-
+-// Multi-owners: HasMany update and delete
+-func TestClauseAssociationSetUpdateAndDeleteManyOwnersHasMany(t *testing.T) {
+-	ctx := context.Background()
+-	u1 := User{Name: "MultiOwners-HasMany-1", Age: 21}
+-	u1.Pets = []*Pet{{Name: "p1"}}
+-	u2 := User{Name: "MultiOwners-HasMany-2", Age: 22}
+-	u2.Pets = []*Pet{{Name: "p2"}}
+-	if err := DB.Create(&u1).Error; err != nil {
+-		t.Fatalf("create u1: %v", err)
+-	}
+-	if err := DB.Create(&u2).Error; err != nil {
+-		t.Fatalf("create u2: %v", err)
+-	}
+-	AssertAssociationCount(t, u1, "Pets", 1, "before")
+-	AssertAssociationCount(t, u2, "Pets", 1, "before")
+-
+-	upd := clause.Association{Association: "Pets", Type: clause.OpUpdate, Set: []clause.Assignment{{Column: clause.Column{Name: "name"}, Value: "x"}}}
+-	if _, err := gorm.G[User](DB).Where("id IN ?", []uint{u1.ID, u2.ID}).Set(upd).Update(ctx); err != nil {
+-		t.Fatalf("OpUpdate has-many failed: %v", err)
+-	}
+-	var got1, got2 User
+-	if err := DB.Preload("Pets").First(&got1, u1.ID).Error; err != nil {
+-		t.Fatalf("load u1: %v", err)
+-	}
+-	if err := DB.Preload("Pets").First(&got2, u2.ID).Error; err != nil {
+-		t.Fatalf("load u2: %v", err)
+-	}
+-	if len(got1.Pets) != 1 || got1.Pets[0].Name != "x" {
+-		t.Fatalf("u1 pet not updated: %+v", got1.Pets)
+-	}
+-	if len(got2.Pets) != 1 || got2.Pets[0].Name != "x" {
+-		t.Fatalf("u2 pet not updated: %+v", got2.Pets)
+-	}
+-
+-	del := clause.Association{Association: "Pets", Type: clause.OpDelete}
+-	if _, err := gorm.G[User](DB).Where("id IN ?", []uint{u1.ID, u2.ID}).Set(del).Update(ctx); err != nil {
+-		t.Fatalf("OpDelete has-many failed: %v", err)
+-	}
+-	AssertAssociationCount(t, u1, "Pets", 0, "after delete")
+-	AssertAssociationCount(t, u2, "Pets", 0, "after delete")
+-}
+-
+-// Multi-owners: BelongsTo update and delete
+-
+-func TestClauseAssociationSetUpdateAndDeleteManyOwnersBelongsTo(t *testing.T) {
+-	ctx := context.Background()
+-
+-	// Create companies
+-	c1 := Company{Name: "Electronics"}
+-	c2 := Company{Name: "Books"}
+-	if err := DB.Create(&c1).Error; err != nil {
+-		t.Fatalf("create c1: %v", err)
+-	}
+-	if err := DB.Create(&c2).Error; err != nil {
+-		t.Fatalf("create c2: %v", err)
+-	}
+-
+-	// Create users with companies
+-	u1 := User{Name: "John", Age: 25, CompanyID: &c1.ID}
+-	u2 := User{Name: "Jane", Age: 30, CompanyID: &c2.ID}
+-	if err := DB.Create(&u1).Error; err != nil {
+-		t.Fatalf("create u1: %v", err)
+-	}
+-	if err := DB.Create(&u2).Error; err != nil {
+-		t.Fatalf("create u2: %v", err)
+-	}
+-
+-	// Verify associations exist
+-	AssertAssociationCount(t, &u1, "Company", 1, "before")
+-	AssertAssociationCount(t, &u2, "Company", 1, "before")
+-
+-	// Update companies via OpUpdate for multiple users
+-	upd := clause.Association{Association: "Company", Type: clause.OpUpdate, Set: []clause.Assignment{{Column: clause.Column{Name: "name"}, Value: "Category-New"}}}
+-	if _, err := gorm.G[User](DB).Where("id IN ?", []uint{u1.ID, u2.ID}).Set(upd).Update(ctx); err != nil {
+-		t.Fatalf("OpUpdate belongs-to failed: %v", err)
+-	}
+-
+-	// Check if companies were updated
+-	var g1, g2 User
+-	if err := DB.Preload("Company").First(&g1, u1.ID).Error; err != nil {
+-		t.Fatalf("load u1: %v", err)
+-	}
+-	if err := DB.Preload("Company").First(&g2, u2.ID).Error; err != nil {
+-		t.Fatalf("load u2: %v", err)
+-	}
+-
+-	if (g1.Company.ID == 0 || g1.Company.Name != "Category-New") || (g2.Company.ID == 0 || g2.Company.Name != "Category-New") {
+-		t.Fatalf("company names not updated: %+v, %+v", g1.Company, g2.Company)
+-	}
+-
+-	// Unlink companies via OpUnlink for multiple users (instead of OpDelete which would try to delete the company records)
+-	unlink := clause.Association{Association: "Company", Type: clause.OpUnlink}
+-	if _, err := gorm.G[User](DB).Where("id IN ?", []uint{u1.ID, u2.ID}).Set(unlink).Update(ctx); err != nil {
+-		t.Fatalf("OpUnlink belongs-to failed: %v", err)
+-	}
+-
+-	// Reload users to reflect the changes in the database
+-	if err := DB.First(&u1, u1.ID).Error; err != nil {
+-		t.Fatalf("reload u1: %v", err)
+-	}
+-	if err := DB.First(&u2, u2.ID).Error; err != nil {
+-		t.Fatalf("reload u2: %v", err)
+-	}
+-
+-	// Check if company associations were cleared
+-	AssertAssociationCount(t, &u1, "Company", 0, "after unlink")
+-	AssertAssociationCount(t, &u2, "Company", 0, "after unlink")
+-}
+-
+-// Multi-owners: Many2Many update and delete
+-func TestClauseAssociationSetUpdateAndDeleteManyOwnersMany2Many(t *testing.T) {
+-	ctx := context.Background()
+-	u1 := User{Name: "MultiOwners-M2M-1", Age: 21}
+-	u2 := User{Name: "MultiOwners-M2M-2", Age: 22}
+-	if err := DB.Create(&u1).Error; err != nil {
+-		t.Fatalf("create u1: %v", err)
+-	}
+-	if err := DB.Create(&u2).Error; err != nil {
+-		t.Fatalf("create u2: %v", err)
+-	}
+-	l1 := Language{Code: "zz", Name: "ZZ"}
+-	l2 := Language{Code: "yy", Name: "YY"}
+-	DB.FirstOrCreate(&l1, "code = ?", l1.Code)
+-	DB.FirstOrCreate(&l2, "code = ?", l2.Code)
+-	if err := DB.Model(&u1).Association("Languages").Append(&l1, &l2); err != nil {
+-		t.Fatalf("append u1: %v", err)
+-	}
+-	if err := DB.Model(&u2).Association("Languages").Append(&l1, &l2); err != nil {
+-		t.Fatalf("append u2: %v", err)
+-	}
+-	AssertAssociationCount(t, u1, "Languages", 2, "before")
+-	AssertAssociationCount(t, u2, "Languages", 2, "before")
+-
+-	upd := clause.Association{Association: "Languages", Type: clause.OpUpdate, Set: []clause.Assignment{{Column: clause.Column{Name: "name"}, Value: "ZZZ"}}, Conditions: []clause.Expression{clause.Eq{Column: clause.Column{Name: "code"}, Value: "zz"}}}
+-	if _, err := gorm.G[User](DB).Where("id IN ?", []uint{u1.ID, u2.ID}).Set(upd).Update(ctx); err != nil {
+-		t.Fatalf("OpUpdate m2m failed: %v", err)
+-	}
+-	var l Language
+-	if err := DB.First(&l, "code = ?", "zz").Error; err != nil {
+-		t.Fatalf("load lang: %v", err)
+-	}
+-	if l.Name != "ZZZ" {
+-		t.Fatalf("expected lang updated, got %s", l.Name)
+-	}
+-
+-	del := clause.Association{Association: "Languages", Type: clause.OpDelete, Conditions: []clause.Expression{clause.Eq{Column: clause.Column{Name: "code"}, Value: "zz"}}}
+-	if _, err := gorm.G[User](DB).Where("id IN ?", []uint{u1.ID, u2.ID}).Set(del).Update(ctx); err != nil {
+-		t.Fatalf("OpDelete m2m failed: %v", err)
+-	}
+-	AssertAssociationCount(t, u1, "Languages", 1, "after delete")
+-	AssertAssociationCount(t, u2, "Languages", 1, "after delete")
+-}
+-
+-// Test Set + Update with has-one (NamedPet) using OpCreateValues
+-func TestClauseAssociationSetUpdateHasOneCreateValues(t *testing.T) {
+-	ctx := context.Background()
+-
+-	user := User{Name: "TestClauseAssociationSetUpdateHasOneCreateValues", Age: 25}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("failed to create user: %v", err)
+-	}
+-
+-	assocOp := clause.Association{
+-		Association: "NamedPet",
+-		Type:        clause.OpCreateValues,
+-		Values:      []interface{}{Pet{Name: "named-pet"}},
+-	}
+-
+-	rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx)
+-	if err != nil {
+-		t.Fatalf("Set Update has-one create values failed: %v", err)
+-	}
+-	if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	var updated User
+-	if err := DB.Preload("NamedPet").First(&updated, user.ID).Error; err != nil {
+-		t.Fatalf("failed to load user: %v", err)
+-	}
+-	if updated.NamedPet == nil || updated.NamedPet.Name != "named-pet" {
+-		t.Fatalf("expected named-pet created, got %+v", updated.NamedPet)
+-	}
+-}
+-
+-// Test Set + Update to clear all has-many (Pets) via OpUnlink without conditions
+-func TestClauseAssociationSetUpdateHasManyClear(t *testing.T) {
+-	ctx := context.Background()
+-
+-	user := User{Name: "TestClauseAssociationSetUpdateHasManyClear", Age: 25}
+-	user.Pets = []*Pet{{Name: "p1"}, {Name: "p2"}}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("failed to create user: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Pets", 2, "before clear")
+-
+-	assocOp := clause.Association{Association: "Pets", Type: clause.OpUnlink}
+-	if rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx); err != nil {
+-		t.Fatalf("Set Update has-many clear failed: %v", err)
+-	} else if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	AssertAssociationCount(t, user, "Pets", 0, "after clear")
+-}
+-
+-// Test Set + Update with many-to-many unlink specific records using conditions
+-func TestClauseAssociationSetUpdateManyToManyUnlink(t *testing.T) {
+-	ctx := context.Background()
+-
+-	user := User{Name: "TestClauseAssociationSetUpdateManyToManyUnlink", Age: 25}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("failed to create user: %v", err)
+-	}
+-
+-	langs := []Language{{Code: "es", Name: "Spanish"}, {Code: "de", Name: "German"}}
+-	for _, l := range langs {
+-		DB.FirstOrCreate(&l, "code = ?", l.Code)
+-	}
+-
+-	// Associate both
+-	if err := DB.Model(&user).Association("Languages").Append(&langs); err != nil {
+-		t.Fatalf("failed to append languages: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Languages", 2, "before unlink")
+-
+-	assocOp := clause.Association{
+-		Association: "Languages",
+-		Type:        clause.OpUnlink,
+-		Conditions:  []clause.Expression{clause.Eq{Column: clause.Column{Name: "code"}, Value: "es"}},
+-	}
+-	if rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx); err != nil {
+-		t.Fatalf("Set Update many-to-many unlink failed: %v", err)
+-	} else if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-	AssertAssociationCount(t, user, "Languages", 1, "after unlink one")
+-}
+-
+-// Test Set + Update with polymorphic has-many (Toys) using OpCreate
+-func TestClauseAssociationSetUpdatePolymorphicCreate(t *testing.T) {
+-	ctx := context.Background()
+-	user := User{Name: "TestClauseAssociationSetUpdatePolymorphicCreate", Age: 25}
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("failed to create user: %v", err)
+-	}
+-
+-	assocOp := clause.Association{
+-		Association: "Toys",
+-		Type:        clause.OpCreate,
+-		Set:         []clause.Assignment{{Column: clause.Column{Name: "name"}, Value: "yo-yo"}},
+-	}
+-	if rows, err := gorm.G[User](DB).Where("id = ?", user.ID).Set(assocOp).Update(ctx); err != nil {
+-		t.Fatalf("Set Update polymorphic create failed: %v", err)
+-	} else if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	AssertAssociationCount(t, user, "Toys", 1, "after create toy")
+-}
+-
+-// Test Set + Update across multiple owners
+-func TestClauseAssociationSetUpdateMultipleOwners(t *testing.T) {
+-	ctx := context.Background()
+-
+-	u1 := User{Name: "SetUpdateMultipleOwners-1", Age: 20}
+-	u2 := User{Name: "SetUpdateMultipleOwners-2", Age: 21}
+-	if err := DB.Create(&u1).Error; err != nil {
+-		t.Fatalf("create u1: %v", err)
+-	}
+-	if err := DB.Create(&u2).Error; err != nil {
+-		t.Fatalf("create u2: %v", err)
+-	}
+-
+-	assocOp := clause.Association{Association: "Pets", Type: clause.OpCreate, Set: []clause.Assignment{{Column: clause.Column{Name: "name"}, Value: "multi-pet"}}}
+-	if rows, err := gorm.G[User](DB).Where("name IN ?", []string{u1.Name, u2.Name}).Set(assocOp).Update(ctx); err != nil {
+-		t.Fatalf("Set Update multi owners failed: %v", err)
+-	} else if rows != 0 {
+-		t.Fatalf("expected 0 rows affected for association-only update, got %d", rows)
+-	}
+-
+-	AssertAssociationCount(t, u1, "Pets", 1, "u1 after create")
+-	AssertAssociationCount(t, u2, "Pets", 1, "u2 after create")
+-}
+diff --git a/tests/associations_has_many_test.go b/tests/associations_has_many_test.go
+index a011e9d..db397eb 100644
+--- a/tests/associations_has_many_test.go
++++ b/tests/associations_has_many_test.go
+@@ -555,20 +555,14 @@ func TestHasManyAssociationUnscoped(t *testing.T) {
+ 	}
+ }
+ 
+-func TestHasManyAssociationReplaceWithStructValue(t *testing.T) {
+-	user := User{Name: "HasManyAssociationReplaceWithStructValue", Languages: []Language{{Name: "EN", Code: "en"}}}
++func TestHasManyAssociationReplaceWithNonValidValue(t *testing.T) {
++	user := User{Name: "jinzhu", Languages: []Language{{Name: "EN"}}}
+ 
+ 	if err := DB.Create(&user).Error; err != nil {
+ 		t.Fatalf("errors happened when create: %v", err)
+ 	}
+ 
+-	if err := DB.Model(&user).Association("Languages").Replace(Language{Name: "DE", Code: "de"}, Language{Name: "FR", Code: "fr"}); err != nil {
++	if err := DB.Model(&user).Association("Languages").Replace(Language{Name: "DE"}, Language{Name: "FR"}); err == nil {
+ 		t.Error("expected association error to be not nil")
+ 	}
+-
+-	var result User
+-	DB.Preload("Languages").Where("name = ?", "HasManyAssociationReplaceWithStructValue").Find(&result)
+-	if len(result.Languages) != 2 {
+-		t.Errorf("invalid languages found for user, got %v", result.Languages)
+-	}
+ }
+diff --git a/tests/associations_test.go b/tests/associations_test.go
+index 2abbbc8..4e8862e 100644
+--- a/tests/associations_test.go
++++ b/tests/associations_test.go
+@@ -394,72 +394,3 @@ func TestAssociationEmptyPrimaryKey(t *testing.T) {
+ 
+ 	AssertEqual(t, result, user)
+ }
+-
+-// Ensure Association.Append/Replace supports map for many2many
+-func TestAssociationMany2ManyAppendMap(t *testing.T) {
+-	user := *GetUser("assoc_m2m_append_map", Config{})
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create user: %v", err)
+-	}
+-
+-	// Append single map
+-	if err := DB.Model(&user).Association("Languages").Append(map[string]interface{}{
+-		"code": "am2m_map_1", "name": "AppendMap1",
+-	}); err != nil {
+-		t.Fatalf("append map: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Languages", 1, "after append 1 map")
+-
+-	// Append more maps individually
+-	if err := DB.Model(&user).Association("Languages").Append(map[string]interface{}{"code": "am2m_map_2", "name": "AppendMap2"}); err != nil {
+-		t.Fatalf("append map 2: %v", err)
+-	}
+-	if err := DB.Model(&user).Association("Languages").Append(map[string]interface{}{"code": "am2m_map_3", "name": "AppendMap3"}); err != nil {
+-		t.Fatalf("append map 3: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Languages", 3, "after append 3 maps total")
+-
+-	// Verify codes exist
+-	var langs []Language
+-	if err := DB.Model(&user).Association("Languages").Find(&langs); err != nil {
+-		t.Fatalf("find languages: %v", err)
+-	}
+-	codeSet := map[string]bool{}
+-	for _, l := range langs {
+-		codeSet[l.Code] = true
+-	}
+-	for _, c := range []string{"am2m_map_1", "am2m_map_2", "am2m_map_3"} {
+-		if !codeSet[c] {
+-			t.Fatalf("expected language code %s present", c)
+-		}
+-	}
+-}
+-
+-func TestAssociationMany2ManyReplaceMap(t *testing.T) {
+-	user := *GetUser("assoc_m2m_replace_map", Config{})
+-	if err := DB.Create(&user).Error; err != nil {
+-		t.Fatalf("create user: %v", err)
+-	}
+-
+-	// Prime with one language
+-	if err := DB.Model(&user).Association("Languages").Append(&Language{Code: "prime", Name: "Prime"}); err != nil {
+-		t.Fatalf("prime append: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Languages", 1, "before replace")
+-
+-	// Replace with a new map value
+-	if err := DB.Model(&user).Association("Languages").Replace(map[string]interface{}{
+-		"code": "rm2m_map_1", "name": "ReplaceMap1",
+-	}); err != nil {
+-		t.Fatalf("replace map: %v", err)
+-	}
+-	AssertAssociationCount(t, user, "Languages", 1, "after replace with 1 map")
+-
+-	var langs []Language
+-	if err := DB.Model(&user).Association("Languages").Find(&langs); err != nil {
+-		t.Fatalf("find languages after replace: %v", err)
+-	}
+-	if len(langs) != 1 || langs[0].Code != "rm2m_map_1" {
+-		t.Fatalf("expected only rm2m_map_1 after replace, got %+v", langs)
+-	}
+-}
+diff --git a/tests/generics_test.go b/tests/generics_test.go
+index e429e97..4b955e1 100644
+--- a/tests/generics_test.go
++++ b/tests/generics_test.go
+@@ -976,74 +976,3 @@ func TestGenericsDeleteAPI(t *testing.T) {
+ 		t.Fatalf("Delete failed: %v", err)
+ 	}
+ }
+-
+-func TestGenericsAssociation(t *testing.T) {
+-	// Test basic Association creation
+-	assoc := clause.Association{
+-		Association: "Orders",
+-		Type:        clause.OpCreate,
+-		Set: []clause.Assignment{
+-			{Column: clause.Column{Name: "amount"}, Value: 100},
+-			{Column: clause.Column{Name: "state"}, Value: "new"},
+-		},
+-	}
+-
+-	// Verify it implements Assigner interface
+-	assignments := assoc.Assignments()
+-	if len(assignments) != 0 {
+-		t.Errorf("Association.Assignments() should return empty slice, got %v", assignments)
+-	}
+-
+-	// Verify it implements AssociationAssigner interface
+-	assocAssignments := assoc.AssociationAssignments()
+-	if len(assocAssignments) != 1 {
+-		t.Errorf("Association.AssociationAssignments() should return slice with one element, got %v", assocAssignments)
+-	}
+-
+-	if assocAssignments[0].Association != "Orders" {
+-		t.Errorf("Association.AssociationAssignments()[0].Association should be 'Orders', got %v", assocAssignments[0].Association)
+-	}
+-
+-	// Test different association operation types
+-	operations := []struct {
+-		Type     clause.AssociationOpType
+-		TypeName string
+-	}{
+-		{clause.OpUnlink, "OpUnlink"},
+-		{clause.OpDelete, "OpDelete"},
+-		{clause.OpUpdate, "OpUpdate"},
+-		{clause.OpCreate, "OpCreate"},
+-		{clause.OpCreateValues, "OpCreateValues"},
+-	}
+-
+-	for _, op := range operations {
+-		assoc := clause.Association{
+-			Association: "Orders",
+-			Type:        op.Type,
+-		}
+-
+-		if assoc.Type != op.Type {
+-			t.Errorf("Association type should be %s, got %v", op.TypeName, assoc.Type)
+-		}
+-	}
+-}
+-
+-func TestGenericsAssociationSlice(t *testing.T) {
+-	// Test that a slice of Association can be used
+-	associations := []clause.Association{
+-		{Association: "Orders", Type: clause.OpDelete},
+-		{Association: "Profiles", Type: clause.OpUpdate},
+-	}
+-
+-	// In practice, each Association would be processed individually
+-	// since []clause.Association doesn't implement AssociationAssigner directly
+-	for i, assoc := range associations {
+-		assigns := assoc.AssociationAssignments()
+-		if len(assigns) != 1 {
+-			t.Errorf("Association %d should return one assignment, got %v", i, len(assigns))
+-		}
+-		if assigns[0].Association != assoc.Association {
+-			t.Errorf("Association %d name should be %s, got %v", i, assoc.Association, assigns[0].Association)
+-		}
+-	}
+-}
+diff --git a/tests/go.mod b/tests/go.mod
+index 86e4c2d..a8e4521 100644
+--- a/tests/go.mod
++++ b/tests/go.mod
+@@ -12,7 +12,7 @@ require (
+ 	gorm.io/driver/postgres v1.6.0
+ 	gorm.io/driver/sqlite v1.6.0
+ 	gorm.io/driver/sqlserver v1.6.1
+-	gorm.io/gorm v1.30.5
++	gorm.io/gorm v1.30.4
+ )
+ 
+ require (
+@@ -24,14 +24,14 @@ require (
+ 	github.com/golang-sql/sqlexp v0.1.0 // indirect
+ 	github.com/jackc/pgpassfile v1.0.0 // indirect
+ 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+-	github.com/jackc/pgx/v5 v5.7.6 // indirect
++	github.com/jackc/pgx/v5 v5.7.5 // indirect
+ 	github.com/jackc/puddle/v2 v2.2.2 // indirect
+ 	github.com/jinzhu/inflection v1.0.0 // indirect
+ 	github.com/mattn/go-sqlite3 v1.14.32 // indirect
+ 	github.com/microsoft/go-mssqldb v1.9.3 // indirect
+ 	github.com/pmezard/go-difflib v1.0.0 // indirect
+ 	github.com/tjfoc/gmsm v1.4.1 // indirect
+-	golang.org/x/crypto v0.42.0 // indirect
++	golang.org/x/crypto v0.41.0 // indirect
+ 	golang.org/x/sync v0.17.0 // indirect
+ 	golang.org/x/text v0.29.0 // indirect
+ 	gopkg.in/yaml.v3 v3.0.1 // indirect

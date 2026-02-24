@@ -1,0 +1,232 @@
+diff --git a/internal/envconfig/envconfig.go b/internal/envconfig/envconfig.go
+index 91f76093..6414ee4b 100644
+--- a/internal/envconfig/envconfig.go
++++ b/internal/envconfig/envconfig.go
+@@ -77,6 +77,11 @@ var (
+ 	//   - Target resolution is disabled.
+ 	//   - The DNS resolver is being used.
+ 	EnableDefaultPortForProxyTarget = boolFromEnv("GRPC_EXPERIMENTAL_ENABLE_DEFAULT_PORT_FOR_PROXY_TARGET", true)
++
++	// XDSAuthorityRewrite indicates whether xDS authority rewriting is enabled.
++	// This feature is defined in gRFC A81 and is enabled by setting the
++	// environment variable GRPC_EXPERIMENTAL_XDS_AUTHORITY_REWRITE to "true".
++	XDSAuthorityRewrite = boolFromEnv("GRPC_EXPERIMENTAL_XDS_AUTHORITY_REWRITE", false)
+ )
+ 
+ func boolFromEnv(envVar string, def bool) bool {
+diff --git a/internal/xds/xdsclient/xdsresource/filter_chain.go b/internal/xds/xdsclient/xdsresource/filter_chain.go
+index 76ace109..50b72e0d 100644
+--- a/internal/xds/xdsclient/xdsresource/filter_chain.go
++++ b/internal/xds/xdsclient/xdsresource/filter_chain.go
+@@ -680,7 +680,7 @@ func processNetworkFilters(filters []*v3listenerpb.Filter) (*FilterChain, error)
+ 					// server-side." - A36
+ 					// Can specify v3 here, as will never get to this function
+ 					// if v2.
+-					routeU, err := generateRDSUpdateFromRouteConfiguration(hcm.GetRouteConfig())
++					routeU, err := generateRDSUpdateFromRouteConfiguration(hcm.GetRouteConfig(), nil)
+ 					if err != nil {
+ 						return nil, fmt.Errorf("failed to parse inline RDS resp: %v", err)
+ 					}
+diff --git a/internal/xds/xdsclient/xdsresource/listener_resource_type.go b/internal/xds/xdsclient/xdsresource/listener_resource_type.go
+index f4f69365..2b9000fd 100644
+--- a/internal/xds/xdsclient/xdsresource/listener_resource_type.go
++++ b/internal/xds/xdsclient/xdsresource/listener_resource_type.go
+@@ -35,8 +35,8 @@ type listenerResourceDecoder struct {
+ 	bootstrapConfig *bootstrap.Config
+ }
+ 
+-func (d *listenerResourceDecoder) Decode(resource *xdsclient.AnyProto, _ xdsclient.DecodeOptions) (*xdsclient.DecodeResult, error) {
+-	name, listener, err := unmarshalListenerResource(resource.ToAny())
++func (d *listenerResourceDecoder) Decode(resource *xdsclient.AnyProto, opts xdsclient.DecodeOptions) (*xdsclient.DecodeResult, error) {
++	name, listener, err := unmarshalListenerResource(resource.ToAny(), &opts)
+ 	if name == "" {
+ 		// Name is unset only when protobuf deserialization fails.
+ 		return nil, err
+diff --git a/internal/xds/xdsclient/xdsresource/route_config_resource_type.go b/internal/xds/xdsclient/xdsresource/route_config_resource_type.go
+index 81033c91..1104fe9f 100644
+--- a/internal/xds/xdsclient/xdsresource/route_config_resource_type.go
++++ b/internal/xds/xdsclient/xdsresource/route_config_resource_type.go
+@@ -37,8 +37,8 @@ type routeConfigResourceDecoder struct {
+ 	bootstrapConfig *bootstrap.Config
+ }
+ 
+-func (d *routeConfigResourceDecoder) Decode(resource *xdsclient.AnyProto, _ xdsclient.DecodeOptions) (*xdsclient.DecodeResult, error) {
+-	name, rc, err := unmarshalRouteConfigResource(resource.ToAny())
++func (d *routeConfigResourceDecoder) Decode(resource *xdsclient.AnyProto, opts xdsclient.DecodeOptions) (*xdsclient.DecodeResult, error) {
++	name, rc, err := unmarshalRouteConfigResource(resource.ToAny(), &opts)
+ 	if name == "" {
+ 		// Name is unset only when protobuf deserialization fails.
+ 		return nil, err
+diff --git a/internal/xds/xdsclient/xdsresource/type_eds.go b/internal/xds/xdsclient/xdsresource/type_eds.go
+index a8d568e1..39b2ba74 100644
+--- a/internal/xds/xdsclient/xdsresource/type_eds.go
++++ b/internal/xds/xdsclient/xdsresource/type_eds.go
+@@ -54,6 +54,7 @@ type Endpoint struct {
+ 	Weight       uint32
+ 	HashKey      string
+ 	Metadata     map[string]any
++	Hostname     string
+ }
+ 
+ // Locality contains information of a locality.
+diff --git a/internal/xds/xdsclient/xdsresource/type_rds.go b/internal/xds/xdsclient/xdsresource/type_rds.go
+index 0cde9738..48e8051b 100644
+--- a/internal/xds/xdsclient/xdsresource/type_rds.go
++++ b/internal/xds/xdsclient/xdsresource/type_rds.go
+@@ -150,6 +150,9 @@ type Route struct {
+ 	// ClusterSpecifierPlugin is the name of the Cluster Specifier Plugin that
+ 	// this Route is linked to, if specified by xDS.
+ 	ClusterSpecifierPlugin string
++	// AutoHostRewrite indicates that the ":authority" header can be rewritten
++	// to the hostname of the upstream endpoint.
++	AutoHostRewrite bool
+ }
+ 
+ // WeightedCluster contains settings for an xds ActionType.WeightedCluster.
+diff --git a/internal/xds/xdsclient/xdsresource/unmarshal_eds.go b/internal/xds/xdsclient/xdsresource/unmarshal_eds.go
+index c5b9723a..ebf47961 100644
+--- a/internal/xds/xdsclient/xdsresource/unmarshal_eds.go
++++ b/internal/xds/xdsclient/xdsresource/unmarshal_eds.go
+@@ -132,6 +132,7 @@ func parseEndpoints(lbEndpoints []*v3endpointpb.LbEndpoint, uniqueEndpointAddrs
+ 			Weight:       weight,
+ 			HashKey:      hashKey,
+ 			Metadata:     endpointMetadata,
++			Hostname:     lbEndpoint.GetEndpoint().GetHostname(),
+ 		})
+ 	}
+ 	return endpoints, nil
+diff --git a/internal/xds/xdsclient/xdsresource/unmarshal_lds.go b/internal/xds/xdsclient/xdsresource/unmarshal_lds.go
+index 25c607b4..604c086b 100644
+--- a/internal/xds/xdsclient/xdsresource/unmarshal_lds.go
++++ b/internal/xds/xdsclient/xdsresource/unmarshal_lds.go
+@@ -27,12 +27,13 @@ import (
+ 	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+ 	v3routepb "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+ 	v3httppb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
++	"google.golang.org/grpc/internal/xds/clients/xdsclient"
+ 	"google.golang.org/grpc/internal/xds/httpfilter"
+ 	"google.golang.org/protobuf/proto"
+ 	"google.golang.org/protobuf/types/known/anypb"
+ )
+ 
+-func unmarshalListenerResource(r *anypb.Any) (string, ListenerUpdate, error) {
++func unmarshalListenerResource(r *anypb.Any, opts *xdsclient.DecodeOptions) (string, ListenerUpdate, error) {
+ 	r, err := UnwrapResource(r)
+ 	if err != nil {
+ 		return "", ListenerUpdate{}, fmt.Errorf("failed to unwrap resource: %v", err)
+@@ -46,7 +47,7 @@ func unmarshalListenerResource(r *anypb.Any) (string, ListenerUpdate, error) {
+ 		return "", ListenerUpdate{}, fmt.Errorf("failed to unmarshal resource: %v", err)
+ 	}
+ 
+-	lu, err := processListener(lis)
++	lu, err := processListener(lis, opts)
+ 	if err != nil {
+ 		return lis.GetName(), ListenerUpdate{}, err
+ 	}
+@@ -54,16 +55,16 @@ func unmarshalListenerResource(r *anypb.Any) (string, ListenerUpdate, error) {
+ 	return lis.GetName(), *lu, nil
+ }
+ 
+-func processListener(lis *v3listenerpb.Listener) (*ListenerUpdate, error) {
++func processListener(lis *v3listenerpb.Listener, opts *xdsclient.DecodeOptions) (*ListenerUpdate, error) {
+ 	if lis.GetApiListener() != nil {
+-		return processClientSideListener(lis)
++		return processClientSideListener(lis, opts)
+ 	}
+ 	return processServerSideListener(lis)
+ }
+ 
+ // processClientSideListener checks if the provided Listener proto meets
+ // the expected criteria. If so, it returns a non-empty routeConfigName.
+-func processClientSideListener(lis *v3listenerpb.Listener) (*ListenerUpdate, error) {
++func processClientSideListener(lis *v3listenerpb.Listener, opts *xdsclient.DecodeOptions) (*ListenerUpdate, error) {
+ 	update := &ListenerUpdate{}
+ 
+ 	apiLisAny := lis.GetApiListener().GetApiListener()
+@@ -95,7 +96,7 @@ func processClientSideListener(lis *v3listenerpb.Listener) (*ListenerUpdate, err
+ 		}
+ 		update.RouteConfigName = name
+ 	case *v3httppb.HttpConnectionManager_RouteConfig:
+-		routeU, err := generateRDSUpdateFromRouteConfiguration(apiLis.GetRouteConfig())
++		routeU, err := generateRDSUpdateFromRouteConfiguration(apiLis.GetRouteConfig(), opts)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to parse inline RDS resp: %v", err)
+ 		}
+diff --git a/internal/xds/xdsclient/xdsresource/unmarshal_rds.go b/internal/xds/xdsclient/xdsresource/unmarshal_rds.go
+index 479d023f..d988b4e7 100644
+--- a/internal/xds/xdsclient/xdsresource/unmarshal_rds.go
++++ b/internal/xds/xdsclient/xdsresource/unmarshal_rds.go
+@@ -25,6 +25,8 @@ import (
+ 	"time"
+ 
+ 	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/internal/envconfig"
++	"google.golang.org/grpc/internal/xds/clients/xdsclient"
+ 	"google.golang.org/grpc/internal/xds/clusterspecifier"
+ 	"google.golang.org/grpc/internal/xds/matcher"
+ 	"google.golang.org/protobuf/proto"
+@@ -34,7 +36,7 @@ import (
+ 	v3typepb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+ )
+ 
+-func unmarshalRouteConfigResource(r *anypb.Any) (string, RouteConfigUpdate, error) {
++func unmarshalRouteConfigResource(r *anypb.Any, opts *xdsclient.DecodeOptions) (string, RouteConfigUpdate, error) {
+ 	r, err := UnwrapResource(r)
+ 	if err != nil {
+ 		return "", RouteConfigUpdate{}, fmt.Errorf("failed to unwrap resource: %v", err)
+@@ -48,7 +50,7 @@ func unmarshalRouteConfigResource(r *anypb.Any) (string, RouteConfigUpdate, erro
+ 		return "", RouteConfigUpdate{}, fmt.Errorf("failed to unmarshal resource: %v", err)
+ 	}
+ 
+-	u, err := generateRDSUpdateFromRouteConfiguration(rc)
++	u, err := generateRDSUpdateFromRouteConfiguration(rc, opts)
+ 	if err != nil {
+ 		return rc.GetName(), RouteConfigUpdate{}, err
+ 	}
+@@ -67,12 +69,12 @@ func unmarshalRouteConfigResource(r *anypb.Any) (string, RouteConfigUpdate, erro
+ // The RouteConfiguration includes a list of virtualHosts, which may have zero
+ // or more elements. We are interested in the element whose domains field
+ // matches the server name specified in the "xds:" URI. The only field in the
+-// VirtualHost proto that the we are interested in is the list of routes. We
++// VirtualHost proto that we are interested in is the list of routes. We
+ // only look at the last route in the list (the default route), whose match
+-// field must be empty and whose route field must be set.  Inside that route
++// field must be empty and whose route field must be set. Inside that route
+ // message, the cluster field will contain the clusterName or weighted clusters
+ // we are looking for.
+-func generateRDSUpdateFromRouteConfiguration(rc *v3routepb.RouteConfiguration) (RouteConfigUpdate, error) {
++func generateRDSUpdateFromRouteConfiguration(rc *v3routepb.RouteConfiguration, opts *xdsclient.DecodeOptions) (RouteConfigUpdate, error) {
+ 	vhs := make([]*VirtualHost, 0, len(rc.GetVirtualHosts()))
+ 	csps, err := processClusterSpecifierPlugins(rc.ClusterSpecifierPlugins)
+ 	if err != nil {
+@@ -83,7 +85,7 @@ func generateRDSUpdateFromRouteConfiguration(rc *v3routepb.RouteConfiguration) (
+ 	// ignored and not emitted by the xdsclient.
+ 	var cspNames = make(map[string]bool)
+ 	for _, vh := range rc.GetVirtualHosts() {
+-		routes, cspNs, err := routesProtoToSlice(vh.Routes, csps)
++		routes, cspNs, err := routesProtoToSlice(vh.Routes, csps, opts)
+ 		if err != nil {
+ 			return RouteConfigUpdate{}, fmt.Errorf("received route is invalid: %v", err)
+ 		}
+@@ -206,7 +208,7 @@ func generateRetryConfig(rp *v3routepb.RetryPolicy) (*RetryConfig, error) {
+ 	return cfg, nil
+ }
+ 
+-func routesProtoToSlice(routes []*v3routepb.Route, csps map[string]clusterspecifier.BalancerConfig) ([]*Route, map[string]bool, error) {
++func routesProtoToSlice(routes []*v3routepb.Route, csps map[string]clusterspecifier.BalancerConfig, opts *xdsclient.DecodeOptions) ([]*Route, map[string]bool, error) {
+ 	var routesRet []*Route
+ 	var cspNames = make(map[string]bool)
+ 	for _, r := range routes {
+@@ -302,6 +304,12 @@ func routesProtoToSlice(routes []*v3routepb.Route, csps map[string]clusterspecif
+ 		case *v3routepb.Route_Route:
+ 			action := r.GetRoute()
+ 
++			if envconfig.XDSAuthorityRewrite {
++				if opts != nil && opts.ServerConfig != nil && opts.ServerConfig.SupportsServerFeature(xdsclient.ServerFeatureTrustedXDSServer) {
++					route.AutoHostRewrite = action.GetAutoHostRewrite().GetValue()
++				}
++			}
++
+ 			// Hash Policies are only applicable for a Ring Hash LB.
+ 			hp, err := hashPoliciesProtoToSlice(action.HashPolicy)
+ 			if err != nil {

@@ -1,0 +1,30 @@
+#!/bin/bash
+
+cd /app/gorm
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+cp "/tests/joins_test.go" "tests/joins_test.go"
+cp "/tests/utils/tests/utils.go" "utils/tests/utils.go"
+
+# Remove all other test files in tests/ except the ones we need
+cd tests
+for f in *_test.go; do
+  if [ "$f" != "joins_test.go" ] && [ "$f" != "tests_test.go" ] && [ "$f" != "helper_test.go" ] && [ "$f" != "sql_builder_test.go" ] && [ "$f" != "scopes_test.go" ] && [ "$f" != "tracer_test.go" ]; then
+    rm -f "$f"
+  fi
+done
+cd ..
+
+# Download compatible test dependencies (v1.4.x versions compatible with this GORM version)
+go get gorm.io/driver/sqlite@v1.4.4 gorm.io/driver/mysql@v1.4.5 gorm.io/driver/postgres@v1.4.8 gorm.io/driver/sqlserver@v1.4.2 2>/dev/null || true
+
+# Run tests in tests/ directory
+cd /app/gorm/tests && go test -mod=mod -v .
+test_status=$?
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+exit "$test_status"

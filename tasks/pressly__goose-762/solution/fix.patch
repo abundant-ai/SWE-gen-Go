@@ -1,0 +1,414 @@
+diff --git a/go.mod b/go.mod
+index e6b3b85..8031a23 100644
+--- a/go.mod
++++ b/go.mod
+@@ -9,6 +9,7 @@ require (
+ 	github.com/mfridman/interpolate v0.0.2
+ 	github.com/microsoft/go-mssqldb v1.7.0
+ 	github.com/sethvargo/go-retry v0.2.4
++	github.com/stretchr/testify v1.8.4
+ 	github.com/tursodatabase/libsql-client-go v0.0.0-20240411070317-a1138d155304
+ 	github.com/vertica/vertica-sql-go v1.3.3
+ 	github.com/ydb-platform/ydb-go-sdk/v3 v3.55.1
+@@ -23,6 +24,7 @@ require (
+ 	github.com/ClickHouse/ch-go v0.58.2 // indirect
+ 	github.com/andybalholm/brotli v1.0.6 // indirect
+ 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
++	github.com/davecgh/go-spew v1.1.1 // indirect
+ 	github.com/dustin/go-humanize v1.0.1 // indirect
+ 	github.com/elastic/go-sysinfo v1.11.2 // indirect
+ 	github.com/elastic/go-windows v1.0.1 // indirect
+@@ -46,6 +48,7 @@ require (
+ 	github.com/paulmach/orb v0.10.0 // indirect
+ 	github.com/pierrec/lz4/v4 v4.1.18 // indirect
+ 	github.com/pkg/errors v0.9.1 // indirect
++	github.com/pmezard/go-difflib v1.0.0 // indirect
+ 	github.com/prometheus/procfs v0.12.0 // indirect
+ 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+ 	github.com/segmentio/asm v1.2.0 // indirect
+diff --git a/go.sum b/go.sum
+index 317acec..6954d15 100644
+--- a/go.sum
++++ b/go.sum
+@@ -168,6 +168,7 @@ github.com/stretchr/testify v1.5.1/go.mod h1:5W2xD1RspED5o8YsWQXVCued0rvSQ+mT+I5
+ github.com/stretchr/testify v1.6.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
+ github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
+ github.com/stretchr/testify v1.8.4 h1:CcVxjf3Q8PM0mHUKJCdn+eZZtm5yQwehR5yeSVQQcUk=
++github.com/stretchr/testify v1.8.4/go.mod h1:sz/lmYIOXD/1dqDmKjjqLyZ2RngseejIcXlSw2iwfAo=
+ github.com/tidwall/pretty v1.0.0/go.mod h1:XNkn88O1ChpSDQmQeStsy+sBenx6DDtFZJxhVysOjyk=
+ github.com/tursodatabase/libsql-client-go v0.0.0-20240411070317-a1138d155304 h1:Y6cw8yjWCEJDy5Bll7HjTinkgTQU55AXiKSEe29SpgA=
+ github.com/tursodatabase/libsql-client-go v0.0.0-20240411070317-a1138d155304/go.mod h1:2Fu26tjM011BLeR5+jwTfs6DX/fNMEWV/3CBZvggrA4=
+diff --git a/internal/gooseutil/resolve.go b/internal/gooseutil/resolve.go
+new file mode 100644
+index 0000000..a70245b
+--- /dev/null
++++ b/internal/gooseutil/resolve.go
+@@ -0,0 +1,124 @@
++// Package gooseutil provides utility functions we want to keep internal to the package. It's
++// intended to be a collection of well-tested helper functions.
++package gooseutil
++
++import (
++	"fmt"
++	"math"
++	"sort"
++	"strconv"
++	"strings"
++)
++
++// UpVersions returns a list of migrations to apply based on the versions in the filesystem and the
++// versions in the database. The target version can be used to specify a target version. In most
++// cases this will be math.MaxInt64.
++//
++// The allowMissing flag can be used to allow missing migrations as part of the list of migrations
++// to apply. Otherwise, an error will be returned if there are missing migrations in the database.
++func UpVersions(
++	fsysVersions []int64,
++	dbVersions []int64,
++	target int64,
++	allowMissing bool,
++) ([]int64, error) {
++	// Sort the list of versions in the filesystem. This should already be sorted, but we do this
++	// just in case.
++	sortAscending(fsysVersions)
++
++	// dbAppliedVersions is a map of all applied migrations in the database.
++	dbAppliedVersions := make(map[int64]bool, len(dbVersions))
++	var dbMaxVersion int64
++	for _, v := range dbVersions {
++		dbAppliedVersions[v] = true
++		if v > dbMaxVersion {
++			dbMaxVersion = v
++		}
++	}
++
++	// Get a list of migrations that are missing from the database. A missing migration is one that
++	// has a version less than the max version in the database and has not been applied.
++	//
++	// In most cases the target version is math.MaxInt64, but it can be used to specify a target
++	// version. In which case we respect the target version and only surface migrations up to and
++	// including that target.
++	var missing []int64
++	for _, v := range fsysVersions {
++		if dbAppliedVersions[v] {
++			continue
++		}
++		if v < dbMaxVersion && v <= target {
++			missing = append(missing, v)
++		}
++	}
++
++	// feat(mf): It is very possible someone may want to apply ONLY new migrations and skip missing
++	// migrations entirely. At the moment this is not supported, but leaving this comment because
++	// that's where that logic would be handled.
++	//
++	// For example, if database has 1,4 already applied and 2,3,5 are new, we would apply only 5 and
++	// skip 2,3. Not sure if this is a common use case, but it's possible someone may want to do
++	// this.
++	if len(missing) > 0 && !allowMissing {
++		return nil, newMissingError(missing, dbMaxVersion, target)
++	}
++
++	var out []int64
++
++	// 1. Add missing migrations to the list of migrations to apply, if any.
++	out = append(out, missing...)
++
++	// 2. Add new migrations to the list of migrations to apply, if any.
++	for _, v := range fsysVersions {
++		if dbAppliedVersions[v] {
++			continue
++		}
++		if v > dbMaxVersion && v <= target {
++			out = append(out, v)
++		}
++	}
++	// 3. Sort the list of migrations to apply.
++	sortAscending(out)
++
++	return out, nil
++}
++
++func newMissingError(
++	missing []int64,
++	dbMaxVersion int64,
++	target int64,
++) error {
++	sortAscending(missing)
++
++	collected := make([]string, 0, len(missing))
++	for _, v := range missing {
++		collected = append(collected, strconv.FormatInt(v, 10))
++	}
++
++	msg := "migration"
++	if len(collected) > 1 {
++		msg += "s"
++	}
++
++	var versionsMsg string
++	if len(collected) > 1 {
++		versionsMsg = "versions " + strings.Join(collected, ",")
++	} else {
++		versionsMsg = "version " + collected[0]
++	}
++
++	desiredMsg := fmt.Sprintf("database version (%d)", dbMaxVersion)
++	if target != math.MaxInt64 {
++		desiredMsg += fmt.Sprintf(", with target version (%d)", target)
++	}
++
++	return fmt.Errorf("detected %d missing (out-of-order) %s lower than %s: %s",
++		len(missing), msg, desiredMsg, versionsMsg,
++	)
++}
++
++func sortAscending(versions []int64) {
++	sort.Slice(versions, func(i, j int) bool {
++		return versions[i] < versions[j]
++	})
++}
+diff --git a/provider.go b/provider.go
+index 03ee10f..091c1b5 100644
+--- a/provider.go
++++ b/provider.go
+@@ -12,6 +12,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/pressly/goose/v3/database"
++	"github.com/pressly/goose/v3/internal/gooseutil"
+ 	"github.com/pressly/goose/v3/internal/sqlparser"
+ 	"go.uber.org/multierr"
+ )
+@@ -153,7 +154,8 @@ func (p *Provider) Status(ctx context.Context) ([]*MigrationStatus, error) {
+ 	return p.status(ctx)
+ }
+ 
+-// HasPending returns true if there are pending migrations to apply, otherwise, it returns false.
++// HasPending returns true if there are pending migrations to apply, otherwise, it returns false. If
++// out-of-order migrations are disabled, yet some are detected, this method returns an error.
+ //
+ // Note, this method will not use a SessionLocker if one is configured. This allows callers to check
+ // for pending migrations without blocking or being blocked by other operations.
+@@ -373,10 +375,22 @@ func (p *Provider) up(
+ 		if len(dbMigrations) == 0 {
+ 			return nil, errMissingZeroVersion
+ 		}
+-		apply, err = p.resolveUpMigrations(dbMigrations, version)
++		versions, err := gooseutil.UpVersions(
++			getVersionsFromMigrations(p.migrations),     // fsys versions
++			getVersionsFromListMigrations(dbMigrations), // db versions
++			version,
++			p.cfg.allowMissing,
++		)
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		for _, v := range versions {
++			m, err := p.getMigration(v)
++			if err != nil {
++				return nil, err
++			}
++			apply = append(apply, m)
++		}
+ 	}
+ 	return p.runMigrations(ctx, conn, apply, sqlparser.DirectionUp, byOne)
+ }
+@@ -517,39 +531,55 @@ func (p *Provider) hasPending(ctx context.Context) (_ bool, retErr error) {
+ 	if p.cfg.disableVersioning {
+ 		return true, nil
+ 	}
+-	if p.cfg.allowMissing {
+-		// List all migrations from the database. We cannot optimize this because we need to check
+-		// that EVERY migration known the provider has been applied.
+-		dbMigrations, err := p.store.ListMigrations(ctx, conn)
+-		if err != nil {
+-			return false, err
+-		}
+-		// If there are no migrations in the database, we have pending migrations.
+-		if len(dbMigrations) == 0 {
+-			return true, nil
+-		}
+-		applied := make(map[int64]bool, len(dbMigrations))
+-		for _, m := range dbMigrations {
+-			applied[m.Version] = true
+-		}
+-		// Iterate over all migrations and check if any are missing.
+-		for _, m := range p.migrations {
+-			if !applied[m.Version] {
+-				return true, nil
+-			}
+-		}
+-		return false, nil
++
++	// List all migrations from the database. Careful, optimizations here can lead to subtle bugs.
++	// We have 2 important cases to consider:
++	//
++	//  1.  Users have enabled out-of-order migrations, in which case we need to check if any
++	//      migrations are missing and report that there are pending migrations. Do not surface an
++	//      error because this is a valid state.
++	//
++	//  2.  Users have disabled out-of-order migrations (default), in which case we need to check if all
++	//      migrations have been applied. We cannot check for the highest applied version because we lose the
++	//      ability to surface an error if an out-of-order migration was introduced. It would be silently
++	//      ignored and the user would not know that they have unapplied migrations.
++	//
++	//      Maybe we could consider adding a flag to the provider such as IgnoreMissing, which would
++	//      allow silently ignoring missing migrations. This would be useful for users that have built
++	//      checks that prevent missing migrations from being introduced.
++
++	dbMigrations, err := p.store.ListMigrations(ctx, conn)
++	if err != nil {
++		return false, err
+ 	}
+-	// If out-of-order migrations are not allowed, we can optimize this by only checking the latest
+-	// version in the database against the latest migration version.
+-	current, err := p.store.GetLatestVersion(ctx, conn)
++	apply, err := gooseutil.UpVersions(
++		getVersionsFromMigrations(p.migrations),     // fsys versions
++		getVersionsFromListMigrations(dbMigrations), // db versions
++		math.MaxInt64,
++		p.cfg.allowMissing,
++	)
+ 	if err != nil {
+-		if errors.Is(err, database.ErrVersionNotFound) {
+-			return false, errMissingZeroVersion
+-		}
+ 		return false, err
+ 	}
+-	return current < p.migrations[len(p.migrations)-1].Version, nil
++	return len(apply) > 0, nil
++}
++
++func getVersionsFromMigrations(in []*Migration) []int64 {
++	out := make([]int64, 0, len(in))
++	for _, m := range in {
++		out = append(out, m.Version)
++	}
++	return out
++
++}
++
++func getVersionsFromListMigrations(in []*database.ListMigrationsResult) []int64 {
++	out := make([]int64, 0, len(in))
++	for _, m := range in {
++		out = append(out, m.Version)
++	}
++	return out
++
+ }
+ 
+ func (p *Provider) status(ctx context.Context) (_ []*MigrationStatus, retErr error) {
+diff --git a/provider_run.go b/provider_run.go
+index d6c4c9f..a07ef87 100644
+--- a/provider_run.go
++++ b/provider_run.go
+@@ -7,8 +7,6 @@ import (
+ 	"fmt"
+ 	"io/fs"
+ 	"runtime/debug"
+-	"sort"
+-	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -22,66 +20,6 @@ var (
+ 	errMissingZeroVersion = errors.New("missing zero version migration")
+ )
+ 
+-func (p *Provider) resolveUpMigrations(
+-	dbVersions []*database.ListMigrationsResult,
+-	version int64,
+-) ([]*Migration, error) {
+-	var apply []*Migration
+-	var dbMaxVersion int64
+-	// dbAppliedVersions is a map of all applied migrations in the database.
+-	dbAppliedVersions := make(map[int64]bool, len(dbVersions))
+-	for _, m := range dbVersions {
+-		dbAppliedVersions[m.Version] = true
+-		if m.Version > dbMaxVersion {
+-			dbMaxVersion = m.Version
+-		}
+-	}
+-	missingMigrations := checkMissingMigrations(dbVersions, p.migrations)
+-	// feat(mf): It is very possible someone may want to apply ONLY new migrations and skip missing
+-	// migrations entirely. At the moment this is not supported, but leaving this comment because
+-	// that's where that logic would be handled.
+-	//
+-	// For example, if db has 1,4 applied and 2,3,5 are new, we would apply only 5 and skip 2,3. Not
+-	// sure if this is a common use case, but it's possible.
+-	if len(missingMigrations) > 0 && !p.cfg.allowMissing {
+-		var collected []string
+-		for _, v := range missingMigrations {
+-			collected = append(collected, strconv.FormatInt(v, 10))
+-		}
+-		msg := "migration"
+-		if len(collected) > 1 {
+-			msg += "s"
+-		}
+-		var versionsMsg string
+-		if len(collected) > 1 {
+-			versionsMsg = "versions " + strings.Join(collected, ",")
+-		} else {
+-			versionsMsg = "version " + collected[0]
+-		}
+-		return nil, fmt.Errorf("found %d missing (out-of-order) %s lower than current max (%d): %s",
+-			len(missingMigrations), msg, dbMaxVersion, versionsMsg,
+-		)
+-	}
+-	for _, missingVersion := range missingMigrations {
+-		m, err := p.getMigration(missingVersion)
+-		if err != nil {
+-			return nil, err
+-		}
+-		apply = append(apply, m)
+-	}
+-	// filter all migrations with a version greater than the supplied version (min) and less than or
+-	// equal to the requested version (max). Skip any migrations that have already been applied.
+-	for _, m := range p.migrations {
+-		if dbAppliedVersions[m.Version] {
+-			continue
+-		}
+-		if m.Version > dbMaxVersion && m.Version <= version {
+-			apply = append(apply, m)
+-		}
+-	}
+-	return apply, nil
+-}
+-
+ func (p *Provider) prepareMigration(fsys fs.FS, m *Migration, direction bool) error {
+ 	switch m.Type {
+ 	case TypeGo:
+@@ -395,32 +333,6 @@ func (p *Provider) tryEnsureVersionTable(ctx context.Context, conn *sql.Conn) er
+ 	})
+ }
+ 
+-// checkMissingMigrations returns a list of migrations that are missing from the database. A missing
+-// migration is one that has a version less than the max version in the database.
+-func checkMissingMigrations(
+-	dbMigrations []*database.ListMigrationsResult,
+-	fsMigrations []*Migration,
+-) []int64 {
+-	existing := make(map[int64]bool)
+-	var dbMaxVersion int64
+-	for _, m := range dbMigrations {
+-		existing[m.Version] = true
+-		if m.Version > dbMaxVersion {
+-			dbMaxVersion = m.Version
+-		}
+-	}
+-	var missing []int64
+-	for _, m := range fsMigrations {
+-		if !existing[m.Version] && m.Version < dbMaxVersion {
+-			missing = append(missing, m.Version)
+-		}
+-	}
+-	sort.Slice(missing, func(i, j int) bool {
+-		return missing[i] < missing[j]
+-	})
+-	return missing
+-}
+-
+ // getMigration returns the migration for the given version. If no migration is found, then
+ // ErrVersionNotFound is returned.
+ func (p *Provider) getMigration(version int64) (*Migration, error) {

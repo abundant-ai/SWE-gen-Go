@@ -1,0 +1,195 @@
+diff --git a/pkg/goanalysis/position.go b/pkg/goanalysis/position.go
+index 28441b34..96328479 100644
+--- a/pkg/goanalysis/position.go
++++ b/pkg/goanalysis/position.go
+@@ -8,6 +8,10 @@ import (
+ 	"golang.org/x/tools/go/analysis"
+ )
+ 
++func GetFilePosition(pass *analysis.Pass, f *ast.File) token.Position {
++	return GetFilePositionFor(pass.Fset, f.Pos())
++}
++
+ func GetGoFilePosition(pass *analysis.Pass, f *ast.File) (token.Position, bool) {
+ 	position := GetFilePositionFor(pass.Fset, f.Pos())
+ 
+diff --git a/pkg/golinters/dupl/dupl.go b/pkg/golinters/dupl/dupl.go
+index d2bb3d8d..b11a0b8e 100644
+--- a/pkg/golinters/dupl/dupl.go
++++ b/pkg/golinters/dupl/dupl.go
+@@ -3,6 +3,7 @@ package dupl
+ import (
+ 	"fmt"
+ 	"go/token"
++	"strings"
+ 	"sync"
+ 
+ 	duplAPI "github.com/golangci/dupl"
+@@ -54,7 +55,19 @@ func New(settings *config.DuplSettings) *goanalysis.Linter {
+ }
+ 
+ func runDupl(pass *analysis.Pass, settings *config.DuplSettings) ([]goanalysis.Issue, error) {
+-	issues, err := duplAPI.Run(internal.GetGoFileNames(pass), settings.Threshold)
++	fileNames := internal.GetFileNames(pass)
++
++	var onlyGofiles []string
++	for _, name := range fileNames {
++		// Related to Windows
++		if !strings.HasSuffix(name, ".go") {
++			continue
++		}
++
++		onlyGofiles = append(onlyGofiles, name)
++	}
++
++	issues, err := duplAPI.Run(onlyGofiles, settings.Threshold)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/golinters/gomodguard/gomodguard.go b/pkg/golinters/gomodguard/gomodguard.go
+index 8bddebc1..8f1036b0 100644
+--- a/pkg/golinters/gomodguard/gomodguard.go
++++ b/pkg/golinters/gomodguard/gomodguard.go
+@@ -73,7 +73,7 @@ func New(settings *config.GoModGuardSettings) *goanalysis.Linter {
+ 		}
+ 
+ 		analyzer.Run = func(pass *analysis.Pass) (any, error) {
+-			gomodguardIssues := processor.ProcessFiles(internal.GetGoFileNames(pass))
++			gomodguardIssues := processor.ProcessFiles(internal.GetFileNames(pass))
+ 
+ 			mu.Lock()
+ 			defer mu.Unlock()
+diff --git a/pkg/golinters/internal/util.go b/pkg/golinters/internal/util.go
+index 7525f2f2..ded7f9ac 100644
+--- a/pkg/golinters/internal/util.go
++++ b/pkg/golinters/internal/util.go
+@@ -18,17 +18,10 @@ func FormatCode(code string, _ *config.Config) string {
+ 	return fmt.Sprintf("`%s`", code)
+ }
+ 
+-func GetGoFileNames(pass *analysis.Pass) []string {
++func GetFileNames(pass *analysis.Pass) []string {
+ 	var filenames []string
+-
+ 	for _, f := range pass.Files {
+-		position, b := goanalysis.GetGoFilePosition(pass, f)
+-		if !b {
+-			continue
+-		}
+-
+-		filenames = append(filenames, position.Filename)
++		filenames = append(filenames, goanalysis.GetFilePosition(pass, f).Filename)
+ 	}
+-
+ 	return filenames
+ }
+diff --git a/pkg/golinters/revive/revive.go b/pkg/golinters/revive/revive.go
+index ec621ccf..a3f7daa8 100644
+--- a/pkg/golinters/revive/revive.go
++++ b/pkg/golinters/revive/revive.go
+@@ -115,7 +115,7 @@ func newWrapper(settings *config.ReviveSettings) (*wrapper, error) {
+ }
+ 
+ func (w *wrapper) run(lintCtx *linter.Context, pass *analysis.Pass) ([]goanalysis.Issue, error) {
+-	packages := [][]string{internal.GetGoFileNames(pass)}
++	packages := [][]string{internal.GetFileNames(pass)}
+ 
+ 	failures, err := w.revive.Lint(packages, w.lintingRules, *w.conf)
+ 	if err != nil {
+@@ -184,16 +184,17 @@ func toIssue(pass *analysis.Pass, object *jsonObject) goanalysis.Issue {
+ 	if object.ReplacementLine != "" {
+ 		f := pass.Fset.File(token.Pos(object.Position.Start.Offset))
+ 
+-		// Skip cgo files because the positions are wrong.
+-		if object.GetFilename() == f.Name() {
+-			issue.SuggestedFixes = []analysis.SuggestedFix{{
+-				TextEdits: []analysis.TextEdit{{
+-					Pos:     f.LineStart(object.Position.Start.Line),
+-					End:     goanalysis.EndOfLinePos(f, object.Position.End.Line),
+-					NewText: []byte(object.ReplacementLine),
+-				}},
+-			}}
+-		}
++		start := f.LineStart(object.Position.Start.Line)
++
++		end := goanalysis.EndOfLinePos(f, object.Position.End.Line)
++
++		issue.SuggestedFixes = []analysis.SuggestedFix{{
++			TextEdits: []analysis.TextEdit{{
++				Pos:     start,
++				End:     end,
++				NewText: []byte(object.ReplacementLine),
++			}},
++		}}
+ 	}
+ 
+ 	return goanalysis.NewIssue(issue, pass)
+diff --git a/pkg/golinters/revive/revive_integration_test.go b/pkg/golinters/revive/revive_integration_test.go
+index 6f882a15..c28e2815 100644
+--- a/pkg/golinters/revive/revive_integration_test.go
++++ b/pkg/golinters/revive/revive_integration_test.go
+@@ -9,11 +9,3 @@ import (
+ func TestFromTestdata(t *testing.T) {
+ 	integration.RunTestdata(t)
+ }
+-
+-func TestFix(t *testing.T) {
+-	integration.RunFix(t)
+-}
+-
+-func TestFixPathPrefix(t *testing.T) {
+-	integration.RunFixPathPrefix(t)
+-}
+diff --git a/pkg/golinters/revive/testdata/fix/in/revive.go b/pkg/golinters/revive/testdata/fix/in/revive.go
+deleted file mode 100644
+index 8187ff36..00000000
+--- a/pkg/golinters/revive/testdata/fix/in/revive.go
++++ /dev/null
+@@ -1,14 +0,0 @@
+-//golangcitest:args -Erevive
+-//golangcitest:config_path testdata/revive-fix.yml
+-//golangcitest:expected_exitcode 0
+-package in
+-
+-import (
+-	"errors"
+-	"fmt"
+-	"math"
+-)
+-
+-func _() error {
+-	return errors.New(fmt.Sprintf("foo: %d", math.MaxInt))
+-}
+diff --git a/pkg/golinters/revive/testdata/fix/out/revive.go b/pkg/golinters/revive/testdata/fix/out/revive.go
+deleted file mode 100644
+index d2d2089b..00000000
+--- a/pkg/golinters/revive/testdata/fix/out/revive.go
++++ /dev/null
+@@ -1,14 +0,0 @@
+-//golangcitest:args -Erevive
+-//golangcitest:config_path testdata/revive-fix.yml
+-//golangcitest:expected_exitcode 0
+-package in
+-
+-import (
+-	"errors"
+-	"fmt"
+-	"math"
+-)
+-
+-func _() error {
+-	return fmt.Errorf("foo: %d", math.MaxInt)
+-}
+diff --git a/pkg/golinters/revive/testdata/revive-fix.yml b/pkg/golinters/revive/testdata/revive-fix.yml
+deleted file mode 100644
+index 763b3a10..00000000
+--- a/pkg/golinters/revive/testdata/revive-fix.yml
++++ /dev/null
+@@ -1,7 +0,0 @@
+-linters-settings:
+-  revive:
+-    ignore-generated-header: true
+-    severity: warning
+-    rules:
+-      - name: errorf
+-      - name: range

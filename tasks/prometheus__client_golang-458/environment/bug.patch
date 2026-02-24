@@ -1,0 +1,715 @@
+diff --git a/prometheus/collector.go b/prometheus/collector.go
+index 08491be..82d4c3b 100644
+--- a/prometheus/collector.go
++++ b/prometheus/collector.go
+@@ -81,8 +81,6 @@ type Collector interface {
+ // it might even get registered as an unchecked Collecter (cf. the Register
+ // method of the Registerer interface). Hence, only use this shortcut
+ // implementation of Describe if you are certain to fulfill the contract.
+-//
+-// The Collector example demonstrates a use of DescribeByCollect.
+ func DescribeByCollect(c Collector, descs chan<- *Desc) {
+ 	metrics := make(chan Metric)
+ 	go func() {
+diff --git a/prometheus/example_clustermanager_test.go b/prometheus/example_clustermanager_test.go
+index 9a5a4b8..260c1b5 100644
+--- a/prometheus/example_clustermanager_test.go
++++ b/prometheus/example_clustermanager_test.go
+@@ -17,18 +17,18 @@ import "github.com/prometheus/client_golang/prometheus"
+ 
+ // ClusterManager is an example for a system that might have been built without
+ // Prometheus in mind. It models a central manager of jobs running in a
+-// cluster. Thus, we implement a custom Collector called
+-// ClusterManagerCollector, which collects information from a ClusterManager
+-// using its provided methods and turns them into Prometheus Metrics for
+-// collection.
++// cluster. To turn it into something that collects Prometheus metrics, we
++// simply add the two methods required for the Collector interface.
+ //
+ // An additional challenge is that multiple instances of the ClusterManager are
+ // run within the same binary, each in charge of a different zone. We need to
+-// make use of wrapping Registerers to be able to register each
+-// ClusterManagerCollector instance with Prometheus.
++// make use of ConstLabels to be able to register each ClusterManager instance
++// with Prometheus.
+ type ClusterManager struct {
+-	Zone string
+-	// Contains many more fields not listed in this example.
++	Zone         string
++	OOMCountDesc *prometheus.Desc
++	RAMUsageDesc *prometheus.Desc
++	// ... many more fields
+ }
+ 
+ // ReallyExpensiveAssessmentOfTheSystemState is a mock for the data gathering a
+@@ -50,30 +50,10 @@ func (c *ClusterManager) ReallyExpensiveAssessmentOfTheSystemState() (
+ 	return
+ }
+ 
+-// ClusterManagerCollector implements the Collector interface.
+-type ClusterManagerCollector struct {
+-	ClusterManager *ClusterManager
+-}
+-
+-// Descriptors used by the ClusterManagerCollector below.
+-var (
+-	oomCountDesc = prometheus.NewDesc(
+-		"clustermanager_oom_crashes_total",
+-		"Number of OOM crashes.",
+-		[]string{"host"}, nil,
+-	)
+-	ramUsageDesc = prometheus.NewDesc(
+-		"clustermanager_ram_usage_bytes",
+-		"RAM usage as reported to the cluster manager.",
+-		[]string{"host"}, nil,
+-	)
+-)
+-
+-// Describe is implemented with DescribeByCollect. That's possible because the
+-// Collect method will always return the same two metrics with the same two
+-// descriptors.
+-func (cc ClusterManagerCollector) Describe(ch chan<- *prometheus.Desc) {
+-	prometheus.DescribeByCollect(cc, ch)
++// Describe simply sends the two Descs in the struct to the channel.
++func (c *ClusterManager) Describe(ch chan<- *prometheus.Desc) {
++	ch <- c.OOMCountDesc
++	ch <- c.RAMUsageDesc
+ }
+ 
+ // Collect first triggers the ReallyExpensiveAssessmentOfTheSystemState. Then it
+@@ -81,11 +61,11 @@ func (cc ClusterManagerCollector) Describe(ch chan<- *prometheus.Desc) {
+ //
+ // Note that Collect could be called concurrently, so we depend on
+ // ReallyExpensiveAssessmentOfTheSystemState to be concurrency-safe.
+-func (cc ClusterManagerCollector) Collect(ch chan<- prometheus.Metric) {
+-	oomCountByHost, ramUsageByHost := cc.ClusterManager.ReallyExpensiveAssessmentOfTheSystemState()
++func (c *ClusterManager) Collect(ch chan<- prometheus.Metric) {
++	oomCountByHost, ramUsageByHost := c.ReallyExpensiveAssessmentOfTheSystemState()
+ 	for host, oomCount := range oomCountByHost {
+ 		ch <- prometheus.MustNewConstMetric(
+-			oomCountDesc,
++			c.OOMCountDesc,
+ 			prometheus.CounterValue,
+ 			float64(oomCount),
+ 			host,
+@@ -93,7 +73,7 @@ func (cc ClusterManagerCollector) Collect(ch chan<- prometheus.Metric) {
+ 	}
+ 	for host, ramUsage := range ramUsageByHost {
+ 		ch <- prometheus.MustNewConstMetric(
+-			ramUsageDesc,
++			c.RAMUsageDesc,
+ 			prometheus.GaugeValue,
+ 			ramUsage,
+ 			host,
+@@ -101,27 +81,38 @@ func (cc ClusterManagerCollector) Collect(ch chan<- prometheus.Metric) {
+ 	}
+ }
+ 
+-// NewClusterManager first creates a Prometheus-ignorant ClusterManager
+-// instance. Then, it creates a ClusterManagerCollector for the just created
+-// ClusterManager. Finally, it registers the ClusterManagerCollector with a
+-// wrapping Registerer that adds the zone as a label. In this way, the metrics
+-// collected by different ClusterManagerCollectors do not collide.
+-func NewClusterManager(zone string, reg prometheus.Registerer) *ClusterManager {
+-	c := &ClusterManager{
++// NewClusterManager creates the two Descs OOMCountDesc and RAMUsageDesc. Note
++// that the zone is set as a ConstLabel. (It's different in each instance of the
++// ClusterManager, but constant over the lifetime of an instance.) Then there is
++// a variable label "host", since we want to partition the collected metrics by
++// host. Since all Descs created in this way are consistent across instances,
++// with a guaranteed distinction by the "zone" label, we can register different
++// ClusterManager instances with the same registry.
++func NewClusterManager(zone string) *ClusterManager {
++	return &ClusterManager{
+ 		Zone: zone,
++		OOMCountDesc: prometheus.NewDesc(
++			"clustermanager_oom_crashes_total",
++			"Number of OOM crashes.",
++			[]string{"host"},
++			prometheus.Labels{"zone": zone},
++		),
++		RAMUsageDesc: prometheus.NewDesc(
++			"clustermanager_ram_usage_bytes",
++			"RAM usage as reported to the cluster manager.",
++			[]string{"host"},
++			prometheus.Labels{"zone": zone},
++		),
+ 	}
+-	cc := ClusterManagerCollector{ClusterManager: c}
+-	prometheus.WrapRegistererWith(prometheus.Labels{"zone": zone}, reg).MustRegister(cc)
+-	return c
+ }
+ 
+ func ExampleCollector() {
++	workerDB := NewClusterManager("db")
++	workerCA := NewClusterManager("ca")
++
+ 	// Since we are dealing with custom Collector implementations, it might
+ 	// be a good idea to try it out with a pedantic registry.
+ 	reg := prometheus.NewPedanticRegistry()
+-
+-	// Construct cluster managers. In real code, we would assign them to
+-	// variables to then do something with them.
+-	NewClusterManager("db", reg)
+-	NewClusterManager("ca", reg)
++	reg.MustRegister(workerDB)
++	reg.MustRegister(workerCA)
+ }
+diff --git a/prometheus/metric.go b/prometheus/metric.go
+index ae44621..bfda075 100644
+--- a/prometheus/metric.go
++++ b/prometheus/metric.go
+@@ -17,7 +17,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/golang/protobuf/proto"
++	"github.com/gogo/protobuf/proto"
+ 
+ 	dto "github.com/prometheus/client_model/go"
+ )
+diff --git a/prometheus/registry.go b/prometheus/registry.go
+index 2c0b908..7cd206e 100644
+--- a/prometheus/registry.go
++++ b/prometheus/registry.go
+@@ -539,11 +539,6 @@ func processMetric(
+ 	registeredDescIDs map[uint64]struct{},
+ ) error {
+ 	desc := metric.Desc()
+-	// Wrapped metrics collected by an unchecked Collector can have an
+-	// invalid Desc.
+-	if desc.err != nil {
+-		return desc.err
+-	}
+ 	dtoMetric := &dto.Metric{}
+ 	if err := metric.Write(dtoMetric); err != nil {
+ 		return fmt.Errorf("error collecting metric %v: %s", desc, err)
+diff --git a/prometheus/value.go b/prometheus/value.go
+index 5e7d4b6..e066298 100644
+--- a/prometheus/value.go
++++ b/prometheus/value.go
+@@ -17,9 +17,9 @@ import (
+ 	"fmt"
+ 	"sort"
+ 
+-	"github.com/golang/protobuf/proto"
+-
+ 	dto "github.com/prometheus/client_model/go"
++
++	"github.com/golang/protobuf/proto"
+ )
+ 
+ // ValueType is an enumeration of metric types that represent a simple value.
+diff --git a/prometheus/wrap.go b/prometheus/wrap.go
+deleted file mode 100644
+index 49159bf..0000000
+--- a/prometheus/wrap.go
++++ /dev/null
+@@ -1,179 +0,0 @@
+-// Copyright 2018 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package prometheus
+-
+-import (
+-	"fmt"
+-	"sort"
+-
+-	"github.com/golang/protobuf/proto"
+-
+-	dto "github.com/prometheus/client_model/go"
+-)
+-
+-// WrapRegistererWith returns a Registerer wrapping the provided
+-// Registerer. Collectors registered with the returned Registerer will be
+-// registered with the wrapped Registerer in a modified way. The modified
+-// Collector adds the provided Labels to all Metrics it collects (as
+-// ConstLabels). The Metrics collected by the unmodified Collector must not
+-// duplicate any of those labels.
+-//
+-// WrapRegistererWith provides a way to add fixed labels to a subset of
+-// Collectors. It should not be used to add fixed labels to all metrics exposed.
+-//
+-// The Collector example demonstrates a use of WrapRegistererWith.
+-func WrapRegistererWith(labels Labels, reg Registerer) Registerer {
+-	return &wrappingRegisterer{
+-		wrappedRegisterer: reg,
+-		labels:            labels,
+-	}
+-}
+-
+-// WrapRegistererWithPrefix returns a Registerer wrapping the provided
+-// Registerer. Collectors registered with the returned Registerer will be
+-// registered with the wrapped Registerer in a modified way. The modified
+-// Collector adds the provided prefix to the name of all Metrics it collects.
+-//
+-// WrapRegistererWithPrefix is useful to have one place to prefix all metrics of
+-// a sub-system. To make this work, register metrics of the sub-system with the
+-// wrapping Registerer returned by WrapRegistererWithPrefix. It is rarely useful
+-// to use the same prefix for all metrics exposed. In particular, do not prefix
+-// metric names that are standardized across applications, as that would break
+-// horizontal monitoring, for example the metrics provided by the Go collector
+-// (see NewGoCollector) and the process collector (see NewProcessCollector). (In
+-// fact, those metrics are already prefixed with “go_” or “process_”,
+-// respectively.)
+-func WrapRegistererWithPrefix(prefix string, reg Registerer) Registerer {
+-	return &wrappingRegisterer{
+-		wrappedRegisterer: reg,
+-		prefix:            prefix,
+-	}
+-}
+-
+-type wrappingRegisterer struct {
+-	wrappedRegisterer Registerer
+-	prefix            string
+-	labels            Labels
+-}
+-
+-func (r *wrappingRegisterer) Register(c Collector) error {
+-	return r.wrappedRegisterer.Register(&wrappingCollector{
+-		wrappedCollector: c,
+-		prefix:           r.prefix,
+-		labels:           r.labels,
+-	})
+-}
+-
+-func (r *wrappingRegisterer) MustRegister(cs ...Collector) {
+-	for _, c := range cs {
+-		if err := r.Register(c); err != nil {
+-			panic(err)
+-		}
+-	}
+-}
+-
+-func (r *wrappingRegisterer) Unregister(c Collector) bool {
+-	return r.wrappedRegisterer.Unregister(&wrappingCollector{
+-		wrappedCollector: c,
+-		prefix:           r.prefix,
+-		labels:           r.labels,
+-	})
+-}
+-
+-type wrappingCollector struct {
+-	wrappedCollector Collector
+-	prefix           string
+-	labels           Labels
+-}
+-
+-func (c *wrappingCollector) Collect(ch chan<- Metric) {
+-	wrappedCh := make(chan Metric)
+-	go func() {
+-		c.wrappedCollector.Collect(wrappedCh)
+-		close(wrappedCh)
+-	}()
+-	for m := range wrappedCh {
+-		ch <- &wrappingMetric{
+-			wrappedMetric: m,
+-			prefix:        c.prefix,
+-			labels:        c.labels,
+-		}
+-	}
+-}
+-
+-func (c *wrappingCollector) Describe(ch chan<- *Desc) {
+-	wrappedCh := make(chan *Desc)
+-	go func() {
+-		c.wrappedCollector.Describe(wrappedCh)
+-		close(wrappedCh)
+-	}()
+-	for desc := range wrappedCh {
+-		ch <- wrapDesc(desc, c.prefix, c.labels)
+-	}
+-}
+-
+-type wrappingMetric struct {
+-	wrappedMetric Metric
+-	prefix        string
+-	labels        Labels
+-}
+-
+-func (m *wrappingMetric) Desc() *Desc {
+-	return wrapDesc(m.wrappedMetric.Desc(), m.prefix, m.labels)
+-}
+-
+-func (m *wrappingMetric) Write(out *dto.Metric) error {
+-	if err := m.wrappedMetric.Write(out); err != nil {
+-		return err
+-	}
+-	if len(m.labels) == 0 {
+-		// No wrapping labels.
+-		return nil
+-	}
+-	for ln, lv := range m.labels {
+-		out.Label = append(out.Label, &dto.LabelPair{
+-			Name:  proto.String(ln),
+-			Value: proto.String(lv),
+-		})
+-	}
+-	sort.Sort(labelPairSorter(out.Label))
+-	return nil
+-}
+-
+-func wrapDesc(desc *Desc, prefix string, labels Labels) *Desc {
+-	constLabels := Labels{}
+-	for _, lp := range desc.constLabelPairs {
+-		constLabels[*lp.Name] = *lp.Value
+-	}
+-	for ln, lv := range labels {
+-		if _, alreadyUsed := constLabels[ln]; alreadyUsed {
+-			return &Desc{
+-				fqName:          desc.fqName,
+-				help:            desc.help,
+-				variableLabels:  desc.variableLabels,
+-				constLabelPairs: desc.constLabelPairs,
+-				err:             fmt.Errorf("attempted wrapping with already existing label name %q", ln),
+-			}
+-		}
+-		constLabels[ln] = lv
+-	}
+-	// NewDesc will do remaining validations.
+-	newDesc := NewDesc(prefix+desc.fqName, desc.help, desc.variableLabels, constLabels)
+-	// Propagate errors if there was any. This will override any errer
+-	// created by NewDesc above, i.e. earlier errors get precedence.
+-	if desc.err != nil {
+-		newDesc.err = desc.err
+-	}
+-	return newDesc
+-}
+diff --git a/prometheus/wrap_test.go b/prometheus/wrap_test.go
+deleted file mode 100644
+index bed103e..0000000
+--- a/prometheus/wrap_test.go
++++ /dev/null
+@@ -1,322 +0,0 @@
+-// Copyright 2018 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package prometheus
+-
+-import (
+-	"fmt"
+-	"reflect"
+-	"strings"
+-	"testing"
+-
+-	"github.com/gogo/protobuf/proto"
+-
+-	dto "github.com/prometheus/client_model/go"
+-)
+-
+-// uncheckedCollector wraps a Collector but its Describe method yields no Desc.
+-type uncheckedCollector struct {
+-	c Collector
+-}
+-
+-func (u uncheckedCollector) Describe(_ chan<- *Desc) {}
+-func (u uncheckedCollector) Collect(c chan<- Metric) {
+-	u.c.Collect(c)
+-}
+-
+-func toMetricFamilies(cs ...Collector) []*dto.MetricFamily {
+-	reg := NewRegistry()
+-	reg.MustRegister(cs...)
+-	out, err := reg.Gather()
+-	if err != nil {
+-		panic(err)
+-	}
+-	return out
+-}
+-
+-func TestWrap(t *testing.T) {
+-
+-	simpleCnt := NewCounter(CounterOpts{
+-		Name: "simpleCnt",
+-		Help: "helpSimpleCnt",
+-	})
+-	simpleCnt.Inc()
+-
+-	simpleGge := NewGauge(GaugeOpts{
+-		Name: "simpleGge",
+-		Help: "helpSimpleGge",
+-	})
+-	simpleGge.Set(3.14)
+-
+-	preCnt := NewCounter(CounterOpts{
+-		Name: "pre_simpleCnt",
+-		Help: "helpSimpleCnt",
+-	})
+-	preCnt.Inc()
+-
+-	barLabeledCnt := NewCounter(CounterOpts{
+-		Name:        "simpleCnt",
+-		Help:        "helpSimpleCnt",
+-		ConstLabels: Labels{"foo": "bar"},
+-	})
+-	barLabeledCnt.Inc()
+-
+-	bazLabeledCnt := NewCounter(CounterOpts{
+-		Name:        "simpleCnt",
+-		Help:        "helpSimpleCnt",
+-		ConstLabels: Labels{"foo": "baz"},
+-	})
+-	bazLabeledCnt.Inc()
+-
+-	labeledPreCnt := NewCounter(CounterOpts{
+-		Name:        "pre_simpleCnt",
+-		Help:        "helpSimpleCnt",
+-		ConstLabels: Labels{"foo": "bar"},
+-	})
+-	labeledPreCnt.Inc()
+-
+-	twiceLabeledPreCnt := NewCounter(CounterOpts{
+-		Name:        "pre_simpleCnt",
+-		Help:        "helpSimpleCnt",
+-		ConstLabels: Labels{"foo": "bar", "dings": "bums"},
+-	})
+-	twiceLabeledPreCnt.Inc()
+-
+-	barLabeledUncheckedCollector := uncheckedCollector{barLabeledCnt}
+-
+-	scenarios := map[string]struct {
+-		prefix      string // First wrap with this prefix.
+-		labels      Labels // Then wrap the result with these labels.
+-		labels2     Labels // If any, wrap the prefix-wrapped one again.
+-		preRegister []Collector
+-		toRegister  []struct { // If there are any labels2, register every other with that one.
+-			collector         Collector
+-			registrationFails bool
+-		}
+-		gatherFails bool
+-		output      []Collector
+-	}{
+-		"wrap nothing": {
+-			prefix: "pre_",
+-			labels: Labels{"foo": "bar"},
+-		},
+-		"wrap with nothing": {
+-			preRegister: []Collector{simpleGge},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{simpleCnt, false}},
+-			output: []Collector{simpleGge, simpleCnt},
+-		},
+-		"wrap counter with prefix": {
+-			prefix:      "pre_",
+-			preRegister: []Collector{simpleGge},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{simpleCnt, false}},
+-			output: []Collector{simpleGge, preCnt},
+-		},
+-		"wrap counter with label pair": {
+-			labels:      Labels{"foo": "bar"},
+-			preRegister: []Collector{simpleGge},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{simpleCnt, false}},
+-			output: []Collector{simpleGge, barLabeledCnt},
+-		},
+-		"wrap counter with label pair and prefix": {
+-			prefix:      "pre_",
+-			labels:      Labels{"foo": "bar"},
+-			preRegister: []Collector{simpleGge},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{simpleCnt, false}},
+-			output: []Collector{simpleGge, labeledPreCnt},
+-		},
+-		"wrap counter with invalid prefix": {
+-			prefix:      "1+1",
+-			preRegister: []Collector{simpleGge},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{simpleCnt, true}},
+-			output: []Collector{simpleGge},
+-		},
+-		"wrap counter with invalid label": {
+-			preRegister: []Collector{simpleGge},
+-			labels:      Labels{"42": "bar"},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{simpleCnt, true}},
+-			output: []Collector{simpleGge},
+-		},
+-		"counter registered twice but wrapped with different label values": {
+-			labels:  Labels{"foo": "bar"},
+-			labels2: Labels{"foo": "baz"},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{simpleCnt, false}, {simpleCnt, false}},
+-			output: []Collector{barLabeledCnt, bazLabeledCnt},
+-		},
+-		"counter registered twice but wrapped with different inconsistent label values": {
+-			labels:  Labels{"foo": "bar"},
+-			labels2: Labels{"bar": "baz"},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{simpleCnt, false}, {simpleCnt, true}},
+-			output: []Collector{barLabeledCnt},
+-		},
+-		"wrap counter with prefix and two labels": {
+-			prefix:      "pre_",
+-			labels:      Labels{"foo": "bar", "dings": "bums"},
+-			preRegister: []Collector{simpleGge},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{simpleCnt, false}},
+-			output: []Collector{simpleGge, twiceLabeledPreCnt},
+-		},
+-		"wrap labeled counter with prefix and another label": {
+-			prefix:      "pre_",
+-			labels:      Labels{"dings": "bums"},
+-			preRegister: []Collector{simpleGge},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{barLabeledCnt, false}},
+-			output: []Collector{simpleGge, twiceLabeledPreCnt},
+-		},
+-		"wrap labeled counter with prefix and inconsistent label": {
+-			prefix:      "pre_",
+-			labels:      Labels{"foo": "bums"},
+-			preRegister: []Collector{simpleGge},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{barLabeledCnt, true}},
+-			output: []Collector{simpleGge},
+-		},
+-		"wrap labeled counter with prefix and the same label again": {
+-			prefix:      "pre_",
+-			labels:      Labels{"foo": "bar"},
+-			preRegister: []Collector{simpleGge},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{barLabeledCnt, true}},
+-			output: []Collector{simpleGge},
+-		},
+-		"wrap labeled unchecked collector with prefix and another label": {
+-			prefix:      "pre_",
+-			labels:      Labels{"dings": "bums"},
+-			preRegister: []Collector{simpleGge},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{barLabeledUncheckedCollector, false}},
+-			output: []Collector{simpleGge, twiceLabeledPreCnt},
+-		},
+-		"wrap labeled unchecked collector with prefix and inconsistent label": {
+-			prefix:      "pre_",
+-			labels:      Labels{"foo": "bums"},
+-			preRegister: []Collector{simpleGge},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{barLabeledUncheckedCollector, false}},
+-			gatherFails: true,
+-			output:      []Collector{simpleGge},
+-		},
+-		"wrap labeled unchecked collector with prefix and the same label again": {
+-			prefix:      "pre_",
+-			labels:      Labels{"foo": "bar"},
+-			preRegister: []Collector{simpleGge},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{barLabeledUncheckedCollector, false}},
+-			gatherFails: true,
+-			output:      []Collector{simpleGge},
+-		},
+-		"wrap labeled unchecked collector with prefix and another label resulting in collision with pre-registered counter": {
+-			prefix:      "pre_",
+-			labels:      Labels{"dings": "bums"},
+-			preRegister: []Collector{twiceLabeledPreCnt},
+-			toRegister: []struct {
+-				collector         Collector
+-				registrationFails bool
+-			}{{barLabeledUncheckedCollector, false}},
+-			gatherFails: true,
+-			output:      []Collector{twiceLabeledPreCnt},
+-		},
+-	}
+-
+-	for n, s := range scenarios {
+-		t.Run(n, func(t *testing.T) {
+-			reg := NewPedanticRegistry()
+-			for _, c := range s.preRegister {
+-				if err := reg.Register(c); err != nil {
+-					t.Fatal("error registering with unwrapped registry:", err)
+-				}
+-			}
+-			preReg := WrapRegistererWithPrefix(s.prefix, reg)
+-			lReg := WrapRegistererWith(s.labels, preReg)
+-			l2Reg := WrapRegistererWith(s.labels2, preReg)
+-			for i, tr := range s.toRegister {
+-				var err error
+-				if i%2 != 0 && len(s.labels2) != 0 {
+-					err = l2Reg.Register(tr.collector)
+-				} else {
+-					err = lReg.Register(tr.collector)
+-				}
+-				if tr.registrationFails && err == nil {
+-					t.Fatalf("registration with wrapping registry unexpectedly succeded for collector #%d", i)
+-				}
+-				if !tr.registrationFails && err != nil {
+-					t.Fatalf("registration with wrapping registry failed for collector #%d: %s", i, err)
+-				}
+-			}
+-			wantMF := toMetricFamilies(s.output...)
+-			gotMF, err := reg.Gather()
+-			if s.gatherFails && err == nil {
+-				t.Fatal("gathering unexpectedly succeded")
+-			}
+-			if !s.gatherFails && err != nil {
+-				t.Fatal("gathering failed:", err)
+-			}
+-			if !reflect.DeepEqual(gotMF, wantMF) {
+-				var want, got []string
+-
+-				for i, mf := range wantMF {
+-					want = append(want, fmt.Sprintf("%3d: %s", i, proto.MarshalTextString(mf)))
+-				}
+-				for i, mf := range gotMF {
+-					got = append(got, fmt.Sprintf("%3d: %s", i, proto.MarshalTextString(mf)))
+-				}
+-
+-				t.Fatalf(
+-					"unexpected output of gathering:\n\nWANT:\n%s\n\nGOT:\n%s\n",
+-					strings.Join(want, "\n"),
+-					strings.Join(got, "\n"),
+-				)
+-			}
+-		})
+-	}
+-
+-}

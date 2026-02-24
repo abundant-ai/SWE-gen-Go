@@ -1,0 +1,239 @@
+diff --git a/context.go b/context.go
+index 01c7cb4..65819c6 100644
+--- a/context.go
++++ b/context.go
+@@ -17,7 +17,7 @@ import (
+ 
+ 	"github.com/gin-gonic/gin/binding"
+ 	"github.com/gin-gonic/gin/render"
+-	"github.com/manucorporat/sse"
++	"gopkg.in/gin-contrib/sse.v0"
+ )
+ 
+ // Content-Type MIME of the most common data formats
+@@ -404,6 +404,19 @@ func (c *Context) requestHeader(key string) string {
+ /******** RESPONSE RENDERING ********/
+ /************************************/
+ 
++// bodyAllowedForStatus is a copy of http.bodyAllowedForStatus non-exported function
++func bodyAllowedForStatus(status int) bool {
++	switch {
++	case status >= 100 && status <= 199:
++		return false
++	case status == 204:
++		return false
++	case status == 304:
++		return false
++	}
++	return true
++}
++
+ func (c *Context) Status(code int) {
+ 	c.writermem.WriteHeader(code)
+ }
+@@ -453,6 +466,13 @@ func (c *Context) Cookie(name string) (string, error) {
+ 
+ func (c *Context) Render(code int, r render.Render) {
+ 	c.Status(code)
++
++	if !bodyAllowedForStatus(code) {
++		r.WriteContentType(c.Writer)
++		c.Writer.WriteHeaderNow()
++		return
++	}
++
+ 	if err := r.Render(c.Writer); err != nil {
+ 		panic(err)
+ 	}
+@@ -477,10 +497,7 @@ func (c *Context) IndentedJSON(code int, obj interface{}) {
+ // JSON serializes the given struct as JSON into the response body.
+ // It also sets the Content-Type as "application/json".
+ func (c *Context) JSON(code int, obj interface{}) {
+-	c.Status(code)
+-	if err := render.WriteJSON(c.Writer, obj); err != nil {
+-		panic(err)
+-	}
++	c.Render(code, render.JSON{Data: obj})
+ }
+ 
+ // XML serializes the given struct as XML into the response body.
+@@ -496,8 +513,7 @@ func (c *Context) YAML(code int, obj interface{}) {
+ 
+ // String writes the given string into the response body.
+ func (c *Context) String(code int, format string, values ...interface{}) {
+-	c.Status(code)
+-	render.WriteString(c.Writer, format, values)
++	c.Render(code, render.String{Format: format, Data: values})
+ }
+ 
+ // Redirect returns a HTTP redirect to the specific location.
+diff --git a/render/data.go b/render/data.go
+index efa75d5..c296042 100644
+--- a/render/data.go
++++ b/render/data.go
+@@ -11,10 +11,13 @@ type Data struct {
+ 	Data        []byte
+ }
+ 
+-func (r Data) Render(w http.ResponseWriter) error {
+-	if len(r.ContentType) > 0 {
+-		w.Header()["Content-Type"] = []string{r.ContentType}
+-	}
+-	w.Write(r.Data)
+-	return nil
++// Render (Data) writes data with custom ContentType
++func (r Data) Render(w http.ResponseWriter) (err error) {
++	r.WriteContentType(w)
++	_, err = w.Write(r.Data)
++	return
++}
++
++func (r Data) WriteContentType(w http.ResponseWriter) {
++	writeContentType(w, []string{r.ContentType})
+ }
+diff --git a/render/html.go b/render/html.go
+index 8bfb23a..a3cbda6 100644
+--- a/render/html.go
++++ b/render/html.go
+@@ -58,9 +58,14 @@ func (r HTMLDebug) loadTemplate() *template.Template {
+ }
+ 
+ func (r HTML) Render(w http.ResponseWriter) error {
+-	writeContentType(w, htmlContentType)
++	r.WriteContentType(w)
++
+ 	if len(r.Name) == 0 {
+ 		return r.Template.Execute(w, r.Data)
+ 	}
+ 	return r.Template.ExecuteTemplate(w, r.Name, r.Data)
+ }
++
++func (r HTML) WriteContentType(w http.ResponseWriter) {
++	writeContentType(w, htmlContentType)
++}
+diff --git a/render/json.go b/render/json.go
+index b652c4c..3ee8b13 100644
+--- a/render/json.go
++++ b/render/json.go
+@@ -21,13 +21,20 @@ type (
+ 
+ var jsonContentType = []string{"application/json; charset=utf-8"}
+ 
+-func (r JSON) Render(w http.ResponseWriter) error {
+-	return WriteJSON(w, r.Data)
++func (r JSON) Render(w http.ResponseWriter) (err error) {
++	if err = WriteJSON(w, r.Data); err != nil {
++		panic(err)
++	}
++	return
+ }
+ 
+-func (r IndentedJSON) Render(w http.ResponseWriter) error {
++func (r JSON) WriteContentType(w http.ResponseWriter) {
+ 	writeContentType(w, jsonContentType)
+-	jsonBytes, err := json.MarshalIndent(r.Data, "", "    ")
++}
++
++func WriteJSON(w http.ResponseWriter, obj interface{}) error {
++	writeContentType(w, jsonContentType)
++	jsonBytes, err := json.Marshal(obj)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -35,12 +42,16 @@ func (r IndentedJSON) Render(w http.ResponseWriter) error {
+ 	return nil
+ }
+ 
+-func WriteJSON(w http.ResponseWriter, obj interface{}) error {
+-	writeContentType(w, jsonContentType)
+-	jsonBytes, err := json.Marshal(obj)
++func (r IndentedJSON) Render(w http.ResponseWriter) error {
++	r.WriteContentType(w)
++	jsonBytes, err := json.MarshalIndent(r.Data, "", "    ")
+ 	if err != nil {
+ 		return err
+ 	}
+ 	w.Write(jsonBytes)
+ 	return nil
+ }
++
++func (r IndentedJSON) WriteContentType(w http.ResponseWriter) {
++	writeContentType(w, jsonContentType)
++}
+diff --git a/render/redirect.go b/render/redirect.go
+index bd48d7d..f874a35 100644
+--- a/render/redirect.go
++++ b/render/redirect.go
+@@ -22,3 +22,5 @@ func (r Redirect) Render(w http.ResponseWriter) error {
+ 	http.Redirect(w, r.Request, r.Location, r.Code)
+ 	return nil
+ }
++
++func (r Redirect) WriteContentType(http.ResponseWriter) {}
+diff --git a/render/render.go b/render/render.go
+index 3808666..7e99737 100644
+--- a/render/render.go
++++ b/render/render.go
+@@ -8,6 +8,7 @@ import "net/http"
+ 
+ type Render interface {
+ 	Render(http.ResponseWriter) error
++	WriteContentType(w http.ResponseWriter)
+ }
+ 
+ var (
+diff --git a/render/text.go b/render/text.go
+index 5a9e280..74cd26b 100644
+--- a/render/text.go
++++ b/render/text.go
+@@ -22,9 +22,12 @@ func (r String) Render(w http.ResponseWriter) error {
+ 	return nil
+ }
+ 
+-func WriteString(w http.ResponseWriter, format string, data []interface{}) {
++func (r String) WriteContentType(w http.ResponseWriter) {
+ 	writeContentType(w, plainContentType)
++}
+ 
++func WriteString(w http.ResponseWriter, format string, data []interface{}) {
++	writeContentType(w, plainContentType)
+ 	if len(data) > 0 {
+ 		fmt.Fprintf(w, format, data...)
+ 	} else {
+diff --git a/render/xml.go b/render/xml.go
+index be22e6f..cff1ac3 100644
+--- a/render/xml.go
++++ b/render/xml.go
+@@ -16,6 +16,10 @@ type XML struct {
+ var xmlContentType = []string{"application/xml; charset=utf-8"}
+ 
+ func (r XML) Render(w http.ResponseWriter) error {
+-	writeContentType(w, xmlContentType)
++	r.WriteContentType(w)
+ 	return xml.NewEncoder(w).Encode(r.Data)
+ }
++
++func (r XML) WriteContentType(w http.ResponseWriter) {
++	writeContentType(w, xmlContentType)
++}
+diff --git a/render/yaml.go b/render/yaml.go
+index 46937d8..25d0ebd 100644
+--- a/render/yaml.go
++++ b/render/yaml.go
+@@ -17,7 +17,7 @@ type YAML struct {
+ var yamlContentType = []string{"application/x-yaml; charset=utf-8"}
+ 
+ func (r YAML) Render(w http.ResponseWriter) error {
+-	writeContentType(w, yamlContentType)
++	r.WriteContentType(w)
+ 
+ 	bytes, err := yaml.Marshal(r.Data)
+ 	if err != nil {
+@@ -27,3 +27,7 @@ func (r YAML) Render(w http.ResponseWriter) error {
+ 	w.Write(bytes)
+ 	return nil
+ }
++
++func (r YAML) WriteContentType(w http.ResponseWriter) {
++	writeContentType(w, yamlContentType)
++}

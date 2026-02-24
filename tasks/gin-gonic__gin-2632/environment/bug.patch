@@ -1,0 +1,543 @@
+diff --git a/README.md b/README.md
+index d4772d7..eb84031 100644
+--- a/README.md
++++ b/README.md
+@@ -2124,39 +2124,6 @@ func main() {
+ }
+ ```
+ 
+-## Don't trust all proxies
+-
+-Gin lets you specify which headers to hold the real client IP (if any),
+-as well as specifying which proxies (or direct clients) you trust to
+-specify one of these headers.
+-
+-The `TrustedProxies` slice on your `gin.Engine` specifes network addresses or
+-network CIDRs from where clients which their request headers related to client
+-IP can be trusted. They can be IPv4 addresses, IPv4 CIDRs, IPv6 addresses or
+-IPv6 CIDRs.
+-
+-```go
+-import (
+-	"fmt"
+-
+-	"github.com/gin-gonic/gin"
+-)
+-
+-func main() {
+-
+-	router := gin.Default()
+-	router.TrustedProxies = []string{"192.168.1.2"}
+-
+-	router.GET("/", func(c *gin.Context) {
+-		// If the client is 192.168.1.2, use the X-Forwarded-For
+-		// header to deduce the original client IP from the trust-
+-		// worthy parts of that header.
+-		// Otherwise, simply return the direct client IP
+-		fmt.Printf("ClientIP: %s\n", c.ClientIP())
+-	})
+-	router.Run()
+-}
+-```
+ 
+ ## Testing
+ 
+diff --git a/context.go b/context.go
+index 1ba0fa2..3d6b56d 100644
+--- a/context.go
++++ b/context.go
+@@ -725,82 +725,32 @@ func (c *Context) ShouldBindBodyWith(obj interface{}, bb binding.BindingBody) (e
+ 	return bb.BindBody(body, obj)
+ }
+ 
+-// ClientIP implements a best effort algorithm to return the real client IP.
+-// It called c.RemoteIP() under the hood, to check if the remote IP is a trusted proxy or not.
+-// If it's it will then try to parse the headers defined in Engine.RemoteIPHeaders (defaulting to [X-Forwarded-For, X-Real-Ip]).
+-// If the headers are nots syntactically valid OR the remote IP does not correspong to a trusted proxy,
+-// the remote IP (coming form Request.RemoteAddr) is returned.
++// ClientIP implements a best effort algorithm to return the real client IP, it parses
++// X-Real-IP and X-Forwarded-For in order to work properly with reverse-proxies such us: nginx or haproxy.
++// Use X-Forwarded-For before X-Real-Ip as nginx uses X-Real-Ip with the proxy's IP.
+ func (c *Context) ClientIP() string {
+-	if c.engine.AppEngine {
+-		if addr := c.requestHeader("X-Appengine-Remote-Addr"); addr != "" {
+-			return addr
++	if c.engine.ForwardedByClientIP {
++		clientIP := c.requestHeader("X-Forwarded-For")
++		clientIP = strings.TrimSpace(strings.Split(clientIP, ",")[0])
++		if clientIP == "" {
++			clientIP = strings.TrimSpace(c.requestHeader("X-Real-Ip"))
+ 		}
+-	}
+-
+-	remoteIP, trusted := c.RemoteIP()
+-	if remoteIP == nil {
+-		return ""
+-	}
+-
+-	if trusted && c.engine.ForwardedByClientIP && c.engine.RemoteIPHeaders != nil {
+-		for _, headerName := range c.engine.RemoteIPHeaders {
+-			ip, valid := validateHeader(c.requestHeader(headerName))
+-			if valid {
+-				return ip
+-			}
++		if clientIP != "" {
++			return clientIP
+ 		}
+ 	}
+-	return remoteIP.String()
+-}
+-
+-// RemoteIP parses the IP from Request.RemoteAddr, normalizes and returns the IP (without the port).
+-// It also checks if the remoteIP is a trusted proxy or not.
+-// In order to perform this validation, it will see if the IP is contained within at least one of the CIDR blocks
+-// defined in Engine.TrustedProxies
+-func (c *Context) RemoteIP() (net.IP, bool) {
+-	ip, _, err := net.SplitHostPort(strings.TrimSpace(c.Request.RemoteAddr))
+-	if err != nil {
+-		return nil, false
+-	}
+-	remoteIP := net.ParseIP(ip)
+-	if remoteIP == nil {
+-		return nil, false
+-	}
+ 
+-	trustedCIDRs, _ := c.engine.prepareTrustedCIDRs()
+-	c.engine.trustedCIDRs = trustedCIDRs
+-	if c.engine.trustedCIDRs != nil {
+-		for _, cidr := range c.engine.trustedCIDRs {
+-			if cidr.Contains(remoteIP) {
+-				return remoteIP, true
+-			}
++	if c.engine.AppEngine {
++		if addr := c.requestHeader("X-Appengine-Remote-Addr"); addr != "" {
++			return addr
+ 		}
+ 	}
+ 
+-	return remoteIP, false
+-}
+-
+-func validateHeader(header string) (clientIP string, valid bool) {
+-	if header == "" {
+-		return "", false
++	if ip, _, err := net.SplitHostPort(strings.TrimSpace(c.Request.RemoteAddr)); err == nil {
++		return ip
+ 	}
+-	items := strings.Split(header, ",")
+-	for i, ipStr := range items {
+-		ipStr = strings.TrimSpace(ipStr)
+-		ip := net.ParseIP(ipStr)
+-		if ip == nil {
+-			return "", false
+-		}
+ 
+-		// We need to return the first IP in the list, but,
+-		// we should not early return since we need to validate that
+-		// the rest of the header is syntactically valid
+-		if i == 0 {
+-			clientIP = ipStr
+-			valid = true
+-		}
+-	}
+-	return
++	return ""
+ }
+ 
+ // ContentType returns the Content-Type header of the request.
+diff --git a/context_test.go b/context_test.go
+index 8fe4761..8e1e3b5 100644
+--- a/context_test.go
++++ b/context_test.go
+@@ -1392,10 +1392,11 @@ func TestContextClientIP(t *testing.T) {
+ 	c, _ := CreateTestContext(httptest.NewRecorder())
+ 	c.Request, _ = http.NewRequest("POST", "/", nil)
+ 
+-	resetContextForClientIPTests(c)
++	c.Request.Header.Set("X-Real-IP", " 10.10.10.10  ")
++	c.Request.Header.Set("X-Forwarded-For", "  20.20.20.20, 30.30.30.30")
++	c.Request.Header.Set("X-Appengine-Remote-Addr", "50.50.50.50")
++	c.Request.RemoteAddr = "  40.40.40.40:42123 "
+ 
+-	// Legacy tests (validating that the defaults don't break the
+-	// (insecure!) old behaviour)
+ 	assert.Equal(t, "20.20.20.20", c.ClientIP())
+ 
+ 	c.Request.Header.Del("X-Forwarded-For")
+@@ -1415,74 +1416,6 @@ func TestContextClientIP(t *testing.T) {
+ 	// no port
+ 	c.Request.RemoteAddr = "50.50.50.50"
+ 	assert.Empty(t, c.ClientIP())
+-
+-	// Tests exercising the TrustedProxies functionality
+-	resetContextForClientIPTests(c)
+-
+-	// No trusted proxies
+-	c.engine.TrustedProxies = []string{}
+-	c.engine.RemoteIPHeaders = []string{"X-Forwarded-For"}
+-	assert.Equal(t, "40.40.40.40", c.ClientIP())
+-
+-	// Last proxy is trusted, but the RemoteAddr is not
+-	c.engine.TrustedProxies = []string{"30.30.30.30"}
+-	assert.Equal(t, "40.40.40.40", c.ClientIP())
+-
+-	// Only trust RemoteAddr
+-	c.engine.TrustedProxies = []string{"40.40.40.40"}
+-	assert.Equal(t, "20.20.20.20", c.ClientIP())
+-
+-	// All steps are trusted
+-	c.engine.TrustedProxies = []string{"40.40.40.40", "30.30.30.30", "20.20.20.20"}
+-	assert.Equal(t, "20.20.20.20", c.ClientIP())
+-
+-	// Use CIDR
+-	c.engine.TrustedProxies = []string{"40.40.25.25/16", "30.30.30.30"}
+-	assert.Equal(t, "20.20.20.20", c.ClientIP())
+-
+-	// Use hostname that resolves to all the proxies
+-	c.engine.TrustedProxies = []string{"foo"}
+-	assert.Equal(t, "40.40.40.40", c.ClientIP())
+-
+-	// Use hostname that returns an error
+-	c.engine.TrustedProxies = []string{"bar"}
+-	assert.Equal(t, "40.40.40.40", c.ClientIP())
+-
+-	// X-Forwarded-For has a non-IP element
+-	c.engine.TrustedProxies = []string{"40.40.40.40"}
+-	c.Request.Header.Set("X-Forwarded-For", " blah ")
+-	assert.Equal(t, "40.40.40.40", c.ClientIP())
+-
+-	// Result from LookupHost has non-IP element. This should never
+-	// happen, but we should test it to make sure we handle it
+-	// gracefully.
+-	c.engine.TrustedProxies = []string{"baz"}
+-	c.Request.Header.Set("X-Forwarded-For", " 30.30.30.30 ")
+-	assert.Equal(t, "40.40.40.40", c.ClientIP())
+-
+-	c.engine.TrustedProxies = []string{"40.40.40.40"}
+-	c.Request.Header.Del("X-Forwarded-For")
+-	c.engine.RemoteIPHeaders = []string{"X-Forwarded-For", "X-Real-IP"}
+-	assert.Equal(t, "10.10.10.10", c.ClientIP())
+-
+-	c.engine.RemoteIPHeaders = []string{}
+-	c.engine.AppEngine = true
+-	assert.Equal(t, "50.50.50.50", c.ClientIP())
+-
+-	c.Request.Header.Del("X-Appengine-Remote-Addr")
+-	assert.Equal(t, "40.40.40.40", c.ClientIP())
+-
+-	// no port
+-	c.Request.RemoteAddr = "50.50.50.50"
+-	assert.Empty(t, c.ClientIP())
+-}
+-
+-func resetContextForClientIPTests(c *Context) {
+-	c.Request.Header.Set("X-Real-IP", " 10.10.10.10  ")
+-	c.Request.Header.Set("X-Forwarded-For", "  20.20.20.20, 30.30.30.30")
+-	c.Request.Header.Set("X-Appengine-Remote-Addr", "50.50.50.50")
+-	c.Request.RemoteAddr = "  40.40.40.40:42123 "
+-	c.engine.AppEngine = false
+ }
+ 
+ func TestContextContentType(t *testing.T) {
+@@ -2027,12 +1960,3 @@ func TestContextWithKeysMutex(t *testing.T) {
+ 	assert.Nil(t, value)
+ 	assert.False(t, err)
+ }
+-
+-func TestRemoteIPFail(t *testing.T) {
+-	c, _ := CreateTestContext(httptest.NewRecorder())
+-	c.Request, _ = http.NewRequest("POST", "/", nil)
+-	c.Request.RemoteAddr = "[:::]:80"
+-	ip, trust := c.RemoteIP()
+-	assert.Nil(t, ip)
+-	assert.False(t, trust)
+-}
+diff --git a/gin.go b/gin.go
+index 03a0e12..1e12617 100644
+--- a/gin.go
++++ b/gin.go
+@@ -11,7 +11,6 @@ import (
+ 	"net/http"
+ 	"os"
+ 	"path"
+-	"strings"
+ 	"sync"
+ 
+ 	"github.com/gin-gonic/gin/internal/bytesconv"
+@@ -82,26 +81,9 @@ type Engine struct {
+ 	// If no other Method is allowed, the request is delegated to the NotFound
+ 	// handler.
+ 	HandleMethodNotAllowed bool
++	ForwardedByClientIP    bool
+ 
+-	// If enabled, client IP will be parsed from the request's headers that
+-	// match those stored at `(*gin.Engine).RemoteIPHeaders`. If no IP was
+-	// fetched, it falls back to the IP obtained from
+-	// `(*gin.Context).Request.RemoteAddr`.
+-	ForwardedByClientIP bool
+-
+-	// List of headers used to obtain the client IP when
+-	// `(*gin.Engine).ForwardedByClientIP` is `true` and
+-	// `(*gin.Context).Request.RemoteAddr` is matched by at least one of the
+-	// network origins of `(*gin.Engine).TrustedProxies`.
+-	RemoteIPHeaders []string
+-
+-	// List of network origins (IPv4 addresses, IPv4 CIDRs, IPv6 addresses or
+-	// IPv6 CIDRs) from which to trust request's headers that contain
+-	// alternative client IP when `(*gin.Engine).ForwardedByClientIP` is
+-	// `true`.
+-	TrustedProxies []string
+-
+-	// #726 #755 If enabled, it will trust some headers starting with
++	// #726 #755 If enabled, it will thrust some headers starting with
+ 	// 'X-AppEngine...' for better integration with that PaaS.
+ 	AppEngine bool
+ 
+@@ -132,7 +114,6 @@ type Engine struct {
+ 	pool             sync.Pool
+ 	trees            methodTrees
+ 	maxParams        uint16
+-	trustedCIDRs     []*net.IPNet
+ }
+ 
+ var _ IRouter = &Engine{}
+@@ -158,8 +139,6 @@ func New() *Engine {
+ 		RedirectFixedPath:      false,
+ 		HandleMethodNotAllowed: false,
+ 		ForwardedByClientIP:    true,
+-		RemoteIPHeaders:        []string{"X-Forwarded-For", "X-Real-IP"},
+-		TrustedProxies:         []string{"0.0.0.0/0"},
+ 		AppEngine:              defaultAppEngine,
+ 		UseRawPath:             false,
+ 		RemoveExtraSlash:       false,
+@@ -326,60 +305,12 @@ func iterate(path, method string, routes RoutesInfo, root *node) RoutesInfo {
+ func (engine *Engine) Run(addr ...string) (err error) {
+ 	defer func() { debugPrintError(err) }()
+ 
+-	trustedCIDRs, err := engine.prepareTrustedCIDRs()
+-	if err != nil {
+-		return err
+-	}
+-	engine.trustedCIDRs = trustedCIDRs
+ 	address := resolveAddress(addr)
+ 	debugPrint("Listening and serving HTTP on %s\n", address)
+ 	err = http.ListenAndServe(address, engine)
+ 	return
+ }
+ 
+-func (engine *Engine) prepareTrustedCIDRs() ([]*net.IPNet, error) {
+-	if engine.TrustedProxies == nil {
+-		return nil, nil
+-	}
+-
+-	cidr := make([]*net.IPNet, 0, len(engine.TrustedProxies))
+-	for _, trustedProxy := range engine.TrustedProxies {
+-		if !strings.Contains(trustedProxy, "/") {
+-			ip := parseIP(trustedProxy)
+-			if ip == nil {
+-				return cidr, &net.ParseError{Type: "IP address", Text: trustedProxy}
+-			}
+-
+-			switch len(ip) {
+-			case net.IPv4len:
+-				trustedProxy += "/32"
+-			case net.IPv6len:
+-				trustedProxy += "/128"
+-			}
+-		}
+-		_, cidrNet, err := net.ParseCIDR(trustedProxy)
+-		if err != nil {
+-			return cidr, err
+-		}
+-		cidr = append(cidr, cidrNet)
+-	}
+-	return cidr, nil
+-}
+-
+-// parseIP parse a string representation of an IP and returns a net.IP with the
+-// minimum byte representation or nil if input is invalid.
+-func parseIP(ip string) net.IP {
+-	parsedIP := net.ParseIP(ip)
+-
+-	if ipv4 := parsedIP.To4(); ipv4 != nil {
+-		// return ip in a 4-byte representation
+-		return ipv4
+-	}
+-
+-	// return ip in a 16-byte representation or nil
+-	return parsedIP
+-}
+-
+ // RunTLS attaches the router to a http.Server and starts listening and serving HTTPS (secure) requests.
+ // It is a shortcut for http.ListenAndServeTLS(addr, certFile, keyFile, router)
+ // Note: this method will block the calling goroutine indefinitely unless an error happens.
+diff --git a/gin_integration_test.go b/gin_integration_test.go
+index fd97265..41ad987 100644
+--- a/gin_integration_test.go
++++ b/gin_integration_test.go
+@@ -55,13 +55,6 @@ func TestRunEmpty(t *testing.T) {
+ 	testRequest(t, "http://localhost:8080/example")
+ }
+ 
+-func TestTrustedCIDRsForRun(t *testing.T) {
+-	os.Setenv("PORT", "")
+-	router := New()
+-	router.TrustedProxies = []string{"hello/world"}
+-	assert.Error(t, router.Run(":8080"))
+-}
+-
+ func TestRunTLS(t *testing.T) {
+ 	router := New()
+ 	go func() {
+diff --git a/gin_test.go b/gin_test.go
+index 678d95f..11bdd79 100644
+--- a/gin_test.go
++++ b/gin_test.go
+@@ -9,7 +9,6 @@ import (
+ 	"fmt"
+ 	"html/template"
+ 	"io/ioutil"
+-	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"reflect"
+@@ -533,139 +532,6 @@ func TestEngineHandleContextManyReEntries(t *testing.T) {
+ 	assert.Equal(t, int64(expectValue), middlewareCounter)
+ }
+ 
+-func TestPrepareTrustedCIRDsWith(t *testing.T) {
+-	r := New()
+-
+-	// valid ipv4 cidr
+-	{
+-		expectedTrustedCIDRs := []*net.IPNet{parseCIDR("0.0.0.0/0")}
+-		r.TrustedProxies = []string{"0.0.0.0/0"}
+-
+-		trustedCIDRs, err := r.prepareTrustedCIDRs()
+-
+-		assert.NoError(t, err)
+-		assert.Equal(t, expectedTrustedCIDRs, trustedCIDRs)
+-	}
+-
+-	// invalid ipv4 cidr
+-	{
+-		r.TrustedProxies = []string{"192.168.1.33/33"}
+-
+-		_, err := r.prepareTrustedCIDRs()
+-
+-		assert.Error(t, err)
+-	}
+-
+-	// valid ipv4 address
+-	{
+-		expectedTrustedCIDRs := []*net.IPNet{parseCIDR("192.168.1.33/32")}
+-		r.TrustedProxies = []string{"192.168.1.33"}
+-
+-		trustedCIDRs, err := r.prepareTrustedCIDRs()
+-
+-		assert.NoError(t, err)
+-		assert.Equal(t, expectedTrustedCIDRs, trustedCIDRs)
+-	}
+-
+-	// invalid ipv4 address
+-	{
+-		r.TrustedProxies = []string{"192.168.1.256"}
+-
+-		_, err := r.prepareTrustedCIDRs()
+-
+-		assert.Error(t, err)
+-	}
+-
+-	// valid ipv6 address
+-	{
+-		expectedTrustedCIDRs := []*net.IPNet{parseCIDR("2002:0000:0000:1234:abcd:ffff:c0a8:0101/128")}
+-		r.TrustedProxies = []string{"2002:0000:0000:1234:abcd:ffff:c0a8:0101"}
+-
+-		trustedCIDRs, err := r.prepareTrustedCIDRs()
+-
+-		assert.NoError(t, err)
+-		assert.Equal(t, expectedTrustedCIDRs, trustedCIDRs)
+-	}
+-
+-	// invalid ipv6 address
+-	{
+-		r.TrustedProxies = []string{"gggg:0000:0000:1234:abcd:ffff:c0a8:0101"}
+-
+-		_, err := r.prepareTrustedCIDRs()
+-
+-		assert.Error(t, err)
+-	}
+-
+-	// valid ipv6 cidr
+-	{
+-		expectedTrustedCIDRs := []*net.IPNet{parseCIDR("::/0")}
+-		r.TrustedProxies = []string{"::/0"}
+-
+-		trustedCIDRs, err := r.prepareTrustedCIDRs()
+-
+-		assert.NoError(t, err)
+-		assert.Equal(t, expectedTrustedCIDRs, trustedCIDRs)
+-	}
+-
+-	// invalid ipv6 cidr
+-	{
+-		r.TrustedProxies = []string{"gggg:0000:0000:1234:abcd:ffff:c0a8:0101/129"}
+-
+-		_, err := r.prepareTrustedCIDRs()
+-
+-		assert.Error(t, err)
+-	}
+-
+-	// valid combination
+-	{
+-		expectedTrustedCIDRs := []*net.IPNet{
+-			parseCIDR("::/0"),
+-			parseCIDR("192.168.0.0/16"),
+-			parseCIDR("172.16.0.1/32"),
+-		}
+-		r.TrustedProxies = []string{
+-			"::/0",
+-			"192.168.0.0/16",
+-			"172.16.0.1",
+-		}
+-
+-		trustedCIDRs, err := r.prepareTrustedCIDRs()
+-
+-		assert.NoError(t, err)
+-		assert.Equal(t, expectedTrustedCIDRs, trustedCIDRs)
+-	}
+-
+-	// invalid combination
+-	{
+-		r.TrustedProxies = []string{
+-			"::/0",
+-			"192.168.0.0/16",
+-			"172.16.0.256",
+-		}
+-		_, err := r.prepareTrustedCIDRs()
+-
+-		assert.Error(t, err)
+-	}
+-
+-	// nil value
+-	{
+-		r.TrustedProxies = nil
+-		trustedCIDRs, err := r.prepareTrustedCIDRs()
+-
+-		assert.Nil(t, trustedCIDRs)
+-		assert.Nil(t, err)
+-	}
+-
+-}
+-
+-func parseCIDR(cidr string) *net.IPNet {
+-	_, parsedCIDR, err := net.ParseCIDR(cidr)
+-	if err != nil {
+-		fmt.Println(err)
+-	}
+-	return parsedCIDR
+-}
+-
+ func assertRoutePresent(t *testing.T, gotRoutes RoutesInfo, wantRoute RouteInfo) {
+ 	for _, gotRoute := range gotRoutes {
+ 		if gotRoute.Path == wantRoute.Path && gotRoute.Method == wantRoute.Method {

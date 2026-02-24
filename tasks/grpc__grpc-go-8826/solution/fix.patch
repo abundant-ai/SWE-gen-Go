@@ -1,0 +1,685 @@
+diff --git a/internal/transport/grpchttp2/errors.go b/internal/transport/grpchttp2/errors.go
+deleted file mode 100644
+index 34c48534..00000000
+--- a/internal/transport/grpchttp2/errors.go
++++ /dev/null
+@@ -1,73 +0,0 @@
+-/*
+- *
+- * Copyright 2024 gRPC authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- *
+- */
+-
+-package grpchttp2
+-
+-import "fmt"
+-
+-// ErrCode represents an HTTP/2 Error Code. Error codes are 32-bit fields
+-// that are used in [RST_STREAM] and [GOAWAY] frames to convey the reasons for
+-// the stream or connection error. See [HTTP/2 Error Code] for definitions of
+-// each of the following error codes.
+-//
+-// [HTTP/2 Error Code]: https://httpwg.org/specs/rfc7540.html#ErrorCodes
+-// [RST_STREAM]: https://httpwg.org/specs/rfc7540.html#RST_STREAM
+-// [GOAWAY]: https://httpwg.org/specs/rfc7540.html#GOAWAY
+-type ErrCode uint32
+-
+-// Error Codes defined by the HTTP/2 Spec.
+-const (
+-	ErrCodeNoError            ErrCode = 0x0
+-	ErrCodeProtocol           ErrCode = 0x1
+-	ErrCodeInternal           ErrCode = 0x2
+-	ErrCodeFlowControl        ErrCode = 0x3
+-	ErrCodeSettingsTimeout    ErrCode = 0x4
+-	ErrCodeStreamClosed       ErrCode = 0x5
+-	ErrCodeFrameSize          ErrCode = 0x6
+-	ErrCodeRefusedStream      ErrCode = 0x7
+-	ErrCodeCancel             ErrCode = 0x8
+-	ErrCodeCompression        ErrCode = 0x9
+-	ErrCodeConnect            ErrCode = 0xa
+-	ErrCodeEnhanceYourCalm    ErrCode = 0xb
+-	ErrCodeInadequateSecurity ErrCode = 0xc
+-	ErrCodeHTTP11Required     ErrCode = 0xd
+-)
+-
+-var errorCodeNames = map[ErrCode]string{
+-	ErrCodeNoError:            "NO_ERROR",
+-	ErrCodeProtocol:           "PROTOCOL_ERROR",
+-	ErrCodeInternal:           "INTERNAL_ERROR",
+-	ErrCodeFlowControl:        "FLOW_CONTROL_ERROR",
+-	ErrCodeSettingsTimeout:    "SETTINGS_TIMEOUT",
+-	ErrCodeStreamClosed:       "STREAM_CLOSED",
+-	ErrCodeFrameSize:          "FRAME_SIZE_ERROR",
+-	ErrCodeRefusedStream:      "REFUSED_STREAM",
+-	ErrCodeCancel:             "CANCEL",
+-	ErrCodeCompression:        "COMPRESSION_ERROR",
+-	ErrCodeConnect:            "CONNECT_ERROR",
+-	ErrCodeEnhanceYourCalm:    "ENHANCE_YOUR_CALM",
+-	ErrCodeInadequateSecurity: "INADEQUATE_SECURITY",
+-	ErrCodeHTTP11Required:     "HTTP_1_1_REQUIRED",
+-}
+-
+-func (err ErrCode) String() string {
+-	if v, ok := errorCodeNames[err]; ok {
+-		return v
+-	}
+-	return fmt.Sprintf("unknown error code %#x", uint32(err))
+-}
+diff --git a/internal/transport/grpchttp2/framer.go b/internal/transport/grpchttp2/framer.go
+deleted file mode 100644
+index 82953d67..00000000
+--- a/internal/transport/grpchttp2/framer.go
++++ /dev/null
+@@ -1,369 +0,0 @@
+-/*
+- *
+- * Copyright 2024 gRPC authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- *
+- */
+-
+-// Package grpchttp2 defines HTTP/2 types and a framer API and implementation.
+-package grpchttp2
+-
+-import "golang.org/x/net/http2/hpack"
+-
+-const initHeaderTableSize = 4096 // Default HTTP/2 header table size.
+-
+-// FrameType represents the type of an HTTP/2 Frame.
+-// See [Frame Type].
+-//
+-// [Frame Type]: https://httpwg.org/specs/rfc7540.html#FrameType
+-type FrameType uint8
+-
+-// Frame types defined in the HTTP/2 Spec.
+-const (
+-	FrameTypeData         FrameType = 0x0
+-	FrameTypeHeaders      FrameType = 0x1
+-	FrameTypeRSTStream    FrameType = 0x3
+-	FrameTypeSettings     FrameType = 0x4
+-	FrameTypePing         FrameType = 0x6
+-	FrameTypeGoAway       FrameType = 0x7
+-	FrameTypeWindowUpdate FrameType = 0x8
+-	FrameTypeContinuation FrameType = 0x9
+-)
+-
+-// Flag represents one or more flags set on an HTTP/2 Frame.
+-type Flag uint8
+-
+-// Flags defined in the HTTP/2 Spec.
+-const (
+-	FlagDataEndStream          Flag = 0x1
+-	FlagDataPadded             Flag = 0x8
+-	FlagHeadersEndStream       Flag = 0x1
+-	FlagHeadersEndHeaders      Flag = 0x4
+-	FlagHeadersPadded          Flag = 0x8
+-	FlagHeadersPriority        Flag = 0x20
+-	FlagSettingsAck            Flag = 0x1
+-	FlagPingAck                Flag = 0x1
+-	FlagContinuationEndHeaders Flag = 0x4
+-)
+-
+-// IsSet returns a boolean indicating whether the passed flag is set on this
+-// flag instance.
+-func (f Flag) IsSet(flag Flag) bool {
+-	return f&flag != 0
+-}
+-
+-// Setting represents the id and value pair of an HTTP/2 setting.
+-// See [Setting Format].
+-//
+-// [Setting Format]: https://httpwg.org/specs/rfc7540.html#SettingFormat
+-type Setting struct {
+-	ID    SettingID
+-	Value uint32
+-}
+-
+-// SettingID represents the id of an HTTP/2 setting.
+-// See [Setting Values].
+-//
+-// [Setting Values]: https://httpwg.org/specs/rfc7540.html#SettingValues
+-type SettingID uint16
+-
+-// Setting IDs defined in the HTTP/2 Spec.
+-const (
+-	SettingsHeaderTableSize      SettingID = 0x1
+-	SettingsEnablePush           SettingID = 0x2
+-	SettingsMaxConcurrentStreams SettingID = 0x3
+-	SettingsInitialWindowSize    SettingID = 0x4
+-	SettingsMaxFrameSize         SettingID = 0x5
+-	SettingsMaxHeaderListSize    SettingID = 0x6
+-)
+-
+-// FrameHeader is the 9 byte header of any HTTP/2 Frame.
+-// See [Frame Header].
+-//
+-// [Frame Header]: https://httpwg.org/specs/rfc7540.html#FrameHeader
+-type FrameHeader struct {
+-	// Size is the size of the frame's payload without the 9 header bytes.
+-	// As per the HTTP/2 spec, size can be up to 3 bytes, but only frames
+-	// up to 16KB can be processed without agreement.
+-	Size uint32
+-	// Type is a byte that represents the Frame Type.
+-	Type FrameType
+-	// Flags is a byte representing the flags set on this Frame.
+-	Flags Flag
+-	// StreamID is the ID for the stream which this frame is for. If the
+-	// frame is connection specific instead of stream specific, the
+-	// streamID is 0.
+-	StreamID uint32
+-}
+-
+-// Frame represents an HTTP/2 Frame. This interface struct is only to be used
+-// on the read path of the Framer. The writing path expects the data to be
+-// passed individually, not using this type.
+-//
+-// Each concrete Frame type defined below implements the Frame interface.
+-type Frame interface {
+-	// Header returns the HTTP/2 9 byte header from the current Frame.
+-	Header() *FrameHeader
+-	// Free frees the underlying buffer if present so it can be reused by the
+-	// framer.
+-	//
+-	// TODO: Remove method from the interface once the mem package gets merged.
+-	// Free will be called on each mem.Buffer individually.
+-	Free()
+-}
+-
+-// DataFrame is the representation of a [DATA frame]. DATA frames convey
+-// arbitrary, variable-length sequences of octets associated with a stream.
+-//
+-// [DATA frame]: https://httpwg.org/specs/rfc7540.html#DATA
+-type DataFrame struct {
+-	hdr  *FrameHeader
+-	free func()
+-	Data []byte
+-}
+-
+-// Header returns the 9 byte HTTP/2 header for this frame.
+-func (f *DataFrame) Header() *FrameHeader {
+-	return f.hdr
+-}
+-
+-// Free frees the buffer containing the data in this frame.
+-func (f *DataFrame) Free() {
+-	if f.free != nil {
+-		f.free()
+-	}
+-}
+-
+-// HeadersFrame is the representation of a [HEADERS Frame]. The HEADERS frame
+-// is used to open a stream, and additionally carries a header block fragment.
+-//
+-// [HEADERS Frame]: https://httpwg.org/specs/rfc7540.html#HEADERS
+-type HeadersFrame struct {
+-	hdr      *FrameHeader
+-	free     func()
+-	HdrBlock []byte
+-}
+-
+-// Header returns the 9 byte HTTP/2 header for this frame.
+-func (f *HeadersFrame) Header() *FrameHeader {
+-	return f.hdr
+-}
+-
+-// Free frees the buffer containing the header block in this frame.
+-func (f *HeadersFrame) Free() {
+-	if f.free != nil {
+-		f.free()
+-	}
+-}
+-
+-// RSTStreamFrame is the representation of a [RST_STREAM Frame]. There is no
+-// underlying byte array in this frame, so Free() is a no-op. The RST_STREAM
+-// frame allows for immediate termination of a stream
+-//
+-// [RST_STREAM Frame]: https://httpwg.org/specs/rfc7540.html#RST_STREAM
+-type RSTStreamFrame struct {
+-	hdr  *FrameHeader
+-	Code ErrCode
+-}
+-
+-// Header returns the 9 byte HTTP/2 header for this frame.
+-func (f *RSTStreamFrame) Header() *FrameHeader {
+-	return f.hdr
+-}
+-
+-// Free is a no-op for RSTStreamFrame.
+-func (f *RSTStreamFrame) Free() {}
+-
+-// SettingsFrame is the representation of a [SETTINGS Frame]. There is no
+-// underlying byte array in this frame, so Free() is a no-op.
+-//
+-// The SETTINGS frame conveys configuration parameters that affect how
+-// endpoints communicate, such as preferences and constraints on peer behavior.
+-//
+-// [SETTINGS Frame]: https://httpwg.org/specs/rfc7540.html#SETTINGS
+-type SettingsFrame struct {
+-	hdr      *FrameHeader
+-	Settings []Setting
+-}
+-
+-// Header returns the 9 byte HTTP/2 header for this frame.
+-func (f *SettingsFrame) Header() *FrameHeader {
+-	return f.hdr
+-}
+-
+-// Free is a no-op for SettingsFrame.
+-func (f *SettingsFrame) Free() {}
+-
+-// PingFrame is the representation of a [PING Frame]. The PING frame is a
+-// mechanism for measuring a minimal round-trip time from the sender, as well
+-// as determining whether an idle connection is still functional.
+-//
+-// [PING Frame]: https://httpwg.org/specs/rfc7540.html#PING
+-type PingFrame struct {
+-	hdr  *FrameHeader
+-	free func()
+-	Data []byte
+-}
+-
+-// Header returns the 9 byte HTTP/2 header for this frame.
+-func (f *PingFrame) Header() *FrameHeader {
+-	return f.hdr
+-}
+-
+-// Free frees the buffer containing the data in this frame.
+-func (f *PingFrame) Free() {
+-	if f.free != nil {
+-		f.free()
+-	}
+-}
+-
+-// GoAwayFrame is the representation of a [GOAWAY Frame]. The GOAWAY frame is
+-// used to initiate shutdown of a connection or to signal serious error
+-// conditions.
+-//
+-// [GOAWAY Frame]: https://httpwg.org/specs/rfc7540.html#GOAWAY
+-type GoAwayFrame struct {
+-	hdr          *FrameHeader
+-	free         func()
+-	LastStreamID uint32
+-	Code         ErrCode
+-	DebugData    []byte
+-}
+-
+-// Header returns the 9 byte HTTP/2 header for this frame.
+-func (f *GoAwayFrame) Header() *FrameHeader {
+-	return f.hdr
+-}
+-
+-// Free frees the buffer containing the debug data in this frame.
+-func (f *GoAwayFrame) Free() {
+-	if f.free != nil {
+-		f.free()
+-	}
+-}
+-
+-// WindowUpdateFrame is the representation of a [WINDOW_UPDATE Frame]. The
+-// WINDOW_UPDATE frame is used to implement flow control.
+-//
+-// [WINDOW_UPDATE Frame]: https://httpwg.org/specs/rfc7540.html#WINDOW_UPDATE
+-type WindowUpdateFrame struct {
+-	hdr *FrameHeader
+-	Inc uint32
+-}
+-
+-// Header returns the 9 byte HTTP/2 header for this frame.
+-func (f *WindowUpdateFrame) Header() *FrameHeader {
+-	return f.hdr
+-}
+-
+-// Free is a no-op for WindowUpdateFrame.
+-func (f *WindowUpdateFrame) Free() {}
+-
+-// ContinuationFrame is the representation of a [CONTINUATION Frame]. The
+-// CONTINUATION frame is used to continue a sequence of header block fragments.
+-//
+-// [CONTINUATION Frame]: https://httpwg.org/specs/rfc7540.html#CONTINUATION
+-type ContinuationFrame struct {
+-	hdr      *FrameHeader
+-	free     func()
+-	HdrBlock []byte
+-}
+-
+-// Header returns the 9 byte HTTP/2 header for this frame.
+-func (f *ContinuationFrame) Header() *FrameHeader {
+-	return f.hdr
+-}
+-
+-// Free frees the buffer containing the header block in this frame.
+-func (f *ContinuationFrame) Free() {
+-	if f.free != nil {
+-		f.free()
+-	}
+-}
+-
+-// MetaHeadersFrame is the representation of one HEADERS frame and zero or more
+-// contiguous CONTINUATION frames and the decoding of their HPACK-encoded
+-// contents.  This frame type is not transmitted over the network and is only
+-// generated by the ReadFrame() function.
+-//
+-// Since there is no underlying buffer in this Frame, Free() is a no-op.
+-type MetaHeadersFrame struct {
+-	hdr    *FrameHeader
+-	Fields []hpack.HeaderField
+-	// Truncated indicates whether the MetaHeadersFrame has been truncated due
+-	// to being longer than the MaxHeaderListSize.
+-	Truncated bool
+-}
+-
+-// Header returns the 9 byte HTTP/2 header for this frame.
+-func (f *MetaHeadersFrame) Header() *FrameHeader {
+-	return f.hdr
+-}
+-
+-// Free is a no-op for MetaHeadersFrame.
+-func (f *MetaHeadersFrame) Free() {}
+-
+-// UnknownFrame is a struct that is returned when the framer encounters an
+-// unsupported frame.
+-type UnknownFrame struct {
+-	hdr     *FrameHeader
+-	Payload []byte
+-	free    func()
+-}
+-
+-// Header returns the 9 byte HTTP/2 header for this frame.
+-func (f *UnknownFrame) Header() *FrameHeader {
+-	return f.hdr
+-}
+-
+-// Free frees the underlying data in the frame.
+-func (f *UnknownFrame) Free() {
+-	if f.free != nil {
+-		f.free()
+-	}
+-}
+-
+-// Framer encapsulates the functionality to read and write HTTP/2 frames.
+-type Framer interface {
+-	// ReadFrame returns grpchttp2.Frame. It is the caller's responsibility to
+-	// call Frame.Free() once it is done using it. Note that once the mem
+-	// package gets merged, this API will change in favor of Buffer.Free().
+-	ReadFrame() (Frame, error)
+-	// WriteData writes an HTTP/2 DATA frame to the stream.
+-	// TODO: Once the mem package gets merged, data will change type to
+-	// mem.BufferSlice.
+-	WriteData(streamID uint32, endStream bool, data ...[]byte) error
+-	// WriteData writes an HTTP/2 HEADERS frame to the stream.
+-	// TODO: Once the mem package gets merged, headerBlock will change type to
+-	// mem.Buffer.
+-	WriteHeaders(streamID uint32, endStream, endHeaders bool, headerBlocks []byte) error
+-	// WriteData writes an HTTP/2 RST_STREAM frame to the stream.
+-	WriteRSTStream(streamID uint32, code ErrCode) error
+-	// WriteSettings writes an HTTP/2 SETTINGS frame to the connection.
+-	WriteSettings(settings ...Setting) error
+-	// WriteSettingsAck writes an HTTP/2 SETTINGS frame with the ACK flag set.
+-	WriteSettingsAck() error
+-	// WritePing writes an HTTP/2 PING frame to the connection.
+-	WritePing(ack bool, data [8]byte) error
+-	// WriteGoAway writes an HTTP/2 GOAWAY frame to the connection.
+-	// TODO: Once the mem package gets merged, debugData will change type to
+-	// mem.Buffer.
+-	WriteGoAway(maxStreamID uint32, code ErrCode, debugData []byte) error
+-	// WriteWindowUpdate writes an HTTP/2 WINDOW_UPDATE frame to the stream.
+-	WriteWindowUpdate(streamID, inc uint32) error
+-	// WriteContinuation writes an HTTP/2 CONTINUATION frame to the stream.
+-	// TODO: Once the mem package gets merged, data will change type to
+-	// mem.Buffer.
+-	WriteContinuation(streamID uint32, endHeaders bool, headerBlock []byte) error
+-}
+diff --git a/internal/transport/grpchttp2/http2bridge.go b/internal/transport/grpchttp2/http2bridge.go
+deleted file mode 100644
+index 73b6eeab..00000000
+--- a/internal/transport/grpchttp2/http2bridge.go
++++ /dev/null
+@@ -1,225 +0,0 @@
+-/*
+- *
+- * Copyright 2024 gRPC authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- *
+- */
+-
+-package grpchttp2
+-
+-import (
+-	"io"
+-
+-	"golang.org/x/net/http2"
+-	"golang.org/x/net/http2/hpack"
+-	"google.golang.org/grpc/mem"
+-)
+-
+-// FramerBridge adapts the net/x/http2 Framer to satisfy the grpchttp2.Framer
+-// interface.
+-//
+-// Note: This allows temporary use of the older framer and will be removed in
+-// a future release after the new framer stabilizes.
+-type FramerBridge struct {
+-	framer *http2.Framer  // the underlying http2.Framer implementation to perform reads and writes.
+-	pool   mem.BufferPool // a pool to reuse buffers when reading.
+-}
+-
+-// NewFramerBridge creates an adaptor that wraps a http2.Framer in a
+-// grpchttp2.Framer.
+-//
+-// Internally, it creates a http2.Framer that uses the provided io.Reader and
+-// io.Writer, and is configured with a maximum header list size of
+-// maxHeaderListSize.
+-//
+-// Frames returned by a call to the underlying http2.Framer's ReadFrame() method
+-// need to be consumed before the next call to it. To overcome this restriction,
+-// the data in a Frame returned by the http2.Framer's ReadFrame is copied into a
+-// buffer from the given pool. If no pool is provided, a default pool provided
+-// by the mem package is used.
+-func NewFramerBridge(w io.Writer, r io.Reader, maxHeaderListSize uint32, pool mem.BufferPool) *FramerBridge {
+-	fr := http2.NewFramer(w, r)
+-	fr.SetReuseFrames()
+-	fr.MaxHeaderListSize = maxHeaderListSize
+-	fr.ReadMetaHeaders = hpack.NewDecoder(initHeaderTableSize, nil)
+-
+-	if pool == nil {
+-		pool = mem.DefaultBufferPool()
+-	}
+-
+-	return &FramerBridge{
+-		framer: fr,
+-		pool:   pool,
+-	}
+-}
+-
+-// ReadFrame reads a frame from the underlying http2.Framer and returns a
+-// Frame defined in the grpchttp2 package. This operation copies the data to a
+-// buffer from the pool, making it safe to use even after another call to
+-// ReadFrame.
+-func (fr *FramerBridge) ReadFrame() (Frame, error) {
+-	f, err := fr.framer.ReadFrame()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	h := f.Header()
+-	hdr := &FrameHeader{
+-		Size:     h.Length,
+-		Type:     FrameType(h.Type),
+-		Flags:    Flag(h.Flags),
+-		StreamID: h.StreamID,
+-	}
+-
+-	switch f := f.(type) {
+-	case *http2.DataFrame:
+-		buf := fr.pool.Get(int(hdr.Size))
+-		copy(*buf, f.Data())
+-		return &DataFrame{
+-			hdr:  hdr,
+-			Data: *buf,
+-			free: func() { fr.pool.Put(buf) },
+-		}, nil
+-	case *http2.RSTStreamFrame:
+-		return &RSTStreamFrame{
+-			hdr:  hdr,
+-			Code: ErrCode(f.ErrCode),
+-		}, nil
+-	case *http2.SettingsFrame:
+-		buf := make([]Setting, 0, f.NumSettings())
+-		f.ForeachSetting(func(s http2.Setting) error {
+-			buf = append(buf, Setting{
+-				ID:    SettingID(s.ID),
+-				Value: s.Val,
+-			})
+-			return nil
+-		})
+-		return &SettingsFrame{
+-			hdr:      hdr,
+-			Settings: buf,
+-		}, nil
+-	case *http2.PingFrame:
+-		buf := fr.pool.Get(int(hdr.Size))
+-		copy(*buf, f.Data[:])
+-		return &PingFrame{
+-			hdr:  hdr,
+-			Data: *buf,
+-			free: func() { fr.pool.Put(buf) },
+-		}, nil
+-	case *http2.GoAwayFrame:
+-		// Size of the frame minus the code and lastStreamID
+-		buf := fr.pool.Get(int(hdr.Size) - 8)
+-		copy(*buf, f.DebugData())
+-		return &GoAwayFrame{
+-			hdr:          hdr,
+-			LastStreamID: f.LastStreamID,
+-			Code:         ErrCode(f.ErrCode),
+-			DebugData:    *buf,
+-			free:         func() { fr.pool.Put(buf) },
+-		}, nil
+-	case *http2.WindowUpdateFrame:
+-		return &WindowUpdateFrame{
+-			hdr: hdr,
+-			Inc: f.Increment,
+-		}, nil
+-	case *http2.MetaHeadersFrame:
+-		return &MetaHeadersFrame{
+-			hdr:    hdr,
+-			Fields: f.Fields,
+-		}, nil
+-	default:
+-		buf := fr.pool.Get(int(hdr.Size))
+-		uf := f.(*http2.UnknownFrame)
+-		copy(*buf, uf.Payload())
+-		return &UnknownFrame{
+-			hdr:     hdr,
+-			Payload: *buf,
+-			free:    func() { fr.pool.Put(buf) },
+-		}, nil
+-	}
+-}
+-
+-// WriteData writes a DATA Frame into the underlying writer.
+-func (fr *FramerBridge) WriteData(streamID uint32, endStream bool, data ...[]byte) error {
+-	if len(data) == 1 {
+-		return fr.framer.WriteData(streamID, endStream, data[0])
+-	}
+-
+-	tl := 0
+-	for _, s := range data {
+-		tl += len(s)
+-	}
+-
+-	buf := fr.pool.Get(tl)
+-	*buf = (*buf)[:0]
+-	defer fr.pool.Put(buf)
+-	for _, s := range data {
+-		*buf = append(*buf, s...)
+-	}
+-
+-	return fr.framer.WriteData(streamID, endStream, *buf)
+-}
+-
+-// WriteHeaders writes a Headers Frame into the underlying writer.
+-func (fr *FramerBridge) WriteHeaders(streamID uint32, endStream, endHeaders bool, headerBlock []byte) error {
+-	return fr.framer.WriteHeaders(http2.HeadersFrameParam{
+-		StreamID:      streamID,
+-		EndStream:     endStream,
+-		EndHeaders:    endHeaders,
+-		BlockFragment: headerBlock,
+-	})
+-}
+-
+-// WriteRSTStream writes a RSTStream Frame into the underlying writer.
+-func (fr *FramerBridge) WriteRSTStream(streamID uint32, code ErrCode) error {
+-	return fr.framer.WriteRSTStream(streamID, http2.ErrCode(code))
+-}
+-
+-// WriteSettings writes a Settings Frame into the underlying writer.
+-func (fr *FramerBridge) WriteSettings(settings ...Setting) error {
+-	ss := make([]http2.Setting, 0, len(settings))
+-	for _, s := range settings {
+-		ss = append(ss, http2.Setting{
+-			ID:  http2.SettingID(s.ID),
+-			Val: s.Value,
+-		})
+-	}
+-
+-	return fr.framer.WriteSettings(ss...)
+-}
+-
+-// WriteSettingsAck writes a Settings Frame with the Ack flag set.
+-func (fr *FramerBridge) WriteSettingsAck() error {
+-	return fr.framer.WriteSettingsAck()
+-}
+-
+-// WritePing writes a Ping frame to the underlying writer.
+-func (fr *FramerBridge) WritePing(ack bool, data [8]byte) error {
+-	return fr.framer.WritePing(ack, data)
+-}
+-
+-// WriteGoAway writes a GoAway Frame to the underlying writer.
+-func (fr *FramerBridge) WriteGoAway(maxStreamID uint32, code ErrCode, debugData []byte) error {
+-	return fr.framer.WriteGoAway(maxStreamID, http2.ErrCode(code), debugData)
+-}
+-
+-// WriteWindowUpdate writes a WindowUpdate Frame into the underlying writer.
+-func (fr *FramerBridge) WriteWindowUpdate(streamID, inc uint32) error {
+-	return fr.framer.WriteWindowUpdate(streamID, inc)
+-}
+-
+-// WriteContinuation writes a Continuation Frame into the underlying writer.
+-func (fr *FramerBridge) WriteContinuation(streamID uint32, endHeaders bool, headerBlock []byte) error {
+-	return fr.framer.WriteContinuation(streamID, endHeaders, headerBlock)
+-}

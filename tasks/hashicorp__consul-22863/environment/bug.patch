@@ -1,0 +1,514 @@
+diff --git a/agent/config/builder.go b/agent/config/builder.go
+index 63b73e9d64..1d8643c4bb 100644
+--- a/agent/config/builder.go
++++ b/agent/config/builder.go
+@@ -1020,7 +1020,6 @@ func (b *builder) build() (rt RuntimeConfig, err error) {
+ 		EnableAgentTLSForChecks:    boolVal(c.EnableAgentTLSForChecks),
+ 		EnableCentralServiceConfig: boolVal(c.EnableCentralServiceConfig),
+ 		EnableDebug:                boolVal(c.EnableDebug),
+-		DisableKVKeyValidation:     boolVal(c.DisableKVKeyValidation),
+ 		EnableRemoteScriptChecks:   enableRemoteScriptChecks,
+ 		EnableLocalScriptChecks:    enableLocalScriptChecks,
+ 		EncryptKey:                 stringVal(c.EncryptKey),
+diff --git a/agent/config/config.go b/agent/config/config.go
+index b46c01450c..d2443d9902 100644
+--- a/agent/config/config.go
++++ b/agent/config/config.go
+@@ -181,7 +181,6 @@ type Config struct {
+ 	EnableDebug                      *bool               `mapstructure:"enable_debug" json:"enable_debug,omitempty"`
+ 	EnableScriptChecks               *bool               `mapstructure:"enable_script_checks" json:"enable_script_checks,omitempty"`
+ 	EnableLocalScriptChecks          *bool               `mapstructure:"enable_local_script_checks" json:"enable_local_script_checks,omitempty"`
+-	DisableKVKeyValidation           *bool               `mapstructure:"disable_kv_key_validation" json:"disable_kv_key_validation,omitempty"`
+ 	EnableSyslog                     *bool               `mapstructure:"enable_syslog" json:"enable_syslog,omitempty"`
+ 	EncryptKey                       *string             `mapstructure:"encrypt" json:"encrypt,omitempty"`
+ 	EncryptVerifyIncoming            *bool               `mapstructure:"encrypt_verify_incoming" json:"encrypt_verify_incoming,omitempty"`
+diff --git a/agent/config/runtime.go b/agent/config/runtime.go
+index fb5728af34..5b8ea76dc0 100644
+--- a/agent/config/runtime.go
++++ b/agent/config/runtime.go
+@@ -670,14 +670,6 @@ type RuntimeConfig struct {
+ 	// flag: -enable-script-checks, -enable-local-script-checks
+ 	EnableLocalScriptChecks bool
+ 
+-	// DisableKVKeyValidation controls whether KV key validation is disabled.
+-	// When set to true, it disables validation that prevents path traversal and other
+-	// security issues in KV key names. This can introduce security risks if not used carefully.
+-	// We recommend keeping validation enabled (false) unless you have a specific reason to disable it.
+-	//
+-	// hcl: disable_kv_key_validation = (true|false)
+-	DisableKVKeyValidation bool
+-
+ 	// EnableRemoeScriptChecks controls whether health checks declared from the http API
+ 	// which execute scripts are enabled. This includes regular script checks and Docker
+ 	// checks.
+diff --git a/agent/config/runtime_test.go b/agent/config/runtime_test.go
+index c1bad574a1..5d1028adc0 100644
+--- a/agent/config/runtime_test.go
++++ b/agent/config/runtime_test.go
+@@ -6720,7 +6720,6 @@ func TestLoad_FullConfig(t *testing.T) {
+ 		EnableAgentTLSForChecks:          true,
+ 		EnableCentralServiceConfig:       false,
+ 		EnableDebug:                      true,
+-		DisableKVKeyValidation:           false,
+ 		EnableRemoteScriptChecks:         true,
+ 		EnableLocalScriptChecks:          true,
+ 		EncryptKey:                       "A4wELWqH",
+diff --git a/agent/config/testdata/TestRuntimeConfig_Sanitize.golden b/agent/config/testdata/TestRuntimeConfig_Sanitize.golden
+index 04006cf36b..fc2ac6d7f7 100644
+--- a/agent/config/testdata/TestRuntimeConfig_Sanitize.golden
++++ b/agent/config/testdata/TestRuntimeConfig_Sanitize.golden
+@@ -202,7 +202,6 @@
+     "EnableCentralServiceConfig": false,
+     "EnableDebug": false,
+     "EnableLocalScriptChecks": false,
+-    "DisableKVKeyValidation": false,
+     "EnableRemoteScriptChecks": false,
+     "EncryptKey": "hidden",
+     "EnterpriseRuntimeConfig": {},
+diff --git a/agent/config/testdata/full-config.hcl b/agent/config/testdata/full-config.hcl
+index 53c072191f..6b0c908d81 100644
+--- a/agent/config/testdata/full-config.hcl
++++ b/agent/config/testdata/full-config.hcl
+@@ -281,7 +281,6 @@ enable_central_service_config = false
+ enable_debug = true
+ enable_script_checks = true
+ enable_local_script_checks = true
+-disable_kv_key_validation = false
+ enable_syslog = true
+ encrypt = "A4wELWqH"
+ encrypt_verify_incoming = true
+diff --git a/agent/config/testdata/full-config.json b/agent/config/testdata/full-config.json
+index 90f6fb1647..48d845a824 100644
+--- a/agent/config/testdata/full-config.json
++++ b/agent/config/testdata/full-config.json
+@@ -323,7 +323,6 @@
+   "enable_debug": true,
+   "enable_script_checks": true,
+   "enable_local_script_checks": true,
+-  "disable_kv_key_validation": false,
+   "enable_syslog": true,
+   "encrypt": "A4wELWqH",
+   "encrypt_verify_incoming": true,
+diff --git a/agent/kvs_endpoint.go b/agent/kvs_endpoint.go
+index 616d0e7cd4..69ddeadc28 100644
+--- a/agent/kvs_endpoint.go
++++ b/agent/kvs_endpoint.go
+@@ -8,8 +8,8 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+-	"net/url"
+ 	"path"
++	"regexp"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -40,19 +40,15 @@ func (s *HTTPHandlers) KVSEndpoint(resp http.ResponseWriter, req *http.Request)
+ 	}
+ 	args.Key = cleanedKey
+ 
+-	// The DisableKVKeyValidation configuration option controls whether
+-	// we validate the key name to prevent path traversal or leading/trailing spaces.
+-	// We strongly recommend leaving this validation enabled (false) unless you have a specific reason
+-	// to disable it for legacy compatibility.
+-	if args.Key != "" {
+-		if err := validateKVKey(args.Key); err != nil {
+-			if s.agent.config.DisableKVKeyValidation {
+-				// When validation is disabled, log a warning
+-				s.agent.logger.Warn("KV key validation is disabled but key would fail validation",
+-					"key", args.Key, "validation_error", err.Error())
+-			} else {
+-				return nil, err
+-			}
++	// Validate key format unless unprintable character filter is disabled
++	// The DisableHTTPUnprintableCharFilter flag allows access to keys with
++	// unprintable characters for cleanup purposes
++	if !s.agent.config.DisableHTTPUnprintableCharFilter && args.Key != "" {
++		// Allowed key pattern: a-zA-Z0-9 ,-_./
++		// https://developer.hashicorp.com/consul/docs/automate/kv#using-consul-kv
++		kvKeyPattern := `^[a-zA-Z0-9,_./\-?&=+*%ç]+$`
++		if err := validateKVKey(args.Key, kvKeyPattern); err != nil {
++			return nil, fmt.Errorf("invalid key name, keys should respect the %q format", kvKeyPattern)
+ 		}
+ 	}
+ 
+@@ -334,31 +330,20 @@ func conflictingFlags(resp http.ResponseWriter, req *http.Request, flags ...stri
+ 	return false
+ }
+ 
+-func validateKVKey(key string) error {
++func validateKVKey(key string, pattern string) error {
+ 	if len(key) == 0 {
+-		return fmt.Errorf("empty key name is not allowed")
++		return fmt.Errorf("invalid key name, keys should respect the %q format", pattern)
+ 	}
+ 
+-	if strings.HasPrefix(key, " ") || strings.HasSuffix(key, " ") {
+-		return fmt.Errorf("invalid key name, leading/trailing spaces are not allowed")
++	matched, err := regexp.MatchString(pattern, key)
++	if err != nil {
++		return fmt.Errorf("failed to validate key: %w", err)
+ 	}
+-
+-	parts := strings.Split(key, "/")
+-	for _, p := range parts {
+-		if p == ".." {
+-			return fmt.Errorf("invalid key name, path traversal is not allowed")
+-		}
++	if !matched {
++		return fmt.Errorf("invalid key name, keys should respect the %q format", pattern)
+ 	}
+-
+-	decoded, err := url.PathUnescape(key)
+-	if err == nil && decoded != key {
+-		if strings.Contains(decoded, "..") {
+-			return fmt.Errorf("invalid key name, path traversal is not allowed")
+-		}
+-		if strings.Contains(decoded, " ") {
+-			return fmt.Errorf("invalid key name, leading/trailing spaces are not allowed")
+-		}
++	if strings.Contains(key, "..") {
++		return fmt.Errorf("invalid key name, path traversal is not allowed")
+ 	}
+-
+ 	return nil
+ }
+diff --git a/agent/kvs_endpoint_test.go b/agent/kvs_endpoint_test.go
+index 9f290b89f0..e4d788de62 100644
+--- a/agent/kvs_endpoint_test.go
++++ b/agent/kvs_endpoint_test.go
+@@ -15,7 +15,6 @@ import (
+ 
+ 	"github.com/hashicorp/consul/agent/structs"
+ 	"github.com/hashicorp/consul/testrpc"
+-	"github.com/hashicorp/go-hclog"
+ )
+ 
+ func TestKVSEndpoint_PUT_GET_DELETE(t *testing.T) {
+@@ -579,6 +578,7 @@ func TestKVSEndpoint_DELETE_ConflictingFlags(t *testing.T) {
+ }
+ 
+ func TestValidateKVKey(t *testing.T) {
++	pattern := `^[a-zA-Z0-9,_./\-?&=+*%ç]+$`
+ 	tests := []struct {
+ 		name    string
+ 		key     string
+@@ -600,29 +600,19 @@ func TestValidateKVKey(t *testing.T) {
+ 		{"valid key with asterisk", "foo*bar", false},
+ 		{"valid key with percent", "foo%bar", false},
+ 		{"valid key with C-cedilla", "fooçbar", false},
+-		{"valid key with space", "foo bar", false},
+-		{"valid key with colon", "foo:bar", false},
+-		{"valid key with semicolon", "foo;bar", false},
+-		{"valid key with dots in middle", "con..fig", false},
+-		{"valid URL encoded key", "foo/bar/baz%2Fqux", false},
+-		{"valid URL encoded key 2", "foo/bar%2Fbaz%2Fqux", false},
+-		{"valid key with leading slash", "/foo/bar", false},
+-		{"valid key with + in name", "foo+bar/baz", false},
+-		// Invalid
+ 		{"empty key", "", true},
+-		{"trailing space", "foo ", true},
++		// Invalid
++		{"invalid key with space", "foo bar", true},
++		{"invalid key with colon", "foo:bar", true},
++		{"invalid key with semicolon", "foo;bar", true},
+ 		{"malicious key with path traversal", "../../etc/passwd", true},
+-		{"malicious key with path traversal from current directory", "./../../etc/passwd", true},
+ 		{"malicious key with path traversal with URL encoded /", "..%2F..%2Fetc%2Fpasswd", true},
+-		{"URL encoded path traversal", "..%2Fetc%2Fpasswd", true},
+-		{"URL encoded double dot", "%2E%2E/config", true},
+-		{"mixed encoded path traversal", "../%2E%2E/secret", true},
+-		{"encoded slash with dots", "..%2F..%2Fconfig", true},
++		{"malicious key with unicode control", "foo\u202Etxt", true},
+ 	}
+ 
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			err := validateKVKey(tt.key)
++			err := validateKVKey(tt.key, pattern)
+ 			if (err != nil) != tt.wantErr {
+ 				t.Errorf("validateKVKey(%q) error = %v, wantErr %v", tt.key, err, tt.wantErr)
+ 			}
+@@ -860,269 +850,6 @@ func TestKVSEndpoint_KeyConstruction_TrailingSlashes(t *testing.T) {
+ 	}
+ }
+ 
+-func TestKVSEndpoint_DisableValidation(t *testing.T) {
+-	if testing.Short() {
+-		t.Skip("too slow for testing.Short")
+-	}
+-
+-	t.Parallel()
+-
+-	// Test with disable_kv_key_validation set to true
+-	// Should allow normally invalid keys
+-	a := NewTestAgent(t, `disable_kv_key_validation = true`)
+-	defer a.Shutdown()
+-
+-	// Wait for leader
+-	testrpc.WaitForLeader(t, a.RPC, "dc1")
+-
+-	// Test keys that would normally be rejected by validation but should be allowed now
+-	// because validation is disabled
+-	testCases := []struct {
+-		name        string
+-		key         string
+-		description string
+-	}{
+-		{
+-			name:        "path traversal",
+-			key:         "../../etc/passwd",
+-			description: "Path traversal should be allowed when validation is disabled",
+-		},
+-		{
+-			name:        "url encoded path traversal",
+-			key:         "..%2F..%2Fetc%2Fpasswd",
+-			description: "URL encoded path traversal should be allowed when validation is disabled",
+-		},
+-		{
+-			name:        "trailing space",
+-			key:         "foo ",
+-			description: "Trailing space should be allowed when validation is disabled",
+-		},
+-		{
+-			name:        "leading space",
+-			key:         " foo",
+-			description: "Leading space should be allowed when validation is disabled",
+-		},
+-		{
+-			name:        "url encoded double dot",
+-			key:         "%2E%2E/config",
+-			description: "URL encoded double dot should be allowed when validation is disabled",
+-		},
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.name, func(t *testing.T) {
+-			// Try to PUT the key - should succeed with validation disabled
+-			buf := bytes.NewBuffer([]byte("test-value"))
+-			req, _ := http.NewRequest("PUT", "/v1/kv/"+tc.key, buf)
+-			resp := httptest.NewRecorder()
+-			obj, err := a.srv.KVSEndpoint(resp, req)
+-
+-			if err != nil {
+-				t.Errorf("Expected success with validation disabled, but got error: %v (%s)", err, tc.description)
+-				return
+-			}
+-
+-			if obj == nil {
+-				t.Errorf("Expected non-nil response with validation disabled (%s)", tc.description)
+-				return
+-			}
+-
+-			result, ok := obj.(bool)
+-			if !ok || !result {
+-				t.Errorf("Expected successful PUT response with validation disabled (%s)", tc.description)
+-				return
+-			}
+-
+-			// Verify we can retrieve the key
+-			getReq, _ := http.NewRequest("GET", "/v1/kv/"+tc.key, nil)
+-			getResp := httptest.NewRecorder()
+-			getObj, getErr := a.srv.KVSEndpoint(getResp, getReq)
+-
+-			if getErr != nil {
+-				t.Errorf("Failed to retrieve key %q with validation disabled: %v (%s)", tc.key, getErr, tc.description)
+-				return
+-			}
+-
+-			if getObj == nil {
+-				t.Errorf("Key %q was not found with validation disabled (%s)", tc.key, tc.description)
+-				return
+-			}
+-
+-			entries, ok := getObj.(structs.DirEntries)
+-			if !ok || len(entries) == 0 {
+-				t.Errorf("Unexpected response format for key %q with validation disabled (%s)", tc.key, tc.description)
+-				return
+-			}
+-
+-			if string(entries[0].Value) != "test-value" {
+-				t.Errorf("Expected value 'test-value' for key %q, got %q (%s)", tc.key, string(entries[0].Value), tc.description)
+-			}
+-		})
+-	}
+-}
+-
+-func TestKVSEndpoint_EnabledValidation(t *testing.T) {
+-	if testing.Short() {
+-		t.Skip("too slow for testing.Short")
+-	}
+-
+-	t.Parallel()
+-
+-	// Test with disable_kv_key_validation set to false (default)
+-	// Should reject invalid keys
+-	a := NewTestAgent(t, `disable_kv_key_validation = false`)
+-	defer a.Shutdown()
+-
+-	// Wait for leader
+-	testrpc.WaitForLeader(t, a.RPC, "dc1")
+-
+-	// Test keys that should be rejected by validation
+-	testCases := []struct {
+-		name        string
+-		key         string
+-		description string
+-	}{
+-		{
+-			name:        "path traversal",
+-			key:         "../../etc/passwd",
+-			description: "Path traversal should be rejected when validation is enabled",
+-		},
+-		{
+-			name:        "url encoded path traversal",
+-			key:         "..%2F..%2Fetc%2Fpasswd",
+-			description: "URL encoded path traversal should be rejected when validation is enabled",
+-		},
+-		{
+-			name:        "trailing space",
+-			key:         "foo ",
+-			description: "Trailing space should be rejected when validation is enabled",
+-		},
+-		{
+-			name:        "leading space",
+-			key:         " foo",
+-			description: "Leading space should be rejected when validation is enabled",
+-		},
+-		{
+-			name:        "url encoded double dot",
+-			key:         "%2E%2E/config",
+-			description: "URL encoded double dot should be rejected when validation is enabled",
+-		},
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.name, func(t *testing.T) {
+-			// Try to PUT the key - should fail with validation enabled
+-			buf := bytes.NewBuffer([]byte("test-value"))
+-			req, _ := http.NewRequest("PUT", "/v1/kv/"+tc.key, buf)
+-			resp := httptest.NewRecorder()
+-			_, err := a.srv.KVSEndpoint(resp, req)
+-
+-			if err == nil {
+-				t.Errorf("Expected error with validation enabled, but got success (%s)", tc.description)
+-				return
+-			}
+-
+-			if !strings.Contains(err.Error(), "invalid key name") {
+-				t.Errorf("Expected 'invalid key name' error, but got: %v (%s)", err, tc.description)
+-			}
+-		})
+-	}
+-}
+-
+-func TestKVSEndpoint_DisableValidation_LogsWarning(t *testing.T) {
+-	if testing.Short() {
+-		t.Skip("too slow for testing.Short")
+-	}
+-
+-	t.Parallel()
+-
+-	var logBuffer bytes.Buffer
+-
+-	// Test with disable_kv_key_validation set to true
+-	a := NewTestAgent(t, `disable_kv_key_validation = true`)
+-	defer a.Shutdown()
+-
+-	a.logger = hclog.NewInterceptLogger(&hclog.LoggerOptions{
+-		Name:       "consul.agent",
+-		Level:      hclog.Warn,
+-		Output:     &logBuffer,
+-		TimeFormat: "15:04:05.000",
+-	})
+-
+-	testrpc.WaitForLeader(t, a.RPC, "dc1")
+-
+-	// Test keys that would fail validation but should now only generate warnings
+-	testCases := []struct {
+-		name              string
+-		key               string
+-		expectedLogSubstr string
+-		description       string
+-	}{
+-		{
+-			name:              "path traversal",
+-			key:               "../../etc/passwd",
+-			expectedLogSubstr: "path traversal is not allowed",
+-			description:       "Path traversal should log warning when validation is disabled",
+-		},
+-		{
+-			name:              "trailing space",
+-			key:               "foo ",
+-			expectedLogSubstr: "leading/trailing spaces are not allowed",
+-			description:       "Trailing space should log warning when validation is disabled",
+-		},
+-		{
+-			name:              "leading space",
+-			key:               " foo",
+-			expectedLogSubstr: "leading/trailing spaces are not allowed",
+-			description:       "Leading space should log warning when validation is disabled",
+-		},
+-		{
+-			name:              "url encoded double dot",
+-			key:               "%2E%2E/config",
+-			expectedLogSubstr: "path traversal is not allowed",
+-			description:       "URL encoded double dot should log warning when validation is disabled",
+-		},
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.name, func(t *testing.T) {
+-			// Clear the log buffer before each test
+-			logBuffer.Reset()
+-
+-			buf := bytes.NewBuffer([]byte("test-value"))
+-			req, _ := http.NewRequest("PUT", "/v1/kv/"+tc.key, buf)
+-			resp := httptest.NewRecorder()
+-			obj, err := a.srv.KVSEndpoint(resp, req)
+-
+-			if err != nil {
+-				t.Errorf("Expected success with validation disabled, but got error: %v (%s)", err, tc.description)
+-				return
+-			}
+-
+-			if obj == nil {
+-				t.Errorf("Expected non-nil response with validation disabled (%s)", tc.description)
+-				return
+-			}
+-
+-			result, ok := obj.(bool)
+-			if !ok || !result {
+-				t.Errorf("Expected successful PUT response with validation disabled (%s)", tc.description)
+-				return
+-			}
+-
+-			// Check that the warning was logged
+-			logOutput := logBuffer.String()
+-			if !strings.Contains(logOutput, "KV key validation is disabled but key would fail validation") {
+-				t.Errorf("Expected warning log message not found in log output: %s (%s)", logOutput, tc.description)
+-			}
+-			if !strings.Contains(logOutput, tc.expectedLogSubstr) {
+-				t.Errorf("Expected validation error message '%s' not found in log output: %s (%s)",
+-					tc.expectedLogSubstr, logOutput, tc.description)
+-			}
+-		})
+-	}
+-}
+-
+ func TestKVSEndpoint_PathCleaningEdgeCases(t *testing.T) {
+ 	if testing.Short() {
+ 		t.Skip("too slow for testing.Short")
+diff --git a/website/content/docs/reference/agent/configuration-file/general.mdx b/website/content/docs/reference/agent/configuration-file/general.mdx
+index 250fb0aa54..77c2559d5d 100644
+--- a/website/content/docs/reference/agent/configuration-file/general.mdx
++++ b/website/content/docs/reference/agent/configuration-file/general.mdx
+@@ -151,8 +151,6 @@ The page provides reference information for general parameters in a Consul agent
+ 
+ - `enable_debug` (boolean, default is `false`): When set to `true`, enables Consul to report additional debugging information, including runtime profiling (`pprof`) data. This setting is only required for clusters without ACL [enabled](/consul/docs/reference/agent/configuration-file/acl#acl_enabled). If you change this setting, you must restart the agent for the change to take effect.
+ 
+-- `disable_kv_key_validation` (boolean, default is `false`): When set to `true`, it disables KV key validation that prevents path traversal attacks and other security issues. We strongly recommend keeping validation enabled (false) for security reasons unless you have a specific legacy compatibility requirement.
+-
+ - `enable_script_checks` ((#\_enable_script_checks)) This parameter controls whether
+   [health checks that execute scripts](/consul/docs/register/health-check/vm) are enabled on this
+   agent, and defaults to `false` so operators must opt-in to allowing these.

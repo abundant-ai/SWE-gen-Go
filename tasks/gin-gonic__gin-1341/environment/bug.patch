@@ -1,0 +1,432 @@
+diff --git a/README.md b/README.md
+index 70a5a13..cff9bc8 100644
+--- a/README.md
++++ b/README.md
+@@ -52,7 +52,6 @@ Gin is a web framework written in Go (Golang). It features a martini-like API wi
+     - [Graceful restart or stop](#graceful-restart-or-stop)
+     - [Build a single binary with templates](#build-a-single-binary-with-templates)
+     - [Bind form-data request with custom struct](#bind-form-data-request-with-custom-struct)
+-    - [Try to bind body into different structs](#try-to-bind-body-into-different-structs)
+ - [Testing](#testing)
+ - [Users](#users--)
+ 
+@@ -1555,64 +1554,6 @@ type StructZ struct {
+ 
+ In a word, only support nested custom struct which have no `form` now.
+ 
+-### Try to bind body into different structs
+-
+-The normal methods for binding request body consumes `c.Request.Body` and they
+-cannot be called multiple times.
+-
+-```go
+-type formA struct {
+-  Foo string `json:"foo" xml:"foo" binding:"required"`
+-}
+-
+-type formB struct {
+-  Bar string `json:"bar" xml:"bar" binding:"required"`
+-}
+-
+-func SomeHandler(c *gin.Context) {
+-  objA := formA{}
+-  objB := formB{}
+-  // This c.ShouldBind consumes c.Request.Body and it cannot be reused.
+-  if errA := c.ShouldBind(&objA); errA == nil {
+-    c.String(http.StatusOK, `the body should be formA`)
+-  // Always an error is occurred by this because c.Request.Body is EOF now.
+-  } else if errB := c.ShouldBind(&objB); errB == nil {
+-    c.String(http.StatusOK, `the body should be formB`)
+-  } else {
+-    ...
+-  }
+-}
+-```
+-
+-For this, you can use `c.ShouldBindBodyWith`.
+-
+-```go
+-func SomeHandler(c *gin.Context) {
+-  objA := formA{}
+-  objB := formB{}
+-  // This reads c.Request.Body and stores the result into the context.
+-  if errA := c.ShouldBindBodyWith(&objA, binding.JSON); errA == nil {
+-    c.String(http.StatusOK, `the body should be formA`)
+-  // At this time, it reuses body stored in the context.
+-  } else if errB := c.ShouldBindBodyWith(&objB, binding.JSON); errB == nil {
+-    c.String(http.StatusOK, `the body should be formB JSON`)
+-  // And it can accepts other formats
+-  } else if errB2 := c.ShouldBindBodyWith(&objB, binding.XML); errB2 == nil {
+-    c.String(http.StatusOK, `the body should be formB XML`)
+-  } else {
+-    ...
+-  }
+-}
+-```
+-
+-* `c.ShouldBindBodyWith` stores body into the context before binding. This has
+-a slight impact to performance, so you should not use this method if you are
+-enough to call binding at once.
+-* This feature is only needed for some formats -- `JSON`, `XML`, `MsgPack`,
+-`ProtoBuf`. For other formats, `Query`, `Form`, `FormPost`, `FormMultipart`,
+-can be called by `c.ShouldBind()` multiple times without any damage to
+-performance (See [#1341](https://github.com/gin-gonic/gin/pull/1341)).
+-
+ ## Testing
+ 
+ The `net/http/httptest` package is preferable way for HTTP testing.
+diff --git a/binding/binding.go b/binding/binding.go
+index 1a98477..646eb80 100644
+--- a/binding/binding.go
++++ b/binding/binding.go
+@@ -29,13 +29,6 @@ type Binding interface {
+ 	Bind(*http.Request, interface{}) error
+ }
+ 
+-// BindingBody adds BindBody method to Binding. BindBody is similar with Bind,
+-// but it reads the body from supplied bytes instead of req.Body.
+-type BindingBody interface {
+-	Binding
+-	BindBody([]byte, interface{}) error
+-}
+-
+ // StructValidator is the minimal interface which needs to be implemented in
+ // order for it to be used as the validator engine for ensuring the correctness
+ // of the reqest. Gin provides a default implementation for this using
+diff --git a/binding/binding_body_test.go b/binding/binding_body_test.go
+deleted file mode 100644
+index c41d9f8..0000000
+--- a/binding/binding_body_test.go
++++ /dev/null
+@@ -1,67 +0,0 @@
+-package binding
+-
+-import (
+-	"bytes"
+-	"io/ioutil"
+-	"testing"
+-
+-	"github.com/gin-gonic/gin/binding/example"
+-	"github.com/golang/protobuf/proto"
+-	"github.com/stretchr/testify/assert"
+-	"github.com/ugorji/go/codec"
+-)
+-
+-func TestBindingBody(t *testing.T) {
+-	for _, tt := range []struct {
+-		name    string
+-		binding BindingBody
+-		body    string
+-		want    string
+-	}{
+-		{
+-			name:    "JSON bidning",
+-			binding: JSON,
+-			body:    `{"foo":"FOO"}`,
+-		},
+-		{
+-			name:    "XML bidning",
+-			binding: XML,
+-			body: `<?xml version="1.0" encoding="UTF-8"?>
+-<root>
+-   <foo>FOO</foo>
+-</root>`,
+-		},
+-		{
+-			name:    "MsgPack binding",
+-			binding: MsgPack,
+-			body:    msgPackBody(t),
+-		},
+-	} {
+-		t.Logf("testing: %s", tt.name)
+-		req := requestWithBody("POST", "/", tt.body)
+-		form := FooStruct{}
+-		body, _ := ioutil.ReadAll(req.Body)
+-		assert.NoError(t, tt.binding.BindBody(body, &form))
+-		assert.Equal(t, FooStruct{"FOO"}, form)
+-	}
+-}
+-
+-func msgPackBody(t *testing.T) string {
+-	test := FooStruct{"FOO"}
+-	h := new(codec.MsgpackHandle)
+-	buf := bytes.NewBuffer(nil)
+-	assert.NoError(t, codec.NewEncoder(buf, h).Encode(test))
+-	return buf.String()
+-}
+-
+-func TestBindingBodyProto(t *testing.T) {
+-	test := example.Test{
+-		Label: proto.String("FOO"),
+-	}
+-	data, _ := proto.Marshal(&test)
+-	req := requestWithBody("POST", "/", string(data))
+-	form := example.Test{}
+-	body, _ := ioutil.ReadAll(req.Body)
+-	assert.NoError(t, ProtoBuf.BindBody(body, &form))
+-	assert.Equal(t, test, form)
+-}
+diff --git a/binding/json.go b/binding/json.go
+index fea17bb..e928a8c 100644
+--- a/binding/json.go
++++ b/binding/json.go
+@@ -5,8 +5,6 @@
+ package binding
+ 
+ import (
+-	"bytes"
+-	"io"
+ 	"net/http"
+ 
+ 	"github.com/gin-gonic/gin/json"
+@@ -24,15 +22,7 @@ func (jsonBinding) Name() string {
+ }
+ 
+ func (jsonBinding) Bind(req *http.Request, obj interface{}) error {
+-	return decodeJSON(req.Body, obj)
+-}
+-
+-func (jsonBinding) BindBody(body []byte, obj interface{}) error {
+-	return decodeJSON(bytes.NewReader(body), obj)
+-}
+-
+-func decodeJSON(r io.Reader, obj interface{}) error {
+-	decoder := json.NewDecoder(r)
++	decoder := json.NewDecoder(req.Body)
+ 	if EnableDecoderUseNumber {
+ 		decoder.UseNumber()
+ 	}
+diff --git a/binding/msgpack.go b/binding/msgpack.go
+index b7f7319..7faea4b 100644
+--- a/binding/msgpack.go
++++ b/binding/msgpack.go
+@@ -5,8 +5,6 @@
+ package binding
+ 
+ import (
+-	"bytes"
+-	"io"
+ 	"net/http"
+ 
+ 	"github.com/ugorji/go/codec"
+@@ -19,16 +17,7 @@ func (msgpackBinding) Name() string {
+ }
+ 
+ func (msgpackBinding) Bind(req *http.Request, obj interface{}) error {
+-	return decodeMsgPack(req.Body, obj)
+-}
+-
+-func (msgpackBinding) BindBody(body []byte, obj interface{}) error {
+-	return decodeMsgPack(bytes.NewReader(body), obj)
+-}
+-
+-func decodeMsgPack(r io.Reader, obj interface{}) error {
+-	cdc := new(codec.MsgpackHandle)
+-	if err := codec.NewDecoder(r, cdc).Decode(&obj); err != nil {
++	if err := codec.NewDecoder(req.Body, new(codec.MsgpackHandle)).Decode(&obj); err != nil {
+ 		return err
+ 	}
+ 	return validate(obj)
+diff --git a/binding/protobuf.go b/binding/protobuf.go
+index 540e9c1..c7eb84e 100644
+--- a/binding/protobuf.go
++++ b/binding/protobuf.go
+@@ -17,20 +17,19 @@ func (protobufBinding) Name() string {
+ 	return "protobuf"
+ }
+ 
+-func (b protobufBinding) Bind(req *http.Request, obj interface{}) error {
++func (protobufBinding) Bind(req *http.Request, obj interface{}) error {
++
+ 	buf, err := ioutil.ReadAll(req.Body)
+ 	if err != nil {
+ 		return err
+ 	}
+-	return b.BindBody(buf, obj)
+-}
+ 
+-func (protobufBinding) BindBody(body []byte, obj interface{}) error {
+-	if err := proto.Unmarshal(body, obj.(proto.Message)); err != nil {
++	if err = proto.Unmarshal(buf, obj.(proto.Message)); err != nil {
+ 		return err
+ 	}
+-	// Here it's same to return validate(obj), but util now we cann't add
+-	// `binding:""` to the struct which automatically generate by gen-proto
++
++	//Here it's same to return validate(obj), but util now we cann't add `binding:""` to the struct
++	//which automatically generate by gen-proto
+ 	return nil
+-	// return validate(obj)
++	//return validate(obj)
+ }
+diff --git a/binding/xml.go b/binding/xml.go
+index 4e90114..f84a6b7 100644
+--- a/binding/xml.go
++++ b/binding/xml.go
+@@ -5,9 +5,7 @@
+ package binding
+ 
+ import (
+-	"bytes"
+ 	"encoding/xml"
+-	"io"
+ 	"net/http"
+ )
+ 
+@@ -18,14 +16,7 @@ func (xmlBinding) Name() string {
+ }
+ 
+ func (xmlBinding) Bind(req *http.Request, obj interface{}) error {
+-	return decodeXML(req.Body, obj)
+-}
+-
+-func (xmlBinding) BindBody(body []byte, obj interface{}) error {
+-	return decodeXML(bytes.NewReader(body), obj)
+-}
+-func decodeXML(r io.Reader, obj interface{}) error {
+-	decoder := xml.NewDecoder(r)
++	decoder := xml.NewDecoder(req.Body)
+ 	if err := decoder.Decode(obj); err != nil {
+ 		return err
+ 	}
+diff --git a/context.go b/context.go
+index 9a51e46..be205f4 100755
+--- a/context.go
++++ b/context.go
+@@ -31,7 +31,6 @@ const (
+ 	MIMEPlain             = binding.MIMEPlain
+ 	MIMEPOSTForm          = binding.MIMEPOSTForm
+ 	MIMEMultipartPOSTForm = binding.MIMEMultipartPOSTForm
+-	BodyBytesKey          = "_gin-gonic/gin/bodybyteskey"
+ )
+ 
+ const abortIndex int8 = math.MaxInt8 / 2
+@@ -509,30 +508,6 @@ func (c *Context) ShouldBindWith(obj interface{}, b binding.Binding) error {
+ 	return b.Bind(c.Request, obj)
+ }
+ 
+-// ShouldBindBodyWith is similar with ShouldBindWith, but it stores the request
+-// body into the context, and reuse when it is called again.
+-//
+-// NOTE: This method reads the body before binding. So you should use
+-// ShouldBindWith for better performance if you need to call only once.
+-func (c *Context) ShouldBindBodyWith(
+-	obj interface{}, bb binding.BindingBody,
+-) (err error) {
+-	var body []byte
+-	if cb, ok := c.Get(BodyBytesKey); ok {
+-		if cbb, ok := cb.([]byte); ok {
+-			body = cbb
+-		}
+-	}
+-	if body == nil {
+-		body, err = ioutil.ReadAll(c.Request.Body)
+-		if err != nil {
+-			return err
+-		}
+-		c.Set(BodyBytesKey, body)
+-	}
+-	return bb.BindBody(body, obj)
+-}
+-
+ // ClientIP implements a best effort algorithm to return the real client IP, it parses
+ // X-Real-IP and X-Forwarded-For in order to work properly with reverse-proxies such us: nginx or haproxy.
+ // Use X-Forwarded-For before X-Real-Ip as nginx uses X-Real-Ip with the proxy's IP.
+diff --git a/context_test.go b/context_test.go
+index e94866b..841d8af 100644
+--- a/context_test.go
++++ b/context_test.go
+@@ -18,7 +18,6 @@ import (
+ 	"time"
+ 
+ 	"github.com/gin-contrib/sse"
+-	"github.com/gin-gonic/gin/binding"
+ 	"github.com/stretchr/testify/assert"
+ 	"golang.org/x/net/context"
+ )
+@@ -1335,85 +1334,6 @@ func TestContextBadAutoShouldBind(t *testing.T) {
+ 	assert.False(t, c.IsAborted())
+ }
+ 
+-func TestContextShouldBindBodyWith(t *testing.T) {
+-	type typeA struct {
+-		Foo string `json:"foo" xml:"foo" binding:"required"`
+-	}
+-	type typeB struct {
+-		Bar string `json:"bar" xml:"bar" binding:"required"`
+-	}
+-	for _, tt := range []struct {
+-		name               string
+-		bindingA, bindingB binding.BindingBody
+-		bodyA, bodyB       string
+-	}{
+-		{
+-			name:     "JSON & JSON",
+-			bindingA: binding.JSON,
+-			bindingB: binding.JSON,
+-			bodyA:    `{"foo":"FOO"}`,
+-			bodyB:    `{"bar":"BAR"}`,
+-		},
+-		{
+-			name:     "JSON & XML",
+-			bindingA: binding.JSON,
+-			bindingB: binding.XML,
+-			bodyA:    `{"foo":"FOO"}`,
+-			bodyB: `<?xml version="1.0" encoding="UTF-8"?>
+-<root>
+-   <bar>BAR</bar>
+-</root>`,
+-		},
+-		{
+-			name:     "XML & XML",
+-			bindingA: binding.XML,
+-			bindingB: binding.XML,
+-			bodyA: `<?xml version="1.0" encoding="UTF-8"?>
+-<root>
+-   <foo>FOO</foo>
+-</root>`,
+-			bodyB: `<?xml version="1.0" encoding="UTF-8"?>
+-<root>
+-   <bar>BAR</bar>
+-</root>`,
+-		},
+-	} {
+-		t.Logf("testing: %s", tt.name)
+-		// bodyA to typeA and typeB
+-		{
+-			w := httptest.NewRecorder()
+-			c, _ := CreateTestContext(w)
+-			c.Request, _ = http.NewRequest(
+-				"POST", "http://example.com", bytes.NewBufferString(tt.bodyA),
+-			)
+-			// When it binds to typeA and typeB, it finds the body is
+-			// not typeB but typeA.
+-			objA := typeA{}
+-			assert.NoError(t, c.ShouldBindBodyWith(&objA, tt.bindingA))
+-			assert.Equal(t, typeA{"FOO"}, objA)
+-			objB := typeB{}
+-			assert.Error(t, c.ShouldBindBodyWith(&objB, tt.bindingB))
+-			assert.NotEqual(t, typeB{"BAR"}, objB)
+-		}
+-		// bodyB to typeA and typeB
+-		{
+-			// When it binds to typeA and typeB, it finds the body is
+-			// not typeA but typeB.
+-			w := httptest.NewRecorder()
+-			c, _ := CreateTestContext(w)
+-			c.Request, _ = http.NewRequest(
+-				"POST", "http://example.com", bytes.NewBufferString(tt.bodyB),
+-			)
+-			objA := typeA{}
+-			assert.Error(t, c.ShouldBindBodyWith(&objA, tt.bindingA))
+-			assert.NotEqual(t, typeA{"FOO"}, objA)
+-			objB := typeB{}
+-			assert.NoError(t, c.ShouldBindBodyWith(&objB, tt.bindingB))
+-			assert.Equal(t, typeB{"BAR"}, objB)
+-		}
+-	}
+-}
+-
+ func TestContextGolangContext(t *testing.T) {
+ 	c, _ := CreateTestContext(httptest.NewRecorder())
+ 	c.Request, _ = http.NewRequest("POST", "/", bytes.NewBufferString("{\"foo\":\"bar\", \"bar\":\"foo\"}"))

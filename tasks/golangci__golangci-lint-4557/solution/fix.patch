@@ -1,0 +1,380 @@
+diff --git a/pkg/commands/config.go b/pkg/commands/config.go
+index cfb7d67a..b14f1f9b 100644
+--- a/pkg/commands/config.go
++++ b/pkg/commands/config.go
+@@ -77,7 +77,7 @@ func newConfigCommand(log logutils.Log, info BuildInfo) *configCommand {
+ 	return c
+ }
+ 
+-func (c *configCommand) preRunE(cmd *cobra.Command, _ []string) error {
++func (c *configCommand) preRunE(cmd *cobra.Command, args []string) error {
+ 	// The command doesn't depend on the real configuration.
+ 	// It only needs to know the path of the configuration file.
+ 	cfg := config.NewDefault()
+@@ -89,7 +89,7 @@ func (c *configCommand) preRunE(cmd *cobra.Command, _ []string) error {
+ 	// TODO(ldez) add an option (check deprecation) to `Loader.Load()` but this require a dedicated PR.
+ 	cfg.Run.UseDefaultSkipDirs = true
+ 
+-	loader := config.NewLoader(c.log.Child(logutils.DebugKeyConfigReader), c.viper, cmd.Flags(), c.opts, cfg)
++	loader := config.NewLoader(c.log.Child(logutils.DebugKeyConfigReader), c.viper, cmd.Flags(), c.opts, cfg, args)
+ 
+ 	if err := loader.Load(); err != nil {
+ 		return fmt.Errorf("can't load config: %w", err)
+diff --git a/pkg/commands/linters.go b/pkg/commands/linters.go
+index e9c15518..72e8a985 100644
+--- a/pkg/commands/linters.go
++++ b/pkg/commands/linters.go
+@@ -58,7 +58,7 @@ func newLintersCommand(logger logutils.Log) *lintersCommand {
+ 	return c
+ }
+ 
+-func (c *lintersCommand) preRunE(cmd *cobra.Command, _ []string) error {
++func (c *lintersCommand) preRunE(cmd *cobra.Command, args []string) error {
+ 	// Hack to hide deprecation messages related to `--skip-dirs-use-default`:
+ 	// Flags are not bound then the default values, defined only through flags, are not applied.
+ 	// In this command, linters information are the only requirements, i.e. it don't need flag values.
+@@ -66,7 +66,7 @@ func (c *lintersCommand) preRunE(cmd *cobra.Command, _ []string) error {
+ 	// TODO(ldez) add an option (check deprecation) to `Loader.Load()` but this require a dedicated PR.
+ 	c.cfg.Run.UseDefaultSkipDirs = true
+ 
+-	loader := config.NewLoader(c.log.Child(logutils.DebugKeyConfigReader), c.viper, cmd.Flags(), c.opts.LoaderOptions, c.cfg)
++	loader := config.NewLoader(c.log.Child(logutils.DebugKeyConfigReader), c.viper, cmd.Flags(), c.opts.LoaderOptions, c.cfg, args)
+ 
+ 	if err := loader.Load(); err != nil {
+ 		return fmt.Errorf("can't load config: %w", err)
+diff --git a/pkg/commands/run.go b/pkg/commands/run.go
+index 4240af21..089806e0 100644
+--- a/pkg/commands/run.go
++++ b/pkg/commands/run.go
+@@ -147,12 +147,12 @@ func newRunCommand(logger logutils.Log, info BuildInfo) *runCommand {
+ 	return c
+ }
+ 
+-func (c *runCommand) persistentPreRunE(cmd *cobra.Command, _ []string) error {
++func (c *runCommand) persistentPreRunE(cmd *cobra.Command, args []string) error {
+ 	if err := c.startTracing(); err != nil {
+ 		return err
+ 	}
+ 
+-	loader := config.NewLoader(c.log.Child(logutils.DebugKeyConfigReader), c.viper, cmd.Flags(), c.opts.LoaderOptions, c.cfg)
++	loader := config.NewLoader(c.log.Child(logutils.DebugKeyConfigReader), c.viper, cmd.Flags(), c.opts.LoaderOptions, c.cfg, args)
+ 
+ 	if err := loader.Load(); err != nil {
+ 		return fmt.Errorf("can't load config: %w", err)
+diff --git a/pkg/config/loader.go b/pkg/config/loader.go
+index 141137c2..41fda911 100644
+--- a/pkg/config/loader.go
++++ b/pkg/config/loader.go
+@@ -6,7 +6,6 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"slices"
+-	"strings"
+ 
+ 	"github.com/go-viper/mapstructure/v2"
+ 	"github.com/mitchellh/go-homedir"
+@@ -33,16 +32,18 @@ type Loader struct {
+ 
+ 	log logutils.Log
+ 
+-	cfg *Config
++	cfg  *Config
++	args []string
+ }
+ 
+-func NewLoader(log logutils.Log, v *viper.Viper, fs *pflag.FlagSet, opts LoaderOptions, cfg *Config) *Loader {
++func NewLoader(log logutils.Log, v *viper.Viper, fs *pflag.FlagSet, opts LoaderOptions, cfg *Config, args []string) *Loader {
+ 	return &Loader{
+ 		opts:  opts,
+ 		viper: v,
+ 		fs:    fs,
+ 		log:   log,
+ 		cfg:   cfg,
++		args:  args,
+ 	}
+ }
+ 
+@@ -116,50 +117,59 @@ func (l *Loader) evaluateOptions() (string, error) {
+ }
+ 
+ func (l *Loader) setupConfigFileSearch() {
+-	firstArg := extractFirstPathArg()
++	l.viper.SetConfigName(".golangci")
++
++	configSearchPaths := l.getConfigSearchPaths()
++
++	l.log.Infof("Config search paths: %s", configSearchPaths)
++
++	for _, p := range configSearchPaths {
++		l.viper.AddConfigPath(p)
++	}
++}
++
++func (l *Loader) getConfigSearchPaths() []string {
++	firstArg := "./..."
++	if len(l.args) > 0 {
++		firstArg = l.args[0]
++	}
+ 
+-	absStartPath, err := filepath.Abs(firstArg)
++	absPath, err := filepath.Abs(firstArg)
+ 	if err != nil {
+ 		l.log.Warnf("Can't make abs path for %q: %s", firstArg, err)
+-		absStartPath = filepath.Clean(firstArg)
++		absPath = filepath.Clean(firstArg)
+ 	}
+ 
+ 	// start from it
+-	var curDir string
+-	if fsutils.IsDir(absStartPath) {
+-		curDir = absStartPath
++	var currentDir string
++	if fsutils.IsDir(absPath) {
++		currentDir = absPath
+ 	} else {
+-		curDir = filepath.Dir(absStartPath)
++		currentDir = filepath.Dir(absPath)
+ 	}
+ 
+ 	// find all dirs from it up to the root
+-	configSearchPaths := []string{"./"}
++	searchPaths := []string{"./"}
+ 
+ 	for {
+-		configSearchPaths = append(configSearchPaths, curDir)
++		searchPaths = append(searchPaths, currentDir)
+ 
+-		newCurDir := filepath.Dir(curDir)
+-		if curDir == newCurDir || newCurDir == "" {
++		parent := filepath.Dir(currentDir)
++		if currentDir == parent || parent == "" {
+ 			break
+ 		}
+ 
+-		curDir = newCurDir
++		currentDir = parent
+ 	}
+ 
+ 	// find home directory for global config
+ 	if home, err := homedir.Dir(); err != nil {
+-		l.log.Warnf("Can't get user's home directory: %s", err.Error())
+-	} else if !slices.Contains(configSearchPaths, home) {
+-		configSearchPaths = append(configSearchPaths, home)
++		l.log.Warnf("Can't get user's home directory: %v", err)
++	} else if !slices.Contains(searchPaths, home) {
++		searchPaths = append(searchPaths, home)
+ 	}
+ 
+-	l.log.Infof("Config search paths: %s", configSearchPaths)
+-
+-	l.viper.SetConfigName(".golangci")
+-
+-	for _, p := range configSearchPaths {
+-		l.viper.AddConfigPath(p)
+-	}
++	return searchPaths
+ }
+ 
+ func (l *Loader) parseConfig() error {
+@@ -416,28 +426,3 @@ func customDecoderHook() viper.DecoderConfigOption {
+ 		mapstructure.TextUnmarshallerHookFunc(),
+ 	))
+ }
+-
+-func extractFirstPathArg() string {
+-	args := os.Args
+-
+-	// skip all args ([golangci-lint, run/linters]) before files/dirs list
+-	for len(args) != 0 {
+-		if args[0] == "run" {
+-			args = args[1:]
+-			break
+-		}
+-
+-		args = args[1:]
+-	}
+-
+-	// find first file/dir arg
+-	firstArg := "./..."
+-	for _, arg := range args {
+-		if !strings.HasPrefix(arg, "-") {
+-			firstArg = arg
+-			break
+-		}
+-	}
+-
+-	return firstArg
+-}
+diff --git a/pkg/lint/package.go b/pkg/lint/package.go
+index 7faa399e..c03d4c27 100644
+--- a/pkg/lint/package.go
++++ b/pkg/lint/package.go
+@@ -78,8 +78,10 @@ func (l *PackageLoader) loadPackages(ctx context.Context, loadMode packages.Load
+ 		// TODO: use fset, parsefile, overlay
+ 	}
+ 
+-	args := l.buildArgs()
++	args := buildArgs(l.args)
++
+ 	l.debugf("Built loader args are %s", args)
++
+ 	pkgs, err := packages.Load(conf, args...)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to load with go/packages: %w", err)
+@@ -212,24 +214,6 @@ func (l *PackageLoader) prepareBuildContext() {
+ 	build.Default.BuildTags = l.cfg.Run.BuildTags
+ }
+ 
+-func (l *PackageLoader) buildArgs() []string {
+-	if len(l.args) == 0 {
+-		return []string{"./..."}
+-	}
+-
+-	var retArgs []string
+-	for _, arg := range l.args {
+-		if strings.HasPrefix(arg, ".") || filepath.IsAbs(arg) {
+-			retArgs = append(retArgs, arg)
+-		} else {
+-			// go/packages doesn't work well if we don't have the prefix ./ for local packages
+-			retArgs = append(retArgs, fmt.Sprintf(".%c%s", filepath.Separator, arg))
+-		}
+-	}
+-
+-	return retArgs
+-}
+-
+ func (l *PackageLoader) makeBuildFlags() []string {
+ 	var buildFlags []string
+ 
+@@ -247,6 +231,24 @@ func (l *PackageLoader) makeBuildFlags() []string {
+ 	return buildFlags
+ }
+ 
++func buildArgs(args []string) []string {
++	if len(args) == 0 {
++		return []string{"./..."}
++	}
++
++	var retArgs []string
++	for _, arg := range args {
++		if strings.HasPrefix(arg, ".") || filepath.IsAbs(arg) {
++			retArgs = append(retArgs, arg)
++		} else {
++			// go/packages doesn't work well if we don't have the prefix ./ for local packages
++			retArgs = append(retArgs, fmt.Sprintf(".%c%s", filepath.Separator, arg))
++		}
++	}
++
++	return retArgs
++}
++
+ func findLoadMode(linters []*linter.Config) packages.LoadMode {
+ 	loadMode := packages.LoadMode(0)
+ 	for _, lc := range linters {
+diff --git a/pkg/result/processors/autogenerated_exclude.go b/pkg/result/processors/autogenerated_exclude.go
+index b5944cd1..99f7e7a8 100644
+--- a/pkg/result/processors/autogenerated_exclude.go
++++ b/pkg/result/processors/autogenerated_exclude.go
+@@ -4,7 +4,6 @@ import (
+ 	"fmt"
+ 	"go/parser"
+ 	"go/token"
+-	"path/filepath"
+ 	"regexp"
+ 	"strings"
+ 
+@@ -157,7 +156,3 @@ func getComments(filePath string) (string, error) {
+ 
+ 	return strings.Join(docLines, "\n"), nil
+ }
+-
+-func isGoFile(name string) bool {
+-	return filepath.Ext(name) == ".go"
+-}
+diff --git a/pkg/result/processors/invalid_issue.go b/pkg/result/processors/invalid_issue.go
+index 3bb0eb63..c830e01e 100644
+--- a/pkg/result/processors/invalid_issue.go
++++ b/pkg/result/processors/invalid_issue.go
+@@ -50,3 +50,7 @@ func (p InvalidIssue) shouldPassIssue(issue *result.Issue) (bool, error) {
+ 
+ 	return true, nil
+ }
++
++func isGoFile(name string) bool {
++	return filepath.Ext(name) == ".go"
++}
+diff --git a/pkg/result/processors/skip_dirs.go b/pkg/result/processors/skip_dirs.go
+index 7c4e0b9c..9eeb2137 100644
+--- a/pkg/result/processors/skip_dirs.go
++++ b/pkg/result/processors/skip_dirs.go
+@@ -4,7 +4,6 @@ import (
+ 	"fmt"
+ 	"path/filepath"
+ 	"regexp"
+-	"strings"
+ 
+ 	"github.com/golangci/golangci-lint/pkg/fsutils"
+ 	"github.com/golangci/golangci-lint/pkg/logutils"
+@@ -27,9 +26,7 @@ type SkipDirs struct {
+ 
+ var _ Processor = (*SkipDirs)(nil)
+ 
+-const goFileSuffix = ".go"
+-
+-func NewSkipDirs(patterns []string, log logutils.Log, runArgs []string, pathPrefix string) (*SkipDirs, error) {
++func NewSkipDirs(patterns []string, log logutils.Log, args []string, pathPrefix string) (*SkipDirs, error) {
+ 	var patternsRe []*regexp.Regexp
+ 	for _, p := range patterns {
+ 		p = fsutils.NormalizePathInRegex(p)
+@@ -40,21 +37,9 @@ func NewSkipDirs(patterns []string, log logutils.Log, runArgs []string, pathPref
+ 		patternsRe = append(patternsRe, patternRe)
+ 	}
+ 
+-	if len(runArgs) == 0 {
+-		runArgs = append(runArgs, "./...")
+-	}
+-	var absArgsDirs []string
+-	for _, arg := range runArgs {
+-		base := filepath.Base(arg)
+-		if base == "..." || strings.HasSuffix(base, goFileSuffix) {
+-			arg = filepath.Dir(arg)
+-		}
+-
+-		absArg, err := filepath.Abs(arg)
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to abs-ify arg %q: %w", arg, err)
+-		}
+-		absArgsDirs = append(absArgsDirs, absArg)
++	absArgsDirs, err := absDirs(args)
++	if err != nil {
++		return nil, err
+ 	}
+ 
+ 	return &SkipDirs{
+@@ -144,3 +129,26 @@ func (p *SkipDirs) Finish() {
+ 		p.log.Infof("Skipped %d issues from dir %s by pattern %s", stat.count, dir, stat.pattern)
+ 	}
+ }
++
++func absDirs(args []string) ([]string, error) {
++	if len(args) == 0 {
++		args = append(args, "./...")
++	}
++
++	var absArgsDirs []string
++	for _, arg := range args {
++		base := filepath.Base(arg)
++		if base == "..." || isGoFile(base) {
++			arg = filepath.Dir(arg)
++		}
++
++		absArg, err := filepath.Abs(arg)
++		if err != nil {
++			return nil, fmt.Errorf("failed to abs-ify arg %q: %w", arg, err)
++		}
++
++		absArgsDirs = append(absArgsDirs, absArg)
++	}
++
++	return absArgsDirs, nil
++}

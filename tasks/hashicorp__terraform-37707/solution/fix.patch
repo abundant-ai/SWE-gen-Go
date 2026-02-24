@@ -1,0 +1,298 @@
+diff --git a/.changes/v1.14/BUG FIXES-20250926-113318.yaml b/.changes/v1.14/BUG FIXES-20250926-113318.yaml
+new file mode 100644
+index 0000000000..3adfd48017
+--- /dev/null
++++ b/.changes/v1.14/BUG FIXES-20250926-113318.yaml	
+@@ -0,0 +1,5 @@
++kind: BUG FIXES
++body: 'query: generate unique resource identifiers for results of expanded list resources'
++time: 2025-09-26T11:33:18.241184+02:00
++custom:
++    Issue: "37681"
+diff --git a/.changes/v1.14/ENHANCEMENTS-20250925-151237.yaml b/.changes/v1.14/ENHANCEMENTS-20250925-151237.yaml
+new file mode 100644
+index 0000000000..6e6c3381c7
+--- /dev/null
++++ b/.changes/v1.14/ENHANCEMENTS-20250925-151237.yaml
+@@ -0,0 +1,5 @@
++kind: ENHANCEMENTS
++body: "query: support offline validation of query files via -query flag in the validate command"
++time: 2025-09-25T15:12:37.198573+02:00
++custom:
++  Issue: "37671"
+diff --git a/internal/command/arguments/validate.go b/internal/command/arguments/validate.go
+index 7df4b2c5d9..4347f39eb1 100644
+--- a/internal/command/arguments/validate.go
++++ b/internal/command/arguments/validate.go
+@@ -24,6 +24,9 @@ type Validate struct {
+ 
+ 	// ViewType specifies which output format to use: human, JSON, or "raw".
+ 	ViewType ViewType
++
++	// Query indicates that Terraform should also validate .tfquery files.
++	Query bool
+ }
+ 
+ // ParseValidate processes CLI arguments, returning a Validate value and errors.
+@@ -40,6 +43,7 @@ func ParseValidate(args []string) (*Validate, tfdiags.Diagnostics) {
+ 	cmdFlags.BoolVar(&jsonOutput, "json", false, "json")
+ 	cmdFlags.StringVar(&validate.TestDirectory, "test-directory", "tests", "test-directory")
+ 	cmdFlags.BoolVar(&validate.NoTests, "no-tests", false, "no-tests")
++	cmdFlags.BoolVar(&validate.Query, "query", false, "query")
+ 
+ 	if err := cmdFlags.Parse(args); err != nil {
+ 		diags = diags.Append(tfdiags.Sourceless(
+diff --git a/internal/command/testdata/query/invalid-traversal/main.tf b/internal/command/testdata/query/invalid-traversal/main.tf
+new file mode 100644
+index 0000000000..4a6f9760d0
+--- /dev/null
++++ b/internal/command/testdata/query/invalid-traversal/main.tf
+@@ -0,0 +1,9 @@
++terraform {
++  required_providers {
++    test = {
++      source = "hashicorp/test"
++    }
++  }
++}
++
++provider "test" {}
+diff --git a/internal/command/testdata/query/invalid-traversal/main.tfquery.hcl b/internal/command/testdata/query/invalid-traversal/main.tfquery.hcl
+new file mode 100644
+index 0000000000..71139321a6
+--- /dev/null
++++ b/internal/command/testdata/query/invalid-traversal/main.tfquery.hcl
+@@ -0,0 +1,21 @@
++variable "input" {
++	type = string
++	default = "foo"
++}
++
++list "test_instance" "test" {
++	provider = test
++
++	config {
++		ami = var.input
++	}
++}
++
++list "test_instance" "test2" {
++	provider = test
++	
++	config {
++  	// this traversal is invalid for a list resource
++  	ami = list.test_instance.test.state.instance_type
++	}
++}
+diff --git a/internal/command/validate.go b/internal/command/validate.go
+index a574f00c0f..f679e2fae8 100644
+--- a/internal/command/validate.go
++++ b/internal/command/validate.go
+@@ -19,6 +19,8 @@ import (
+ // ValidateCommand is a Command implementation that validates the terraform files
+ type ValidateCommand struct {
+ 	Meta
++
++	ParsedArgs *arguments.Validate
+ }
+ 
+ func (c *ValidateCommand) Run(rawArgs []string) int {
+@@ -34,6 +36,7 @@ func (c *ValidateCommand) Run(rawArgs []string) int {
+ 		return 1
+ 	}
+ 
++	c.ParsedArgs = args
+ 	view := views.NewValidate(args.ViewType, c.View)
+ 
+ 	// After this point, we must only produce JSON output if JSON mode is
+@@ -54,7 +57,7 @@ func (c *ValidateCommand) Run(rawArgs []string) int {
+ 		return view.Results(diags)
+ 	}
+ 
+-	validateDiags := c.validate(dir, args.TestDirectory, args.NoTests)
++	validateDiags := c.validate(dir)
+ 	diags = diags.Append(validateDiags)
+ 
+ 	// Validating with dev overrides in effect means that the result might
+@@ -66,47 +69,54 @@ func (c *ValidateCommand) Run(rawArgs []string) int {
+ 	return view.Results(diags)
+ }
+ 
+-func (c *ValidateCommand) validate(dir, testDir string, noTests bool) tfdiags.Diagnostics {
++func (c *ValidateCommand) validate(dir string) tfdiags.Diagnostics {
+ 	var diags tfdiags.Diagnostics
+ 	var cfg *configs.Config
+ 
+-	if noTests {
++	// If the query flag is set, include query files in the validation.
++	c.includeQueryFiles = c.ParsedArgs.Query
++
++	if c.ParsedArgs.NoTests {
+ 		cfg, diags = c.loadConfig(dir)
+ 	} else {
+-		cfg, diags = c.loadConfigWithTests(dir, testDir)
++		cfg, diags = c.loadConfigWithTests(dir, c.ParsedArgs.TestDirectory)
+ 	}
+ 	if diags.HasErrors() {
+ 		return diags
+ 	}
+ 
+-	validate := func(cfg *configs.Config) tfdiags.Diagnostics {
+-		var diags tfdiags.Diagnostics
++	diags = diags.Append(c.validateConfig(cfg))
+ 
+-		opts, err := c.contextOpts()
+-		if err != nil {
+-			diags = diags.Append(err)
+-			return diags
+-		}
++	// Unless excluded, we'll also do a quick validation of the Terraform test files. These live
++	// outside the Terraform graph so we have to do this separately.
++	if !c.ParsedArgs.NoTests {
++		diags = diags.Append(c.validateTestFiles(cfg))
++	}
+ 
+-		tfCtx, ctxDiags := terraform.NewContext(opts)
+-		diags = diags.Append(ctxDiags)
+-		if ctxDiags.HasErrors() {
+-			return diags
+-		}
++	return diags
++}
+ 
+-		return diags.Append(tfCtx.Validate(cfg, nil))
+-	}
++func (c *ValidateCommand) validateConfig(cfg *configs.Config) tfdiags.Diagnostics {
++	var diags tfdiags.Diagnostics
+ 
+-	diags = diags.Append(validate(cfg))
++	opts, err := c.contextOpts()
++	if err != nil {
++		diags = diags.Append(err)
++		return diags
++	}
+ 
+-	if noTests {
++	tfCtx, ctxDiags := terraform.NewContext(opts)
++	diags = diags.Append(ctxDiags)
++	if ctxDiags.HasErrors() {
+ 		return diags
+ 	}
+ 
+-	validatedModules := make(map[string]bool)
++	return diags.Append(tfCtx.Validate(cfg, nil))
++}
+ 
+-	// We'll also do a quick validation of the Terraform test files. These live
+-	// outside the Terraform graph so we have to do this separately.
++func (c *ValidateCommand) validateTestFiles(cfg *configs.Config) tfdiags.Diagnostics {
++	diags := tfdiags.Diagnostics{}
++	validatedModules := make(map[string]bool)
+ 	for _, file := range cfg.Module.Tests {
+ 
+ 		// The file validation only returns warnings so we'll just add them
+@@ -131,7 +141,7 @@ func (c *ValidateCommand) validate(dir, testDir string, noTests bool) tfdiags.Di
+ 						// not validate the same thing multiple times.
+ 
+ 						validatedModules[run.Module.Source.String()] = true
+-						diags = diags.Append(validate(run.ConfigUnderTest))
++						diags = diags.Append(c.validateConfig(run.ConfigUnderTest))
+ 					}
+ 
+ 				}
+@@ -188,6 +198,8 @@ Options:
+   -no-tests             If specified, Terraform will not validate test files.
+ 
+   -test-directory=path	Set the Terraform test directory, defaults to "tests".
++  
++  -query                If specified, the command will also validate .tfquery.hcl files.
+ `
+ 	return strings.TrimSpace(helpText)
+ }
+diff --git a/internal/genconfig/generate_config.go b/internal/genconfig/generate_config.go
+index 80a6f01734..746a04220d 100644
+--- a/internal/genconfig/generate_config.go
++++ b/internal/genconfig/generate_config.go
+@@ -138,6 +138,9 @@ type ResourceListElement struct {
+ 	Config cty.Value
+ 
+ 	Identity cty.Value
++
++	// ExpansionEnum is a unique enumeration of the list resource address relative to its expanded siblings.
++	ExpansionEnum int
+ }
+ 
+ func GenerateListResourceContents(addr addrs.AbsResourceInstance,
+@@ -158,12 +161,18 @@ func GenerateListResourceContents(addr addrs.AbsResourceInstance,
+ 				Resource: addrs.Resource{
+ 					Mode: addrs.ManagedResourceMode,
+ 					Type: addr.Resource.Resource.Type,
+-					Name: fmt.Sprintf("%s_%d", addr.Resource.Resource.Name, idx),
+ 				},
+-				Key: addr.Resource.Key,
+ 			},
+ 		}
+ 
++		// If the list resource instance is keyed, the expansion counter is included in the address
++		// to ensure uniqueness across the entire configuration.
++		if addr.Resource.Key == addrs.NoKey {
++			resAddr.Resource.Resource.Name = fmt.Sprintf("%s_%d", addr.Resource.Resource.Name, idx)
++		} else {
++			resAddr.Resource.Resource.Name = fmt.Sprintf("%s_%d_%d", addr.Resource.Resource.Name, res.ExpansionEnum, idx)
++		}
++
+ 		content, gDiags := GenerateResourceContents(resAddr, schema, pc, res.Config, true)
+ 		if gDiags.HasErrors() {
+ 			diags = diags.Append(gDiags)
+diff --git a/internal/instances/expander.go b/internal/instances/expander.go
+index 414ede32c5..93a38b4060 100644
+--- a/internal/instances/expander.go
++++ b/internal/instances/expander.go
+@@ -5,6 +5,7 @@ package instances
+ 
+ import (
+ 	"fmt"
++	"slices"
+ 	"sort"
+ 	"sync"
+ 
+@@ -338,6 +339,16 @@ func (e *Expander) ExpandResource(resourceAddr addrs.AbsResource) []addrs.AbsRes
+ 	return ret
+ }
+ 
++// ResourceExpansionEnum returns the expansion enum for the given resource instance address
++// within the sorted list of resource instances belonging to the same resource config within
++// the same module instance.
++func (e *Expander) ResourceExpansionEnum(resourceAddr addrs.AbsResourceInstance) int {
++	res := e.ExpandResource(resourceAddr.ContainingResource())
++	return slices.IndexFunc(res, func(addr addrs.AbsResourceInstance) bool {
++		return addr.Equal(resourceAddr)
++	})
++}
++
+ // UnknownResourceInstances finds a set of patterns that collectively cover
+ // all of the possible resource instance addresses that could appear for the
+ // given static resource once all of the intermediate module expansions are
+diff --git a/internal/terraform/node_resource_plan_instance.go b/internal/terraform/node_resource_plan_instance.go
+index f9c790837a..e4fd8e059d 100644
+--- a/internal/terraform/node_resource_plan_instance.go
++++ b/internal/terraform/node_resource_plan_instance.go
+@@ -938,6 +938,9 @@ func (n *NodePlannableResourceInstance) generateHCLListResourceDef(ctx EvalConte
+ 
+ 	var listElements []genconfig.ResourceListElement
+ 
++	expander := ctx.InstanceExpander()
++	enum := expander.ResourceExpansionEnum(addr)
++
+ 	iter := state.ElementIterator()
+ 	for iter.Next() {
+ 		_, val := iter.Element()
+@@ -955,7 +958,7 @@ func (n *NodePlannableResourceInstance) generateHCLListResourceDef(ctx EvalConte
+ 		}
+ 		idVal := val.GetAttr("identity")
+ 
+-		listElements = append(listElements, genconfig.ResourceListElement{Config: config, Identity: idVal})
++		listElements = append(listElements, genconfig.ResourceListElement{Config: config, Identity: idVal, ExpansionEnum: enum})
+ 	}
+ 
+ 	return genconfig.GenerateListResourceContents(addr, schema.Body, schema.Identity, providerAddr, listElements)

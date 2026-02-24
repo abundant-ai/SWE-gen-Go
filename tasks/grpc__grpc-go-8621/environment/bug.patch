@@ -1,0 +1,269 @@
+diff --git a/balancer/pickfirst/pickfirst.go b/balancer/pickfirst/pickfirst.go
+index b15c10e4..ea889981 100644
+--- a/balancer/pickfirst/pickfirst.go
++++ b/balancer/pickfirst/pickfirst.go
+@@ -169,7 +169,7 @@ func (b *pickfirstBalancer) UpdateClientConnState(state balancer.ClientConnState
+ 		addrs = state.ResolverState.Addresses
+ 		if cfg.ShuffleAddressList {
+ 			addrs = append([]resolver.Address{}, addrs...)
+-			internal.RandShuffle(len(addrs), func(i, j int) { addrs[i], addrs[j] = addrs[j], addrs[i] })
++			rand.Shuffle(len(addrs), func(i, j int) { addrs[i], addrs[j] = addrs[j], addrs[i] })
+ 		}
+ 	}
+ 
+diff --git a/balancer/pickfirst/pickfirst_ext_test.go b/balancer/pickfirst/pickfirst_ext_test.go
+index 207fc431..81691fc8 100644
+--- a/balancer/pickfirst/pickfirst_ext_test.go
++++ b/balancer/pickfirst/pickfirst_ext_test.go
+@@ -20,7 +20,6 @@ package pickfirst_test
+ 
+ import (
+ 	"context"
+-	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"strings"
+@@ -29,14 +28,11 @@ import (
+ 
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/backoff"
+-	"google.golang.org/grpc/balancer"
+-	pfbalancer "google.golang.org/grpc/balancer/pickfirst"
+ 	pfinternal "google.golang.org/grpc/balancer/pickfirst/internal"
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/connectivity"
+ 	"google.golang.org/grpc/credentials/insecure"
+ 	"google.golang.org/grpc/internal"
+-	"google.golang.org/grpc/internal/balancer/stub"
+ 	"google.golang.org/grpc/internal/channelz"
+ 	"google.golang.org/grpc/internal/grpctest"
+ 	"google.golang.org/grpc/internal/stubserver"
+@@ -467,85 +463,6 @@ func (s) TestPickFirst_ShuffleAddressList(t *testing.T) {
+ 	}
+ }
+ 
+-// Tests the PF LB policy with shuffling enabled. It explicitly unsets the
+-// Endpoints field in the resolver update to test the shuffling of the
+-// Addresses.
+-func (s) TestPickFirst_ShuffleAddressListNoEndpoints(t *testing.T) {
+-	// Install a shuffler that always reverses two entries.
+-	origShuf := pfinternal.RandShuffle
+-	defer func() { pfinternal.RandShuffle = origShuf }()
+-	pfinternal.RandShuffle = func(n int, f func(int, int)) {
+-		if n != 2 {
+-			t.Errorf("Shuffle called with n=%v; want 2", n)
+-			return
+-		}
+-		f(0, 1) // reverse the two addresses
+-	}
+-
+-	pfBuilder := balancer.Get(pfbalancer.Name)
+-	shuffleConfig, err := pfBuilder.(balancer.ConfigParser).ParseConfig(json.RawMessage(`{ "shuffleAddressList": true }`))
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	noShuffleConfig, err := pfBuilder.(balancer.ConfigParser).ParseConfig(json.RawMessage(`{ "shuffleAddressList": false }`))
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	var activeCfg serviceconfig.LoadBalancingConfig
+-
+-	bf := stub.BalancerFuncs{
+-		Init: func(bd *stub.BalancerData) {
+-			bd.ChildBalancer = pfBuilder.Build(bd.ClientConn, bd.BuildOptions)
+-		},
+-		Close: func(bd *stub.BalancerData) {
+-			bd.ChildBalancer.Close()
+-		},
+-		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
+-			ccs.BalancerConfig = activeCfg
+-			ccs.ResolverState.Endpoints = nil
+-			return bd.ChildBalancer.UpdateClientConnState(ccs)
+-		},
+-	}
+-
+-	stub.Register(t.Name(), bf)
+-	svcCfg := fmt.Sprintf(`{ "loadBalancingConfig": [{%q: {}}] }`, t.Name())
+-	// Set up our backends.
+-	cc, r, backends := setupPickFirst(t, 2, grpc.WithDefaultServiceConfig(svcCfg))
+-	addrs := stubBackendsToResolverAddrs(backends)
+-
+-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+-	defer cancel()
+-
+-	// Push an update with both addresses and shuffling disabled.  We should
+-	// connect to backend 0.
+-	activeCfg = noShuffleConfig
+-	resolverState := resolver.State{Addresses: addrs}
+-	r.UpdateState(resolverState)
+-	if err := pickfirst.CheckRPCsToBackend(ctx, cc, addrs[0]); err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	// Send a config with shuffling enabled.  This will reverse the addresses,
+-	// but the channel should still be connected to backend 0.
+-	activeCfg = shuffleConfig
+-	r.UpdateState(resolverState)
+-	if err := pickfirst.CheckRPCsToBackend(ctx, cc, addrs[0]); err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	// Send a resolver update with no addresses. This should push the channel
+-	// into TransientFailure.
+-	r.UpdateState(resolver.State{})
+-	testutils.AwaitState(ctx, t, cc, connectivity.TransientFailure)
+-
+-	// Send the same config as last time with shuffling enabled.  Since we are
+-	// not connected to backend 0, we should connect to backend 1.
+-	r.UpdateState(resolverState)
+-	if err := pickfirst.CheckRPCsToBackend(ctx, cc, addrs[1]); err != nil {
+-		t.Fatal(err)
+-	}
+-}
+-
+ // Test config parsing with the env var turned on and off for various scenarios.
+ func (s) TestPickFirst_ParseConfig_Success(t *testing.T) {
+ 	// Install a shuffler that always reverses two entries.
+diff --git a/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go b/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go
+index 9ffdd28a..67f315a0 100644
+--- a/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go
++++ b/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go
+@@ -283,7 +283,7 @@ func (b *pickfirstBalancer) UpdateClientConnState(state balancer.ClientConnState
+ 		newAddrs = state.ResolverState.Addresses
+ 		if cfg.ShuffleAddressList {
+ 			newAddrs = append([]resolver.Address{}, newAddrs...)
+-			internal.RandShuffle(len(newAddrs), func(i, j int) { newAddrs[i], newAddrs[j] = newAddrs[j], newAddrs[i] })
++			internal.RandShuffle(len(endpoints), func(i, j int) { endpoints[i], endpoints[j] = endpoints[j], endpoints[i] })
+ 		}
+ 	}
+ 
+@@ -351,13 +351,6 @@ func (b *pickfirstBalancer) ExitIdle() {
+ 	b.mu.Lock()
+ 	defer b.mu.Unlock()
+ 	if b.state == connectivity.Idle {
+-		// Move the balancer into CONNECTING state immediately. This is done to
+-		// avoid staying in IDLE if a resolver update arrives before the first
+-		// SubConn reports CONNECTING.
+-		b.updateBalancerState(balancer.State{
+-			ConnectivityState: connectivity.Connecting,
+-			Picker:            &picker{err: balancer.ErrNoSubConnAvailable},
+-		})
+ 		b.startFirstPassLocked()
+ 	}
+ }
+@@ -611,7 +604,7 @@ func (b *pickfirstBalancer) updateSubConnState(sd *scData, newState balancer.Sub
+ 		if !b.addressList.seekTo(sd.addr) {
+ 			// This should not fail as we should have only one SubConn after
+ 			// entering READY. The SubConn should be present in the addressList.
+-			b.logger.Errorf("Address %q not found address list in %v", sd.addr, b.addressList.addresses)
++			b.logger.Errorf("Address %q not found address list in  %v", sd.addr, b.addressList.addresses)
+ 			return
+ 		}
+ 		if !b.healthCheckingEnabled {
+diff --git a/balancer/pickfirst/pickfirstleaf/pickfirstleaf_ext_test.go b/balancer/pickfirst/pickfirstleaf/pickfirstleaf_ext_test.go
+index 6b2fabe2..df8c06f4 100644
+--- a/balancer/pickfirst/pickfirstleaf/pickfirstleaf_ext_test.go
++++ b/balancer/pickfirst/pickfirstleaf/pickfirstleaf_ext_test.go
+@@ -1504,102 +1504,6 @@ func (s) TestPickFirstLeaf_AddressUpdateWithMetadata(t *testing.T) {
+ 	}
+ }
+ 
+-// Tests the scenario where a connection is established and then breaks, leading
+-// to a reconnection attempt. While the reconnection is in progress, a resolver
+-// update with a new address is received. The test verifies that the balancer
+-// creates a new SubConn for the new address and that the ClientConn eventually
+-// becomes READY.
+-func (s) TestPickFirstLeaf_Reconnection(t *testing.T) {
+-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+-	defer cancel()
+-	cc := testutils.NewBalancerClientConn(t)
+-	bal := balancer.Get(pickfirstleaf.Name).Build(cc, balancer.BuildOptions{})
+-	defer bal.Close()
+-	ccState := balancer.ClientConnState{
+-		ResolverState: resolver.State{
+-			Endpoints: []resolver.Endpoint{
+-				{Addresses: []resolver.Address{{Addr: "1.1.1.1:1"}}},
+-			},
+-		},
+-	}
+-	if err := bal.UpdateClientConnState(ccState); err != nil {
+-		t.Fatalf("UpdateClientConnState(%v) returned error: %v", ccState, err)
+-	}
+-
+-	select {
+-	case state := <-cc.NewStateCh:
+-		if got, want := state, connectivity.Connecting; got != want {
+-			t.Fatalf("Received unexpected ClientConn sate: got %v, want %v", got, want)
+-		}
+-	case <-ctx.Done():
+-		t.Fatal("Context timed out waiting for ClientConn state update.")
+-	}
+-
+-	sc1 := <-cc.NewSubConnCh
+-	select {
+-	case <-sc1.ConnectCh:
+-	case <-ctx.Done():
+-		t.Fatal("Context timed out waiting for Connect() to be called on sc1.")
+-	}
+-	sc1.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
+-	sc1.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Ready})
+-
+-	if err := cc.WaitForConnectivityState(ctx, connectivity.Ready); err != nil {
+-		t.Fatalf("Context timed out waiting for ClientConn to become READY.")
+-	}
+-
+-	// Simulate a connection breakage, this should result the channel
+-	// transitioning to IDLE.
+-	sc1.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Idle})
+-	if err := cc.WaitForConnectivityState(ctx, connectivity.Idle); err != nil {
+-		t.Fatalf("Context timed out waiting for ClientConn to enter IDLE.")
+-	}
+-
+-	// Calling the idle picker should result in the SubConn being re-connected.
+-	picker := <-cc.NewPickerCh
+-	if _, err := picker.Pick(balancer.PickInfo{}); err != balancer.ErrNoSubConnAvailable {
+-		t.Fatalf("picker.Pick() returned error: %v, want %v", err, balancer.ErrNoSubConnAvailable)
+-	}
+-
+-	select {
+-	case <-sc1.ConnectCh:
+-	case <-ctx.Done():
+-		t.Fatal("Context timed out waiting for Connect() to be called on sc1.")
+-	}
+-
+-	// Send a resolver update, removing the existing SubConn. Since the balancer
+-	// is connecting, it should create a new SubConn for the new backend
+-	// address.
+-	ccState = balancer.ClientConnState{
+-		ResolverState: resolver.State{
+-			Endpoints: []resolver.Endpoint{
+-				{Addresses: []resolver.Address{{Addr: "2.2.2.2:2"}}},
+-			},
+-		},
+-	}
+-	if err := bal.UpdateClientConnState(ccState); err != nil {
+-		t.Fatalf("UpdateClientConnState(%v) returned error: %v", ccState, err)
+-	}
+-
+-	var sc2 *testutils.TestSubConn
+-	select {
+-	case sc2 = <-cc.NewSubConnCh:
+-	case <-ctx.Done():
+-		t.Fatal("Context timed out waiting for new SubConn to be created.")
+-	}
+-
+-	select {
+-	case <-sc2.ConnectCh:
+-	case <-ctx.Done():
+-		t.Fatal("Context timed out waiting for Connect() to be called on sc2.")
+-	}
+-	sc2.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
+-	sc2.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Ready})
+-	if err := cc.WaitForConnectivityState(ctx, connectivity.Ready); err != nil {
+-		t.Fatalf("Context timed out waiting for ClientConn to become READY.")
+-	}
+-}
+-
+ // healthListenerCapturingCCWrapper is used to capture the health listener so
+ // that health updates can be mocked for testing.
+ type healthListenerCapturingCCWrapper struct {

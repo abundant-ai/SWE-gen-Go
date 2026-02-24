@@ -1,0 +1,241 @@
+diff --git a/api/client_test.go b/api/client_test.go
+index b1bcfc9..53226d7 100644
+--- a/api/client_test.go
++++ b/api/client_test.go
+@@ -89,7 +89,7 @@ func TestClientURL(t *testing.T) {
+ 			address:  "http://localhost:9090",
+ 			endpoint: "/test/:param",
+ 			args: map[string]string{
+-				"nonexistent": "content",
++				"nonexistant": "content",
+ 			},
+ 			expected: "http://localhost:9090/test/:param",
+ 		},
+diff --git a/prometheus/expvar_collector_test.go b/prometheus/expvar_collector_test.go
+index 6bcd9b6..910dac3 100644
+--- a/prometheus/expvar_collector_test.go
++++ b/prometheus/expvar_collector_test.go
+@@ -78,7 +78,7 @@ func ExampleNewExpvarCollector() {
+ 		close(metricChan)
+ 	}()
+ 	for m := range metricChan {
+-		if !strings.Contains(m.Desc().String(), "expvar_memstats") {
++		if strings.Index(m.Desc().String(), "expvar_memstats") == -1 {
+ 			metric.Reset()
+ 			m.Write(&metric)
+ 			metricStrings = append(metricStrings, metric.String())
+diff --git a/prometheus/go_collector.go b/prometheus/go_collector.go
+index 122b169..096454a 100644
+--- a/prometheus/go_collector.go
++++ b/prometheus/go_collector.go
+@@ -265,7 +265,7 @@ func (c *goCollector) Collect(ch chan<- Metric) {
+ 		quantiles[float64(idx+1)/float64(len(stats.PauseQuantiles)-1)] = pq.Seconds()
+ 	}
+ 	quantiles[0.0] = stats.PauseQuantiles[0].Seconds()
+-	ch <- MustNewConstSummary(c.gcDesc, uint64(stats.NumGC), stats.PauseTotal.Seconds(), quantiles)
++	ch <- MustNewConstSummary(c.gcDesc, uint64(stats.NumGC), float64(stats.PauseTotal.Seconds()), quantiles)
+ 
+ 	ch <- MustNewConstMetric(c.goInfoDesc, GaugeValue, 1)
+ 
+diff --git a/prometheus/http.go b/prometheus/http.go
+index 4d08154..dd0f819 100644
+--- a/prometheus/http.go
++++ b/prometheus/http.go
+@@ -115,7 +115,7 @@ func decorateWriter(request *http.Request, writer io.Writer) (io.Writer, string)
+ 	header := request.Header.Get(acceptEncodingHeader)
+ 	parts := strings.Split(header, ",")
+ 	for _, part := range parts {
+-		part = strings.TrimSpace(part)
++		part := strings.TrimSpace(part)
+ 		if part == "gzip" || strings.HasPrefix(part, "gzip;") {
+ 			return gzip.NewWriter(writer), "gzip"
+ 		}
+@@ -139,6 +139,16 @@ var now nower = nowFunc(func() time.Time {
+ 	return time.Now()
+ })
+ 
++func nowSeries(t ...time.Time) nower {
++	return nowFunc(func() time.Time {
++		defer func() {
++			t = t[1:]
++		}()
++
++		return t[0]
++	})
++}
++
+ // InstrumentHandler wraps the given HTTP handler for instrumentation. It
+ // registers four metric collectors (if not already done) and reports HTTP
+ // metrics to the (newly or already) registered collectors: http_requests_total
+@@ -342,9 +352,10 @@ func computeApproximateRequestSize(r *http.Request) <-chan int {
+ type responseWriterDelegator struct {
+ 	http.ResponseWriter
+ 
+-	status      int
+-	written     int64
+-	wroteHeader bool
++	handler, method string
++	status          int
++	written         int64
++	wroteHeader     bool
+ }
+ 
+ func (r *responseWriterDelegator) WriteHeader(code int) {
+diff --git a/prometheus/http_test.go b/prometheus/http_test.go
+index dd89ccf..0c7fa23 100644
+--- a/prometheus/http_test.go
++++ b/prometheus/http_test.go
+@@ -29,16 +29,6 @@ func (b respBody) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	w.Write([]byte(b))
+ }
+ 
+-func nowSeries(t ...time.Time) nower {
+-	return nowFunc(func() time.Time {
+-		defer func() {
+-			t = t[1:]
+-		}()
+-
+-		return t[0]
+-	})
+-}
+-
+ func TestInstrumentHandler(t *testing.T) {
+ 	defer func(n nower) {
+ 		now = n.(nower)
+@@ -47,9 +37,9 @@ func TestInstrumentHandler(t *testing.T) {
+ 	instant := time.Now()
+ 	end := instant.Add(30 * time.Second)
+ 	now = nowSeries(instant, end)
+-	body := respBody("Howdy there!")
++	respBody := respBody("Howdy there!")
+ 
+-	hndlr := InstrumentHandler("test-handler", body)
++	hndlr := InstrumentHandler("test-handler", respBody)
+ 
+ 	opts := SummaryOpts{
+ 		Subsystem:   "http",
+@@ -124,8 +114,8 @@ func TestInstrumentHandler(t *testing.T) {
+ 	if resp.Code != http.StatusTeapot {
+ 		t.Fatalf("expected status %d, got %d", http.StatusTeapot, resp.Code)
+ 	}
+-	if resp.Body.String() != "Howdy there!" {
+-		t.Fatalf("expected body %s, got %s", "Howdy there!", resp.Body.String())
++	if string(resp.Body.Bytes()) != "Howdy there!" {
++		t.Fatalf("expected body %s, got %s", "Howdy there!", string(resp.Body.Bytes()))
+ 	}
+ 
+ 	out := &dto.Metric{}
+diff --git a/prometheus/metric.go b/prometheus/metric.go
+index 76035bc..6213ee8 100644
+--- a/prometheus/metric.go
++++ b/prometheus/metric.go
+@@ -127,6 +127,20 @@ func (s LabelPairSorter) Less(i, j int) bool {
+ 	return s[i].GetName() < s[j].GetName()
+ }
+ 
++type hashSorter []uint64
++
++func (s hashSorter) Len() int {
++	return len(s)
++}
++
++func (s hashSorter) Swap(i, j int) {
++	s[i], s[j] = s[j], s[i]
++}
++
++func (s hashSorter) Less(i, j int) bool {
++	return s[i] < s[j]
++}
++
+ type invalidMetric struct {
+ 	desc *Desc
+ 	err  error
+diff --git a/prometheus/process_collector.go b/prometheus/process_collector.go
+index b80adc6..32ac74a 100644
+--- a/prometheus/process_collector.go
++++ b/prometheus/process_collector.go
+@@ -16,6 +16,7 @@ package prometheus
+ import "github.com/prometheus/procfs"
+ 
+ type processCollector struct {
++	pid             int
+ 	collectFn       func(chan<- Metric)
+ 	pidFn           func() (int, error)
+ 	cpuTotal        *Desc
+diff --git a/prometheus/process_collector_test.go b/prometheus/process_collector_test.go
+index d59ad77..c7acb47 100644
+--- a/prometheus/process_collector_test.go
++++ b/prometheus/process_collector_test.go
+@@ -1,5 +1,3 @@
+-// +build linux
+-
+ package prometheus
+ 
+ import (
+diff --git a/prometheus/promhttp/http.go b/prometheus/promhttp/http.go
+index 0135737..8dc2603 100644
+--- a/prometheus/promhttp/http.go
++++ b/prometheus/promhttp/http.go
+@@ -302,7 +302,7 @@ func decorateWriter(request *http.Request, writer io.Writer, compressionDisabled
+ 	header := request.Header.Get(acceptEncodingHeader)
+ 	parts := strings.Split(header, ",")
+ 	for _, part := range parts {
+-		part = strings.TrimSpace(part)
++		part := strings.TrimSpace(part)
+ 		if part == "gzip" || strings.HasPrefix(part, "gzip;") {
+ 			return gzip.NewWriter(writer), "gzip"
+ 		}
+diff --git a/prometheus/promhttp/http_test.go b/prometheus/promhttp/http_test.go
+index 24d2f8c..aeaa0b4 100644
+--- a/prometheus/promhttp/http_test.go
++++ b/prometheus/promhttp/http_test.go
+@@ -121,7 +121,7 @@ the_count 0
+ 		t.Errorf("got HTTP status code %d, want %d", got, want)
+ 	}
+ 	if got := logBuf.String(); got != wantMsg {
+-		t.Errorf("got log message:\n%s\nwant log message:\n%s\n", got, wantMsg)
++		t.Errorf("got log message:\n%s\nwant log mesage:\n%s\n", got, wantMsg)
+ 	}
+ 	if got := writer.Body.String(); got != wantErrorBody {
+ 		t.Errorf("got body:\n%s\nwant body:\n%s\n", got, wantErrorBody)
+diff --git a/prometheus/push/push.go b/prometheus/push/push.go
+index 3721ff1..02be52c 100644
+--- a/prometheus/push/push.go
++++ b/prometheus/push/push.go
+@@ -66,7 +66,7 @@ type Pusher struct {
+ 	username, password string
+ }
+ 
+-// New creates a new Pusher to push to the provided URL with the provided job
++// New creates a new Pusher to push to the provided URL withe the provided job
+ // name. You can use just host:port or ip:port as url, in which case “http://”
+ // is added automatically. Alternatively, include the schema in the
+ // URL. However, do not include the “/metrics/jobs/…” part.
+diff --git a/prometheus/registry.go b/prometheus/registry.go
+index f8efd1f..bee3703 100644
+--- a/prometheus/registry.go
++++ b/prometheus/registry.go
+@@ -437,7 +437,7 @@ collectLoop:
+ 			))
+ 		default:
+ 			if goroutineBudget <= 0 || len(collectors) == 0 {
+-				// All collectors are already being worked on or
++				// All collectors are aleady being worked on or
+ 				// we have already as many goroutines started as
+ 				// there are collectors. Just process metrics
+ 				// from now on.
+diff --git a/prometheus/value.go b/prometheus/value.go
+index 9fb7eab..543b57c 100644
+--- a/prometheus/value.go
++++ b/prometheus/value.go
+@@ -152,7 +152,9 @@ func makeLabelPairs(desc *Desc, labelValues []string) []*dto.LabelPair {
+ 			Value: proto.String(labelValues[i]),
+ 		})
+ 	}
+-	labelPairs = append(labelPairs, desc.constLabelPairs...)
++	for _, lp := range desc.constLabelPairs {
++		labelPairs = append(labelPairs, lp)
++	}
+ 	sort.Sort(LabelPairSorter(labelPairs))
+ 	return labelPairs
+ }

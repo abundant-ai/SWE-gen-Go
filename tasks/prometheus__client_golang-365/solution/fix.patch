@@ -1,0 +1,1399 @@
+diff --git a/prometheus/counter.go b/prometheus/counter.go
+index 273db5f..02ea9a6 100644
+--- a/prometheus/counter.go
++++ b/prometheus/counter.go
+@@ -111,7 +111,7 @@ func NewCounterVec(opts CounterOpts, labelNames []string) *CounterVec {
+ // Counter with the same label values is created later.
+ //
+ // An error is returned if the number of label values is not the same as the
+-// number of VariableLabels in Desc.
++// number of VariableLabels in Desc (minus any curried labels).
+ //
+ // Note that for more than one label value, this method is prone to mistakes
+ // caused by an incorrect order of arguments. Consider GetMetricWith(Labels) as
+@@ -119,8 +119,8 @@ func NewCounterVec(opts CounterOpts, labelNames []string) *CounterVec {
+ // latter has a much more readable (albeit more verbose) syntax, but it comes
+ // with a performance overhead (for creating and processing the Labels map).
+ // See also the GaugeVec example.
+-func (m *CounterVec) GetMetricWithLabelValues(lvs ...string) (Counter, error) {
+-	metric, err := m.metricVec.getMetricWithLabelValues(lvs...)
++func (v *CounterVec) GetMetricWithLabelValues(lvs ...string) (Counter, error) {
++	metric, err := v.metricVec.getMetricWithLabelValues(lvs...)
+ 	if metric != nil {
+ 		return metric.(Counter), err
+ 	}
+@@ -134,13 +134,13 @@ func (m *CounterVec) GetMetricWithLabelValues(lvs ...string) (Counter, error) {
+ // the same as for GetMetricWithLabelValues.
+ //
+ // An error is returned if the number and names of the Labels are inconsistent
+-// with those of the VariableLabels in Desc.
++// with those of the VariableLabels in Desc (minus any curried labels).
+ //
+ // This method is used for the same purpose as
+ // GetMetricWithLabelValues(...string). See there for pros and cons of the two
+ // methods.
+-func (m *CounterVec) GetMetricWith(labels Labels) (Counter, error) {
+-	metric, err := m.metricVec.getMetricWith(labels)
++func (v *CounterVec) GetMetricWith(labels Labels) (Counter, error) {
++	metric, err := v.metricVec.getMetricWith(labels)
+ 	if metric != nil {
+ 		return metric.(Counter), err
+ 	}
+@@ -148,18 +148,57 @@ func (m *CounterVec) GetMetricWith(labels Labels) (Counter, error) {
+ }
+ 
+ // WithLabelValues works as GetMetricWithLabelValues, but panics where
+-// GetMetricWithLabelValues would have returned an error. By not returning an
+-// error, WithLabelValues allows shortcuts like
++// GetMetricWithLabelValues would have returned an error. Not returning an
++// error allows shortcuts like
+ //     myVec.WithLabelValues("404", "GET").Add(42)
+-func (m *CounterVec) WithLabelValues(lvs ...string) Counter {
+-	return m.metricVec.withLabelValues(lvs...).(Counter)
++func (v *CounterVec) WithLabelValues(lvs ...string) Counter {
++	c, err := v.GetMetricWithLabelValues(lvs...)
++	if err != nil {
++		panic(err)
++	}
++	return c
+ }
+ 
+ // With works as GetMetricWith, but panics where GetMetricWithLabels would have
+-// returned an error. By not returning an error, With allows shortcuts like
+-//     myVec.With(Labels{"code": "404", "method": "GET"}).Add(42)
+-func (m *CounterVec) With(labels Labels) Counter {
+-	return m.metricVec.with(labels).(Counter)
++// returned an error. Not returning an error allows shortcuts like
++//     myVec.With(prometheus.Labels{"code": "404", "method": "GET"}).Add(42)
++func (v *CounterVec) With(labels Labels) Counter {
++	c, err := v.GetMetricWith(labels)
++	if err != nil {
++		panic(err)
++	}
++	return c
++}
++
++// CurryWith returns a vector curried with the provided labels, i.e. the
++// returned vector has those labels pre-set for all labeled operations performed
++// on it. The cardinality of the curried vector is reduced accordingly. The
++// order of the remaining labels stays the same (just with the curried labels
++// taken out of the sequence – which is relevant for the
++// (GetMetric)WithLabelValues methods). It is possible to curry a curried
++// vector, but only with labels not yet used for currying before.
++//
++// The metrics contained in the CounterVec are shared between the curried and
++// uncurried vectors. They are just accessed differently. Curried and uncurried
++// vectors behave identically in terms of collection. Only one must be
++// registered with a given registry (usually the uncurried version). The Reset
++// method deletes all metrics, even if called on a curried vector.
++func (v *CounterVec) CurryWith(labels Labels) (*CounterVec, error) {
++	vec, err := v.curryWith(labels)
++	if vec != nil {
++		return &CounterVec{vec}, err
++	}
++	return nil, err
++}
++
++// MustCurryWith works as CurryWith but panics where CurryWith would have
++// returned an error.
++func (v *CounterVec) MustCurryWith(labels Labels) *CounterVec {
++	vec, err := v.CurryWith(labels)
++	if err != nil {
++		panic(err)
++	}
++	return vec
+ }
+ 
+ // CounterFunc is a Counter whose value is determined at collect time by calling a
+diff --git a/prometheus/desc.go b/prometheus/desc.go
+index 920abc9..4a755b0 100644
+--- a/prometheus/desc.go
++++ b/prometheus/desc.go
+@@ -73,8 +73,7 @@ type Desc struct {
+ // and therefore not part of the Desc. (They are managed within the Metric.)
+ //
+ // For constLabels, the label values are constant. Therefore, they are fully
+-// specified in the Desc. See the Opts documentation for the implications of
+-// constant labels.
++// specified in the Desc. See the Collector example for a usage pattern.
+ func NewDesc(fqName, help string, variableLabels []string, constLabels Labels) *Desc {
+ 	d := &Desc{
+ 		fqName:         fqName,
+diff --git a/prometheus/gauge.go b/prometheus/gauge.go
+index 13064da..b47d70a 100644
+--- a/prometheus/gauge.go
++++ b/prometheus/gauge.go
+@@ -98,15 +98,15 @@ func NewGaugeVec(opts GaugeOpts, labelNames []string) *GaugeVec {
+ // example.
+ //
+ // An error is returned if the number of label values is not the same as the
+-// number of VariableLabels in Desc.
++// number of VariableLabels in Desc (minus any curried labels).
+ //
+ // Note that for more than one label value, this method is prone to mistakes
+ // caused by an incorrect order of arguments. Consider GetMetricWith(Labels) as
+ // an alternative to avoid that type of mistake. For higher label numbers, the
+ // latter has a much more readable (albeit more verbose) syntax, but it comes
+ // with a performance overhead (for creating and processing the Labels map).
+-func (m *GaugeVec) GetMetricWithLabelValues(lvs ...string) (Gauge, error) {
+-	metric, err := m.metricVec.getMetricWithLabelValues(lvs...)
++func (v *GaugeVec) GetMetricWithLabelValues(lvs ...string) (Gauge, error) {
++	metric, err := v.metricVec.getMetricWithLabelValues(lvs...)
+ 	if metric != nil {
+ 		return metric.(Gauge), err
+ 	}
+@@ -120,13 +120,13 @@ func (m *GaugeVec) GetMetricWithLabelValues(lvs ...string) (Gauge, error) {
+ // the same as for GetMetricWithLabelValues.
+ //
+ // An error is returned if the number and names of the Labels are inconsistent
+-// with those of the VariableLabels in Desc.
++// with those of the VariableLabels in Desc (minus any curried labels).
+ //
+ // This method is used for the same purpose as
+ // GetMetricWithLabelValues(...string). See there for pros and cons of the two
+ // methods.
+-func (m *GaugeVec) GetMetricWith(labels Labels) (Gauge, error) {
+-	metric, err := m.metricVec.getMetricWith(labels)
++func (v *GaugeVec) GetMetricWith(labels Labels) (Gauge, error) {
++	metric, err := v.metricVec.getMetricWith(labels)
+ 	if metric != nil {
+ 		return metric.(Gauge), err
+ 	}
+@@ -134,18 +134,57 @@ func (m *GaugeVec) GetMetricWith(labels Labels) (Gauge, error) {
+ }
+ 
+ // WithLabelValues works as GetMetricWithLabelValues, but panics where
+-// GetMetricWithLabelValues would have returned an error. By not returning an
+-// error, WithLabelValues allows shortcuts like
++// GetMetricWithLabelValues would have returned an error. Not returning an
++// error allows shortcuts like
+ //     myVec.WithLabelValues("404", "GET").Add(42)
+-func (m *GaugeVec) WithLabelValues(lvs ...string) Gauge {
+-	return m.metricVec.withLabelValues(lvs...).(Gauge)
++func (v *GaugeVec) WithLabelValues(lvs ...string) Gauge {
++	g, err := v.GetMetricWithLabelValues(lvs...)
++	if err != nil {
++		panic(err)
++	}
++	return g
+ }
+ 
+ // With works as GetMetricWith, but panics where GetMetricWithLabels would have
+-// returned an error. By not returning an error, With allows shortcuts like
+-//     myVec.With(Labels{"code": "404", "method": "GET"}).Add(42)
+-func (m *GaugeVec) With(labels Labels) Gauge {
+-	return m.metricVec.with(labels).(Gauge)
++// returned an error. Not returning an error allows shortcuts like
++//     myVec.With(prometheus.Labels{"code": "404", "method": "GET"}).Add(42)
++func (v *GaugeVec) With(labels Labels) Gauge {
++	g, err := v.GetMetricWith(labels)
++	if err != nil {
++		panic(err)
++	}
++	return g
++}
++
++// CurryWith returns a vector curried with the provided labels, i.e. the
++// returned vector has those labels pre-set for all labeled operations performed
++// on it. The cardinality of the curried vector is reduced accordingly. The
++// order of the remaining labels stays the same (just with the curried labels
++// taken out of the sequence – which is relevant for the
++// (GetMetric)WithLabelValues methods). It is possible to curry a curried
++// vector, but only with labels not yet used for currying before.
++//
++// The metrics contained in the GaugeVec are shared between the curried and
++// uncurried vectors. They are just accessed differently. Curried and uncurried
++// vectors behave identically in terms of collection. Only one must be
++// registered with a given registry (usually the uncurried version). The Reset
++// method deletes all metrics, even if called on a curried vector.
++func (v *GaugeVec) CurryWith(labels Labels) (*GaugeVec, error) {
++	vec, err := v.curryWith(labels)
++	if vec != nil {
++		return &GaugeVec{vec}, err
++	}
++	return nil, err
++}
++
++// MustCurryWith works as CurryWith but panics where CurryWith would have
++// returned an error.
++func (v *GaugeVec) MustCurryWith(labels Labels) *GaugeVec {
++	vec, err := v.CurryWith(labels)
++	if err != nil {
++		panic(err)
++	}
++	return vec
+ }
+ 
+ // GaugeFunc is a Gauge whose value is determined at collect time by calling a
+diff --git a/prometheus/histogram.go b/prometheus/histogram.go
+index 6cc6e68..331783a 100644
+--- a/prometheus/histogram.go
++++ b/prometheus/histogram.go
+@@ -126,23 +126,16 @@ type HistogramOpts struct {
+ 	// string.
+ 	Help string
+ 
+-	// ConstLabels are used to attach fixed labels to this
+-	// Histogram. Histograms with the same fully-qualified name must have the
+-	// same label names in their ConstLabels.
++	// ConstLabels are used to attach fixed labels to this metric. Metrics
++	// with the same fully-qualified name must have the same label names in
++	// their ConstLabels.
+ 	//
+-	// Note that in most cases, labels have a value that varies during the
+-	// lifetime of a process. Those labels are usually managed with a
+-	// HistogramVec. ConstLabels serve only special purposes. One is for the
+-	// special case where the value of a label does not change during the
+-	// lifetime of a process, e.g. if the revision of the running binary is
+-	// put into a label. Another, more advanced purpose is if more than one
+-	// Collector needs to collect Histograms with the same fully-qualified
+-	// name. In that case, those Summaries must differ in the values of
+-	// their ConstLabels. See the Collector examples.
+-	//
+-	// If the value of a label never changes (not even between binaries),
+-	// that label most likely should not be a label at all (but part of the
+-	// metric name).
++	// ConstLabels are only used rarely. In particular, do not use them to
++	// attach the same labels to all your metrics. Those use cases are
++	// better covered by target labels set by the scraping Prometheus
++	// server, or by one specific metric (e.g. a build_info or a
++	// machine_role metric). See also
++	// https://prometheus.io/docs/instrumenting/writing_exporters/#target-labels,-not-static-scraped-labels
+ 	ConstLabels Labels
+ 
+ 	// Buckets defines the buckets into which observations are counted. Each
+@@ -322,7 +315,7 @@ func NewHistogramVec(opts HistogramOpts, labelNames []string) *HistogramVec {
+ // example.
+ //
+ // An error is returned if the number of label values is not the same as the
+-// number of VariableLabels in Desc.
++// number of VariableLabels in Desc (minus any curried labels).
+ //
+ // Note that for more than one label value, this method is prone to mistakes
+ // caused by an incorrect order of arguments. Consider GetMetricWith(Labels) as
+@@ -330,8 +323,8 @@ func NewHistogramVec(opts HistogramOpts, labelNames []string) *HistogramVec {
+ // latter has a much more readable (albeit more verbose) syntax, but it comes
+ // with a performance overhead (for creating and processing the Labels map).
+ // See also the GaugeVec example.
+-func (m *HistogramVec) GetMetricWithLabelValues(lvs ...string) (Observer, error) {
+-	metric, err := m.metricVec.getMetricWithLabelValues(lvs...)
++func (v *HistogramVec) GetMetricWithLabelValues(lvs ...string) (Observer, error) {
++	metric, err := v.metricVec.getMetricWithLabelValues(lvs...)
+ 	if metric != nil {
+ 		return metric.(Observer), err
+ 	}
+@@ -345,13 +338,13 @@ func (m *HistogramVec) GetMetricWithLabelValues(lvs ...string) (Observer, error)
+ // are the same as for GetMetricWithLabelValues.
+ //
+ // An error is returned if the number and names of the Labels are inconsistent
+-// with those of the VariableLabels in Desc.
++// with those of the VariableLabels in Desc (minus any curried labels).
+ //
+ // This method is used for the same purpose as
+ // GetMetricWithLabelValues(...string). See there for pros and cons of the two
+ // methods.
+-func (m *HistogramVec) GetMetricWith(labels Labels) (Observer, error) {
+-	metric, err := m.metricVec.getMetricWith(labels)
++func (v *HistogramVec) GetMetricWith(labels Labels) (Observer, error) {
++	metric, err := v.metricVec.getMetricWith(labels)
+ 	if metric != nil {
+ 		return metric.(Observer), err
+ 	}
+@@ -359,18 +352,57 @@ func (m *HistogramVec) GetMetricWith(labels Labels) (Observer, error) {
+ }
+ 
+ // WithLabelValues works as GetMetricWithLabelValues, but panics where
+-// GetMetricWithLabelValues would have returned an error. By not returning an
+-// error, WithLabelValues allows shortcuts like
++// GetMetricWithLabelValues would have returned an error. Not returning an
++// error allows shortcuts like
+ //     myVec.WithLabelValues("404", "GET").Observe(42.21)
+-func (m *HistogramVec) WithLabelValues(lvs ...string) Observer {
+-	return m.metricVec.withLabelValues(lvs...).(Observer)
++func (v *HistogramVec) WithLabelValues(lvs ...string) Observer {
++	h, err := v.GetMetricWithLabelValues(lvs...)
++	if err != nil {
++		panic(err)
++	}
++	return h
+ }
+ 
+-// With works as GetMetricWith, but panics where GetMetricWithLabels would have
+-// returned an error. By not returning an error, With allows shortcuts like
+-//     myVec.With(Labels{"code": "404", "method": "GET"}).Observe(42.21)
+-func (m *HistogramVec) With(labels Labels) Observer {
+-	return m.metricVec.with(labels).(Observer)
++// With works as GetMetricWith but panics where GetMetricWithLabels would have
++// returned an error. Not returning an error allows shortcuts like
++//     myVec.With(prometheus.Labels{"code": "404", "method": "GET"}).Observe(42.21)
++func (v *HistogramVec) With(labels Labels) Observer {
++	h, err := v.GetMetricWith(labels)
++	if err != nil {
++		panic(err)
++	}
++	return h
++}
++
++// CurryWith returns a vector curried with the provided labels, i.e. the
++// returned vector has those labels pre-set for all labeled operations performed
++// on it. The cardinality of the curried vector is reduced accordingly. The
++// order of the remaining labels stays the same (just with the curried labels
++// taken out of the sequence – which is relevant for the
++// (GetMetric)WithLabelValues methods). It is possible to curry a curried
++// vector, but only with labels not yet used for currying before.
++//
++// The metrics contained in the HistogramVec are shared between the curried and
++// uncurried vectors. They are just accessed differently. Curried and uncurried
++// vectors behave identically in terms of collection. Only one must be
++// registered with a given registry (usually the uncurried version). The Reset
++// method deletes all metrics, even if called on a curried vector.
++func (v *HistogramVec) CurryWith(labels Labels) (ObserverVec, error) {
++	vec, err := v.curryWith(labels)
++	if vec != nil {
++		return &HistogramVec{vec}, err
++	}
++	return nil, err
++}
++
++// MustCurryWith works as CurryWith but panics where CurryWith would have
++// returned an error.
++func (v *HistogramVec) MustCurryWith(labels Labels) ObserverVec {
++	vec, err := v.CurryWith(labels)
++	if err != nil {
++		panic(err)
++	}
++	return vec
+ }
+ 
+ type constHistogram struct {
+diff --git a/prometheus/metric.go b/prometheus/metric.go
+index d4063d9..6213ee8 100644
+--- a/prometheus/metric.go
++++ b/prometheus/metric.go
+@@ -79,20 +79,12 @@ type Opts struct {
+ 	// with the same fully-qualified name must have the same label names in
+ 	// their ConstLabels.
+ 	//
+-	// Note that in most cases, labels have a value that varies during the
+-	// lifetime of a process. Those labels are usually managed with a metric
+-	// vector collector (like CounterVec, GaugeVec, UntypedVec). ConstLabels
+-	// serve only special purposes. One is for the special case where the
+-	// value of a label does not change during the lifetime of a process,
+-	// e.g. if the revision of the running binary is put into a
+-	// label. Another, more advanced purpose is if more than one Collector
+-	// needs to collect Metrics with the same fully-qualified name. In that
+-	// case, those Metrics must differ in the values of their
+-	// ConstLabels. See the Collector examples.
+-	//
+-	// If the value of a label never changes (not even between binaries),
+-	// that label most likely should not be a label at all (but part of the
+-	// metric name).
++	// ConstLabels are only used rarely. In particular, do not use them to
++	// attach the same labels to all your metrics. Those use cases are
++	// better covered by target labels set by the scraping Prometheus
++	// server, or by one specific metric (e.g. a build_info or a
++	// machine_role metric). See also
++	// https://prometheus.io/docs/instrumenting/writing_exporters/#target-labels,-not-static-scraped-labels
+ 	ConstLabels Labels
+ }
+ 
+diff --git a/prometheus/observer.go b/prometheus/observer.go
+index b0520e8..5806cd0 100644
+--- a/prometheus/observer.go
++++ b/prometheus/observer.go
+@@ -45,6 +45,8 @@ type ObserverVec interface {
+ 	GetMetricWithLabelValues(lvs ...string) (Observer, error)
+ 	With(Labels) Observer
+ 	WithLabelValues(...string) Observer
++	CurryWith(Labels) (ObserverVec, error)
++	MustCurryWith(Labels) ObserverVec
+ 
+ 	Collector
+ }
+diff --git a/prometheus/promhttp/instrument_client.go b/prometheus/promhttp/instrument_client.go
+index 65f9425..91e2a5f 100644
+--- a/prometheus/promhttp/instrument_client.go
++++ b/prometheus/promhttp/instrument_client.go
+@@ -45,12 +45,11 @@ func InstrumentRoundTripperInFlight(gauge prometheus.Gauge, next http.RoundTripp
+ 
+ // InstrumentRoundTripperCounter is a middleware that wraps the provided
+ // http.RoundTripper to observe the request result with the provided CounterVec.
+-// The CounterVec must have zero, one, or two labels. The only allowed label
+-// names are "code" and "method". The function panics if any other instance
+-// labels are provided. Partitioning of the CounterVec happens by HTTP status
+-// code and/or HTTP method if the respective instance label names are present
+-// in the CounterVec. For unpartitioned counting, use a CounterVec with
+-// zero labels.
++// The CounterVec must have zero, one, or two non-const non-curried labels. For
++// those, the only allowed label names are "code" and "method". The function
++// panics otherwise. Partitioning of the CounterVec happens by HTTP status code
++// and/or HTTP method if the respective instance label names are present in the
++// CounterVec. For unpartitioned counting, use a CounterVec with zero labels.
+ //
+ // If the wrapped RoundTripper panics or returns a non-nil error, the Counter
+ // is not incremented.
+diff --git a/prometheus/promhttp/instrument_server.go b/prometheus/promhttp/instrument_server.go
+index 3d145ad..9db2438 100644
+--- a/prometheus/promhttp/instrument_server.go
++++ b/prometheus/promhttp/instrument_server.go
+@@ -14,6 +14,7 @@
+ package promhttp
+ 
+ import (
++	"errors"
+ 	"net/http"
+ 	"strconv"
+ 	"strings"
+@@ -42,10 +43,10 @@ func InstrumentHandlerInFlight(g prometheus.Gauge, next http.Handler) http.Handl
+ 
+ // InstrumentHandlerDuration is a middleware that wraps the provided
+ // http.Handler to observe the request duration with the provided ObserverVec.
+-// The ObserverVec must have zero, one, or two labels. The only allowed label
+-// names are "code" and "method". The function panics if any other instance
+-// labels are provided. The Observe method of the Observer in the ObserverVec
+-// is called with the request duration in seconds. Partitioning happens by HTTP
++// The ObserverVec must have zero, one, or two non-const non-curried labels. For
++// those, the only allowed label names are "code" and "method". The function
++// panics otherwise. The Observe method of the Observer in the ObserverVec is
++// called with the request duration in seconds. Partitioning happens by HTTP
+ // status code and/or HTTP method if the respective instance label names are
+ // present in the ObserverVec. For unpartitioned observations, use an
+ // ObserverVec with zero labels. Note that partitioning of Histograms is
+@@ -77,14 +78,13 @@ func InstrumentHandlerDuration(obs prometheus.ObserverVec, next http.Handler) ht
+ 	})
+ }
+ 
+-// InstrumentHandlerCounter is a middleware that wraps the provided
+-// http.Handler to observe the request result with the provided CounterVec.
+-// The CounterVec must have zero, one, or two labels. The only allowed label
+-// names are "code" and "method". The function panics if any other instance
+-// labels are provided. Partitioning of the CounterVec happens by HTTP status
+-// code and/or HTTP method if the respective instance label names are present
+-// in the CounterVec. For unpartitioned counting, use a CounterVec with
+-// zero labels.
++// InstrumentHandlerCounter is a middleware that wraps the provided http.Handler
++// to observe the request result with the provided CounterVec.  The CounterVec
++// must have zero, one, or two non-const non-curried labels. For those, the only
++// allowed label names are "code" and "method". The function panics
++// otherwise. Partitioning of the CounterVec happens by HTTP status code and/or
++// HTTP method if the respective instance label names are present in the
++// CounterVec. For unpartitioned counting, use a CounterVec with zero labels.
+ //
+ // If the wrapped Handler does not set a status code, a status code of 200 is assumed.
+ //
+@@ -111,14 +111,13 @@ func InstrumentHandlerCounter(counter *prometheus.CounterVec, next http.Handler)
+ // InstrumentHandlerTimeToWriteHeader is a middleware that wraps the provided
+ // http.Handler to observe with the provided ObserverVec the request duration
+ // until the response headers are written. The ObserverVec must have zero, one,
+-// or two labels. The only allowed label names are "code" and "method". The
+-// function panics if any other instance labels are provided. The Observe
+-// method of the Observer in the ObserverVec is called with the request
+-// duration in seconds. Partitioning happens by HTTP status code and/or HTTP
+-// method if the respective instance label names are present in the
+-// ObserverVec. For unpartitioned observations, use an ObserverVec with zero
+-// labels. Note that partitioning of Histograms is expensive and should be used
+-// judiciously.
++// or two non-const non-curried labels. For those, the only allowed label names
++// are "code" and "method". The function panics otherwise. The Observe method of
++// the Observer in the ObserverVec is called with the request duration in
++// seconds. Partitioning happens by HTTP status code and/or HTTP method if the
++// respective instance label names are present in the ObserverVec. For
++// unpartitioned observations, use an ObserverVec with zero labels. Note that
++// partitioning of Histograms is expensive and should be used judiciously.
+ //
+ // If the wrapped Handler panics before calling WriteHeader, no value is
+ // reported.
+@@ -140,15 +139,15 @@ func InstrumentHandlerTimeToWriteHeader(obs prometheus.ObserverVec, next http.Ha
+ }
+ 
+ // InstrumentHandlerRequestSize is a middleware that wraps the provided
+-// http.Handler to observe the request size with the provided ObserverVec.
+-// The ObserverVec must have zero, one, or two labels. The only allowed label
+-// names are "code" and "method". The function panics if any other instance
+-// labels are provided. The Observe method of the Observer in the ObserverVec
+-// is called with the request size in bytes. Partitioning happens by HTTP
+-// status code and/or HTTP method if the respective instance label names are
+-// present in the ObserverVec. For unpartitioned observations, use an
+-// ObserverVec with zero labels. Note that partitioning of Histograms is
+-// expensive and should be used judiciously.
++// http.Handler to observe the request size with the provided ObserverVec.  The
++// ObserverVec must have zero, one, or two non-const non-curried labels. For
++// those, the only allowed label names are "code" and "method". The function
++// panics otherwise. The Observe method of the Observer in the ObserverVec is
++// called with the request size in bytes. Partitioning happens by HTTP status
++// code and/or HTTP method if the respective instance label names are present in
++// the ObserverVec. For unpartitioned observations, use an ObserverVec with zero
++// labels. Note that partitioning of Histograms is expensive and should be used
++// judiciously.
+ //
+ // If the wrapped Handler does not set a status code, a status code of 200 is assumed.
+ //
+@@ -175,15 +174,15 @@ func InstrumentHandlerRequestSize(obs prometheus.ObserverVec, next http.Handler)
+ }
+ 
+ // InstrumentHandlerResponseSize is a middleware that wraps the provided
+-// http.Handler to observe the response size with the provided ObserverVec.
+-// The ObserverVec must have zero, one, or two labels. The only allowed label
+-// names are "code" and "method". The function panics if any other instance
+-// labels are provided. The Observe method of the Observer in the ObserverVec
+-// is called with the response size in bytes. Partitioning happens by HTTP
+-// status code and/or HTTP method if the respective instance label names are
+-// present in the ObserverVec. For unpartitioned observations, use an
+-// ObserverVec with zero labels. Note that partitioning of Histograms is
+-// expensive and should be used judiciously.
++// http.Handler to observe the response size with the provided ObserverVec.  The
++// ObserverVec must have zero, one, or two non-const non-curried labels. For
++// those, the only allowed label names are "code" and "method". The function
++// panics otherwise. The Observe method of the Observer in the ObserverVec is
++// called with the response size in bytes. Partitioning happens by HTTP status
++// code and/or HTTP method if the respective instance label names are present in
++// the ObserverVec. For unpartitioned observations, use an ObserverVec with zero
++// labels. Note that partitioning of Histograms is expensive and should be used
++// judiciously.
+ //
+ // If the wrapped Handler does not set a status code, a status code of 200 is assumed.
+ //
+@@ -204,9 +203,12 @@ func checkLabels(c prometheus.Collector) (code bool, method bool) {
+ 	// once Descriptors can have their dimensionality queried.
+ 	var (
+ 		desc *prometheus.Desc
++		m    prometheus.Metric
+ 		pm   dto.Metric
++		lvs  []string
+ 	)
+ 
++	// Get the Desc from the Collector.
+ 	descc := make(chan *prometheus.Desc, 1)
+ 	c.Describe(descc)
+ 
+@@ -223,49 +225,54 @@ func checkLabels(c prometheus.Collector) (code bool, method bool) {
+ 
+ 	close(descc)
+ 
+-	if _, err := prometheus.NewConstMetric(desc, prometheus.UntypedValue, 0); err == nil {
+-		return
++	// Create a ConstMetric with the Desc. Since we don't know how many
++	// variable labels there are, try for as long as it needs.
++	for err := errors.New("dummy"); err != nil; lvs = append(lvs, magicString) {
++		m, err = prometheus.NewConstMetric(desc, prometheus.UntypedValue, 0, lvs...)
++	}
++
++	// Write out the metric into a proto message and look at the labels.
++	// If the value is not the magicString, it is a constLabel, which doesn't interest us.
++	// If the label is curried, it doesn't interest us.
++	// In all other cases, only "code" or "method" is allowed.
++	if err := m.Write(&pm); err != nil {
++		panic("error checking metric for labels")
+ 	}
+-	if m, err := prometheus.NewConstMetric(desc, prometheus.UntypedValue, 0, magicString); err == nil {
+-		if err := m.Write(&pm); err != nil {
+-			panic("error checking metric for labels")
++	for _, label := range pm.Label {
++		name, value := label.GetName(), label.GetValue()
++		if value != magicString || isLabelCurried(c, name) {
++			continue
+ 		}
+-		for _, label := range pm.Label {
+-			name, value := label.GetName(), label.GetValue()
+-			if value != magicString {
+-				continue
+-			}
+-			switch name {
+-			case "code":
+-				code = true
+-			case "method":
+-				method = true
+-			default:
+-				panic("metric partitioned with non-supported labels")
+-			}
+-			return
++		switch name {
++		case "code":
++			code = true
++		case "method":
++			method = true
++		default:
++			panic("metric partitioned with non-supported labels")
+ 		}
+-		panic("previously set label not found – this must never happen")
+ 	}
+-	if m, err := prometheus.NewConstMetric(desc, prometheus.UntypedValue, 0, magicString, magicString); err == nil {
+-		if err := m.Write(&pm); err != nil {
+-			panic("error checking metric for labels")
++	return
++}
++
++func isLabelCurried(c prometheus.Collector, label string) bool {
++	// This is even hackier than the label test above.
++	// We essentially try to curry again and see if it works.
++	// But for that, we need to type-convert to the two
++	// types we use here, ObserverVec or *CounterVec.
++	switch v := c.(type) {
++	case *prometheus.CounterVec:
++		if _, err := v.CurryWith(prometheus.Labels{label: "dummy"}); err == nil {
++			return false
+ 		}
+-		for _, label := range pm.Label {
+-			name, value := label.GetName(), label.GetValue()
+-			if value != magicString {
+-				continue
+-			}
+-			if name == "code" || name == "method" {
+-				continue
+-			}
+-			panic("metric partitioned with non-supported labels")
++	case prometheus.ObserverVec:
++		if _, err := v.CurryWith(prometheus.Labels{label: "dummy"}); err == nil {
++			return false
+ 		}
+-		code = true
+-		method = true
+-		return
++	default:
++		panic("unsupported metric vec type")
+ 	}
+-	panic("metric partitioned with non-supported labels")
++	return true
+ }
+ 
+ // emptyLabels is a one-time allocation for non-partitioned metrics to avoid
+diff --git a/prometheus/summary.go b/prometheus/summary.go
+index 21c031e..f7dc85b 100644
+--- a/prometheus/summary.go
++++ b/prometheus/summary.go
+@@ -101,23 +101,16 @@ type SummaryOpts struct {
+ 	// string.
+ 	Help string
+ 
+-	// ConstLabels are used to attach fixed labels to this
+-	// Summary. Summaries with the same fully-qualified name must have the
+-	// same label names in their ConstLabels.
++	// ConstLabels are used to attach fixed labels to this metric. Metrics
++	// with the same fully-qualified name must have the same label names in
++	// their ConstLabels.
+ 	//
+-	// Note that in most cases, labels have a value that varies during the
+-	// lifetime of a process. Those labels are usually managed with a
+-	// SummaryVec. ConstLabels serve only special purposes. One is for the
+-	// special case where the value of a label does not change during the
+-	// lifetime of a process, e.g. if the revision of the running binary is
+-	// put into a label. Another, more advanced purpose is if more than one
+-	// Collector needs to collect Summaries with the same fully-qualified
+-	// name. In that case, those Summaries must differ in the values of
+-	// their ConstLabels. See the Collector examples.
+-	//
+-	// If the value of a label never changes (not even between binaries),
+-	// that label most likely should not be a label at all (but part of the
+-	// metric name).
++	// ConstLabels are only used rarely. In particular, do not use them to
++	// attach the same labels to all your metrics. Those use cases are
++	// better covered by target labels set by the scraping Prometheus
++	// server, or by one specific metric (e.g. a build_info or a
++	// machine_role metric). See also
++	// https://prometheus.io/docs/instrumenting/writing_exporters/#target-labels,-not-static-scraped-labels
+ 	ConstLabels Labels
+ 
+ 	// Objectives defines the quantile rank estimates with their respective
+@@ -433,13 +426,13 @@ func NewSummaryVec(opts SummaryOpts, labelNames []string) *SummaryVec {
+ //
+ // Keeping the Summary for later use is possible (and should be considered if
+ // performance is critical), but keep in mind that Reset, DeleteLabelValues and
+-// Delete can be used to delete the Summary from the SummaryVec. In that case, the
+-// Summary will still exist, but it will not be exported anymore, even if a
++// Delete can be used to delete the Summary from the SummaryVec. In that case,
++// the Summary will still exist, but it will not be exported anymore, even if a
+ // Summary with the same label values is created later. See also the CounterVec
+ // example.
+ //
+ // An error is returned if the number of label values is not the same as the
+-// number of VariableLabels in Desc.
++// number of VariableLabels in Desc (minus any curried labels).
+ //
+ // Note that for more than one label value, this method is prone to mistakes
+ // caused by an incorrect order of arguments. Consider GetMetricWith(Labels) as
+@@ -447,8 +440,8 @@ func NewSummaryVec(opts SummaryOpts, labelNames []string) *SummaryVec {
+ // latter has a much more readable (albeit more verbose) syntax, but it comes
+ // with a performance overhead (for creating and processing the Labels map).
+ // See also the GaugeVec example.
+-func (m *SummaryVec) GetMetricWithLabelValues(lvs ...string) (Observer, error) {
+-	metric, err := m.metricVec.getMetricWithLabelValues(lvs...)
++func (v *SummaryVec) GetMetricWithLabelValues(lvs ...string) (Observer, error) {
++	metric, err := v.metricVec.getMetricWithLabelValues(lvs...)
+ 	if metric != nil {
+ 		return metric.(Observer), err
+ 	}
+@@ -462,13 +455,13 @@ func (m *SummaryVec) GetMetricWithLabelValues(lvs ...string) (Observer, error) {
+ // the same as for GetMetricWithLabelValues.
+ //
+ // An error is returned if the number and names of the Labels are inconsistent
+-// with those of the VariableLabels in Desc.
++// with those of the VariableLabels in Desc (minus any curried labels).
+ //
+ // This method is used for the same purpose as
+ // GetMetricWithLabelValues(...string). See there for pros and cons of the two
+ // methods.
+-func (m *SummaryVec) GetMetricWith(labels Labels) (Observer, error) {
+-	metric, err := m.metricVec.getMetricWith(labels)
++func (v *SummaryVec) GetMetricWith(labels Labels) (Observer, error) {
++	metric, err := v.metricVec.getMetricWith(labels)
+ 	if metric != nil {
+ 		return metric.(Observer), err
+ 	}
+@@ -476,18 +469,57 @@ func (m *SummaryVec) GetMetricWith(labels Labels) (Observer, error) {
+ }
+ 
+ // WithLabelValues works as GetMetricWithLabelValues, but panics where
+-// GetMetricWithLabelValues would have returned an error. By not returning an
+-// error, WithLabelValues allows shortcuts like
++// GetMetricWithLabelValues would have returned an error. Not returning an
++// error allows shortcuts like
+ //     myVec.WithLabelValues("404", "GET").Observe(42.21)
+-func (m *SummaryVec) WithLabelValues(lvs ...string) Observer {
+-	return m.metricVec.withLabelValues(lvs...).(Observer)
++func (v *SummaryVec) WithLabelValues(lvs ...string) Observer {
++	s, err := v.GetMetricWithLabelValues(lvs...)
++	if err != nil {
++		panic(err)
++	}
++	return s
+ }
+ 
+ // With works as GetMetricWith, but panics where GetMetricWithLabels would have
+-// returned an error. By not returning an error, With allows shortcuts like
+-//     myVec.With(Labels{"code": "404", "method": "GET"}).Observe(42.21)
+-func (m *SummaryVec) With(labels Labels) Observer {
+-	return m.metricVec.with(labels).(Observer)
++// returned an error. Not returning an error allows shortcuts like
++//     myVec.With(prometheus.Labels{"code": "404", "method": "GET"}).Observe(42.21)
++func (v *SummaryVec) With(labels Labels) Observer {
++	s, err := v.GetMetricWith(labels)
++	if err != nil {
++		panic(err)
++	}
++	return s
++}
++
++// CurryWith returns a vector curried with the provided labels, i.e. the
++// returned vector has those labels pre-set for all labeled operations performed
++// on it. The cardinality of the curried vector is reduced accordingly. The
++// order of the remaining labels stays the same (just with the curried labels
++// taken out of the sequence – which is relevant for the
++// (GetMetric)WithLabelValues methods). It is possible to curry a curried
++// vector, but only with labels not yet used for currying before.
++//
++// The metrics contained in the SummaryVec are shared between the curried and
++// uncurried vectors. They are just accessed differently. Curried and uncurried
++// vectors behave identically in terms of collection. Only one must be
++// registered with a given registry (usually the uncurried version). The Reset
++// method deletes all metrics, even if called on a curried vector.
++func (v *SummaryVec) CurryWith(labels Labels) (ObserverVec, error) {
++	vec, err := v.curryWith(labels)
++	if vec != nil {
++		return &SummaryVec{vec}, err
++	}
++	return nil, err
++}
++
++// MustCurryWith works as CurryWith but panics where CurryWith would have
++// returned an error.
++func (v *SummaryVec) MustCurryWith(labels Labels) ObserverVec {
++	vec, err := v.CurryWith(labels)
++	if err != nil {
++		panic(err)
++	}
++	return vec
+ }
+ 
+ type constSummary struct {
+diff --git a/prometheus/vec.go b/prometheus/vec.go
+index 65d13fe..cea1582 100644
+--- a/prometheus/vec.go
++++ b/prometheus/vec.go
+@@ -23,88 +23,31 @@ import (
+ // metricVec is a Collector to bundle metrics of the same name that differ in
+ // their label values. metricVec is not used directly (and therefore
+ // unexported). It is used as a building block for implementations of vectors of
+-// a given metric type, like GaugeVec, CounterVec, SummaryVec, HistogramVec, and
+-// UntypedVec.
++// a given metric type, like GaugeVec, CounterVec, SummaryVec, and HistogramVec.
++// It also handles label currying. It uses basicMetricVec internally.
+ type metricVec struct {
+-	mtx      sync.RWMutex // Protects the children.
+-	children map[uint64][]metricWithLabelValues
+-	desc     *Desc
++	*metricMap
+ 
+-	newMetric   func(labelValues ...string) Metric
+-	hashAdd     func(h uint64, s string) uint64 // replace hash function for testing collision handling
++	curry []curriedLabelValue
++
++	// hashAdd and hashAddByte can be replaced for testing collision handling.
++	hashAdd     func(h uint64, s string) uint64
+ 	hashAddByte func(h uint64, b byte) uint64
+ }
+ 
+ // newMetricVec returns an initialized metricVec.
+ func newMetricVec(desc *Desc, newMetric func(lvs ...string) Metric) *metricVec {
+ 	return &metricVec{
+-		children:    map[uint64][]metricWithLabelValues{},
+-		desc:        desc,
+-		newMetric:   newMetric,
++		metricMap: &metricMap{
++			metrics:   map[uint64][]metricWithLabelValues{},
++			desc:      desc,
++			newMetric: newMetric,
++		},
+ 		hashAdd:     hashAdd,
+ 		hashAddByte: hashAddByte,
+ 	}
+ }
+ 
+-// metricWithLabelValues provides the metric and its label values for
+-// disambiguation on hash collision.
+-type metricWithLabelValues struct {
+-	values []string
+-	metric Metric
+-}
+-
+-// Describe implements Collector. The length of the returned slice
+-// is always one.
+-func (m *metricVec) Describe(ch chan<- *Desc) {
+-	ch <- m.desc
+-}
+-
+-// Collect implements Collector.
+-func (m *metricVec) Collect(ch chan<- Metric) {
+-	m.mtx.RLock()
+-	defer m.mtx.RUnlock()
+-
+-	for _, metrics := range m.children {
+-		for _, metric := range metrics {
+-			ch <- metric.metric
+-		}
+-	}
+-}
+-
+-func (m *metricVec) getMetricWithLabelValues(lvs ...string) (Metric, error) {
+-	h, err := m.hashLabelValues(lvs)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return m.getOrCreateMetricWithLabelValues(h, lvs), nil
+-}
+-
+-func (m *metricVec) getMetricWith(labels Labels) (Metric, error) {
+-	h, err := m.hashLabels(labels)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return m.getOrCreateMetricWithLabels(h, labels), nil
+-}
+-
+-func (m *metricVec) withLabelValues(lvs ...string) Metric {
+-	metric, err := m.getMetricWithLabelValues(lvs...)
+-	if err != nil {
+-		panic(err)
+-	}
+-	return metric
+-}
+-
+-func (m *metricVec) with(labels Labels) Metric {
+-	metric, err := m.getMetricWith(labels)
+-	if err != nil {
+-		panic(err)
+-	}
+-	return metric
+-}
+-
+ // DeleteLabelValues removes the metric where the variable labels are the same
+ // as those passed in as labels (same order as the VariableLabels in Desc). It
+ // returns true if a metric was deleted.
+@@ -121,14 +64,12 @@ func (m *metricVec) with(labels Labels) Metric {
+ // with a performance overhead (for creating and processing the Labels map).
+ // See also the CounterVec example.
+ func (m *metricVec) DeleteLabelValues(lvs ...string) bool {
+-	m.mtx.Lock()
+-	defer m.mtx.Unlock()
+-
+ 	h, err := m.hashLabelValues(lvs)
+ 	if err != nil {
+ 		return false
+ 	}
+-	return m.deleteByHashWithLabelValues(h, lvs)
++
++	return m.metricMap.deleteByHashWithLabelValues(h, lvs, m.curry)
+ }
+ 
+ // Delete deletes the metric where the variable labels are the same as those
+@@ -142,35 +83,190 @@ func (m *metricVec) DeleteLabelValues(lvs ...string) bool {
+ // This method is used for the same purpose as DeleteLabelValues(...string). See
+ // there for pros and cons of the two methods.
+ func (m *metricVec) Delete(labels Labels) bool {
+-	m.mtx.Lock()
+-	defer m.mtx.Unlock()
+-
+ 	h, err := m.hashLabels(labels)
+ 	if err != nil {
+ 		return false
+ 	}
+ 
+-	return m.deleteByHashWithLabels(h, labels)
++	return m.metricMap.deleteByHashWithLabels(h, labels, m.curry)
++}
++
++func (m *metricVec) curryWith(labels Labels) (*metricVec, error) {
++	var (
++		newCurry []curriedLabelValue
++		oldCurry = m.curry
++		iCurry   int
++	)
++	for i, label := range m.desc.variableLabels {
++		val, ok := labels[label]
++		if iCurry < len(oldCurry) && oldCurry[iCurry].index == i {
++			if ok {
++				return nil, fmt.Errorf("label name %q is already curried", label)
++			}
++			newCurry = append(newCurry, oldCurry[iCurry])
++			iCurry++
++		} else {
++			if !ok {
++				continue // Label stays uncurried.
++			}
++			newCurry = append(newCurry, curriedLabelValue{i, val})
++		}
++	}
++	if l := len(oldCurry) + len(labels) - len(newCurry); l > 0 {
++		return nil, fmt.Errorf("%d unknown label(s) found during currying", l)
++	}
++
++	return &metricVec{
++		metricMap:   m.metricMap,
++		curry:       newCurry,
++		hashAdd:     m.hashAdd,
++		hashAddByte: m.hashAddByte,
++	}, nil
++}
++
++func (m *metricVec) getMetricWithLabelValues(lvs ...string) (Metric, error) {
++	h, err := m.hashLabelValues(lvs)
++	if err != nil {
++		return nil, err
++	}
++
++	return m.metricMap.getOrCreateMetricWithLabelValues(h, lvs, m.curry), nil
++}
++
++func (m *metricVec) getMetricWith(labels Labels) (Metric, error) {
++	h, err := m.hashLabels(labels)
++	if err != nil {
++		return nil, err
++	}
++
++	return m.metricMap.getOrCreateMetricWithLabels(h, labels, m.curry), nil
++}
++
++func (m *metricVec) hashLabelValues(vals []string) (uint64, error) {
++	if err := validateLabelValues(vals, len(m.desc.variableLabels)-len(m.curry)); err != nil {
++		return 0, err
++	}
++
++	var (
++		h             = hashNew()
++		curry         = m.curry
++		iVals, iCurry int
++	)
++	for i := 0; i < len(m.desc.variableLabels); i++ {
++		if iCurry < len(curry) && curry[iCurry].index == i {
++			h = m.hashAdd(h, curry[iCurry].value)
++			iCurry++
++		} else {
++			h = m.hashAdd(h, vals[iVals])
++			iVals++
++		}
++		h = m.hashAddByte(h, model.SeparatorByte)
++	}
++	return h, nil
++}
++
++func (m *metricVec) hashLabels(labels Labels) (uint64, error) {
++	if err := validateValuesInLabels(labels, len(m.desc.variableLabels)-len(m.curry)); err != nil {
++		return 0, err
++	}
++
++	var (
++		h      = hashNew()
++		curry  = m.curry
++		iCurry int
++	)
++	for i, label := range m.desc.variableLabels {
++		val, ok := labels[label]
++		if iCurry < len(curry) && curry[iCurry].index == i {
++			if ok {
++				return 0, fmt.Errorf("label name %q is already curried", label)
++			}
++			h = m.hashAdd(h, curry[iCurry].value)
++			iCurry++
++		} else {
++			if !ok {
++				return 0, fmt.Errorf("label name %q missing in label map", label)
++			}
++			h = m.hashAdd(h, val)
++		}
++		h = m.hashAddByte(h, model.SeparatorByte)
++	}
++	return h, nil
++}
++
++// metricWithLabelValues provides the metric and its label values for
++// disambiguation on hash collision.
++type metricWithLabelValues struct {
++	values []string
++	metric Metric
++}
++
++// curriedLabelValue sets the curried value for a label at the given index.
++type curriedLabelValue struct {
++	index int
++	value string
++}
++
++// metricMap is a helper for metricVec and shared between differently curried
++// metricVecs.
++type metricMap struct {
++	mtx       sync.RWMutex // Protects metrics.
++	metrics   map[uint64][]metricWithLabelValues
++	desc      *Desc
++	newMetric func(labelValues ...string) Metric
++}
++
++// Describe implements Collector. It will send exactly one Desc to the provided
++// channel.
++func (m *metricMap) Describe(ch chan<- *Desc) {
++	ch <- m.desc
++}
++
++// Collect implements Collector.
++func (m *metricMap) Collect(ch chan<- Metric) {
++	m.mtx.RLock()
++	defer m.mtx.RUnlock()
++
++	for _, metrics := range m.metrics {
++		for _, metric := range metrics {
++			ch <- metric.metric
++		}
++	}
++}
++
++// Reset deletes all metrics in this vector.
++func (m *metricMap) Reset() {
++	m.mtx.Lock()
++	defer m.mtx.Unlock()
++
++	for h := range m.metrics {
++		delete(m.metrics, h)
++	}
+ }
+ 
+ // deleteByHashWithLabelValues removes the metric from the hash bucket h. If
+ // there are multiple matches in the bucket, use lvs to select a metric and
+ // remove only that metric.
+-func (m *metricVec) deleteByHashWithLabelValues(h uint64, lvs []string) bool {
+-	metrics, ok := m.children[h]
++func (m *metricMap) deleteByHashWithLabelValues(
++	h uint64, lvs []string, curry []curriedLabelValue,
++) bool {
++	m.mtx.Lock()
++	defer m.mtx.Unlock()
++
++	metrics, ok := m.metrics[h]
+ 	if !ok {
+ 		return false
+ 	}
+ 
+-	i := m.findMetricWithLabelValues(metrics, lvs)
++	i := findMetricWithLabelValues(metrics, lvs, curry)
+ 	if i >= len(metrics) {
+ 		return false
+ 	}
+ 
+ 	if len(metrics) > 1 {
+-		m.children[h] = append(metrics[:i], metrics[i+1:]...)
++		m.metrics[h] = append(metrics[:i], metrics[i+1:]...)
+ 	} else {
+-		delete(m.children, h)
++		delete(m.metrics, h)
+ 	}
+ 	return true
+ }
+@@ -178,71 +274,35 @@ func (m *metricVec) deleteByHashWithLabelValues(h uint64, lvs []string) bool {
+ // deleteByHashWithLabels removes the metric from the hash bucket h. If there
+ // are multiple matches in the bucket, use lvs to select a metric and remove
+ // only that metric.
+-func (m *metricVec) deleteByHashWithLabels(h uint64, labels Labels) bool {
+-	metrics, ok := m.children[h]
++func (m *metricMap) deleteByHashWithLabels(
++	h uint64, labels Labels, curry []curriedLabelValue,
++) bool {
++	metrics, ok := m.metrics[h]
+ 	if !ok {
+ 		return false
+ 	}
+-	i := m.findMetricWithLabels(metrics, labels)
++	i := findMetricWithLabels(m.desc, metrics, labels, curry)
+ 	if i >= len(metrics) {
+ 		return false
+ 	}
+ 
+ 	if len(metrics) > 1 {
+-		m.children[h] = append(metrics[:i], metrics[i+1:]...)
++		m.metrics[h] = append(metrics[:i], metrics[i+1:]...)
+ 	} else {
+-		delete(m.children, h)
++		delete(m.metrics, h)
+ 	}
+ 	return true
+ }
+ 
+-// Reset deletes all metrics in this vector.
+-func (m *metricVec) Reset() {
+-	m.mtx.Lock()
+-	defer m.mtx.Unlock()
+-
+-	for h := range m.children {
+-		delete(m.children, h)
+-	}
+-}
+-
+-func (m *metricVec) hashLabelValues(vals []string) (uint64, error) {
+-	if err := validateLabelValues(vals, len(m.desc.variableLabels)); err != nil {
+-		return 0, err
+-	}
+-
+-	h := hashNew()
+-	for _, val := range vals {
+-		h = m.hashAdd(h, val)
+-		h = m.hashAddByte(h, model.SeparatorByte)
+-	}
+-	return h, nil
+-}
+-
+-func (m *metricVec) hashLabels(labels Labels) (uint64, error) {
+-	if err := validateValuesInLabels(labels, len(m.desc.variableLabels)); err != nil {
+-		return 0, err
+-	}
+-
+-	h := hashNew()
+-	for _, label := range m.desc.variableLabels {
+-		val, ok := labels[label]
+-		if !ok {
+-			return 0, fmt.Errorf("label name %q missing in label map", label)
+-		}
+-		h = m.hashAdd(h, val)
+-		h = m.hashAddByte(h, model.SeparatorByte)
+-	}
+-	return h, nil
+-}
+-
+ // getOrCreateMetricWithLabelValues retrieves the metric by hash and label value
+ // or creates it and returns the new one.
+ //
+ // This function holds the mutex.
+-func (m *metricVec) getOrCreateMetricWithLabelValues(hash uint64, lvs []string) Metric {
++func (m *metricMap) getOrCreateMetricWithLabelValues(
++	hash uint64, lvs []string, curry []curriedLabelValue,
++) Metric {
+ 	m.mtx.RLock()
+-	metric, ok := m.getMetricWithHashAndLabelValues(hash, lvs)
++	metric, ok := m.getMetricWithHashAndLabelValues(hash, lvs, curry)
+ 	m.mtx.RUnlock()
+ 	if ok {
+ 		return metric
+@@ -250,13 +310,11 @@ func (m *metricVec) getOrCreateMetricWithLabelValues(hash uint64, lvs []string)
+ 
+ 	m.mtx.Lock()
+ 	defer m.mtx.Unlock()
+-	metric, ok = m.getMetricWithHashAndLabelValues(hash, lvs)
++	metric, ok = m.getMetricWithHashAndLabelValues(hash, lvs, curry)
+ 	if !ok {
+-		// Copy to avoid allocation in case wo don't go down this code path.
+-		copiedLVs := make([]string, len(lvs))
+-		copy(copiedLVs, lvs)
+-		metric = m.newMetric(copiedLVs...)
+-		m.children[hash] = append(m.children[hash], metricWithLabelValues{values: copiedLVs, metric: metric})
++		inlinedLVs := inlineLabelValues(lvs, curry)
++		metric = m.newMetric(inlinedLVs...)
++		m.metrics[hash] = append(m.metrics[hash], metricWithLabelValues{values: inlinedLVs, metric: metric})
+ 	}
+ 	return metric
+ }
+@@ -265,9 +323,11 @@ func (m *metricVec) getOrCreateMetricWithLabelValues(hash uint64, lvs []string)
+ // or creates it and returns the new one.
+ //
+ // This function holds the mutex.
+-func (m *metricVec) getOrCreateMetricWithLabels(hash uint64, labels Labels) Metric {
++func (m *metricMap) getOrCreateMetricWithLabels(
++	hash uint64, labels Labels, curry []curriedLabelValue,
++) Metric {
+ 	m.mtx.RLock()
+-	metric, ok := m.getMetricWithHashAndLabels(hash, labels)
++	metric, ok := m.getMetricWithHashAndLabels(hash, labels, curry)
+ 	m.mtx.RUnlock()
+ 	if ok {
+ 		return metric
+@@ -275,21 +335,23 @@ func (m *metricVec) getOrCreateMetricWithLabels(hash uint64, labels Labels) Metr
+ 
+ 	m.mtx.Lock()
+ 	defer m.mtx.Unlock()
+-	metric, ok = m.getMetricWithHashAndLabels(hash, labels)
++	metric, ok = m.getMetricWithHashAndLabels(hash, labels, curry)
+ 	if !ok {
+-		lvs := m.extractLabelValues(labels)
++		lvs := extractLabelValues(m.desc, labels, curry)
+ 		metric = m.newMetric(lvs...)
+-		m.children[hash] = append(m.children[hash], metricWithLabelValues{values: lvs, metric: metric})
++		m.metrics[hash] = append(m.metrics[hash], metricWithLabelValues{values: lvs, metric: metric})
+ 	}
+ 	return metric
+ }
+ 
+ // getMetricWithHashAndLabelValues gets a metric while handling possible
+ // collisions in the hash space. Must be called while holding the read mutex.
+-func (m *metricVec) getMetricWithHashAndLabelValues(h uint64, lvs []string) (Metric, bool) {
+-	metrics, ok := m.children[h]
++func (m *metricMap) getMetricWithHashAndLabelValues(
++	h uint64, lvs []string, curry []curriedLabelValue,
++) (Metric, bool) {
++	metrics, ok := m.metrics[h]
+ 	if ok {
+-		if i := m.findMetricWithLabelValues(metrics, lvs); i < len(metrics) {
++		if i := findMetricWithLabelValues(metrics, lvs, curry); i < len(metrics) {
+ 			return metrics[i].metric, true
+ 		}
+ 	}
+@@ -298,10 +360,12 @@ func (m *metricVec) getMetricWithHashAndLabelValues(h uint64, lvs []string) (Met
+ 
+ // getMetricWithHashAndLabels gets a metric while handling possible collisions in
+ // the hash space. Must be called while holding read mutex.
+-func (m *metricVec) getMetricWithHashAndLabels(h uint64, labels Labels) (Metric, bool) {
+-	metrics, ok := m.children[h]
++func (m *metricMap) getMetricWithHashAndLabels(
++	h uint64, labels Labels, curry []curriedLabelValue,
++) (Metric, bool) {
++	metrics, ok := m.metrics[h]
+ 	if ok {
+-		if i := m.findMetricWithLabels(metrics, labels); i < len(metrics) {
++		if i := findMetricWithLabels(m.desc, metrics, labels, curry); i < len(metrics) {
+ 			return metrics[i].metric, true
+ 		}
+ 	}
+@@ -310,9 +374,11 @@ func (m *metricVec) getMetricWithHashAndLabels(h uint64, labels Labels) (Metric,
+ 
+ // findMetricWithLabelValues returns the index of the matching metric or
+ // len(metrics) if not found.
+-func (m *metricVec) findMetricWithLabelValues(metrics []metricWithLabelValues, lvs []string) int {
++func findMetricWithLabelValues(
++	metrics []metricWithLabelValues, lvs []string, curry []curriedLabelValue,
++) int {
+ 	for i, metric := range metrics {
+-		if m.matchLabelValues(metric.values, lvs) {
++		if matchLabelValues(metric.values, lvs, curry) {
+ 			return i
+ 		}
+ 	}
+@@ -321,32 +387,51 @@ func (m *metricVec) findMetricWithLabelValues(metrics []metricWithLabelValues, l
+ 
+ // findMetricWithLabels returns the index of the matching metric or len(metrics)
+ // if not found.
+-func (m *metricVec) findMetricWithLabels(metrics []metricWithLabelValues, labels Labels) int {
++func findMetricWithLabels(
++	desc *Desc, metrics []metricWithLabelValues, labels Labels, curry []curriedLabelValue,
++) int {
+ 	for i, metric := range metrics {
+-		if m.matchLabels(metric.values, labels) {
++		if matchLabels(desc, metric.values, labels, curry) {
+ 			return i
+ 		}
+ 	}
+ 	return len(metrics)
+ }
+ 
+-func (m *metricVec) matchLabelValues(values []string, lvs []string) bool {
+-	if len(values) != len(lvs) {
++func matchLabelValues(values []string, lvs []string, curry []curriedLabelValue) bool {
++	if len(values) != len(lvs)+len(curry) {
+ 		return false
+ 	}
++	var iLVs, iCurry int
+ 	for i, v := range values {
+-		if v != lvs[i] {
++		if iCurry < len(curry) && curry[iCurry].index == i {
++			if v != curry[iCurry].value {
++				return false
++			}
++			iCurry++
++			continue
++		}
++		if v != lvs[iLVs] {
+ 			return false
+ 		}
++		iLVs++
+ 	}
+ 	return true
+ }
+ 
+-func (m *metricVec) matchLabels(values []string, labels Labels) bool {
+-	if len(labels) != len(values) {
++func matchLabels(desc *Desc, values []string, labels Labels, curry []curriedLabelValue) bool {
++	if len(values) != len(labels)+len(curry) {
+ 		return false
+ 	}
+-	for i, k := range m.desc.variableLabels {
++	iCurry := 0
++	for i, k := range desc.variableLabels {
++		if iCurry < len(curry) && curry[iCurry].index == i {
++			if values[i] != curry[iCurry].value {
++				return false
++			}
++			iCurry++
++			continue
++		}
+ 		if values[i] != labels[k] {
+ 			return false
+ 		}
+@@ -354,10 +439,31 @@ func (m *metricVec) matchLabels(values []string, labels Labels) bool {
+ 	return true
+ }
+ 
+-func (m *metricVec) extractLabelValues(labels Labels) []string {
+-	labelValues := make([]string, len(labels))
+-	for i, k := range m.desc.variableLabels {
++func extractLabelValues(desc *Desc, labels Labels, curry []curriedLabelValue) []string {
++	labelValues := make([]string, len(labels)+len(curry))
++	iCurry := 0
++	for i, k := range desc.variableLabels {
++		if iCurry < len(curry) && curry[iCurry].index == i {
++			labelValues[i] = curry[iCurry].value
++			iCurry++
++			continue
++		}
+ 		labelValues[i] = labels[k]
+ 	}
+ 	return labelValues
+ }
++
++func inlineLabelValues(lvs []string, curry []curriedLabelValue) []string {
++	labelValues := make([]string, len(lvs)+len(curry))
++	var iCurry, iLVs int
++	for i := range labelValues {
++		if iCurry < len(curry) && curry[iCurry].index == i {
++			labelValues[i] = curry[iCurry].value
++			iCurry++
++			continue
++		}
++		labelValues[i] = lvs[iLVs]
++		iLVs++
++	}
++	return labelValues
++}

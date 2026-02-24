@@ -1,0 +1,213 @@
+diff --git a/prometheus/registry.go b/prometheus/registry.go
+index 6c32516..f2fb67a 100644
+--- a/prometheus/registry.go
++++ b/prometheus/registry.go
+@@ -325,17 +325,9 @@ func (r *Registry) Register(c Collector) error {
+ 		return nil
+ 	}
+ 	if existing, exists := r.collectorsByID[collectorID]; exists {
+-		switch e := existing.(type) {
+-		case *wrappingCollector:
+-			return AlreadyRegisteredError{
+-				ExistingCollector: e.unwrapRecursively(),
+-				NewCollector:      c,
+-			}
+-		default:
+-			return AlreadyRegisteredError{
+-				ExistingCollector: e,
+-				NewCollector:      c,
+-			}
++		return AlreadyRegisteredError{
++			ExistingCollector: existing,
++			NewCollector:      c,
+ 		}
+ 	}
+ 	// If the collectorID is new, but at least one of the descs existed
+diff --git a/prometheus/registry_test.go b/prometheus/registry_test.go
+index 2062e67..3324c7c 100644
+--- a/prometheus/registry_test.go
++++ b/prometheus/registry_test.go
+@@ -746,120 +746,37 @@ func BenchmarkHandler(b *testing.B) {
+ }
+ 
+ func TestAlreadyRegistered(t *testing.T) {
++	reg := prometheus.NewRegistry()
+ 	original := prometheus.NewCounterVec(
+-		prometheus.CounterOpts{
+-			Name:        "test",
+-			Help:        "help",
+-			ConstLabels: prometheus.Labels{"const": "label"},
+-		},
+-		[]string{"foo", "bar"},
+-	)
+-	equalButNotSame := prometheus.NewCounterVec(
+-		prometheus.CounterOpts{
+-			Name:        "test",
+-			Help:        "help",
+-			ConstLabels: prometheus.Labels{"const": "label"},
+-		},
+-		[]string{"foo", "bar"},
+-	)
+-	originalWithoutConstLabel := prometheus.NewCounterVec(
+ 		prometheus.CounterOpts{
+ 			Name: "test",
+ 			Help: "help",
+ 		},
+ 		[]string{"foo", "bar"},
+ 	)
+-	equalButNotSameWithoutConstLabel := prometheus.NewCounterVec(
++	equalButNotSame := prometheus.NewCounterVec(
+ 		prometheus.CounterOpts{
+ 			Name: "test",
+ 			Help: "help",
+ 		},
+ 		[]string{"foo", "bar"},
+ 	)
+-
+-	scenarios := []struct {
+-		name              string
+-		originalCollector prometheus.Collector
+-		registerWith      func(prometheus.Registerer) prometheus.Registerer
+-		newCollector      prometheus.Collector
+-		reRegisterWith    func(prometheus.Registerer) prometheus.Registerer
+-	}{
+-		{
+-			"RegisterNormallyReregisterNormally",
+-			original,
+-			func(r prometheus.Registerer) prometheus.Registerer { return r },
+-			equalButNotSame,
+-			func(r prometheus.Registerer) prometheus.Registerer { return r },
+-		},
+-		{
+-			"RegisterNormallyReregisterWrapped",
+-			original,
+-			func(r prometheus.Registerer) prometheus.Registerer { return r },
+-			equalButNotSameWithoutConstLabel,
+-			func(r prometheus.Registerer) prometheus.Registerer {
+-				return prometheus.WrapRegistererWith(prometheus.Labels{"const": "label"}, r)
+-			},
+-		},
+-		{
+-			"RegisterWrappedReregisterWrapped",
+-			originalWithoutConstLabel,
+-			func(r prometheus.Registerer) prometheus.Registerer {
+-				return prometheus.WrapRegistererWith(prometheus.Labels{"const": "label"}, r)
+-			},
+-			equalButNotSameWithoutConstLabel,
+-			func(r prometheus.Registerer) prometheus.Registerer {
+-				return prometheus.WrapRegistererWith(prometheus.Labels{"const": "label"}, r)
+-			},
+-		},
+-		{
+-			"RegisterWrappedReregisterNormally",
+-			originalWithoutConstLabel,
+-			func(r prometheus.Registerer) prometheus.Registerer {
+-				return prometheus.WrapRegistererWith(prometheus.Labels{"const": "label"}, r)
+-			},
+-			equalButNotSame,
+-			func(r prometheus.Registerer) prometheus.Registerer { return r },
+-		},
+-		{
+-			"RegisterDoublyWrappedReregisterDoublyWrapped",
+-			originalWithoutConstLabel,
+-			func(r prometheus.Registerer) prometheus.Registerer {
+-				return prometheus.WrapRegistererWithPrefix(
+-					"wrap_",
+-					prometheus.WrapRegistererWith(prometheus.Labels{"const": "label"}, r),
+-				)
+-			},
+-			equalButNotSameWithoutConstLabel,
+-			func(r prometheus.Registerer) prometheus.Registerer {
+-				return prometheus.WrapRegistererWithPrefix(
+-					"wrap_",
+-					prometheus.WrapRegistererWith(prometheus.Labels{"const": "label"}, r),
+-				)
+-			},
+-		},
++	var err error
++	if err = reg.Register(original); err != nil {
++		t.Fatal(err)
+ 	}
+-
+-	for _, s := range scenarios {
+-		t.Run(s.name, func(t *testing.T) {
+-			var err error
+-			reg := prometheus.NewRegistry()
+-			if err = s.registerWith(reg).Register(s.originalCollector); err != nil {
+-				t.Fatal(err)
+-			}
+-			if err = s.reRegisterWith(reg).Register(s.newCollector); err == nil {
+-				t.Fatal("expected error when registering new collector")
+-			}
+-			if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+-				if are.ExistingCollector != s.originalCollector {
+-					t.Error("expected original collector but got something else")
+-				}
+-				if are.ExistingCollector == s.newCollector {
+-					t.Error("expected original collector but got new one")
+-				}
+-			} else {
+-				t.Error("unexpected error:", err)
+-			}
+-		})
++	if err = reg.Register(equalButNotSame); err == nil {
++		t.Fatal("expected error when registering equal collector")
++	}
++	if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
++		if are.ExistingCollector != original {
++			t.Error("expected original collector but got something else")
++		}
++		if are.ExistingCollector == equalButNotSame {
++			t.Error("expected original callector but got new one")
++		}
++	} else {
++		t.Error("unexpected error:", err)
+ 	}
+ }
+ 
+diff --git a/prometheus/wrap.go b/prometheus/wrap.go
+index e303eef..49159bf 100644
+--- a/prometheus/wrap.go
++++ b/prometheus/wrap.go
+@@ -32,12 +32,6 @@ import (
+ // WrapRegistererWith provides a way to add fixed labels to a subset of
+ // Collectors. It should not be used to add fixed labels to all metrics exposed.
+ //
+-// Conflicts between Collectors registered through the original Registerer with
+-// Collectors registered through the wrapping Registerer will still be
+-// detected. Any AlreadyRegisteredError returned by the Register method of
+-// either Registerer will contain the ExistingCollector in the form it was
+-// provided to the respective registry.
+-//
+ // The Collector example demonstrates a use of WrapRegistererWith.
+ func WrapRegistererWith(labels Labels, reg Registerer) Registerer {
+ 	return &wrappingRegisterer{
+@@ -60,12 +54,6 @@ func WrapRegistererWith(labels Labels, reg Registerer) Registerer {
+ // (see NewGoCollector) and the process collector (see NewProcessCollector). (In
+ // fact, those metrics are already prefixed with “go_” or “process_”,
+ // respectively.)
+-//
+-// Conflicts between Collectors registered through the original Registerer with
+-// Collectors registered through the wrapping Registerer will still be
+-// detected. Any AlreadyRegisteredError returned by the Register method of
+-// either Registerer will contain the ExistingCollector in the form it was
+-// provided to the respective registry.
+ func WrapRegistererWithPrefix(prefix string, reg Registerer) Registerer {
+ 	return &wrappingRegisterer{
+ 		wrappedRegisterer: reg,
+@@ -135,15 +123,6 @@ func (c *wrappingCollector) Describe(ch chan<- *Desc) {
+ 	}
+ }
+ 
+-func (c *wrappingCollector) unwrapRecursively() Collector {
+-	switch wc := c.wrappedCollector.(type) {
+-	case *wrappingCollector:
+-		return wc.unwrapRecursively()
+-	default:
+-		return wc
+-	}
+-}
+-
+ type wrappingMetric struct {
+ 	wrappedMetric Metric
+ 	prefix        string

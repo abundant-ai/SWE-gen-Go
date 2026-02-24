@@ -1,0 +1,609 @@
+diff --git a/prometheus/promhttp/instrument_client.go b/prometheus/promhttp/instrument_client.go
+index 097aff2..861b4d2 100644
+--- a/prometheus/promhttp/instrument_client.go
++++ b/prometheus/promhttp/instrument_client.go
+@@ -38,11 +38,11 @@ func (rt RoundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+ //
+ // See the example for ExampleInstrumentRoundTripperDuration for example usage.
+ func InstrumentRoundTripperInFlight(gauge prometheus.Gauge, next http.RoundTripper) RoundTripperFunc {
+-	return func(r *http.Request) (*http.Response, error) {
++	return RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+ 		gauge.Inc()
+ 		defer gauge.Dec()
+ 		return next.RoundTrip(r)
+-	}
++	})
+ }
+ 
+ // InstrumentRoundTripperCounter is a middleware that wraps the provided
+@@ -59,29 +59,22 @@ func InstrumentRoundTripperInFlight(gauge prometheus.Gauge, next http.RoundTripp
+ // If the wrapped RoundTripper panics or returns a non-nil error, the Counter
+ // is not incremented.
+ //
+-// Use with WithExemplarFromContext to instrument the exemplars on the counter of requests.
+-//
+ // See the example for ExampleInstrumentRoundTripperDuration for example usage.
+ func InstrumentRoundTripperCounter(counter *prometheus.CounterVec, next http.RoundTripper, opts ...Option) RoundTripperFunc {
+-	rtOpts := defaultOptions()
++	rtOpts := &option{}
+ 	for _, o := range opts {
+-		o.apply(rtOpts)
++		o(rtOpts)
+ 	}
+ 
+ 	code, method := checkLabels(counter)
+ 
+-	return func(r *http.Request) (*http.Response, error) {
++	return RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+ 		resp, err := next.RoundTrip(r)
+ 		if err == nil {
+-			exemplarAdd(
+-				counter.With(labels(code, method, r.Method, resp.StatusCode, rtOpts.extraMethods...)),
+-				1,
+-				rtOpts.getExemplarFn(r.Context()),
+-			)
+ 			counter.With(labels(code, method, r.Method, resp.StatusCode, rtOpts.extraMethods...)).Inc()
+ 		}
+ 		return resp, err
+-	}
++	})
+ }
+ 
+ // InstrumentRoundTripperDuration is a middleware that wraps the provided
+@@ -101,30 +94,24 @@ func InstrumentRoundTripperCounter(counter *prometheus.CounterVec, next http.Rou
+ // If the wrapped RoundTripper panics or returns a non-nil error, no values are
+ // reported.
+ //
+-// Use with WithExemplarFromContext to instrument the exemplars on the duration histograms.
+-//
+ // Note that this method is only guaranteed to never observe negative durations
+ // if used with Go1.9+.
+ func InstrumentRoundTripperDuration(obs prometheus.ObserverVec, next http.RoundTripper, opts ...Option) RoundTripperFunc {
+-	rtOpts := defaultOptions()
++	rtOpts := &option{}
+ 	for _, o := range opts {
+-		o.apply(rtOpts)
++		o(rtOpts)
+ 	}
+ 
+ 	code, method := checkLabels(obs)
+ 
+-	return func(r *http.Request) (*http.Response, error) {
++	return RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+ 		start := time.Now()
+ 		resp, err := next.RoundTrip(r)
+ 		if err == nil {
+-			exemplarObserve(
+-				obs.With(labels(code, method, r.Method, resp.StatusCode, rtOpts.extraMethods...)),
+-				time.Since(start).Seconds(),
+-				rtOpts.getExemplarFn(r.Context()),
+-			)
++			obs.With(labels(code, method, r.Method, resp.StatusCode, rtOpts.extraMethods...)).Observe(time.Since(start).Seconds())
+ 		}
+ 		return resp, err
+-	}
++	})
+ }
+ 
+ // InstrumentTrace is used to offer flexibility in instrumenting the available
+@@ -162,7 +149,7 @@ type InstrumentTrace struct {
+ //
+ // See the example for ExampleInstrumentRoundTripperDuration for example usage.
+ func InstrumentRoundTripperTrace(it *InstrumentTrace, next http.RoundTripper) RoundTripperFunc {
+-	return func(r *http.Request) (*http.Response, error) {
++	return RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+ 		start := time.Now()
+ 
+ 		trace := &httptrace.ClientTrace{
+@@ -244,5 +231,5 @@ func InstrumentRoundTripperTrace(it *InstrumentTrace, next http.RoundTripper) Ro
+ 		r = r.WithContext(httptrace.WithClientTrace(r.Context(), trace))
+ 
+ 		return next.RoundTrip(r)
+-	}
++	})
+ }
+diff --git a/prometheus/promhttp/instrument_client_test.go b/prometheus/promhttp/instrument_client_test.go
+index 98667e8..aab8dbe 100644
+--- a/prometheus/promhttp/instrument_client_test.go
++++ b/prometheus/promhttp/instrument_client_test.go
+@@ -18,19 +18,14 @@ import (
+ 	"log"
+ 	"net/http"
+ 	"net/http/httptest"
+-	"reflect"
+-	"sort"
+ 	"strings"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/prometheus/client_golang/prometheus"
+-
+-	dto "github.com/prometheus/client_model/go"
+-	"google.golang.org/protobuf/proto"
+ )
+ 
+-func makeInstrumentedClient(opts ...Option) (*http.Client, *prometheus.Registry) {
++func makeInstrumentedClient() (*http.Client, *prometheus.Registry) {
+ 	client := http.DefaultClient
+ 	client.Timeout = 1 * time.Second
+ 
+@@ -96,91 +91,13 @@ func makeInstrumentedClient(opts ...Option) (*http.Client, *prometheus.Registry)
+ 	client.Transport = InstrumentRoundTripperInFlight(inFlightGauge,
+ 		InstrumentRoundTripperCounter(counter,
+ 			InstrumentRoundTripperTrace(trace,
+-				InstrumentRoundTripperDuration(histVec, http.DefaultTransport, opts...),
++				InstrumentRoundTripperDuration(histVec, http.DefaultTransport),
+ 			),
+-			opts...),
++		),
+ 	)
+ 	return client, reg
+ }
+ 
+-func labelsToLabelPair(l prometheus.Labels) []*dto.LabelPair {
+-	ret := make([]*dto.LabelPair, 0, len(l))
+-	for k, v := range l {
+-		ret = append(ret, &dto.LabelPair{Name: proto.String(k), Value: proto.String(v)})
+-	}
+-	sort.Slice(ret, func(i, j int) bool {
+-		return *ret[i].Name < *ret[j].Name
+-	})
+-	return ret
+-}
+-
+-func assetMetricAndExemplars(
+-	t *testing.T,
+-	reg *prometheus.Registry,
+-	expectedNumMetrics int,
+-	expectedExemplar []*dto.LabelPair,
+-) {
+-	t.Helper()
+-
+-	mfs, err := reg.Gather()
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if want, got := expectedNumMetrics, len(mfs); want != got {
+-		t.Fatalf("unexpected number of metric families gathered, want %d, got %d", want, got)
+-	}
+-
+-	for _, mf := range mfs {
+-		if len(mf.Metric) == 0 {
+-			t.Errorf("metric family %s must not be empty", mf.GetName())
+-		}
+-		for _, m := range mf.GetMetric() {
+-			if c := m.GetCounter(); c != nil {
+-				if len(expectedExemplar) == 0 {
+-					if c.Exemplar != nil {
+-						t.Errorf("expected no exemplar on the counter %v%v, got %v", mf.GetName(), m.Label, c.Exemplar.String())
+-					}
+-					continue
+-				}
+-
+-				if c.Exemplar == nil {
+-					t.Errorf("expected exemplar %v on the counter %v%v, got none", expectedExemplar, mf.GetName(), m.Label)
+-					continue
+-				}
+-				if got := c.Exemplar.Label; !reflect.DeepEqual(expectedExemplar, got) {
+-					t.Errorf("expected exemplar %v on the counter %v%v, got %v", expectedExemplar, mf.GetName(), m.Label, got)
+-				}
+-				continue
+-			}
+-			if h := m.GetHistogram(); h != nil {
+-				found := false
+-				for _, b := range h.GetBucket() {
+-					if len(expectedExemplar) == 0 {
+-						if b.Exemplar != nil {
+-							t.Errorf("expected no exemplar on histogram %v%v bkt %v, got %v", mf.GetName(), m.Label, b.GetUpperBound(), b.Exemplar.String())
+-						}
+-						continue
+-					}
+-
+-					if b.Exemplar == nil {
+-						continue
+-					}
+-					if got := b.Exemplar.Label; !reflect.DeepEqual(expectedExemplar, got) {
+-						t.Errorf("expected exemplar %v on the histogram %v%v on bkt %v, got %v", expectedExemplar, mf.GetName(), m.Label, b.GetUpperBound(), got)
+-						continue
+-					}
+-					found = true
+-					break
+-				}
+-
+-				if len(expectedExemplar) > 0 && !found {
+-					t.Errorf("expected exemplar %v on at least one bucket of the histogram %v%v, got none", expectedExemplar, mf.GetName(), m.Label)
+-				}
+-			}
+-		}
+-	}
+-}
+-
+ func TestClientMiddlewareAPI(t *testing.T) {
+ 	client, reg := makeInstrumentedClient()
+ 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+@@ -194,28 +111,21 @@ func TestClientMiddlewareAPI(t *testing.T) {
+ 	}
+ 	defer resp.Body.Close()
+ 
+-	assetMetricAndExemplars(t, reg, 3, nil)
+-}
+-
+-func TestClientMiddlewareAPI_WithExemplars(t *testing.T) {
+-	exemplar := prometheus.Labels{"traceID": "example situation observed by this metric"}
+-
+-	client, reg := makeInstrumentedClient(WithExemplarFromContext(func(_ context.Context) prometheus.Labels { return exemplar }))
+-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		w.WriteHeader(http.StatusOK)
+-	}))
+-	defer backend.Close()
+-
+-	resp, err := client.Get(backend.URL)
++	mfs, err := reg.Gather()
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	defer resp.Body.Close()
+-
+-	assetMetricAndExemplars(t, reg, 3, labelsToLabelPair(exemplar))
++	if want, got := 3, len(mfs); want != got {
++		t.Fatalf("unexpected number of metric families gathered, want %d, got %d", want, got)
++	}
++	for _, mf := range mfs {
++		if len(mf.Metric) == 0 {
++			t.Errorf("metric family %s must not be empty", mf.GetName())
++		}
++	}
+ }
+ 
+-func TestClientMiddlewareAPI_WithRequestContext(t *testing.T) {
++func TestClientMiddlewareAPIWithRequestContext(t *testing.T) {
+ 	client, reg := makeInstrumentedClient()
+ 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		w.WriteHeader(http.StatusOK)
+diff --git a/prometheus/promhttp/instrument_server.go b/prometheus/promhttp/instrument_server.go
+index b35d093..1397a1e 100644
+--- a/prometheus/promhttp/instrument_server.go
++++ b/prometheus/promhttp/instrument_server.go
+@@ -28,22 +28,6 @@ import (
+ // magicString is used for the hacky label test in checkLabels. Remove once fixed.
+ const magicString = "zZgWfBxLqvG8kc8IMv3POi2Bb0tZI3vAnBx+gBaFi9FyPzB/CzKUer1yufDa"
+ 
+-func exemplarObserve(obs prometheus.Observer, val float64, labels map[string]string) {
+-	if labels == nil {
+-		obs.Observe(val)
+-		return
+-	}
+-	obs.(prometheus.ExemplarObserver).ObserveWithExemplar(val, labels)
+-}
+-
+-func exemplarAdd(obs prometheus.Counter, val float64, labels map[string]string) {
+-	if labels == nil {
+-		obs.Add(val)
+-		return
+-	}
+-	obs.(prometheus.ExemplarAdder).AddWithExemplar(val, labels)
+-}
+-
+ // InstrumentHandlerInFlight is a middleware that wraps the provided
+ // http.Handler. It sets the provided prometheus.Gauge to the number of
+ // requests currently handled by the wrapped http.Handler.
+@@ -78,37 +62,28 @@ func InstrumentHandlerInFlight(g prometheus.Gauge, next http.Handler) http.Handl
+ // Note that this method is only guaranteed to never observe negative durations
+ // if used with Go1.9+.
+ func InstrumentHandlerDuration(obs prometheus.ObserverVec, next http.Handler, opts ...Option) http.HandlerFunc {
+-	hOpts := defaultOptions()
++	mwOpts := &option{}
+ 	for _, o := range opts {
+-		o.apply(hOpts)
++		o(mwOpts)
+ 	}
+ 
+ 	code, method := checkLabels(obs)
+ 
+ 	if code {
+-		return func(w http.ResponseWriter, r *http.Request) {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 			now := time.Now()
+ 			d := newDelegator(w, nil)
+ 			next.ServeHTTP(d, r)
+ 
+-			exemplarObserve(
+-				obs.With(labels(code, method, r.Method, d.Status(), hOpts.extraMethods...)),
+-				time.Since(now).Seconds(),
+-				hOpts.getExemplarFn(r.Context()),
+-			)
+-		}
++			obs.With(labels(code, method, r.Method, d.Status(), mwOpts.extraMethods...)).Observe(time.Since(now).Seconds())
++		})
+ 	}
+ 
+-	return func(w http.ResponseWriter, r *http.Request) {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		now := time.Now()
+ 		next.ServeHTTP(w, r)
+-
+-		exemplarObserve(
+-			obs.With(labels(code, method, r.Method, 0, hOpts.extraMethods...)),
+-			time.Since(now).Seconds(),
+-			hOpts.getExemplarFn(r.Context()),
+-		)
+-	}
++		obs.With(labels(code, method, r.Method, 0, mwOpts.extraMethods...)).Observe(time.Since(now).Seconds())
++	})
+ }
+ 
+ // InstrumentHandlerCounter is a middleware that wraps the provided http.Handler
+@@ -129,34 +104,25 @@ func InstrumentHandlerDuration(obs prometheus.ObserverVec, next http.Handler, op
+ //
+ // See the example for InstrumentHandlerDuration for example usage.
+ func InstrumentHandlerCounter(counter *prometheus.CounterVec, next http.Handler, opts ...Option) http.HandlerFunc {
+-	hOpts := defaultOptions()
++	mwOpts := &option{}
+ 	for _, o := range opts {
+-		o.apply(hOpts)
++		o(mwOpts)
+ 	}
+ 
+ 	code, method := checkLabels(counter)
+ 
+ 	if code {
+-		return func(w http.ResponseWriter, r *http.Request) {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 			d := newDelegator(w, nil)
+ 			next.ServeHTTP(d, r)
+-
+-			exemplarAdd(
+-				counter.With(labels(code, method, r.Method, d.Status(), hOpts.extraMethods...)),
+-				1,
+-				hOpts.getExemplarFn(r.Context()),
+-			)
+-		}
++			counter.With(labels(code, method, r.Method, d.Status(), mwOpts.extraMethods...)).Inc()
++		})
+ 	}
+ 
+-	return func(w http.ResponseWriter, r *http.Request) {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		next.ServeHTTP(w, r)
+-		exemplarAdd(
+-			counter.With(labels(code, method, r.Method, 0, hOpts.extraMethods...)),
+-			1,
+-			hOpts.getExemplarFn(r.Context()),
+-		)
+-	}
++		counter.With(labels(code, method, r.Method, 0, mwOpts.extraMethods...)).Inc()
++	})
+ }
+ 
+ // InstrumentHandlerTimeToWriteHeader is a middleware that wraps the provided
+@@ -182,24 +148,20 @@ func InstrumentHandlerCounter(counter *prometheus.CounterVec, next http.Handler,
+ //
+ // See the example for InstrumentHandlerDuration for example usage.
+ func InstrumentHandlerTimeToWriteHeader(obs prometheus.ObserverVec, next http.Handler, opts ...Option) http.HandlerFunc {
+-	hOpts := defaultOptions()
++	mwOpts := &option{}
+ 	for _, o := range opts {
+-		o.apply(hOpts)
++		o(mwOpts)
+ 	}
+ 
+ 	code, method := checkLabels(obs)
+ 
+-	return func(w http.ResponseWriter, r *http.Request) {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		now := time.Now()
+ 		d := newDelegator(w, func(status int) {
+-			exemplarObserve(
+-				obs.With(labels(code, method, r.Method, status, hOpts.extraMethods...)),
+-				time.Since(now).Seconds(),
+-				hOpts.getExemplarFn(r.Context()),
+-			)
++			obs.With(labels(code, method, r.Method, status, mwOpts.extraMethods...)).Observe(time.Since(now).Seconds())
+ 		})
+ 		next.ServeHTTP(d, r)
+-	}
++	})
+ }
+ 
+ // InstrumentHandlerRequestSize is a middleware that wraps the provided
+@@ -222,34 +184,27 @@ func InstrumentHandlerTimeToWriteHeader(obs prometheus.ObserverVec, next http.Ha
+ //
+ // See the example for InstrumentHandlerDuration for example usage.
+ func InstrumentHandlerRequestSize(obs prometheus.ObserverVec, next http.Handler, opts ...Option) http.HandlerFunc {
+-	hOpts := defaultOptions()
++	mwOpts := &option{}
+ 	for _, o := range opts {
+-		o.apply(hOpts)
++		o(mwOpts)
+ 	}
+ 
+ 	code, method := checkLabels(obs)
++
+ 	if code {
+-		return func(w http.ResponseWriter, r *http.Request) {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 			d := newDelegator(w, nil)
+ 			next.ServeHTTP(d, r)
+ 			size := computeApproximateRequestSize(r)
+-			exemplarObserve(
+-				obs.With(labels(code, method, r.Method, d.Status(), hOpts.extraMethods...)),
+-				float64(size),
+-				hOpts.getExemplarFn(r.Context()),
+-			)
+-		}
++			obs.With(labels(code, method, r.Method, d.Status(), mwOpts.extraMethods...)).Observe(float64(size))
++		})
+ 	}
+ 
+-	return func(w http.ResponseWriter, r *http.Request) {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		next.ServeHTTP(w, r)
+ 		size := computeApproximateRequestSize(r)
+-		exemplarObserve(
+-			obs.With(labels(code, method, r.Method, 0, hOpts.extraMethods...)),
+-			float64(size),
+-			hOpts.getExemplarFn(r.Context()),
+-		)
+-	}
++		obs.With(labels(code, method, r.Method, 0, mwOpts.extraMethods...)).Observe(float64(size))
++	})
+ }
+ 
+ // InstrumentHandlerResponseSize is a middleware that wraps the provided
+@@ -272,9 +227,9 @@ func InstrumentHandlerRequestSize(obs prometheus.ObserverVec, next http.Handler,
+ //
+ // See the example for InstrumentHandlerDuration for example usage.
+ func InstrumentHandlerResponseSize(obs prometheus.ObserverVec, next http.Handler, opts ...Option) http.Handler {
+-	hOpts := defaultOptions()
++	mwOpts := &option{}
+ 	for _, o := range opts {
+-		o.apply(hOpts)
++		o(mwOpts)
+ 	}
+ 
+ 	code, method := checkLabels(obs)
+@@ -282,11 +237,7 @@ func InstrumentHandlerResponseSize(obs prometheus.ObserverVec, next http.Handler
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		d := newDelegator(w, nil)
+ 		next.ServeHTTP(d, r)
+-		exemplarObserve(
+-			obs.With(labels(code, method, r.Method, d.Status(), hOpts.extraMethods...)),
+-			float64(d.Written()),
+-			hOpts.getExemplarFn(r.Context()),
+-		)
++		obs.With(labels(code, method, r.Method, d.Status(), mwOpts.extraMethods...)).Observe(float64(d.Written()))
+ 	})
+ }
+ 
+diff --git a/prometheus/promhttp/instrument_server_test.go b/prometheus/promhttp/instrument_server_test.go
+index 4215348..a3720c2 100644
+--- a/prometheus/promhttp/instrument_server_test.go
++++ b/prometheus/promhttp/instrument_server_test.go
+@@ -14,7 +14,6 @@
+ package promhttp
+ 
+ import (
+-	"context"
+ 	"io"
+ 	"log"
+ 	"net/http"
+@@ -322,7 +321,7 @@ func TestLabels(t *testing.T) {
+ 	}
+ }
+ 
+-func makeInstrumentedHandler(handler http.HandlerFunc, opts ...Option) (http.Handler, *prometheus.Registry) {
++func TestMiddlewareAPI(t *testing.T) {
+ 	reg := prometheus.NewRegistry()
+ 
+ 	inFlightGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+@@ -367,43 +366,25 @@ func makeInstrumentedHandler(handler http.HandlerFunc, opts ...Option) (http.Han
+ 		[]string{},
+ 	)
+ 
++	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Write([]byte("OK"))
++	})
++
+ 	reg.MustRegister(inFlightGauge, counter, histVec, responseSize, writeHeaderVec)
+ 
+-	return InstrumentHandlerInFlight(inFlightGauge,
++	chain := InstrumentHandlerInFlight(inFlightGauge,
+ 		InstrumentHandlerCounter(counter,
+ 			InstrumentHandlerDuration(histVec,
+ 				InstrumentHandlerTimeToWriteHeader(writeHeaderVec,
+-					InstrumentHandlerResponseSize(responseSize, handler, opts...),
+-					opts...),
+-				opts...),
+-			opts...),
+-	), reg
+-}
+-
+-func TestMiddlewareAPI(t *testing.T) {
+-	chain, reg := makeInstrumentedHandler(func(w http.ResponseWriter, r *http.Request) {
+-		_, _ = w.Write([]byte("OK"))
+-	})
+-
+-	r, _ := http.NewRequest("GET", "www.example.com", nil)
+-	w := httptest.NewRecorder()
+-	chain.ServeHTTP(w, r)
+-
+-	assetMetricAndExemplars(t, reg, 5, nil)
+-}
+-
+-func TestMiddlewareAPI_WithExemplars(t *testing.T) {
+-	exemplar := prometheus.Labels{"traceID": "example situation observed by this metric"}
+-
+-	chain, reg := makeInstrumentedHandler(func(w http.ResponseWriter, r *http.Request) {
+-		_, _ = w.Write([]byte("OK"))
+-	}, WithExemplarFromContext(func(_ context.Context) prometheus.Labels { return exemplar }))
++					InstrumentHandlerResponseSize(responseSize, handler),
++				),
++			),
++		),
++	)
+ 
+ 	r, _ := http.NewRequest("GET", "www.example.com", nil)
+ 	w := httptest.NewRecorder()
+ 	chain.ServeHTTP(w, r)
+-
+-	assetMetricAndExemplars(t, reg, 5, labelsToLabelPair(exemplar))
+ }
+ 
+ func TestInstrumentTimeToFirstWrite(t *testing.T) {
+diff --git a/prometheus/promhttp/option.go b/prometheus/promhttp/option.go
+index c590d91..35e41bd 100644
+--- a/prometheus/promhttp/option.go
++++ b/prometheus/promhttp/option.go
+@@ -13,46 +13,19 @@
+ 
+ package promhttp
+ 
+-import (
+-	"context"
++// Option are used to configure a middleware or round tripper..
++type Option func(*option)
+ 
+-	"github.com/prometheus/client_golang/prometheus"
+-)
+-
+-// Option are used to configure both handler (middleware) or round tripper.
+-type Option interface {
+-	apply(*options)
+-}
+-
+-// options store options for both a handler or round tripper.
+-type options struct {
+-	extraMethods  []string
+-	getExemplarFn func(requestCtx context.Context) prometheus.Labels
+-}
+-
+-func defaultOptions() *options {
+-	return &options{getExemplarFn: func(ctx context.Context) prometheus.Labels { return nil }}
++type option struct {
++	extraMethods []string
+ }
+ 
+-type optionApplyFunc func(*options)
+-
+-func (o optionApplyFunc) apply(opt *options) { o(opt) }
+-
+ // WithExtraMethods adds additional HTTP methods to the list of allowed methods.
+ // See https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods for the default list.
+ //
+ // See the example for ExampleInstrumentHandlerWithExtraMethods for example usage.
+ func WithExtraMethods(methods ...string) Option {
+-	return optionApplyFunc(func(o *options) {
++	return func(o *option) {
+ 		o.extraMethods = methods
+-	})
+-}
+-
+-// WithExemplarFromContext adds allows to put a hook to all counter and histogram metrics.
+-// If the hook function returns non-nil labels, exemplars will be added for that request, otherwise metric
+-// will get instrumented without exemplar.
+-func WithExemplarFromContext(getExemplarFn func(requestCtx context.Context) prometheus.Labels) Option {
+-	return optionApplyFunc(func(o *options) {
+-		o.getExemplarFn = getExemplarFn
+-	})
++	}
+ }

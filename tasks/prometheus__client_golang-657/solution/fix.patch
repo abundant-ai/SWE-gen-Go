@@ -1,0 +1,160 @@
+diff --git a/go.mod b/go.mod
+index 99d0457..51311fc 100644
+--- a/go.mod
++++ b/go.mod
+@@ -2,6 +2,7 @@ module github.com/prometheus/client_golang
+ 
+ require (
+ 	github.com/beorn7/perks v1.0.1
++	github.com/cespare/xxhash/v2 v2.1.0
+ 	github.com/golang/protobuf v1.3.2
+ 	github.com/json-iterator/go v1.1.7
+ 	github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4
+diff --git a/go.sum b/go.sum
+index 5f52411..a0e4eff 100644
+--- a/go.sum
++++ b/go.sum
+@@ -8,6 +8,8 @@ github.com/beorn7/perks v1.0.0 h1:HWo1m869IqiPhD389kmkxeTalrjNbbJTC8LXupb+sl0=
+ github.com/beorn7/perks v1.0.0/go.mod h1:KWe93zE9D1o94FZ5RNwFwVgaQK1VOXiVxmqh+CedLV8=
+ github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
+ github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
++github.com/cespare/xxhash/v2 v2.1.0 h1:yTUvW7Vhb89inJ+8irsUqiWjh8iT6sQPZiQzI6ReGkA=
++github.com/cespare/xxhash/v2 v2.1.0/go.mod h1:dgIUBU3pDso/gPgZ1osOZ0iQf77oPR28Tjxl5dIMyVM=
+ github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
+ github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+diff --git a/prometheus/desc.go b/prometheus/desc.go
+index 1d034f8..e3232d7 100644
+--- a/prometheus/desc.go
++++ b/prometheus/desc.go
+@@ -19,6 +19,7 @@ import (
+ 	"sort"
+ 	"strings"
+ 
++	"github.com/cespare/xxhash/v2"
+ 	"github.com/golang/protobuf/proto"
+ 	"github.com/prometheus/common/model"
+ 
+@@ -126,24 +127,24 @@ func NewDesc(fqName, help string, variableLabels []string, constLabels Labels) *
+ 		return d
+ 	}
+ 
+-	vh := hashNew()
++	xxh := xxhash.New()
+ 	for _, val := range labelValues {
+-		vh = hashAdd(vh, val)
+-		vh = hashAddByte(vh, separatorByte)
++		xxh.WriteString(val)
++		xxh.Write(separatorByteSlice)
+ 	}
+-	d.id = vh
++	d.id = xxh.Sum64()
+ 	// Sort labelNames so that order doesn't matter for the hash.
+ 	sort.Strings(labelNames)
+ 	// Now hash together (in this order) the help string and the sorted
+ 	// label names.
+-	lh := hashNew()
+-	lh = hashAdd(lh, help)
+-	lh = hashAddByte(lh, separatorByte)
++	xxh.Reset()
++	xxh.WriteString(help)
++	xxh.Write(separatorByteSlice)
+ 	for _, labelName := range labelNames {
+-		lh = hashAdd(lh, labelName)
+-		lh = hashAddByte(lh, separatorByte)
++		xxh.WriteString(labelName)
++		xxh.Write(separatorByteSlice)
+ 	}
+-	d.dimHash = lh
++	d.dimHash = xxh.Sum64()
+ 
+ 	d.constLabelPairs = make([]*dto.LabelPair, 0, len(constLabels))
+ 	for n, v := range constLabels {
+diff --git a/prometheus/metric.go b/prometheus/metric.go
+index 55e6d86..5bb7f80 100644
+--- a/prometheus/metric.go
++++ b/prometheus/metric.go
+@@ -24,6 +24,8 @@ import (
+ 
+ const separatorByte byte = 255
+ 
++var separatorByteSlice = []byte{255} // For convenient use with xxhash.
++
+ // A Metric models a single sample value with its meta data being exported to
+ // Prometheus. Implementations of Metric in this package are Gauge, Counter,
+ // Histogram, Summary, and Untyped.
+diff --git a/prometheus/registry.go b/prometheus/registry.go
+index f4e9a99..b1f8ed8 100644
+--- a/prometheus/registry.go
++++ b/prometheus/registry.go
+@@ -25,6 +25,7 @@ import (
+ 	"sync"
+ 	"unicode/utf8"
+ 
++	"github.com/cespare/xxhash/v2"
+ 	"github.com/golang/protobuf/proto"
+ 	"github.com/prometheus/common/expfmt"
+ 
+@@ -266,7 +267,7 @@ func (r *Registry) Register(c Collector) error {
+ 		descChan           = make(chan *Desc, capDescChan)
+ 		newDescIDs         = map[uint64]struct{}{}
+ 		newDimHashesByName = map[string]uint64{}
+-		collectorID        uint64 // Just a sum of all desc IDs.
++		collectorID        uint64 // All desc IDs XOR'd together.
+ 		duplicateDescErr   error
+ 	)
+ 	go func() {
+@@ -293,12 +294,12 @@ func (r *Registry) Register(c Collector) error {
+ 		if _, exists := r.descIDs[desc.id]; exists {
+ 			duplicateDescErr = fmt.Errorf("descriptor %s already exists with the same fully-qualified name and const label values", desc)
+ 		}
+-		// If it is not a duplicate desc in this collector, add it to
++		// If it is not a duplicate desc in this collector, XOR it to
+ 		// the collectorID.  (We allow duplicate descs within the same
+ 		// collector, but their existence must be a no-op.)
+ 		if _, exists := newDescIDs[desc.id]; !exists {
+ 			newDescIDs[desc.id] = struct{}{}
+-			collectorID += desc.id
++			collectorID ^= desc.id
+ 		}
+ 
+ 		// Are all the label names and the help string consistent with
+@@ -875,9 +876,9 @@ func checkMetricConsistency(
+ 	}
+ 
+ 	// Is the metric unique (i.e. no other metric with the same name and the same labels)?
+-	h := hashNew()
+-	h = hashAdd(h, name)
+-	h = hashAddByte(h, separatorByte)
++	h := xxhash.New()
++	h.WriteString(name)
++	h.Write(separatorByteSlice)
+ 	// Make sure label pairs are sorted. We depend on it for the consistency
+ 	// check.
+ 	if !sort.IsSorted(labelPairSorter(dtoMetric.Label)) {
+@@ -888,18 +889,19 @@ func checkMetricConsistency(
+ 		dtoMetric.Label = copiedLabels
+ 	}
+ 	for _, lp := range dtoMetric.Label {
+-		h = hashAdd(h, lp.GetName())
+-		h = hashAddByte(h, separatorByte)
+-		h = hashAdd(h, lp.GetValue())
+-		h = hashAddByte(h, separatorByte)
++		h.WriteString(lp.GetName())
++		h.Write(separatorByteSlice)
++		h.WriteString(lp.GetValue())
++		h.Write(separatorByteSlice)
+ 	}
+-	if _, exists := metricHashes[h]; exists {
++	hSum := h.Sum64()
++	if _, exists := metricHashes[hSum]; exists {
+ 		return fmt.Errorf(
+ 			"collected metric %q { %s} was collected before with the same name and label values",
+ 			name, dtoMetric,
+ 		)
+ 	}
+-	metricHashes[h] = struct{}{}
++	metricHashes[hSum] = struct{}{}
+ 	return nil
+ }
+ 

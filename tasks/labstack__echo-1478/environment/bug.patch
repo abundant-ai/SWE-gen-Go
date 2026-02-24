@@ -1,0 +1,493 @@
+diff --git a/context.go b/context.go
+index 86b5064..0046e5d 100644
+--- a/context.go
++++ b/context.go
+@@ -43,7 +43,6 @@ type (
+ 
+ 		// RealIP returns the client's network address based on `X-Forwarded-For`
+ 		// or `X-Real-IP` request header.
+-		// The behavior can be configured using `Echo#IPExtractor`.
+ 		RealIP() string
+ 
+ 		// Path returns the registered path for the handler.
+@@ -271,10 +270,6 @@ func (c *context) Scheme() string {
+ }
+ 
+ func (c *context) RealIP() string {
+-	if c.echo != nil && c.echo.IPExtractor != nil {
+-		return c.echo.IPExtractor(c.request)
+-	}
+-	// Fall back to legacy behavior
+ 	if ip := c.request.Header.Get(HeaderXForwardedFor); ip != "" {
+ 		return strings.Split(ip, ", ")[0]
+ 	}
+diff --git a/echo.go b/echo.go
+index 1f8abe7..a759e34 100644
+--- a/echo.go
++++ b/echo.go
+@@ -90,7 +90,6 @@ type (
+ 		Validator        Validator
+ 		Renderer         Renderer
+ 		Logger           Logger
+-		IPExtractor      IPExtractor
+ 	}
+ 
+ 	// Route contains a handler and information for matching against requests.
+diff --git a/ip.go b/ip.go
+deleted file mode 100644
+index 39cb421..0000000
+--- a/ip.go
++++ /dev/null
+@@ -1,137 +0,0 @@
+-package echo
+-
+-import (
+-	"net"
+-	"net/http"
+-	"strings"
+-)
+-
+-type ipChecker struct {
+-	trustLoopback    bool
+-	trustLinkLocal   bool
+-	trustPrivateNet  bool
+-	trustExtraRanges []*net.IPNet
+-}
+-
+-// TrustOption is config for which IP address to trust
+-type TrustOption func(*ipChecker)
+-
+-// TrustLoopback configures if you trust loopback address (default: true).
+-func TrustLoopback(v bool) TrustOption {
+-	return func(c *ipChecker) {
+-		c.trustLoopback = v
+-	}
+-}
+-
+-// TrustLinkLocal configures if you trust link-local address (default: true).
+-func TrustLinkLocal(v bool) TrustOption {
+-	return func(c *ipChecker) {
+-		c.trustLinkLocal = v
+-	}
+-}
+-
+-// TrustPrivateNet configures if you trust private network address (default: true).
+-func TrustPrivateNet(v bool) TrustOption {
+-	return func(c *ipChecker) {
+-		c.trustPrivateNet = v
+-	}
+-}
+-
+-// TrustIPRange add trustable IP ranges using CIDR notation.
+-func TrustIPRange(ipRange *net.IPNet) TrustOption {
+-	return func(c *ipChecker) {
+-		c.trustExtraRanges = append(c.trustExtraRanges, ipRange)
+-	}
+-}
+-
+-func newIPChecker(configs []TrustOption) *ipChecker {
+-	checker := &ipChecker{trustLoopback: true, trustLinkLocal: true, trustPrivateNet: true}
+-	for _, configure := range configs {
+-		configure(checker)
+-	}
+-	return checker
+-}
+-
+-func isPrivateIPRange(ip net.IP) bool {
+-	if ip4 := ip.To4(); ip4 != nil {
+-		return ip4[0] == 10 ||
+-			ip4[0] == 172 && ip4[1]&0xf0 == 16 ||
+-			ip4[0] == 192 && ip4[1] == 168
+-	}
+-	return len(ip) == net.IPv6len && ip[0]&0xfe == 0xfc
+-}
+-
+-func (c *ipChecker) trust(ip net.IP) bool {
+-	if c.trustLoopback && ip.IsLoopback() {
+-		return true
+-	}
+-	if c.trustLinkLocal && ip.IsLinkLocalUnicast() {
+-		return true
+-	}
+-	if c.trustPrivateNet && isPrivateIPRange(ip) {
+-		return true
+-	}
+-	for _, trustedRange := range c.trustExtraRanges {
+-		if trustedRange.Contains(ip) {
+-			return true
+-		}
+-	}
+-	return false
+-}
+-
+-// IPExtractor is a function to extract IP addr from http.Request.
+-// Set appropriate one to Echo#IPExtractor.
+-// See https://echo.labstack.com/guide/ip-address for more details.
+-type IPExtractor func(*http.Request) string
+-
+-// ExtractIPDirect extracts IP address using actual IP address.
+-// Use this if your server faces to internet directory (i.e.: uses no proxy).
+-func ExtractIPDirect() IPExtractor {
+-	return func(req *http.Request) string {
+-		ra, _, _ := net.SplitHostPort(req.RemoteAddr)
+-		return ra
+-	}
+-}
+-
+-// ExtractIPFromRealIPHeader extracts IP address using x-real-ip header.
+-// Use this if you put proxy which uses this header.
+-func ExtractIPFromRealIPHeader(options ...TrustOption) IPExtractor {
+-	checker := newIPChecker(options)
+-	return func(req *http.Request) string {
+-		directIP := ExtractIPDirect()(req)
+-		realIP := req.Header.Get(HeaderXRealIP)
+-		if realIP != "" {
+-			if ip := net.ParseIP(directIP); ip != nil && checker.trust(ip) {
+-				return realIP
+-			}
+-		}
+-		return directIP
+-	}
+-}
+-
+-// ExtractIPFromXFFHeader extracts IP address using x-forwarded-for header.
+-// Use this if you put proxy which uses this header.
+-// This returns nearest untrustable IP. If all IPs are trustable, returns furthest one (i.e.: XFF[0]).
+-func ExtractIPFromXFFHeader(options ...TrustOption) IPExtractor {
+-	checker := newIPChecker(options)
+-	return func(req *http.Request) string {
+-		directIP := ExtractIPDirect()(req)
+-		xffs := req.Header[HeaderXForwardedFor]
+-		if len(xffs) == 0 {
+-			return directIP
+-		}
+-		ips := append(strings.Split(strings.Join(xffs, ","), ","), directIP)
+-		for i := len(ips) - 1; i >= 0; i-- {
+-			ip := net.ParseIP(strings.TrimSpace(ips[i]))
+-			if ip == nil {
+-				// Unable to parse IP; cannot trust entire records
+-				return directIP
+-			}
+-			if !checker.trust(ip) {
+-				return ip.String()
+-			}
+-		}
+-		// All of the IPs are trusted; return first element because it is furthest from server (best effort strategy).
+-		return strings.TrimSpace(ips[0])
+-	}
+-}
+diff --git a/ip_test.go b/ip_test.go
+deleted file mode 100644
+index 5acc117..0000000
+--- a/ip_test.go
++++ /dev/null
+@@ -1,235 +0,0 @@
+-package echo
+-
+-import (
+-	"net"
+-	"net/http"
+-	"strings"
+-	"testing"
+-
+-	testify "github.com/stretchr/testify/assert"
+-)
+-
+-const (
+-	// For RemoteAddr
+-	ipForRemoteAddrLoopback  = "127.0.0.1" // From 127.0.0.0/8
+-	sampleRemoteAddrLoopback = ipForRemoteAddrLoopback + ":8080"
+-	ipForRemoteAddrExternal  = "203.0.113.1"
+-	sampleRemoteAddrExternal = ipForRemoteAddrExternal + ":8080"
+-	// For x-real-ip
+-	ipForRealIP = "203.0.113.10"
+-	// For XFF
+-	ipForXFF1LinkLocal = "169.254.0.101" // From 169.254.0.0/16
+-	ipForXFF2Private   = "192.168.0.102" // From 192.168.0.0/16
+-	ipForXFF3External  = "2001:db8::103"
+-	ipForXFF4Private   = "fc00::104" // From fc00::/7
+-	ipForXFF5External  = "198.51.100.105"
+-	ipForXFF6External  = "192.0.2.106"
+-	ipForXFFBroken     = "this.is.broken.lol"
+-	// keys for test cases
+-	ipTestReqKeyNoHeader             = "no header"
+-	ipTestReqKeyRealIPExternal       = "x-real-ip; remote addr external"
+-	ipTestReqKeyRealIPInternal       = "x-real-ip; remote addr internal"
+-	ipTestReqKeyRealIPAndXFFExternal = "x-real-ip and xff; remote addr external"
+-	ipTestReqKeyRealIPAndXFFInternal = "x-real-ip and xff; remote addr internal"
+-	ipTestReqKeyXFFExternal          = "xff; remote addr external"
+-	ipTestReqKeyXFFInternal          = "xff; remote addr internal"
+-	ipTestReqKeyBrokenXFF            = "broken xff"
+-)
+-
+-var (
+-	sampleXFF = strings.Join([]string{
+-		ipForXFF6External, ipForXFF5External, ipForXFF4Private, ipForXFF3External, ipForXFF2Private, ipForXFF1LinkLocal,
+-	}, ", ")
+-
+-	requests = map[string]*http.Request{
+-		ipTestReqKeyNoHeader: &http.Request{
+-			RemoteAddr: sampleRemoteAddrExternal,
+-		},
+-		ipTestReqKeyRealIPExternal: &http.Request{
+-			Header: http.Header{
+-				"X-Real-Ip": []string{ipForRealIP},
+-			},
+-			RemoteAddr: sampleRemoteAddrExternal,
+-		},
+-		ipTestReqKeyRealIPInternal: &http.Request{
+-			Header: http.Header{
+-				"X-Real-Ip": []string{ipForRealIP},
+-			},
+-			RemoteAddr: sampleRemoteAddrLoopback,
+-		},
+-		ipTestReqKeyRealIPAndXFFExternal: &http.Request{
+-			Header: http.Header{
+-				"X-Real-Ip":         []string{ipForRealIP},
+-				HeaderXForwardedFor: []string{sampleXFF},
+-			},
+-			RemoteAddr: sampleRemoteAddrExternal,
+-		},
+-		ipTestReqKeyRealIPAndXFFInternal: &http.Request{
+-			Header: http.Header{
+-				"X-Real-Ip":         []string{ipForRealIP},
+-				HeaderXForwardedFor: []string{sampleXFF},
+-			},
+-			RemoteAddr: sampleRemoteAddrLoopback,
+-		},
+-		ipTestReqKeyXFFExternal: &http.Request{
+-			Header: http.Header{
+-				HeaderXForwardedFor: []string{sampleXFF},
+-			},
+-			RemoteAddr: sampleRemoteAddrExternal,
+-		},
+-		ipTestReqKeyXFFInternal: &http.Request{
+-			Header: http.Header{
+-				HeaderXForwardedFor: []string{sampleXFF},
+-			},
+-			RemoteAddr: sampleRemoteAddrLoopback,
+-		},
+-		ipTestReqKeyBrokenXFF: &http.Request{
+-			Header: http.Header{
+-				HeaderXForwardedFor: []string{ipForXFFBroken + ", " + ipForXFF1LinkLocal},
+-			},
+-			RemoteAddr: sampleRemoteAddrLoopback,
+-		},
+-	}
+-)
+-
+-func TestExtractIP(t *testing.T) {
+-	_, ipv4AllRange, _ := net.ParseCIDR("0.0.0.0/0")
+-	_, ipv6AllRange, _ := net.ParseCIDR("::/0")
+-	_, ipForXFF3ExternalRange, _ := net.ParseCIDR(ipForXFF3External + "/48")
+-	_, ipForRemoteAddrExternalRange, _ := net.ParseCIDR(ipForRemoteAddrExternal + "/24")
+-
+-	tests := map[string]*struct {
+-		extractor   IPExtractor
+-		expectedIPs map[string]string
+-	}{
+-		"ExtractIPDirect": {
+-			ExtractIPDirect(),
+-			map[string]string{
+-				ipTestReqKeyNoHeader:             ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPExternal:       ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPInternal:       ipForRemoteAddrLoopback,
+-				ipTestReqKeyRealIPAndXFFExternal: ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPAndXFFInternal: ipForRemoteAddrLoopback,
+-				ipTestReqKeyXFFExternal:          ipForRemoteAddrExternal,
+-				ipTestReqKeyXFFInternal:          ipForRemoteAddrLoopback,
+-				ipTestReqKeyBrokenXFF:            ipForRemoteAddrLoopback,
+-			},
+-		},
+-		"ExtractIPFromRealIPHeader(default)": {
+-			ExtractIPFromRealIPHeader(),
+-			map[string]string{
+-				ipTestReqKeyNoHeader:             ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPExternal:       ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPInternal:       ipForRealIP,
+-				ipTestReqKeyRealIPAndXFFExternal: ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPAndXFFInternal: ipForRealIP,
+-				ipTestReqKeyXFFExternal:          ipForRemoteAddrExternal,
+-				ipTestReqKeyXFFInternal:          ipForRemoteAddrLoopback,
+-				ipTestReqKeyBrokenXFF:            ipForRemoteAddrLoopback,
+-			},
+-		},
+-		"ExtractIPFromRealIPHeader(trust only direct-facing proxy)": {
+-			ExtractIPFromRealIPHeader(TrustLoopback(false), TrustLinkLocal(false), TrustPrivateNet(false), TrustIPRange(ipForRemoteAddrExternalRange)),
+-			map[string]string{
+-				ipTestReqKeyNoHeader:             ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPExternal:       ipForRealIP,
+-				ipTestReqKeyRealIPInternal:       ipForRemoteAddrLoopback,
+-				ipTestReqKeyRealIPAndXFFExternal: ipForRealIP,
+-				ipTestReqKeyRealIPAndXFFInternal: ipForRemoteAddrLoopback,
+-				ipTestReqKeyXFFExternal:          ipForRemoteAddrExternal,
+-				ipTestReqKeyXFFInternal:          ipForRemoteAddrLoopback,
+-				ipTestReqKeyBrokenXFF:            ipForRemoteAddrLoopback,
+-			},
+-		},
+-		"ExtractIPFromRealIPHeader(trust direct-facing proxy)": {
+-			ExtractIPFromRealIPHeader(TrustIPRange(ipForRemoteAddrExternalRange)),
+-			map[string]string{
+-				ipTestReqKeyNoHeader:             ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPExternal:       ipForRealIP,
+-				ipTestReqKeyRealIPInternal:       ipForRealIP,
+-				ipTestReqKeyRealIPAndXFFExternal: ipForRealIP,
+-				ipTestReqKeyRealIPAndXFFInternal: ipForRealIP,
+-				ipTestReqKeyXFFExternal:          ipForRemoteAddrExternal,
+-				ipTestReqKeyXFFInternal:          ipForRemoteAddrLoopback,
+-				ipTestReqKeyBrokenXFF:            ipForRemoteAddrLoopback,
+-			},
+-		},
+-		"ExtractIPFromXFFHeader(default)": {
+-			ExtractIPFromXFFHeader(),
+-			map[string]string{
+-				ipTestReqKeyNoHeader:             ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPExternal:       ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPInternal:       ipForRemoteAddrLoopback,
+-				ipTestReqKeyRealIPAndXFFExternal: ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPAndXFFInternal: ipForXFF3External,
+-				ipTestReqKeyXFFExternal:          ipForRemoteAddrExternal,
+-				ipTestReqKeyXFFInternal:          ipForXFF3External,
+-				ipTestReqKeyBrokenXFF:            ipForRemoteAddrLoopback,
+-			},
+-		},
+-		"ExtractIPFromXFFHeader(trust only direct-facing proxy)": {
+-			ExtractIPFromXFFHeader(TrustLoopback(false), TrustLinkLocal(false), TrustPrivateNet(false), TrustIPRange(ipForRemoteAddrExternalRange)),
+-			map[string]string{
+-				ipTestReqKeyNoHeader:             ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPExternal:       ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPInternal:       ipForRemoteAddrLoopback,
+-				ipTestReqKeyRealIPAndXFFExternal: ipForXFF1LinkLocal,
+-				ipTestReqKeyRealIPAndXFFInternal: ipForRemoteAddrLoopback,
+-				ipTestReqKeyXFFExternal:          ipForXFF1LinkLocal,
+-				ipTestReqKeyXFFInternal:          ipForRemoteAddrLoopback,
+-				ipTestReqKeyBrokenXFF:            ipForRemoteAddrLoopback,
+-			},
+-		},
+-		"ExtractIPFromXFFHeader(trust direct-facing proxy)": {
+-			ExtractIPFromXFFHeader(TrustIPRange(ipForRemoteAddrExternalRange)),
+-			map[string]string{
+-				ipTestReqKeyNoHeader:             ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPExternal:       ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPInternal:       ipForRemoteAddrLoopback,
+-				ipTestReqKeyRealIPAndXFFExternal: ipForXFF3External,
+-				ipTestReqKeyRealIPAndXFFInternal: ipForXFF3External,
+-				ipTestReqKeyXFFExternal:          ipForXFF3External,
+-				ipTestReqKeyXFFInternal:          ipForXFF3External,
+-				ipTestReqKeyBrokenXFF:            ipForRemoteAddrLoopback,
+-			},
+-		},
+-		"ExtractIPFromXFFHeader(trust everything)": {
+-			// This is similar to legacy behavior, but ignores x-real-ip header.
+-			ExtractIPFromXFFHeader(TrustIPRange(ipv4AllRange), TrustIPRange(ipv6AllRange)),
+-			map[string]string{
+-				ipTestReqKeyNoHeader:             ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPExternal:       ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPInternal:       ipForRemoteAddrLoopback,
+-				ipTestReqKeyRealIPAndXFFExternal: ipForXFF6External,
+-				ipTestReqKeyRealIPAndXFFInternal: ipForXFF6External,
+-				ipTestReqKeyXFFExternal:          ipForXFF6External,
+-				ipTestReqKeyXFFInternal:          ipForXFF6External,
+-				ipTestReqKeyBrokenXFF:            ipForRemoteAddrLoopback,
+-			},
+-		},
+-		"ExtractIPFromXFFHeader(trust ipForXFF3External)": {
+-			// This trusts private network also after "additional" trust ranges unlike `TrustNProxies(1)` doesn't
+-			ExtractIPFromXFFHeader(TrustIPRange(ipForXFF3ExternalRange)),
+-			map[string]string{
+-				ipTestReqKeyNoHeader:             ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPExternal:       ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPInternal:       ipForRemoteAddrLoopback,
+-				ipTestReqKeyRealIPAndXFFExternal: ipForRemoteAddrExternal,
+-				ipTestReqKeyRealIPAndXFFInternal: ipForXFF5External,
+-				ipTestReqKeyXFFExternal:          ipForRemoteAddrExternal,
+-				ipTestReqKeyXFFInternal:          ipForXFF5External,
+-				ipTestReqKeyBrokenXFF:            ipForRemoteAddrLoopback,
+-			},
+-		},
+-	}
+-	for name, test := range tests {
+-		t.Run(name, func(t *testing.T) {
+-			assert := testify.New(t)
+-			for key, req := range requests {
+-				actual := test.extractor(req)
+-				expected := test.expectedIPs[key]
+-				assert.Equal(expected, actual, "Request: %s", key)
+-			}
+-		})
+-	}
+-}
+diff --git a/middleware/proxy.go b/middleware/proxy.go
+index 1da370d..ef5602b 100644
+--- a/middleware/proxy.go
++++ b/middleware/proxy.go
+@@ -231,9 +231,7 @@ func ProxyWithConfig(config ProxyConfig) echo.MiddlewareFunc {
+ 			}
+ 
+ 			// Fix header
+-			// Basically it's not good practice to unconditionally pass incoming x-real-ip header to upstream.
+-			// However, for backward compatibility, legacy behavior is preserved unless you configure Echo#IPExtractor.
+-			if req.Header.Get(echo.HeaderXRealIP) == "" || c.Echo().IPExtractor != nil {
++			if req.Header.Get(echo.HeaderXRealIP) == "" {
+ 				req.Header.Set(echo.HeaderXRealIP, c.RealIP())
+ 			}
+ 			if req.Header.Get(echo.HeaderXForwardedProto) == "" {
+diff --git a/middleware/proxy_test.go b/middleware/proxy_test.go
+index 40d150c..1a375db 100644
+--- a/middleware/proxy_test.go
++++ b/middleware/proxy_test.go
+@@ -2,7 +2,6 @@ package middleware
+ 
+ import (
+ 	"fmt"
+-	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"net/url"
+@@ -120,46 +119,3 @@ func TestProxy(t *testing.T) {
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ }
+-
+-func TestProxyRealIPHeader(t *testing.T) {
+-	// Setup
+-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+-	defer upstream.Close()
+-	url, _ := url.Parse(upstream.URL)
+-	rrb := NewRoundRobinBalancer([]*ProxyTarget{{Name: "upstream", URL: url}})
+-	e := echo.New()
+-	e.Use(Proxy(rrb))
+-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+-	rec := httptest.NewRecorder()
+-
+-	remoteAddrIP, _, _ := net.SplitHostPort(req.RemoteAddr)
+-	realIPHeaderIP := "203.0.113.1"
+-	extractedRealIP := "203.0.113.10"
+-	tests := []*struct {
+-		hasRealIPheader bool
+-		hasIPExtractor  bool
+-		extectedXRealIP string
+-	}{
+-		{false, false, remoteAddrIP},
+-		{false, true, extractedRealIP},
+-		{true, false, realIPHeaderIP},
+-		{true, true, extractedRealIP},
+-	}
+-
+-	for _, tt := range tests {
+-		if tt.hasRealIPheader {
+-			req.Header.Set(echo.HeaderXRealIP, realIPHeaderIP)
+-		} else {
+-			req.Header.Del(echo.HeaderXRealIP)
+-		}
+-		if tt.hasIPExtractor {
+-			e.IPExtractor = func(*http.Request) string {
+-				return extractedRealIP
+-			}
+-		} else {
+-			e.IPExtractor = nil
+-		}
+-		e.ServeHTTP(rec, req)
+-		assert.Equal(t, tt.extectedXRealIP, req.Header.Get(echo.HeaderXRealIP), "hasRealIPheader: %t / hasIPExtractor: %t", tt.hasRealIPheader, tt.hasIPExtractor)
+-	}
+-}

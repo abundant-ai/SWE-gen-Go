@@ -1,0 +1,185 @@
+diff --git a/chi.go b/chi.go
+index 6942e69..fac7045 100644
+--- a/chi.go
++++ b/chi.go
+@@ -9,8 +9,8 @@ import (
+ // NewRouter returns a new Mux object that implements the Router interface.
+ // It accepts an optional parent context.Context argument used by all
+ // request contexts useful for signaling a server shutdown.
+-func NewRouter() *Mux {
+-	return NewMux()
++func NewRouter(parent ...context.Context) *Mux {
++	return NewMux(parent...)
+ }
+ 
+ // A Router consisting of the core routing methods used by chi's Mux.
+diff --git a/context.go b/context.go
+index d076beb..f4db3ac 100644
+--- a/context.go
++++ b/context.go
+@@ -22,10 +22,10 @@ type Context struct {
+ 	RoutePath string
+ }
+ 
+-// NewContext returns a new routing context object.
+-func NewContext() *Context {
++// neContext returns a new routing context object.
++func newContext(parent context.Context) *Context {
+ 	rctx := &Context{}
+-	ctx := context.WithValue(context.Background(), routeCtxKey, rctx)
++	ctx := context.WithValue(parent, routeCtxKey, rctx)
+ 	rctx.Context = ctx
+ 	return rctx
+ }
+diff --git a/mux.go b/mux.go
+index 54e0120..70a74c0 100644
+--- a/mux.go
++++ b/mux.go
+@@ -19,6 +19,9 @@ var _ Router = &Mux{}
+ // for writing large REST API services that break a handler into many smaller
+ // parts composed of middlewares and end handlers.
+ type Mux struct {
++	// A parent root context for any request that is usually a server context
++	parentCtx context.Context
++
+ 	// The middleware stack, supporting..
+ 	// func(http.Handler) http.Handler and func(chi.Handler) chi.Handler
+ 	middlewares []interface{}
+@@ -67,11 +70,17 @@ var methodMap = map[string]methodTyp{
+ }
+ 
+ // NewMux returns a new Mux object with an optional parent context.
+-func NewMux() *Mux {
+-	mux := &Mux{router: newTreeRouter(), handler: nil}
++func NewMux(parent ...context.Context) *Mux {
++	pctx := context.Background()
++	if len(parent) > 0 {
++		pctx = parent[0]
++	}
++
++	mux := &Mux{parentCtx: pctx, router: newTreeRouter(), handler: nil}
+ 	mux.pool.New = func() interface{} {
+-		return NewContext()
++		return newContext(pctx)
+ 	}
++
+ 	return mux
+ }
+ 
+@@ -255,31 +264,15 @@ func (mx *Mux) Mount(path string, handlers ...interface{}) {
+ // Mux interoperable with the standard library. It uses a sync.Pool to get and
+ // reuse routing contexts for each request.
+ func (mx *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+-	mx.ServeHTTPC(nil, w, r)
++	ctx := mx.pool.Get().(*Context)
++	mx.ServeHTTPC(ctx, w, r)
++	ctx.reset()
++	mx.pool.Put(ctx)
+ }
+ 
+ // ServeHTTPC is chi's Handler method that adds a context.Context argument to the
+ // standard ServeHTTP handler function.
+ func (mx *Mux) ServeHTTPC(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+-	if ctx == nil {
+-		rctx := mx.pool.Get().(*Context)
+-		mx.handler.ServeHTTPC(rctx, w, r)
+-		rctx.reset()
+-		mx.pool.Put(rctx)
+-		return
+-	}
+-
+-	if rctx, ok := ctx.(*Context); !ok {
+-		if rctx, ok = ctx.Value(routeCtxKey).(*Context); !ok {
+-			rctx = mx.pool.Get().(*Context)
+-			ctx = context.WithValue(ctx, routeCtxKey, rctx)
+-			mx.handler.ServeHTTPC(ctx, w, r)
+-			rctx.reset()
+-			mx.pool.Put(rctx)
+-			return
+-		}
+-	}
+-
+ 	mx.handler.ServeHTTPC(ctx, w, r)
+ }
+ 
+diff --git a/mux_test.go b/mux_test.go
+index 60005b9..5547416 100644
+--- a/mux_test.go
++++ b/mux_test.go
+@@ -15,39 +15,34 @@ import (
+ 	"golang.org/x/net/context"
+ )
+ 
+-func TestMuxServeHTTPC(t *testing.T) {
++func TestMuxServeHTTP(t *testing.T) {
+ 	r := NewRouter()
+ 	r.Get("/hi", func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+-		s, _ := ctx.Value("testCtx").(string)
+-		w.Write([]byte(s))
++		w.Write([]byte("bye"))
+ 	})
+ 	r.NotFound(func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+-		s, _ := ctx.Value("testCtx").(string)
+ 		w.WriteHeader(404)
+-		w.Write([]byte(s))
++		w.Write([]byte("nothing here"))
+ 	})
+ 
+-	// Thanks to https://github.com/mrcpvn for the clean table test submission
++	// Thanks to https://github.com/mrcpvn for the nice table test code
+ 	testcases := []struct {
+ 		Method         string
+ 		Path           string
+-		Ctx            context.Context
+ 		ExpectedStatus int
+ 		ExpectedBody   string
+ 	}{
+ 		{
+ 			Method:         "GET",
+ 			Path:           "/hi",
+-			Ctx:            context.WithValue(context.Background(), "testCtx", "hi ctx"),
+ 			ExpectedStatus: 200,
+-			ExpectedBody:   "hi ctx",
++			ExpectedBody:   "bye",
+ 		},
+ 		{
+ 			Method:         "GET",
+ 			Path:           "/hello",
+-			Ctx:            context.WithValue(context.Background(), "testCtx", "nothing here ctx"),
+ 			ExpectedStatus: 404,
+-			ExpectedBody:   "nothing here ctx",
++			ExpectedBody:   "nothing here",
+ 		},
+ 	}
+ 
+@@ -57,7 +52,7 @@ func TestMuxServeHTTPC(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatalf("%v", err)
+ 		}
+-		r.ServeHTTPC(tc.Ctx, resp, req)
++		r.ServeHTTP(resp, req)
+ 		b, err := ioutil.ReadAll(resp.Body)
+ 		if err != nil {
+ 			t.Fatalf("%v", err)
+diff --git a/tree_test.go b/tree_test.go
+index 036e22a..1bdb140 100644
+--- a/tree_test.go
++++ b/tree_test.go
+@@ -142,7 +142,7 @@ func TestTree(t *testing.T) {
+ 
+ 	for i, tt := range tests {
+ 		// params := make(map[string]string, 0)
+-		rctx := NewContext()
++		rctx := newContext(context.Background())
+ 		handler := tr.Find(rctx, tt.r) //, params)
+ 		params := urlParams(rctx)
+ 		if fmt.Sprintf("%v", tt.h) != fmt.Sprintf("%v", handler) {
+@@ -197,7 +197,7 @@ func BenchmarkTreeGet(b *testing.B) {
+ 
+ 	for i := 0; i < b.N; i++ {
+ 		// params := map[string]string{}
+-		mctx := NewContext()
++		mctx := newContext(context.Background())
+ 		tr.Find(mctx, "/ping/123/456")
+ 		// tr.Find("/pingggg", params)
+ 	}

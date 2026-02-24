@@ -1,0 +1,573 @@
+diff --git a/clientconn.go b/clientconn.go
+index cd3eaf8d..4f350ca5 100644
+--- a/clientconn.go
++++ b/clientconn.go
+@@ -689,31 +689,22 @@ func (cc *ClientConn) Connect() {
+ 	cc.mu.Unlock()
+ }
+ 
+-// waitForResolvedAddrs blocks until the resolver provides addresses or the
+-// context expires, whichever happens first.
+-//
+-// Error is nil unless the context expires first; otherwise returns a status
+-// error based on the context.
+-//
+-// The returned boolean indicates whether it did block or not. If the
+-// resolution has already happened once before, it returns false without
+-// blocking. Otherwise, it wait for the resolution and return true if
+-// resolution has succeeded or return false along with error if resolution has
+-// failed.
+-func (cc *ClientConn) waitForResolvedAddrs(ctx context.Context) (bool, error) {
++// waitForResolvedAddrs blocks until the resolver has provided addresses or the
++// context expires.  Returns nil unless the context expires first; otherwise
++// returns a status error based on the context.
++func (cc *ClientConn) waitForResolvedAddrs(ctx context.Context) error {
+ 	// This is on the RPC path, so we use a fast path to avoid the
+ 	// more-expensive "select" below after the resolver has returned once.
+ 	if cc.firstResolveEvent.HasFired() {
+-		return false, nil
++		return nil
+ 	}
+-	internal.NewStreamWaitingForResolver()
+ 	select {
+ 	case <-cc.firstResolveEvent.Done():
+-		return true, nil
++		return nil
+ 	case <-ctx.Done():
+-		return false, status.FromContextError(ctx.Err()).Err()
++		return status.FromContextError(ctx.Err()).Err()
+ 	case <-cc.ctx.Done():
+-		return false, ErrClientConnClosing
++		return ErrClientConnClosing
+ 	}
+ }
+ 
+diff --git a/internal/internal.go b/internal/internal.go
+index 3ac798e8..2ce012cd 100644
+--- a/internal/internal.go
++++ b/internal/internal.go
+@@ -266,13 +266,6 @@ var (
+ 	TimeAfterFunc = func(d time.Duration, f func()) Timer {
+ 		return time.AfterFunc(d, f)
+ 	}
+-
+-	// NewStreamWaitingForResolver is a test hook that is triggered when a
+-	// new stream blocks while waiting for name resolution. This can be
+-	// used in tests to synchronize resolver updates and avoid race conditions.
+-	// When set, the function will be called before the stream enters
+-	// the blocking state.
+-	NewStreamWaitingForResolver = func() {}
+ )
+ 
+ // HealthChecker defines the signature of the client-side LB channel health
+diff --git a/stats/handlers.go b/stats/handlers.go
+index 67194a59..dc03731e 100644
+--- a/stats/handlers.go
++++ b/stats/handlers.go
+@@ -38,15 +38,6 @@ type RPCTagInfo struct {
+ 	// FailFast indicates if this RPC is failfast.
+ 	// This field is only valid on client side, it's always false on server side.
+ 	FailFast bool
+-	// NameResolutionDelay indicates if the RPC needed to wait for the
+-	// initial name resolver update before it could begin. This should only
+-	// happen if the channel is IDLE when the RPC is started.  Note that
+-	// all retry or hedging attempts for an RPC that experienced a delay
+-	// will have it set.
+-	//
+-	// This field is only valid on the client side; it is always false on
+-	// the server side.
+-	NameResolutionDelay bool
+ }
+ 
+ // Handler defines the interface for the related stats handling (e.g., RPCs, connections).
+diff --git a/stats/opentelemetry/client_metrics.go b/stats/opentelemetry/client_metrics.go
+index 34e52de1..4fffba60 100644
+--- a/stats/opentelemetry/client_metrics.go
++++ b/stats/opentelemetry/client_metrics.go
+@@ -191,7 +191,7 @@ func (h *clientStatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo)
+ 		method:    removeLeadingSlash(info.FullMethodName),
+ 	}
+ 	if h.options.isTracingEnabled() {
+-		ctx, ai = h.traceTagRPC(ctx, ai, info.NameResolutionDelay)
++		ctx, ai = h.traceTagRPC(ctx, ai)
+ 	}
+ 	return setRPCInfo(ctx, &rpcInfo{
+ 		ai: ai,
+diff --git a/stats/opentelemetry/client_tracing.go b/stats/opentelemetry/client_tracing.go
+index 8aea7c9d..2cc974b5 100644
+--- a/stats/opentelemetry/client_tracing.go
++++ b/stats/opentelemetry/client_tracing.go
+@@ -25,25 +25,14 @@ import (
+ 	otelinternaltracing "google.golang.org/grpc/stats/opentelemetry/internal/tracing"
+ )
+ 
+-const (
+-	delayedResolutionEventName = "Delayed name resolution complete"
+-	tracerName                 = "grpc-go"
+-)
++const tracerName = "grpc-go"
+ 
+ // traceTagRPC populates provided context with a new span using the
+ // TextMapPropagator supplied in trace options and internal itracing.carrier.
+ // It creates a new outgoing carrier which serializes information about this
+ // span into gRPC Metadata, if TextMapPropagator is provided in the trace
+ // options. if TextMapPropagator is not provided, it returns the context as is.
+-func (h *clientStatsHandler) traceTagRPC(ctx context.Context, ai *attemptInfo, nameResolutionDelayed bool) (context.Context, *attemptInfo) {
+-	// Add a "Delayed name resolution complete" event to the call span
+-	// if there was name resolution delay. In case of multiple retry attempts,
+-	// ensure that event is added only once.
+-	callSpan := trace.SpanFromContext(ctx)
+-	ci := getCallInfo(ctx)
+-	if nameResolutionDelayed && !ci.nameResolutionEventAdded.Swap(true) && callSpan.SpanContext().IsValid() {
+-		callSpan.AddEvent(delayedResolutionEventName)
+-	}
++func (h *clientStatsHandler) traceTagRPC(ctx context.Context, ai *attemptInfo) (context.Context, *attemptInfo) {
+ 	mn := "Attempt." + strings.Replace(ai.method, "/", ".", -1)
+ 	tracer := h.options.TraceOptions.TracerProvider.Tracer(tracerName, trace.WithInstrumentationVersion(grpc.Version))
+ 	ctx, span := tracer.Start(ctx, mn)
+diff --git a/stats/opentelemetry/e2e_test.go b/stats/opentelemetry/e2e_test.go
+index d0299a39..970e07cb 100644
+--- a/stats/opentelemetry/e2e_test.go
++++ b/stats/opentelemetry/e2e_test.go
+@@ -21,7 +21,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"slices"
+-	"strconv"
+ 	"testing"
+ 	"time"
+ 
+@@ -49,11 +48,9 @@ import (
+ 	"go.opentelemetry.io/otel/sdk/trace"
+ 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+ 	"google.golang.org/grpc"
+-	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/credentials/insecure"
+ 	"google.golang.org/grpc/encoding/gzip"
+ 	experimental "google.golang.org/grpc/experimental/opentelemetry"
+-	"google.golang.org/grpc/internal"
+ 	"google.golang.org/grpc/internal/grpcsync"
+ 	"google.golang.org/grpc/internal/grpctest"
+ 	"google.golang.org/grpc/internal/stubserver"
+@@ -62,13 +59,9 @@ import (
+ 	setup "google.golang.org/grpc/internal/testutils/xds/e2e/setup"
+ 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+ 	testpb "google.golang.org/grpc/interop/grpc_testing"
+-	"google.golang.org/grpc/metadata"
+ 	"google.golang.org/grpc/orca"
+-	"google.golang.org/grpc/resolver"
+-	"google.golang.org/grpc/resolver/manual"
+ 	"google.golang.org/grpc/stats/opentelemetry"
+ 	"google.golang.org/grpc/stats/opentelemetry/internal/testutils"
+-	"google.golang.org/grpc/status"
+ )
+ 
+ var defaultTestTimeout = 5 * time.Second
+@@ -1567,168 +1560,3 @@ func (s) TestRPCSpanErrorStatus(t *testing.T) {
+ 		t.Fatalf("got rpc error %s, want %s", spans[0].Status.Description, rpcErrorMsg)
+ 	}
+ }
+-
+-const delayedResolutionEventName = "Delayed name resolution complete"
+-
+-// TestTraceSpan_WithRetriesAndNameResolutionDelay verifies that
+-// "Delayed name resolution complete" event is recorded in the call trace span
+-// only once if any of the retry attempt encountered a delay in name resolution
+-func (s) TestTraceSpan_WithRetriesAndNameResolutionDelay(t *testing.T) {
+-	tests := []struct {
+-		name      string
+-		setupStub func() *stubserver.StubServer
+-		doCall    func(context.Context, testgrpc.TestServiceClient) error
+-		spanName  string
+-	}{
+-		{
+-			name: "unary",
+-			setupStub: func() *stubserver.StubServer {
+-				return &stubserver.StubServer{
+-					UnaryCallF: func(ctx context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+-						md, _ := metadata.FromIncomingContext(ctx)
+-						headerAttempts := 0
+-						if h := md["grpc-previous-rpc-attempts"]; len(h) > 0 {
+-							headerAttempts, _ = strconv.Atoi(h[0])
+-						}
+-						if headerAttempts < 2 {
+-							return nil, status.Errorf(codes.Unavailable, "retry (%d)", headerAttempts)
+-						}
+-						return &testpb.SimpleResponse{}, nil
+-					},
+-				}
+-			},
+-			doCall: func(ctx context.Context, client testgrpc.TestServiceClient) error {
+-				_, err := client.UnaryCall(ctx, &testpb.SimpleRequest{})
+-				return err
+-			},
+-			spanName: "grpc.testing.TestService.UnaryCall",
+-		},
+-		{
+-			name: "streaming",
+-			setupStub: func() *stubserver.StubServer {
+-				return &stubserver.StubServer{
+-					FullDuplexCallF: func(stream testgrpc.TestService_FullDuplexCallServer) error {
+-						md, _ := metadata.FromIncomingContext(stream.Context())
+-						headerAttempts := 0
+-						if h := md["grpc-previous-rpc-attempts"]; len(h) > 0 {
+-							headerAttempts, _ = strconv.Atoi(h[0])
+-						}
+-						if headerAttempts < 2 {
+-							return status.Errorf(codes.Unavailable, "retry (%d)", headerAttempts)
+-						}
+-						for {
+-							_, err := stream.Recv()
+-							if err == io.EOF {
+-								return nil
+-							}
+-							if err != nil {
+-								return err
+-							}
+-						}
+-					},
+-				}
+-			},
+-			doCall: func(ctx context.Context, client testgrpc.TestServiceClient) error {
+-				stream, err := client.FullDuplexCall(ctx)
+-				if err != nil {
+-					return err
+-				}
+-				if err := stream.Send(&testpb.StreamingOutputCallRequest{}); err != nil {
+-					return err
+-				}
+-				if err := stream.CloseSend(); err != nil {
+-					return err
+-				}
+-				_, err = stream.Recv()
+-				if err != nil && err != io.EOF {
+-					return err
+-				}
+-				return nil
+-			},
+-			spanName: "grpc.testing.TestService.FullDuplexCall",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			resolutionWait := grpcsync.NewEvent()
+-			prevHook := internal.NewStreamWaitingForResolver
+-			internal.NewStreamWaitingForResolver = func() { resolutionWait.Fire() }
+-			defer func() { internal.NewStreamWaitingForResolver = prevHook }()
+-
+-			mo, _ := defaultMetricsOptions(t, nil)
+-			to, exporter := defaultTraceOptions(t)
+-			rb := manual.NewBuilderWithScheme("delayed")
+-			ss := tt.setupStub()
+-			opts := opentelemetry.Options{MetricsOptions: *mo, TraceOptions: *to}
+-			if err := ss.Start([]grpc.ServerOption{opentelemetry.ServerOption(opts)}); err != nil {
+-				t.Fatal(err)
+-			}
+-			defer ss.Stop()
+-
+-			retryPolicy := `{
+-				"methodConfig": [{
+-					"name": [{"service": "grpc.testing.TestService"}],
+-					"retryPolicy": {
+-						"maxAttempts": 3,
+-						"initialBackoff": "0.05s",
+-						"maxBackoff": "0.2s",
+-						"backoffMultiplier": 1.0,
+-						"retryableStatusCodes": ["UNAVAILABLE"]
+-					}
+-				}]
+-			}`
+-			cc, err := grpc.NewClient(
+-				rb.Scheme()+":///test.server",
+-				grpc.WithTransportCredentials(insecure.NewCredentials()),
+-				grpc.WithResolvers(rb),
+-				opentelemetry.DialOption(opts),
+-				grpc.WithDefaultServiceConfig(retryPolicy),
+-			)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			defer cc.Close()
+-
+-			client := testgrpc.NewTestServiceClient(cc)
+-			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+-			defer cancel()
+-
+-			go func() {
+-				<-resolutionWait.Done()
+-				rb.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: ss.Address}}})
+-			}()
+-			if err := tt.doCall(ctx, client); err != nil {
+-				t.Fatalf("%s call failed: %v", tt.name, err)
+-			}
+-
+-			wantSpanInfo := traceSpanInfo{
+-				name:     tt.spanName,
+-				spanKind: oteltrace.SpanKindClient.String(),
+-				events:   []trace.Event{{Name: delayedResolutionEventName}},
+-			}
+-			spans, err := waitForTraceSpans(ctx, exporter, []traceSpanInfo{wantSpanInfo})
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			verifyTrace(t, spans, wantSpanInfo)
+-		})
+-	}
+-}
+-
+-func verifyTrace(t *testing.T, spans tracetest.SpanStubs, want traceSpanInfo) {
+-	match := false
+-	for _, span := range spans {
+-		if span.Name == want.name && span.SpanKind.String() == want.spanKind {
+-			match = true
+-			if diff := cmp.Diff(want.events, span.Events, cmpopts.IgnoreFields(trace.Event{}, "Time")); diff != "" {
+-				t.Errorf("Span event mismatch for %q (kind: %s) (-want +got):\n%s",
+-					want.name, want.spanKind, diff)
+-			}
+-			break
+-		}
+-	}
+-	if !match {
+-		t.Errorf("Expected span not found: %q (kind: %s)", want.name, want.spanKind)
+-	}
+-}
+diff --git a/stats/opentelemetry/opentelemetry.go b/stats/opentelemetry/opentelemetry.go
+index b4b4518b..d99169e2 100644
+--- a/stats/opentelemetry/opentelemetry.go
++++ b/stats/opentelemetry/opentelemetry.go
+@@ -25,7 +25,6 @@ package opentelemetry
+ import (
+ 	"context"
+ 	"strings"
+-	"sync/atomic"
+ 	"time"
+ 
+ 	otelattribute "go.opentelemetry.io/otel/attribute"
+@@ -149,10 +148,6 @@ type callInfo struct {
+ 	target string
+ 
+ 	method string
+-
+-	// nameResolutionEventAdded is set when the resolver delay trace event
+-	// is added. Prevents duplicate events, since it is reported per-attempt.
+-	nameResolutionEventAdded atomic.Bool
+ }
+ 
+ type callInfoKey struct{}
+diff --git a/stream.go b/stream.go
+index 01e66c1e..12163150 100644
+--- a/stream.go
++++ b/stream.go
+@@ -212,15 +212,14 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
+ 	}
+ 	// Provide an opportunity for the first RPC to see the first service config
+ 	// provided by the resolver.
+-	nameResolutionDelayed, err := cc.waitForResolvedAddrs(ctx)
+-	if err != nil {
++	if err := cc.waitForResolvedAddrs(ctx); err != nil {
+ 		return nil, err
+ 	}
+ 
+ 	var mc serviceconfig.MethodConfig
+ 	var onCommit func()
+ 	newStream := func(ctx context.Context, done func()) (iresolver.ClientStream, error) {
+-		return newClientStreamWithParams(ctx, desc, cc, method, mc, onCommit, done, nameResolutionDelayed, opts...)
++		return newClientStreamWithParams(ctx, desc, cc, method, mc, onCommit, done, opts...)
+ 	}
+ 
+ 	rpcInfo := iresolver.RPCInfo{Context: ctx, Method: method}
+@@ -258,7 +257,7 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
+ 	return newStream(ctx, func() {})
+ }
+ 
+-func newClientStreamWithParams(ctx context.Context, desc *StreamDesc, cc *ClientConn, method string, mc serviceconfig.MethodConfig, onCommit, doneFunc func(), nameResolutionDelayed bool, opts ...CallOption) (_ iresolver.ClientStream, err error) {
++func newClientStreamWithParams(ctx context.Context, desc *StreamDesc, cc *ClientConn, method string, mc serviceconfig.MethodConfig, onCommit, doneFunc func(), opts ...CallOption) (_ iresolver.ClientStream, err error) {
+ 	callInfo := defaultCallInfo()
+ 	if mc.WaitForReady != nil {
+ 		callInfo.failFast = !*mc.WaitForReady
+@@ -322,20 +321,19 @@ func newClientStreamWithParams(ctx context.Context, desc *StreamDesc, cc *Client
+ 	}
+ 
+ 	cs := &clientStream{
+-		callHdr:             callHdr,
+-		ctx:                 ctx,
+-		methodConfig:        &mc,
+-		opts:                opts,
+-		callInfo:            callInfo,
+-		cc:                  cc,
+-		desc:                desc,
+-		codec:               callInfo.codec,
+-		compressorV0:        compressorV0,
+-		compressorV1:        compressorV1,
+-		cancel:              cancel,
+-		firstAttempt:        true,
+-		onCommit:            onCommit,
+-		nameResolutionDelay: nameResolutionDelayed,
++		callHdr:      callHdr,
++		ctx:          ctx,
++		methodConfig: &mc,
++		opts:         opts,
++		callInfo:     callInfo,
++		cc:           cc,
++		desc:         desc,
++		codec:        callInfo.codec,
++		compressorV0: compressorV0,
++		compressorV1: compressorV1,
++		cancel:       cancel,
++		firstAttempt: true,
++		onCommit:     onCommit,
+ 	}
+ 	if !cc.dopts.disableRetry {
+ 		cs.retryThrottler = cc.retryThrottler.Load().(*retryThrottler)
+@@ -419,7 +417,7 @@ func (cs *clientStream) newAttemptLocked(isTransparent bool) (*csAttempt, error)
+ 	var beginTime time.Time
+ 	shs := cs.cc.dopts.copts.StatsHandlers
+ 	for _, sh := range shs {
+-		ctx = sh.TagRPC(ctx, &stats.RPCTagInfo{FullMethodName: method, FailFast: cs.callInfo.failFast, NameResolutionDelay: cs.nameResolutionDelay})
++		ctx = sh.TagRPC(ctx, &stats.RPCTagInfo{FullMethodName: method, FailFast: cs.callInfo.failFast})
+ 		beginTime = time.Now()
+ 		begin := &stats.Begin{
+ 			Client:                    true,
+@@ -575,9 +573,6 @@ type clientStream struct {
+ 	onCommit         func()
+ 	replayBuffer     []replayOp // operations to replay on retry
+ 	replayBufferSize int        // current size of replayBuffer
+-	// nameResolutionDelay indicates if there was a delay in the name resolution.
+-	// This field is only valid on client side, it's always false on server side.
+-	nameResolutionDelay bool
+ }
+ 
+ type replayOp struct {
+diff --git a/test/clientconn_test.go b/test/clientconn_test.go
+index f56ab4da..cc9db2e8 100644
+--- a/test/clientconn_test.go
++++ b/test/clientconn_test.go
+@@ -27,18 +27,11 @@ import (
+ 
+ 	"google.golang.org/grpc"
+ 	"google.golang.org/grpc/codes"
+-	"google.golang.org/grpc/connectivity"
+ 	"google.golang.org/grpc/credentials/insecure"
+-	"google.golang.org/grpc/internal"
+ 	"google.golang.org/grpc/internal/channelz"
+-	"google.golang.org/grpc/internal/grpcsync"
+-	"google.golang.org/grpc/internal/stubserver"
+-	"google.golang.org/grpc/internal/testutils"
+ 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+ 	testpb "google.golang.org/grpc/interop/grpc_testing"
+-	"google.golang.org/grpc/resolver"
+ 	"google.golang.org/grpc/resolver/manual"
+-	"google.golang.org/grpc/stats"
+ 	"google.golang.org/grpc/status"
+ )
+ 
+@@ -90,108 +83,3 @@ func (s) TestClientConnClose_WithPendingRPC(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ }
+-
+-type testStatsHandler struct {
+-	nameResolutionDelayed bool
+-}
+-
+-// TagRPC is called when an RPC is initiated and allows adding metadata to the
+-// context. It checks if the RPC experienced a name resolution delay and
+-// updates the handler's state.
+-func (h *testStatsHandler) TagRPC(ctx context.Context, rpcInfo *stats.RPCTagInfo) context.Context {
+-	h.nameResolutionDelayed = rpcInfo.NameResolutionDelay
+-	return ctx
+-}
+-
+-// This method is required to satisfy the stats.Handler interface.
+-func (h *testStatsHandler) HandleRPC(_ context.Context, _ stats.RPCStats) {}
+-
+-// TagConn exists to satisfy stats.Handler.
+-func (h *testStatsHandler) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+-	return ctx
+-}
+-
+-// HandleConn exists to satisfy stats.Handler.
+-func (h *testStatsHandler) HandleConn(_ context.Context, _ stats.ConnStats) {}
+-
+-// TestClientConnRPC_WithoutNameResolutionDelay verify that if the resolution
+-// has already happened once before at the time of making RPC, the name
+-// resolution flag is not set indicating there was no delay in name resolution.
+-func (s) TestClientConnRPC_WithoutNameResolutionDelay(t *testing.T) {
+-	statsHandler := &testStatsHandler{}
+-	ss := &stubserver.StubServer{
+-		EmptyCallF: func(context.Context, *testpb.Empty) (*testpb.Empty, error) {
+-			return &testpb.Empty{}, nil
+-		},
+-	}
+-	if err := ss.Start(nil, grpc.WithStatsHandler(statsHandler)); err != nil {
+-		t.Fatalf("Failed to start StubServer: %v", err)
+-	}
+-	defer ss.Stop()
+-
+-	rb := manual.NewBuilderWithScheme("instant")
+-	rb.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: ss.Address}}})
+-	cc := ss.CC
+-	defer cc.Close()
+-
+-	cc.Connect()
+-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+-	defer cancel()
+-	testutils.AwaitState(ctx, t, cc, connectivity.Ready)
+-	client := testgrpc.NewTestServiceClient(cc)
+-	// Verify that the RPC succeeds.
+-	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); err != nil {
+-		t.Fatalf("First RPC failed unexpectedly: %v", err)
+-	}
+-	// verifying that RPC was not blocked on resolver indicating there was no
+-	// delay in name resolution.
+-	if statsHandler.nameResolutionDelayed {
+-		t.Fatalf("statsHandler.nameResolutionDelayed = %v; want false", statsHandler.nameResolutionDelayed)
+-	}
+-}
+-
+-// TestStatsHandlerDetectsResolutionDelay verifies that if this is the
+-// first time resolution is happening at the time of making RPC,
+-// nameResolutionDelayed flag is set indicating there was a delay in name
+-// resolution waiting for resolver to return addresses.
+-func (s) TestClientConnRPC_WithNameResolutionDelay(t *testing.T) {
+-	resolutionWait := grpcsync.NewEvent()
+-	prevHook := internal.NewStreamWaitingForResolver
+-	internal.NewStreamWaitingForResolver = func() { resolutionWait.Fire() }
+-	defer func() { internal.NewStreamWaitingForResolver = prevHook }()
+-
+-	ss := &stubserver.StubServer{
+-		EmptyCallF: func(context.Context, *testpb.Empty) (*testpb.Empty, error) {
+-			return &testpb.Empty{}, nil
+-		},
+-	}
+-	if err := ss.Start(nil); err != nil {
+-		t.Fatalf("Failed to start StubServer: %v", err)
+-	}
+-	defer ss.Stop()
+-
+-	statsHandler := &testStatsHandler{}
+-	rb := manual.NewBuilderWithScheme("delayed")
+-	cc, err := grpc.NewClient(rb.Scheme()+":///test.server",
+-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+-		grpc.WithResolvers(rb),
+-		grpc.WithStatsHandler(statsHandler),
+-	)
+-	if err != nil {
+-		t.Fatalf("grpc.NewClient() failed: %v", err)
+-	}
+-	defer cc.Close()
+-	go func() {
+-		<-resolutionWait.Done()
+-		rb.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: ss.Address}}})
+-	}()
+-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+-	defer cancel()
+-	client := testgrpc.NewTestServiceClient(cc)
+-	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); err != nil {
+-		t.Fatalf("EmptyCall RPC failed: %v", err)
+-	}
+-	if !statsHandler.nameResolutionDelayed {
+-		t.Fatalf("statsHandler.nameResolutionDelayed = %v; want true", statsHandler.nameResolutionDelayed)
+-	}
+-}

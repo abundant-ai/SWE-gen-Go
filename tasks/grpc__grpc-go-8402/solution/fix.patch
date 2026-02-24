@@ -1,0 +1,165 @@
+diff --git a/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go b/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go
+index 494314f2..e6204725 100644
+--- a/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go
++++ b/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go
+@@ -54,18 +54,9 @@ func init() {
+ 	balancer.Register(pickfirstBuilder{})
+ }
+ 
+-type (
+-	// enableHealthListenerKeyType is a unique key type used in resolver
+-	// attributes to indicate whether the health listener usage is enabled.
+-	enableHealthListenerKeyType struct{}
+-	// managedByPickfirstKeyType is an attribute key type to inform Outlier
+-	// Detection that the generic health listener is being used.
+-	// TODO: https://github.com/grpc/grpc-go/issues/7915 - Remove this when
+-	// implementing the dualstack design. This is a hack. Once Dualstack is
+-	// completed, outlier detection will stop sending ejection updates through
+-	// the connectivity listener.
+-	managedByPickfirstKeyType struct{}
+-)
++// enableHealthListenerKeyType is a unique key type used in resolver
++// attributes to indicate whether the health listener usage is enabled.
++type enableHealthListenerKeyType struct{}
+ 
+ var (
+ 	logger = grpclog.Component("pick-first-leaf-lb")
+@@ -149,17 +140,6 @@ func EnableHealthListener(state resolver.State) resolver.State {
+ 	return state
+ }
+ 
+-// IsManagedByPickfirst returns whether an address belongs to a SubConn
+-// managed by the pickfirst LB policy.
+-// TODO: https://github.com/grpc/grpc-go/issues/7915 - This is a hack to disable
+-// outlier_detection via the with connectivity listener when using pick_first.
+-// Once Dualstack changes are complete, all SubConns will be created by
+-// pick_first and outlier detection will only use the health listener for
+-// ejection. This hack can then be removed.
+-func IsManagedByPickfirst(addr resolver.Address) bool {
+-	return addr.BalancerAttributes.Value(managedByPickfirstKeyType{}) != nil
+-}
+-
+ type pfConfig struct {
+ 	serviceconfig.LoadBalancingConfig `json:"-"`
+ 
+@@ -186,7 +166,6 @@ type scData struct {
+ }
+ 
+ func (b *pickfirstBalancer) newSCData(addr resolver.Address) (*scData, error) {
+-	addr.BalancerAttributes = addr.BalancerAttributes.WithValue(managedByPickfirstKeyType{}, true)
+ 	sd := &scData{
+ 		rawConnectivityState: connectivity.Idle,
+ 		effectiveState:       connectivity.Idle,
+diff --git a/xds/internal/balancer/outlierdetection/balancer.go b/xds/internal/balancer/outlierdetection/balancer.go
+index bc5cea40..1b0149e3 100644
+--- a/xds/internal/balancer/outlierdetection/balancer.go
++++ b/xds/internal/balancer/outlierdetection/balancer.go
+@@ -32,7 +32,6 @@ import (
+ 	"time"
+ 
+ 	"google.golang.org/grpc/balancer"
+-	"google.golang.org/grpc/balancer/pickfirst/pickfirstleaf"
+ 	"google.golang.org/grpc/connectivity"
+ 	"google.golang.org/grpc/internal/balancer/gracefulswitch"
+ 	"google.golang.org/grpc/internal/buffer"
+@@ -467,12 +466,10 @@ func (b *outlierDetectionBalancer) UpdateState(s balancer.State) {
+ func (b *outlierDetectionBalancer) NewSubConn(addrs []resolver.Address, opts balancer.NewSubConnOptions) (balancer.SubConn, error) {
+ 	oldListener := opts.StateListener
+ 	scw := &subConnWrapper{
+-		addresses:                  addrs,
+-		scUpdateCh:                 b.scUpdateCh,
+-		listener:                   oldListener,
+-		latestRawConnectivityState: balancer.SubConnState{ConnectivityState: connectivity.Idle},
+-		latestHealthState:          balancer.SubConnState{ConnectivityState: connectivity.Connecting},
+-		healthListenerEnabled:      len(addrs) == 1 && pickfirstleaf.IsManagedByPickfirst(addrs[0]),
++		addresses:         addrs,
++		scUpdateCh:        b.scUpdateCh,
++		listener:          oldListener,
++		latestHealthState: balancer.SubConnState{ConnectivityState: connectivity.Connecting},
+ 	}
+ 	opts.StateListener = func(state balancer.SubConnState) { b.updateSubConnState(scw, state) }
+ 	b.mu.Lock()
+diff --git a/xds/internal/balancer/outlierdetection/subconn_wrapper.go b/xds/internal/balancer/outlierdetection/subconn_wrapper.go
+index 2c390d23..b893ea68 100644
+--- a/xds/internal/balancer/outlierdetection/subconn_wrapper.go
++++ b/xds/internal/balancer/outlierdetection/subconn_wrapper.go
+@@ -40,16 +40,6 @@ type subConnWrapper struct {
+ 	// that.
+ 
+ 	listener func(balancer.SubConnState)
+-	// healthListenerEnabled indicates whether the leaf LB policy is using a
+-	// generic health listener. When enabled, ejection updates are sent via the
+-	// health listener instead of the connectivity listener. Once Dualstack
+-	// changes are complete, all SubConns will be created by pickfirst which
+-	// uses the health listener.
+-	// TODO: https://github.com/grpc/grpc-go/issues/7915 - Once Dualstack
+-	// changes are complete, all SubConns will be created by pick_first and
+-	// outlier detection will only use the health listener for ejection and
+-	// this field can be removed.
+-	healthListenerEnabled bool
+ 
+ 	scUpdateCh *buffer.Unbounded
+ 
+@@ -67,9 +57,6 @@ type subConnWrapper struct {
+ 	// latestHealthState is tracked to update the child policy during
+ 	// unejection.
+ 	latestHealthState balancer.SubConnState
+-	// latestRawConnectivityState is tracked to update the child policy during
+-	// unejection.
+-	latestRawConnectivityState balancer.SubConnState
+ 
+ 	// Access to the following fields are protected by a mutex. These fields
+ 	// should not be accessed from outside this file, instead use methods
+@@ -114,12 +101,7 @@ func (scw *subConnWrapper) RegisterHealthListener(listener func(balancer.SubConn
+ 	// pick_first the universal leaf policy (see A61), both these mechanisms
+ 	// started using the new health listener to make health signal visible to
+ 	// the petiole policies without affecting the underlying connectivity
+-	// management of the pick_first policy
+-	if !scw.healthListenerEnabled {
+-		logger.Errorf("Health listener unexpectedly registered on SubConn %v.", scw)
+-		return
+-	}
+-
++	// management of the pick_first policy.
+ 	scw.mu.Lock()
+ 	defer scw.mu.Unlock()
+ 
+@@ -157,12 +139,6 @@ func (scw *subConnWrapper) updateSubConnHealthState(scs balancer.SubConnState) {
+ // updateSubConnConnectivityState stores the latest connectivity state for
+ // unejection and updates the raw connectivity listener.
+ func (scw *subConnWrapper) updateSubConnConnectivityState(scs balancer.SubConnState) {
+-	scw.latestRawConnectivityState = scs
+-	// If the raw connectivity listener is used for ejection, and the SubConn is
+-	// ejected, don't send the update.
+-	if scw.ejected && !scw.healthListenerEnabled {
+-		return
+-	}
+ 	if scw.listener != nil {
+ 		scw.listener(scs)
+ 	}
+@@ -176,12 +152,6 @@ func (scw *subConnWrapper) clearHealthListener() {
+ 
+ func (scw *subConnWrapper) handleUnejection() {
+ 	scw.ejected = false
+-	if !scw.healthListenerEnabled {
+-		// If scw.latestRawConnectivityState has never been written to will
+-		// default to connectivity IDLE, which is fine.
+-		scw.updateSubConnConnectivityState(scw.latestRawConnectivityState)
+-		return
+-	}
+ 	// If scw.latestHealthState has never been written to will use the health
+ 	// state CONNECTING set during object creation.
+ 	scw.updateSubConnHealthState(scw.latestHealthState)
+@@ -192,12 +162,6 @@ func (scw *subConnWrapper) handleEjection() {
+ 	stateToUpdate := balancer.SubConnState{
+ 		ConnectivityState: connectivity.TransientFailure,
+ 	}
+-	if !scw.healthListenerEnabled {
+-		if scw.listener != nil {
+-			scw.listener(stateToUpdate)
+-		}
+-		return
+-	}
+ 	scw.mu.Lock()
+ 	defer scw.mu.Unlock()
+ 	if scw.healthListener != nil {

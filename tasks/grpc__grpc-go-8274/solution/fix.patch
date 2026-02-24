@@ -1,0 +1,209 @@
+diff --git a/xds/internal/clients/config.go b/xds/internal/clients/config.go
+index 0ededfae..f106465f 100644
+--- a/xds/internal/clients/config.go
++++ b/xds/internal/clients/config.go
+@@ -100,3 +100,13 @@ type Locality struct {
+ 	// SubZone is the further subdivision within a zone.
+ 	SubZone string
+ }
++
++// MetricsReporter is used by the XDSClient to report metrics.
++type MetricsReporter interface {
++	// ReportMetric reports a metric. The metric will be one of the predefined
++	// set of types depending on the client (XDSClient or LRSClient).
++	//
++	// Each client will produce different metrics. Please see the client's
++	// documentation for a list of possible metrics events.
++	ReportMetric(metric any)
++}
+diff --git a/xds/internal/clients/xdsclient/authority.go b/xds/internal/clients/xdsclient/authority.go
+index 3ada1465..7a3a2969 100644
+--- a/xds/internal/clients/xdsclient/authority.go
++++ b/xds/internal/clients/xdsclient/authority.go
+@@ -26,8 +26,10 @@ import (
+ 
+ 	"google.golang.org/grpc/grpclog"
+ 	igrpclog "google.golang.org/grpc/internal/grpclog"
++	"google.golang.org/grpc/xds/internal/clients"
+ 	"google.golang.org/grpc/xds/internal/clients/internal/syncutil"
+ 	"google.golang.org/grpc/xds/internal/clients/xdsclient/internal/xdsresource"
++	"google.golang.org/grpc/xds/internal/clients/xdsclient/metrics"
+ 	"google.golang.org/protobuf/types/known/anypb"
+ 	"google.golang.org/protobuf/types/known/timestamppb"
+ 
+@@ -87,6 +89,7 @@ type authority struct {
+ 	xdsClientSerializerClose  func()                       // Function to close the above serializer.
+ 	logger                    *igrpclog.PrefixLogger       // Logger for this authority.
+ 	target                    string                       // The gRPC Channel target.
++	metricsReporter           clients.MetricsReporter
+ 
+ 	// The below defined fields must only be accessed in the context of the
+ 	// serializer callback, owned by this authority.
+@@ -121,6 +124,7 @@ type authorityBuildOptions struct {
+ 	getChannelForADS xdsChannelForADS             // Function to acquire a reference to an xdsChannel
+ 	logPrefix        string                       // Prefix for logging
+ 	target           string                       // Target for the gRPC Channel that owns xDS Client/Authority
++	metricsReporter  clients.MetricsReporter      // Metrics reporter for the authority
+ }
+ 
+ // newAuthority creates a new authority instance with the provided
+@@ -145,6 +149,7 @@ func newAuthority(args authorityBuildOptions) *authority {
+ 		logger:                    igrpclog.NewPrefixLogger(l, logPrefix),
+ 		resources:                 make(map[ResourceType]map[string]*resourceState),
+ 		target:                    args.target,
++		metricsReporter:           args.metricsReporter,
+ 	}
+ 
+ 	// Create an ordered list of xdsChannels with their server configs. The
+@@ -363,6 +368,11 @@ func (a *authority) handleADSResourceUpdate(serverConfig *ServerConfig, rType Re
+ 		// On error, keep previous version of the resource. But update status
+ 		// and error.
+ 		if uErr.Err != nil {
++			if a.metricsReporter != nil {
++				a.metricsReporter.ReportMetric(&metrics.ResourceUpdateInvalid{
++					ServerURI: serverConfig.ServerIdentifier.ServerURI, ResourceType: rType.TypeName,
++				})
++			}
+ 			state.md.ErrState = md.ErrState
+ 			state.md.Status = md.Status
+ 			for watcher := range state.watchers {
+@@ -378,6 +388,12 @@ func (a *authority) handleADSResourceUpdate(serverConfig *ServerConfig, rType Re
+ 			continue
+ 		}
+ 
++		if a.metricsReporter != nil {
++			a.metricsReporter.ReportMetric(&metrics.ResourceUpdateValid{
++				ServerURI: serverConfig.ServerIdentifier.ServerURI, ResourceType: rType.TypeName,
++			})
++		}
++
+ 		if state.deletionIgnored {
+ 			state.deletionIgnored = false
+ 			a.logger.Infof("A valid update was received for resource %q of type %q after previously ignoring a deletion", name, rType.TypeName)
+diff --git a/xds/internal/clients/xdsclient/metrics/metrics.go b/xds/internal/clients/xdsclient/metrics/metrics.go
+new file mode 100644
+index 00000000..2e14efb1
+--- /dev/null
++++ b/xds/internal/clients/xdsclient/metrics/metrics.go
+@@ -0,0 +1,42 @@
++/*
++ *
++ * Copyright 2025 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++// Package metrics defines all metrics that can be produced by an xDS client.
++// All calls to the MetricsRecorder by the xDS client will contain a struct
++// from this package passed by pointer.
++package metrics
++
++// ResourceUpdateValid is a metric to report a valid resource update from
++// the xDS management server for a given resource type.
++type ResourceUpdateValid struct {
++	ServerURI    string
++	ResourceType string
++}
++
++// ResourceUpdateInvalid is a metric to report an invalid resource update
++// from the xDS management server for a given resource type.
++type ResourceUpdateInvalid struct {
++	ServerURI    string
++	ResourceType string
++}
++
++// ServerFailure is a metric to report a server failure of the xDS
++// management server.
++type ServerFailure struct {
++	ServerURI string
++}
+diff --git a/xds/internal/clients/xdsclient/xdsclient.go b/xds/internal/clients/xdsclient/xdsclient.go
+index f0f4a678..415a2a1e 100644
+--- a/xds/internal/clients/xdsclient/xdsclient.go
++++ b/xds/internal/clients/xdsclient/xdsclient.go
+@@ -44,6 +44,7 @@ import (
+ 	"google.golang.org/grpc/xds/internal/clients/internal/backoff"
+ 	"google.golang.org/grpc/xds/internal/clients/internal/syncutil"
+ 	"google.golang.org/grpc/xds/internal/clients/xdsclient/internal/xdsresource"
++	"google.golang.org/grpc/xds/internal/clients/xdsclient/metrics"
+ 	"google.golang.org/protobuf/proto"
+ 
+ 	v3statuspb "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
+@@ -82,8 +83,9 @@ type XDSClient struct {
+ 	resourceTypes      map[string]ResourceType      // Registry of resource types, for parsing incoming ADS responses.
+ 	serializer         *syncutil.CallbackSerializer // Serializer for invoking resource watcher callbacks.
+ 	serializerClose    func()                       // Function to close the serializer.
+-	logger             *grpclog.PrefixLogger        // Logger for this client.
+-	target             string                       // The gRPC target for this client.
++	logger             *grpclog.PrefixLogger
++	target             string
++	metricsReporter    clients.MetricsReporter
+ 
+ 	// The XDSClient owns a bunch of channels to individual xDS servers
+ 	// specified in the xDS client configuration. Authorities acquire references
+@@ -138,6 +140,7 @@ func newClient(config *Config, watchExpiryTimeout time.Duration, streamBackoff f
+ 		transportBuilder:   config.TransportBuilder,
+ 		resourceTypes:      config.ResourceTypes,
+ 		xdsActiveChannels:  make(map[ServerConfig]*channelState),
++		metricsReporter:    config.MetricsReporter,
+ 	}
+ 
+ 	for name, cfg := range config.Authorities {
+@@ -154,6 +157,7 @@ func newClient(config *Config, watchExpiryTimeout time.Duration, streamBackoff f
+ 			getChannelForADS: c.getChannelForADS,
+ 			logPrefix:        clientPrefix(c),
+ 			target:           target,
++			metricsReporter:  c.metricsReporter,
+ 		})
+ 	}
+ 	c.topLevelAuthority = newAuthority(authorityBuildOptions{
+@@ -163,8 +167,10 @@ func newClient(config *Config, watchExpiryTimeout time.Duration, streamBackoff f
+ 		getChannelForADS: c.getChannelForADS,
+ 		logPrefix:        clientPrefix(c),
+ 		target:           target,
++		metricsReporter:  c.metricsReporter,
+ 	})
+ 	c.logger = prefixLogger(c)
++
+ 	return c, nil
+ }
+ 
+@@ -384,6 +390,12 @@ func (cs *channelState) adsStreamFailure(err error) {
+ 		return
+ 	}
+ 
++	if xdsresource.ErrType(err) != xdsresource.ErrTypeStreamFailedAfterRecv && cs.parent.metricsReporter != nil {
++		cs.parent.metricsReporter.ReportMetric(&metrics.ServerFailure{
++			ServerURI: cs.serverConfig.ServerIdentifier.ServerURI,
++		})
++	}
++
+ 	cs.parent.channelsMu.Lock()
+ 	defer cs.parent.channelsMu.Unlock()
+ 	for authority := range cs.interestedAuthorities {
+diff --git a/xds/internal/clients/xdsclient/xdsconfig.go b/xds/internal/clients/xdsclient/xdsconfig.go
+index 4c7d090d..a276309d 100644
+--- a/xds/internal/clients/xdsclient/xdsconfig.go
++++ b/xds/internal/clients/xdsclient/xdsconfig.go
+@@ -56,6 +56,10 @@ type Config struct {
+ 	//
+ 	// For example: "type.googleapis.com/envoy.config.listener.v3.Listener"
+ 	ResourceTypes map[string]ResourceType
++
++	// MetricsReporter is used to report registered metrics. If unset, no
++	// metrics will be reported.
++	MetricsReporter clients.MetricsReporter
+ }
+ 
+ // ServerConfig contains configuration for an xDS management server.

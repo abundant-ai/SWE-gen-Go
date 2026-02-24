@@ -1,0 +1,429 @@
+diff --git a/model/metric.go b/model/metric.go
+index 48210ab..74f394b 100644
+--- a/model/metric.go
++++ b/model/metric.go
+@@ -14,8 +14,10 @@
+ package model
+ 
+ import (
++	"encoding/binary"
+ 	"encoding/json"
+ 	"fmt"
++	"hash/fnv"
+ 	"sort"
+ 	"strings"
+ )
+@@ -64,7 +66,37 @@ func (m Metric) String() string {
+ 
+ // Fingerprint returns a Metric's Fingerprint.
+ func (m Metric) Fingerprint() Fingerprint {
+-	return metricToFingerprint(m)
++	labelNames := make([]string, 0, len(m))
++	maxLength := 0
++
++	for labelName, labelValue := range m {
++		labelNames = append(labelNames, string(labelName))
++		if len(labelName) > maxLength {
++			maxLength = len(labelName)
++		}
++		if len(labelValue) > maxLength {
++			maxLength = len(labelValue)
++		}
++	}
++
++	sort.Strings(labelNames)
++
++	summer := fnv.New64a()
++	buf := make([]byte, maxLength)
++
++	for _, labelName := range labelNames {
++		labelValue := m[LabelName(labelName)]
++
++		copy(buf, labelName)
++		summer.Write(buf[:len(labelName)])
++
++		summer.Write(separator)
++
++		copy(buf, labelValue)
++		summer.Write(buf[:len(labelValue)])
++	}
++
++	return Fingerprint(binary.LittleEndian.Uint64(summer.Sum(nil)))
+ }
+ 
+ // Clone returns a copy of the Metric.
+diff --git a/model/metric_test.go b/model/metric_test.go
+index f4cd6ee..7c31bdf 100644
+--- a/model/metric_test.go
++++ b/model/metric_test.go
+@@ -22,7 +22,7 @@ func testMetric(t testing.TB) {
+ 	}{
+ 		{
+ 			input:       Metric{},
+-			fingerprint: 14695981039346656037,
++			fingerprint: 2676020557754725067,
+ 		},
+ 		{
+ 			input: Metric{
+@@ -30,27 +30,31 @@ func testMetric(t testing.TB) {
+ 				"occupation":   "robot",
+ 				"manufacturer": "westinghouse",
+ 			},
+-			fingerprint: 11310079640881077873,
++			fingerprint: 13260944541294022935,
+ 		},
+ 		{
+ 			input: Metric{
+ 				"x": "y",
+ 			},
+-			fingerprint: 13948396922932177635,
++			fingerprint: 1470933794305433534,
+ 		},
++		// The following two demonstrate a bug in fingerprinting. They
++		// should not have the same fingerprint with a sane
++		// fingerprinting function. See
++		// https://github.com/prometheus/client_golang/issues/74 .
+ 		{
+ 			input: Metric{
+ 				"a": "bb",
+ 				"b": "c",
+ 			},
+-			fingerprint: 3198632812309449502,
++			fingerprint: 3734646176939799877,
+ 		},
+ 		{
+ 			input: Metric{
+ 				"a":  "b",
+ 				"bb": "c",
+ 			},
+-			fingerprint: 5774953389407657638,
++			fingerprint: 3734646176939799877,
+ 		},
+ 	}
+ 
+diff --git a/model/signature.go b/model/signature.go
+index ab77ae8..4b392fb 100644
+--- a/model/signature.go
++++ b/model/signature.go
+@@ -63,10 +63,10 @@ func LabelsToSignature(labels map[string]string) uint64 {
+ 	hb := getHashAndBuf()
+ 	defer putHashAndBuf(hb)
+ 
+-	for labelName, labelValue := range labels {
+-		hb.b.WriteString(labelName)
++	for k, v := range labels {
++		hb.b.WriteString(k)
+ 		hb.b.WriteByte(SeparatorByte)
+-		hb.b.WriteString(labelValue)
++		hb.b.WriteString(v)
+ 		hb.h.Write(hb.b.Bytes())
+ 		result ^= hb.h.Sum64()
+ 		hb.h.Reset()
+@@ -75,58 +75,10 @@ func LabelsToSignature(labels map[string]string) uint64 {
+ 	return result
+ }
+ 
+-// metricToFingerprint works exactly as LabelsToSignature but takes a Metric as
+-// parameter (rather than a label map) and returns a Fingerprint.
+-func metricToFingerprint(m Metric) Fingerprint {
+-	if len(m) == 0 {
+-		return Fingerprint(emptyLabelSignature)
+-	}
+-
+-	var result uint64
+-	hb := getHashAndBuf()
+-	defer putHashAndBuf(hb)
+-
+-	for labelName, labelValue := range m {
+-		hb.b.WriteString(string(labelName))
+-		hb.b.WriteByte(SeparatorByte)
+-		hb.b.WriteString(string(labelValue))
+-		hb.h.Write(hb.b.Bytes())
+-		result ^= hb.h.Sum64()
+-		hb.h.Reset()
+-		hb.b.Reset()
+-	}
+-	return Fingerprint(result)
+-}
+-
+-// SignatureForLabels works like LabelsToSignature but takes a Metric as
+-// parameter (rather than a label map) and only includes the labels with the
+-// specified LabelNames into the signature calculation.
+-func SignatureForLabels(m Metric, labels LabelNames) uint64 {
+-	if len(m) == 0 || len(labels) == 0 {
+-		return emptyLabelSignature
+-	}
+-
+-	var result uint64
+-	hb := getHashAndBuf()
+-	defer putHashAndBuf(hb)
+-
+-	for _, label := range labels {
+-		hb.b.WriteString(string(label))
+-		hb.b.WriteByte(SeparatorByte)
+-		hb.b.WriteString(string(m[label]))
+-		hb.h.Write(hb.b.Bytes())
+-		result ^= hb.h.Sum64()
+-		hb.h.Reset()
+-		hb.b.Reset()
+-	}
+-	return result
+-}
+-
+-// SignatureWithoutLabels works like LabelsToSignature but takes a Metric as
+-// parameter (rather than a label map) and excludes the labels with any of the
+-// specified LabelNames from the signature calculation.
+-func SignatureWithoutLabels(m Metric, labels map[LabelName]struct{}) uint64 {
+-	if len(m) == 0 {
++// LabelValuesToSignature returns a unique signature (i.e., fingerprint) for the
++// values of a given label set.
++func LabelValuesToSignature(labels map[string]string) uint64 {
++	if len(labels) == 0 {
+ 		return emptyLabelSignature
+ 	}
+ 
+@@ -134,20 +86,12 @@ func SignatureWithoutLabels(m Metric, labels map[LabelName]struct{}) uint64 {
+ 	hb := getHashAndBuf()
+ 	defer putHashAndBuf(hb)
+ 
+-	for labelName, labelValue := range m {
+-		if _, exclude := labels[labelName]; exclude {
+-			continue
+-		}
+-		hb.b.WriteString(string(labelName))
+-		hb.b.WriteByte(SeparatorByte)
+-		hb.b.WriteString(string(labelValue))
++	for _, v := range labels {
++		hb.b.WriteString(v)
+ 		hb.h.Write(hb.b.Bytes())
+ 		result ^= hb.h.Sum64()
+ 		hb.h.Reset()
+ 		hb.b.Reset()
+ 	}
+-	if result == 0 {
+-		return emptyLabelSignature
+-	}
+ 	return result
+ }
+diff --git a/model/signature_test.go b/model/signature_test.go
+index be31998..ad20fa3 100644
+--- a/model/signature_test.go
++++ b/model/signature_test.go
+@@ -18,7 +18,7 @@ import (
+ 	"testing"
+ )
+ 
+-func TestLabelsToSignature(t *testing.T) {
++func testLabelsToSignature(t testing.TB) {
+ 	var scenarios = []struct {
+ 		in  map[string]string
+ 		out uint64
+@@ -42,112 +42,57 @@ func TestLabelsToSignature(t *testing.T) {
+ 	}
+ }
+ 
+-func TestMetricToFingerprint(t *testing.T) {
+-	var scenarios = []struct {
+-		in  Metric
+-		out Fingerprint
+-	}{
+-		{
+-			in:  Metric{},
+-			out: 14695981039346656037,
+-		},
+-		{
+-			in:  Metric{"name": "garland, briggs", "fear": "love is not enough"},
+-			out: 12952432476264840823,
+-		},
++func TestLabelToSignature(t *testing.T) {
++	testLabelsToSignature(t)
++}
++
++func TestEmptyLabelSignature(t *testing.T) {
++	input := []map[string]string{nil, {}}
++
++	var ms runtime.MemStats
++	runtime.ReadMemStats(&ms)
++
++	alloc := ms.Alloc
++
++	for _, labels := range input {
++		LabelsToSignature(labels)
+ 	}
+ 
+-	for i, scenario := range scenarios {
+-		actual := metricToFingerprint(scenario.in)
++	runtime.ReadMemStats(&ms)
+ 
+-		if actual != scenario.out {
+-			t.Errorf("%d. expected %d, got %d", i, scenario.out, actual)
+-		}
++	if got := ms.Alloc; alloc != got {
++		t.Fatal("expected LabelsToSignature with empty labels not to perform allocations")
+ 	}
+ }
+ 
+-func TestSignatureForLabels(t *testing.T) {
+-	var scenarios = []struct {
+-		in     Metric
+-		labels LabelNames
+-		out    uint64
+-	}{
+-		{
+-			in:     Metric{},
+-			labels: nil,
+-			out:    14695981039346656037,
+-		},
+-		{
+-			in:     Metric{"name": "garland, briggs", "fear": "love is not enough"},
+-			labels: LabelNames{"fear", "name"},
+-			out:    12952432476264840823,
+-		},
+-		{
+-			in:     Metric{"name": "garland, briggs", "fear": "love is not enough", "foo": "bar"},
+-			labels: LabelNames{"fear", "name"},
+-			out:    12952432476264840823,
+-		},
+-		{
+-			in:     Metric{"name": "garland, briggs", "fear": "love is not enough"},
+-			labels: LabelNames{},
+-			out:    14695981039346656037,
+-		},
+-		{
+-			in:     Metric{"name": "garland, briggs", "fear": "love is not enough"},
+-			labels: nil,
+-			out:    14695981039346656037,
+-		},
++func BenchmarkLabelToSignature(b *testing.B) {
++	for i := 0; i < b.N; i++ {
++		testLabelsToSignature(b)
+ 	}
++}
+ 
+-	for i, scenario := range scenarios {
+-		actual := SignatureForLabels(scenario.in, scenario.labels)
+-
+-		if actual != scenario.out {
+-			t.Errorf("%d. expected %d, got %d", i, scenario.out, actual)
++func benchmarkLabelValuesToSignature(b *testing.B, l map[string]string, e uint64) {
++	for i := 0; i < b.N; i++ {
++		if a := LabelValuesToSignature(l); a != e {
++			b.Fatalf("expected signature of %d for %s, got %d", e, l, a)
+ 		}
+ 	}
+ }
+ 
+-func TestSignatureWithoutLabels(t *testing.T) {
+-	var scenarios = []struct {
+-		in     Metric
+-		labels map[LabelName]struct{}
+-		out    uint64
+-	}{
+-		{
+-			in:     Metric{},
+-			labels: nil,
+-			out:    14695981039346656037,
+-		},
+-		{
+-			in:     Metric{"name": "garland, briggs", "fear": "love is not enough"},
+-			labels: map[LabelName]struct{}{"fear": struct{}{}, "name": struct{}{}},
+-			out:    14695981039346656037,
+-		},
+-		{
+-			in:     Metric{"name": "garland, briggs", "fear": "love is not enough", "foo": "bar"},
+-			labels: map[LabelName]struct{}{"foo": struct{}{}},
+-			out:    12952432476264840823,
+-		},
+-		{
+-			in:     Metric{"name": "garland, briggs", "fear": "love is not enough"},
+-			labels: map[LabelName]struct{}{},
+-			out:    12952432476264840823,
+-		},
+-		{
+-			in:     Metric{"name": "garland, briggs", "fear": "love is not enough"},
+-			labels: nil,
+-			out:    12952432476264840823,
+-		},
+-	}
++func BenchmarkLabelValuesToSignatureScalar(b *testing.B) {
++	benchmarkLabelValuesToSignature(b, nil, 14695981039346656037)
++}
+ 
+-	for i, scenario := range scenarios {
+-		actual := SignatureWithoutLabels(scenario.in, scenario.labels)
++func BenchmarkLabelValuesToSignatureSingle(b *testing.B) {
++	benchmarkLabelValuesToSignature(b, map[string]string{"first-label": "first-label-value"}, 2653746141194979650)
++}
+ 
+-		if actual != scenario.out {
+-			t.Errorf("%d. expected %d, got %d", i, scenario.out, actual)
+-		}
+-	}
++func BenchmarkLabelValuesToSignatureDouble(b *testing.B) {
++	benchmarkLabelValuesToSignature(b, map[string]string{"first-label": "first-label-value", "second-label": "second-label-value"}, 8893559499616767364)
++}
++
++func BenchmarkLabelValuesToSignatureTriple(b *testing.B) {
++	benchmarkLabelValuesToSignature(b, map[string]string{"first-label": "first-label-value", "second-label": "second-label-value", "third-label": "third-label-value"}, 1685970066862087833)
+ }
+ 
+ func benchmarkLabelToSignature(b *testing.B, l map[string]string, e uint64) {
+@@ -173,46 +118,3 @@ func BenchmarkLabelToSignatureDouble(b *testing.B) {
+ func BenchmarkLabelToSignatureTriple(b *testing.B) {
+ 	benchmarkLabelToSignature(b, map[string]string{"first-label": "first-label-value", "second-label": "second-label-value", "third-label": "third-label-value"}, 15738406913934009676)
+ }
+-
+-func benchmarkMetricToFingerprint(b *testing.B, m Metric, e Fingerprint) {
+-	for i := 0; i < b.N; i++ {
+-		if a := metricToFingerprint(m); a != e {
+-			b.Fatalf("expected signature of %d for %s, got %d", e, m, a)
+-		}
+-	}
+-}
+-
+-func BenchmarkMetricToFingerprintScalar(b *testing.B) {
+-	benchmarkMetricToFingerprint(b, nil, 14695981039346656037)
+-}
+-
+-func BenchmarkMetricToFingerprintSingle(b *testing.B) {
+-	benchmarkMetricToFingerprint(b, Metric{"first-label": "first-label-value"}, 5147259542624943964)
+-}
+-
+-func BenchmarkMetricToFingerprintDouble(b *testing.B) {
+-	benchmarkMetricToFingerprint(b, Metric{"first-label": "first-label-value", "second-label": "second-label-value"}, 18269973311206963528)
+-}
+-
+-func BenchmarkMetricToFingerprintTriple(b *testing.B) {
+-	benchmarkMetricToFingerprint(b, Metric{"first-label": "first-label-value", "second-label": "second-label-value", "third-label": "third-label-value"}, 15738406913934009676)
+-}
+-
+-func TestEmptyLabelSignature(t *testing.T) {
+-	input := []map[string]string{nil, {}}
+-
+-	var ms runtime.MemStats
+-	runtime.ReadMemStats(&ms)
+-
+-	alloc := ms.Alloc
+-
+-	for _, labels := range input {
+-		LabelsToSignature(labels)
+-	}
+-
+-	runtime.ReadMemStats(&ms)
+-
+-	if got := ms.Alloc; alloc != got {
+-		t.Fatal("expected LabelsToSignature with empty labels not to perform allocations")
+-	}
+-}
+diff --git a/model/timestamp.go b/model/timestamp.go
+index afffdcf..09bd877 100644
+--- a/model/timestamp.go
++++ b/model/timestamp.go
+@@ -88,7 +88,6 @@ func (t Timestamp) String() string {
+ 	return strconv.FormatFloat(float64(t)/float64(second), 'f', -1, 64)
+ }
+ 
+-// MarshalJSON implements the json.Marshaler interface.
+ func (t Timestamp) MarshalJSON() ([]byte, error) {
+ 	return []byte(t.String()), nil
+ }

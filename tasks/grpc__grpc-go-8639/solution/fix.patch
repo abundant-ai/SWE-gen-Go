@@ -1,0 +1,776 @@
+diff --git a/clientconn.go b/clientconn.go
+index a3c315f2..c0c2c9a7 100644
+--- a/clientconn.go
++++ b/clientconn.go
+@@ -40,11 +40,12 @@ import (
+ 	"google.golang.org/grpc/internal/grpcsync"
+ 	"google.golang.org/grpc/internal/idle"
+ 	iresolver "google.golang.org/grpc/internal/resolver"
+-	"google.golang.org/grpc/internal/stats"
++	istats "google.golang.org/grpc/internal/stats"
+ 	"google.golang.org/grpc/internal/transport"
+ 	"google.golang.org/grpc/keepalive"
+ 	"google.golang.org/grpc/resolver"
+ 	"google.golang.org/grpc/serviceconfig"
++	"google.golang.org/grpc/stats"
+ 	"google.golang.org/grpc/status"
+ 
+ 	_ "google.golang.org/grpc/balancer/roundrobin"           // To register roundrobin.
+@@ -210,7 +211,8 @@ func NewClient(target string, opts ...DialOption) (conn *ClientConn, err error)
+ 	cc.csMgr = newConnectivityStateManager(cc.ctx, cc.channelz)
+ 	cc.pickerWrapper = newPickerWrapper()
+ 
+-	cc.metricsRecorderList = stats.NewMetricsRecorderList(cc.dopts.copts.StatsHandlers)
++	cc.metricsRecorderList = istats.NewMetricsRecorderList(cc.dopts.copts.StatsHandlers)
++	cc.statsHandler = istats.NewCombinedHandler(cc.dopts.copts.StatsHandlers...)
+ 
+ 	cc.initIdleStateLocked() // Safe to call without the lock, since nothing else has a reference to cc.
+ 	cc.idlenessMgr = idle.NewManager((*idler)(cc), cc.dopts.idleTimeout)
+@@ -621,7 +623,8 @@ type ClientConn struct {
+ 	channelz            *channelz.Channel // Channelz object.
+ 	resolverBuilder     resolver.Builder  // See initParsedTargetAndResolverBuilder().
+ 	idlenessMgr         *idle.Manager
+-	metricsRecorderList *stats.MetricsRecorderList
++	metricsRecorderList *istats.MetricsRecorderList
++	statsHandler        stats.Handler
+ 
+ 	// The following provide their own synchronization, and therefore don't
+ 	// require cc.mu to be held to access them.
+diff --git a/internal/stats/stats.go b/internal/stats/stats.go
+new file mode 100644
+index 00000000..49019b80
+--- /dev/null
++++ b/internal/stats/stats.go
+@@ -0,0 +1,70 @@
++/*
++ *
++ * Copyright 2025 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++package stats
++
++import (
++	"context"
++
++	"google.golang.org/grpc/stats"
++)
++
++type combinedHandler struct {
++	handlers []stats.Handler
++}
++
++// NewCombinedHandler combines multiple stats.Handlers into a single handler.
++//
++// It returns nil if no handlers are provided. If only one handler is
++// provided, it is returned directly without wrapping.
++func NewCombinedHandler(handlers ...stats.Handler) stats.Handler {
++	switch len(handlers) {
++	case 0:
++		return nil
++	case 1:
++		return handlers[0]
++	default:
++		return &combinedHandler{handlers: handlers}
++	}
++}
++
++func (ch *combinedHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
++	for _, h := range ch.handlers {
++		ctx = h.TagRPC(ctx, info)
++	}
++	return ctx
++}
++
++func (ch *combinedHandler) HandleRPC(ctx context.Context, stats stats.RPCStats) {
++	for _, h := range ch.handlers {
++		h.HandleRPC(ctx, stats)
++	}
++}
++
++func (ch *combinedHandler) TagConn(ctx context.Context, info *stats.ConnTagInfo) context.Context {
++	for _, h := range ch.handlers {
++		ctx = h.TagConn(ctx, info)
++	}
++	return ctx
++}
++
++func (ch *combinedHandler) HandleConn(ctx context.Context, stats stats.ConnStats) {
++	for _, h := range ch.handlers {
++		h.HandleConn(ctx, stats)
++	}
++}
+diff --git a/internal/transport/handler_server.go b/internal/transport/handler_server.go
+index aadc5d81..4979b363 100644
+--- a/internal/transport/handler_server.go
++++ b/internal/transport/handler_server.go
+@@ -50,7 +50,7 @@ import (
+ // NewServerHandlerTransport returns a ServerTransport handling gRPC from
+ // inside an http.Handler, or writes an HTTP error to w and returns an error.
+ // It requires that the http Server supports HTTP/2.
+-func NewServerHandlerTransport(w http.ResponseWriter, r *http.Request, stats []stats.Handler, bufferPool mem.BufferPool) (ServerTransport, error) {
++func NewServerHandlerTransport(w http.ResponseWriter, r *http.Request, stats stats.Handler, bufferPool mem.BufferPool) (ServerTransport, error) {
+ 	if r.Method != http.MethodPost {
+ 		w.Header().Set("Allow", http.MethodPost)
+ 		msg := fmt.Sprintf("invalid gRPC request method %q", r.Method)
+@@ -170,7 +170,7 @@ type serverHandlerTransport struct {
+ 	// TODO make sure this is consistent across handler_server and http2_server
+ 	contentSubtype string
+ 
+-	stats  []stats.Handler
++	stats  stats.Handler
+ 	logger *grpclog.PrefixLogger
+ 
+ 	bufferPool mem.BufferPool
+@@ -274,15 +274,13 @@ func (ht *serverHandlerTransport) writeStatus(s *ServerStream, st *status.Status
+ 		}
+ 	})
+ 
+-	if err == nil { // transport has not been closed
++	if err == nil && ht.stats != nil { // transport has not been closed
+ 		// Note: The trailer fields are compressed with hpack after this call returns.
+ 		// No WireLength field is set here.
+ 		s.hdrMu.Lock()
+-		for _, sh := range ht.stats {
+-			sh.HandleRPC(s.Context(), &stats.OutTrailer{
+-				Trailer: s.trailer.Copy(),
+-			})
+-		}
++		ht.stats.HandleRPC(s.Context(), &stats.OutTrailer{
++			Trailer: s.trailer.Copy(),
++		})
+ 		s.hdrMu.Unlock()
+ 	}
+ 	ht.Close(errors.New("finished writing status"))
+@@ -374,15 +372,13 @@ func (ht *serverHandlerTransport) writeHeader(s *ServerStream, md metadata.MD) e
+ 		ht.rw.(http.Flusher).Flush()
+ 	})
+ 
+-	if err == nil {
+-		for _, sh := range ht.stats {
+-			// Note: The header fields are compressed with hpack after this call returns.
+-			// No WireLength field is set here.
+-			sh.HandleRPC(s.Context(), &stats.OutHeader{
+-				Header:      md.Copy(),
+-				Compression: s.sendCompress,
+-			})
+-		}
++	if err == nil && ht.stats != nil {
++		// Note: The header fields are compressed with hpack after this call returns.
++		// No WireLength field is set here.
++		ht.stats.HandleRPC(s.Context(), &stats.OutHeader{
++			Header:      md.Copy(),
++			Compression: s.sendCompress,
++		})
+ 	}
+ 	return err
+ }
+diff --git a/internal/transport/http2_client.go b/internal/transport/http2_client.go
+index 386801e0..825d9f4b 100644
+--- a/internal/transport/http2_client.go
++++ b/internal/transport/http2_client.go
+@@ -44,6 +44,7 @@ import (
+ 	"google.golang.org/grpc/internal/grpcutil"
+ 	imetadata "google.golang.org/grpc/internal/metadata"
+ 	"google.golang.org/grpc/internal/proxyattributes"
++	istats "google.golang.org/grpc/internal/stats"
+ 	istatus "google.golang.org/grpc/internal/status"
+ 	isyscall "google.golang.org/grpc/internal/syscall"
+ 	"google.golang.org/grpc/internal/transport/networktype"
+@@ -105,7 +106,7 @@ type http2Client struct {
+ 	kp               keepalive.ClientParameters
+ 	keepaliveEnabled bool
+ 
+-	statsHandlers []stats.Handler
++	statsHandler stats.Handler
+ 
+ 	initialWindowSize int32
+ 
+@@ -342,7 +343,7 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
+ 		isSecure:              isSecure,
+ 		perRPCCreds:           perRPCCreds,
+ 		kp:                    kp,
+-		statsHandlers:         opts.StatsHandlers,
++		statsHandler:          istats.NewCombinedHandler(opts.StatsHandlers...),
+ 		initialWindowSize:     initialWindowSize,
+ 		nextID:                1,
+ 		maxConcurrentStreams:  defaultMaxStreamsClient,
+@@ -386,15 +387,14 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
+ 			updateFlowControl: t.updateFlowControl,
+ 		}
+ 	}
+-	for _, sh := range t.statsHandlers {
+-		t.ctx = sh.TagConn(t.ctx, &stats.ConnTagInfo{
++	if t.statsHandler != nil {
++		t.ctx = t.statsHandler.TagConn(t.ctx, &stats.ConnTagInfo{
+ 			RemoteAddr: t.remoteAddr,
+ 			LocalAddr:  t.localAddr,
+ 		})
+-		connBegin := &stats.ConnBegin{
++		t.statsHandler.HandleConn(t.ctx, &stats.ConnBegin{
+ 			Client: true,
+-		}
+-		sh.HandleConn(t.ctx, connBegin)
++		})
+ 	}
+ 	if t.keepaliveEnabled {
+ 		t.kpDormancyCond = sync.NewCond(&t.mu)
+@@ -905,27 +905,23 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientS
+ 			return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
+ 		}
+ 	}
+-	if len(t.statsHandlers) != 0 {
++	if t.statsHandler != nil {
+ 		header, ok := metadata.FromOutgoingContext(ctx)
+ 		if ok {
+ 			header.Set("user-agent", t.userAgent)
+ 		} else {
+ 			header = metadata.Pairs("user-agent", t.userAgent)
+ 		}
+-		for _, sh := range t.statsHandlers {
+-			// Note: The header fields are compressed with hpack after this call returns.
+-			// No WireLength field is set here.
+-			// Note: Creating a new stats object to prevent pollution.
+-			outHeader := &stats.OutHeader{
+-				Client:      true,
+-				FullMethod:  callHdr.Method,
+-				RemoteAddr:  t.remoteAddr,
+-				LocalAddr:   t.localAddr,
+-				Compression: callHdr.SendCompress,
+-				Header:      header,
+-			}
+-			sh.HandleRPC(s.ctx, outHeader)
+-		}
++		// Note: The header fields are compressed with hpack after this call returns.
++		// No WireLength field is set here.
++		t.statsHandler.HandleRPC(s.ctx, &stats.OutHeader{
++			Client:      true,
++			FullMethod:  callHdr.Method,
++			RemoteAddr:  t.remoteAddr,
++			LocalAddr:   t.localAddr,
++			Compression: callHdr.SendCompress,
++			Header:      header,
++		})
+ 	}
+ 	if transportDrainRequired {
+ 		if t.logger.V(logLevel) {
+@@ -1066,11 +1062,10 @@ func (t *http2Client) Close(err error) {
+ 	for _, s := range streams {
+ 		t.closeStream(s, err, false, http2.ErrCodeNo, st, nil, false)
+ 	}
+-	for _, sh := range t.statsHandlers {
+-		connEnd := &stats.ConnEnd{
++	if t.statsHandler != nil {
++		t.statsHandler.HandleConn(t.ctx, &stats.ConnEnd{
+ 			Client: true,
+-		}
+-		sh.HandleConn(t.ctx, connEnd)
++		})
+ 	}
+ }
+ 
+@@ -1602,22 +1597,20 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
+ 		}
+ 	}
+ 
+-	for _, sh := range t.statsHandlers {
++	if t.statsHandler != nil {
+ 		if !endStream {
+-			inHeader := &stats.InHeader{
++			t.statsHandler.HandleRPC(s.ctx, &stats.InHeader{
+ 				Client:      true,
+ 				WireLength:  int(frame.Header().Length),
+ 				Header:      metadata.MD(mdata).Copy(),
+ 				Compression: s.recvCompress,
+-			}
+-			sh.HandleRPC(s.ctx, inHeader)
++			})
+ 		} else {
+-			inTrailer := &stats.InTrailer{
++			t.statsHandler.HandleRPC(s.ctx, &stats.InTrailer{
+ 				Client:     true,
+ 				WireLength: int(frame.Header().Length),
+ 				Trailer:    metadata.MD(mdata).Copy(),
+-			}
+-			sh.HandleRPC(s.ctx, inTrailer)
++			})
+ 		}
+ 	}
+ 
+diff --git a/internal/transport/http2_server.go b/internal/transport/http2_server.go
+index b7fa73f0..e6c2a101 100644
+--- a/internal/transport/http2_server.go
++++ b/internal/transport/http2_server.go
+@@ -87,7 +87,7 @@ type http2Server struct {
+ 	// updates, reset streams, and various settings) to the controller.
+ 	controlBuf *controlBuffer
+ 	fc         *trInFlow
+-	stats      []stats.Handler
++	stats      stats.Handler
+ 	// Keepalive and max-age parameters for the server.
+ 	kp keepalive.ServerParameters
+ 	// Keepalive enforcement policy.
+@@ -261,7 +261,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
+ 		fc:                &trInFlow{limit: uint32(icwz)},
+ 		state:             reachable,
+ 		activeStreams:     make(map[uint32]*ServerStream),
+-		stats:             config.StatsHandlers,
++		stats:             config.StatsHandler,
+ 		kp:                kp,
+ 		idle:              time.Now(),
+ 		kep:               kep,
+@@ -1059,14 +1059,13 @@ func (t *http2Server) writeHeaderLocked(s *ServerStream) error {
+ 		t.closeStream(s, true, http2.ErrCodeInternal, false)
+ 		return ErrHeaderListSizeLimitViolation
+ 	}
+-	for _, sh := range t.stats {
++	if t.stats != nil {
+ 		// Note: Headers are compressed with hpack after this call returns.
+ 		// No WireLength field is set here.
+-		outHeader := &stats.OutHeader{
++		t.stats.HandleRPC(s.Context(), &stats.OutHeader{
+ 			Header:      s.header.Copy(),
+ 			Compression: s.sendCompress,
+-		}
+-		sh.HandleRPC(s.Context(), outHeader)
++		})
+ 	}
+ 	return nil
+ }
+@@ -1134,10 +1133,10 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
+ 	// Send a RST_STREAM after the trailers if the client has not already half-closed.
+ 	rst := s.getState() == streamActive
+ 	t.finishStream(s, rst, http2.ErrCodeNo, trailingHeader, true)
+-	for _, sh := range t.stats {
++	if t.stats != nil {
+ 		// Note: The trailer fields are compressed with hpack after this call returns.
+ 		// No WireLength field is set here.
+-		sh.HandleRPC(s.Context(), &stats.OutTrailer{
++		t.stats.HandleRPC(s.Context(), &stats.OutTrailer{
+ 			Trailer: s.trailer.Copy(),
+ 		})
+ 	}
+diff --git a/internal/transport/transport.go b/internal/transport/transport.go
+index 617f5ae0..89ae22f5 100644
+--- a/internal/transport/transport.go
++++ b/internal/transport/transport.go
+@@ -468,7 +468,7 @@ type ServerConfig struct {
+ 	ConnectionTimeout     time.Duration
+ 	Credentials           credentials.TransportCredentials
+ 	InTapHandle           tap.ServerInHandle
+-	StatsHandlers         []stats.Handler
++	StatsHandler          stats.Handler
+ 	KeepaliveParams       keepalive.ServerParameters
+ 	KeepalivePolicy       keepalive.EnforcementPolicy
+ 	InitialWindowSize     int32
+diff --git a/server.go b/server.go
+index ded3c344..ddd37734 100644
+--- a/server.go
++++ b/server.go
+@@ -124,7 +124,8 @@ type serviceInfo struct {
+ 
+ // Server is a gRPC server to serve RPC requests.
+ type Server struct {
+-	opts serverOptions
++	opts         serverOptions
++	statsHandler stats.Handler
+ 
+ 	mu  sync.Mutex // guards following
+ 	lis map[net.Listener]bool
+@@ -692,13 +693,14 @@ func NewServer(opt ...ServerOption) *Server {
+ 		o.apply(&opts)
+ 	}
+ 	s := &Server{
+-		lis:      make(map[net.Listener]bool),
+-		opts:     opts,
+-		conns:    make(map[string]map[transport.ServerTransport]bool),
+-		services: make(map[string]*serviceInfo),
+-		quit:     grpcsync.NewEvent(),
+-		done:     grpcsync.NewEvent(),
+-		channelz: channelz.RegisterServer(""),
++		lis:          make(map[net.Listener]bool),
++		opts:         opts,
++		statsHandler: istats.NewCombinedHandler(opts.statsHandlers...),
++		conns:        make(map[string]map[transport.ServerTransport]bool),
++		services:     make(map[string]*serviceInfo),
++		quit:         grpcsync.NewEvent(),
++		done:         grpcsync.NewEvent(),
++		channelz:     channelz.RegisterServer(""),
+ 	}
+ 	chainUnaryServerInterceptors(s)
+ 	chainStreamServerInterceptors(s)
+@@ -999,7 +1001,7 @@ func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
+ 		ConnectionTimeout:     s.opts.connectionTimeout,
+ 		Credentials:           s.opts.creds,
+ 		InTapHandle:           s.opts.inTapHandle,
+-		StatsHandlers:         s.opts.statsHandlers,
++		StatsHandler:          s.statsHandler,
+ 		KeepaliveParams:       s.opts.keepaliveParams,
+ 		KeepalivePolicy:       s.opts.keepalivePolicy,
+ 		InitialWindowSize:     s.opts.initialWindowSize,
+@@ -1036,18 +1038,18 @@ func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
+ func (s *Server) serveStreams(ctx context.Context, st transport.ServerTransport, rawConn net.Conn) {
+ 	ctx = transport.SetConnection(ctx, rawConn)
+ 	ctx = peer.NewContext(ctx, st.Peer())
+-	for _, sh := range s.opts.statsHandlers {
+-		ctx = sh.TagConn(ctx, &stats.ConnTagInfo{
++	if s.statsHandler != nil {
++		ctx = s.statsHandler.TagConn(ctx, &stats.ConnTagInfo{
+ 			RemoteAddr: st.Peer().Addr,
+ 			LocalAddr:  st.Peer().LocalAddr,
+ 		})
+-		sh.HandleConn(ctx, &stats.ConnBegin{})
++		s.statsHandler.HandleConn(ctx, &stats.ConnBegin{})
+ 	}
+ 
+ 	defer func() {
+ 		st.Close(errors.New("finished serving streams for the server transport"))
+-		for _, sh := range s.opts.statsHandlers {
+-			sh.HandleConn(ctx, &stats.ConnEnd{})
++		if s.statsHandler != nil {
++			s.statsHandler.HandleConn(ctx, &stats.ConnEnd{})
+ 		}
+ 	}()
+ 
+@@ -1104,7 +1106,7 @@ var _ http.Handler = (*Server)(nil)
+ // Notice: This API is EXPERIMENTAL and may be changed or removed in a
+ // later release.
+ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+-	st, err := transport.NewServerHandlerTransport(w, r, s.opts.statsHandlers, s.opts.bufferPool)
++	st, err := transport.NewServerHandlerTransport(w, r, s.statsHandler, s.opts.bufferPool)
+ 	if err != nil {
+ 		// Errors returned from transport.NewServerHandlerTransport have
+ 		// already been written to w.
+@@ -1198,12 +1200,8 @@ func (s *Server) sendResponse(ctx context.Context, stream *transport.ServerStrea
+ 		return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", payloadLen, s.opts.maxSendMessageSize)
+ 	}
+ 	err = stream.Write(hdr, payload, opts)
+-	if err == nil {
+-		if len(s.opts.statsHandlers) != 0 {
+-			for _, sh := range s.opts.statsHandlers {
+-				sh.HandleRPC(ctx, outPayload(false, msg, dataLen, payloadLen, time.Now()))
+-			}
+-		}
++	if err == nil && s.statsHandler != nil {
++		s.statsHandler.HandleRPC(ctx, outPayload(false, msg, dataLen, payloadLen, time.Now()))
+ 	}
+ 	return err
+ }
+@@ -1245,16 +1243,15 @@ func getChainUnaryHandler(interceptors []UnaryServerInterceptor, curr int, info
+ }
+ 
+ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerStream, info *serviceInfo, md *MethodDesc, trInfo *traceInfo) (err error) {
+-	shs := s.opts.statsHandlers
+-	if len(shs) != 0 || trInfo != nil || channelz.IsOn() {
++	sh := s.statsHandler
++	if sh != nil || trInfo != nil || channelz.IsOn() {
+ 		if channelz.IsOn() {
+ 			s.incrCallsStarted()
+ 		}
+ 		var statsBegin *stats.Begin
+-		for _, sh := range shs {
+-			beginTime := time.Now()
++		if sh != nil {
+ 			statsBegin = &stats.Begin{
+-				BeginTime:      beginTime,
++				BeginTime:      time.Now(),
+ 				IsClientStream: false,
+ 				IsServerStream: false,
+ 			}
+@@ -1282,7 +1279,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
+ 				trInfo.tr.Finish()
+ 			}
+ 
+-			for _, sh := range shs {
++			if sh != nil {
+ 				end := &stats.End{
+ 					BeginTime: statsBegin.BeginTime,
+ 					EndTime:   time.Now(),
+@@ -1379,7 +1376,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
+ 	}
+ 
+ 	var payInfo *payloadInfo
+-	if len(shs) != 0 || len(binlogs) != 0 {
++	if sh != nil || len(binlogs) != 0 {
+ 		payInfo = &payloadInfo{}
+ 		defer payInfo.free()
+ 	}
+@@ -1405,7 +1402,7 @@ func (s *Server) processUnaryRPC(ctx context.Context, stream *transport.ServerSt
+ 			return status.Errorf(codes.Internal, "grpc: error unmarshalling request: %v", err)
+ 		}
+ 
+-		for _, sh := range shs {
++		if sh != nil {
+ 			sh.HandleRPC(ctx, &stats.InPayload{
+ 				RecvTime:         time.Now(),
+ 				Payload:          v,
+@@ -1579,18 +1576,15 @@ func (s *Server) processStreamingRPC(ctx context.Context, stream *transport.Serv
+ 	if channelz.IsOn() {
+ 		s.incrCallsStarted()
+ 	}
+-	shs := s.opts.statsHandlers
++	sh := s.statsHandler
+ 	var statsBegin *stats.Begin
+-	if len(shs) != 0 {
+-		beginTime := time.Now()
++	if sh != nil {
+ 		statsBegin = &stats.Begin{
+-			BeginTime:      beginTime,
++			BeginTime:      time.Now(),
+ 			IsClientStream: sd.ClientStreams,
+ 			IsServerStream: sd.ServerStreams,
+ 		}
+-		for _, sh := range shs {
+-			sh.HandleRPC(ctx, statsBegin)
+-		}
++		sh.HandleRPC(ctx, statsBegin)
+ 	}
+ 	ctx = NewContextWithServerTransportStream(ctx, stream)
+ 	ss := &serverStream{
+@@ -1602,10 +1596,10 @@ func (s *Server) processStreamingRPC(ctx context.Context, stream *transport.Serv
+ 		maxReceiveMessageSize: s.opts.maxReceiveMessageSize,
+ 		maxSendMessageSize:    s.opts.maxSendMessageSize,
+ 		trInfo:                trInfo,
+-		statsHandler:          shs,
++		statsHandler:          sh,
+ 	}
+ 
+-	if len(shs) != 0 || trInfo != nil || channelz.IsOn() {
++	if sh != nil || trInfo != nil || channelz.IsOn() {
+ 		// See comment in processUnaryRPC on defers.
+ 		defer func() {
+ 			if trInfo != nil {
+@@ -1619,7 +1613,7 @@ func (s *Server) processStreamingRPC(ctx context.Context, stream *transport.Serv
+ 				ss.mu.Unlock()
+ 			}
+ 
+-			if len(shs) != 0 {
++			if sh != nil {
+ 				end := &stats.End{
+ 					BeginTime: statsBegin.BeginTime,
+ 					EndTime:   time.Now(),
+@@ -1627,9 +1621,7 @@ func (s *Server) processStreamingRPC(ctx context.Context, stream *transport.Serv
+ 				if err != nil && err != io.EOF {
+ 					end.Error = toRPCErr(err)
+ 				}
+-				for _, sh := range shs {
+-					sh.HandleRPC(ctx, end)
+-				}
++				sh.HandleRPC(ctx, end)
+ 			}
+ 
+ 			if channelz.IsOn() {
+@@ -1818,19 +1810,17 @@ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Ser
+ 	method := sm[pos+1:]
+ 
+ 	// FromIncomingContext is expensive: skip if there are no statsHandlers
+-	if len(s.opts.statsHandlers) > 0 {
++	if s.statsHandler != nil {
+ 		md, _ := metadata.FromIncomingContext(ctx)
+-		for _, sh := range s.opts.statsHandlers {
+-			ctx = sh.TagRPC(ctx, &stats.RPCTagInfo{FullMethodName: stream.Method()})
+-			sh.HandleRPC(ctx, &stats.InHeader{
+-				FullMethod:  stream.Method(),
+-				RemoteAddr:  t.Peer().Addr,
+-				LocalAddr:   t.Peer().LocalAddr,
+-				Compression: stream.RecvCompress(),
+-				WireLength:  stream.HeaderWireLength(),
+-				Header:      md,
+-			})
+-		}
++		ctx = s.statsHandler.TagRPC(ctx, &stats.RPCTagInfo{FullMethodName: stream.Method()})
++		s.statsHandler.HandleRPC(ctx, &stats.InHeader{
++			FullMethod:  stream.Method(),
++			RemoteAddr:  t.Peer().Addr,
++			LocalAddr:   t.Peer().LocalAddr,
++			Compression: stream.RecvCompress(),
++			WireLength:  stream.HeaderWireLength(),
++			Header:      md,
++		})
+ 	}
+ 	// To have calls in stream callouts work. Will delete once all stats handler
+ 	// calls come from the gRPC layer.
+diff --git a/stream.go b/stream.go
+index f74a6875..62c5d3ff 100644
+--- a/stream.go
++++ b/stream.go
+@@ -418,19 +418,21 @@ func (cs *clientStream) newAttemptLocked(isTransparent bool) (*csAttempt, error)
+ 	ctx := newContextWithRPCInfo(cs.ctx, cs.callInfo.failFast, cs.callInfo.codec, cs.compressorV0, cs.compressorV1)
+ 	method := cs.callHdr.Method
+ 	var beginTime time.Time
+-	shs := cs.cc.dopts.copts.StatsHandlers
+-	for _, sh := range shs {
+-		ctx = sh.TagRPC(ctx, &stats.RPCTagInfo{FullMethodName: method, FailFast: cs.callInfo.failFast, NameResolutionDelay: cs.nameResolutionDelay})
++	sh := cs.cc.statsHandler
++	if sh != nil {
+ 		beginTime = time.Now()
+-		begin := &stats.Begin{
++		ctx = sh.TagRPC(ctx, &stats.RPCTagInfo{
++			FullMethodName: method, FailFast: cs.callInfo.failFast,
++			NameResolutionDelay: cs.nameResolutionDelay,
++		})
++		sh.HandleRPC(ctx, &stats.Begin{
+ 			Client:                    true,
+ 			BeginTime:                 beginTime,
+ 			FailFast:                  cs.callInfo.failFast,
+ 			IsClientStream:            cs.desc.ClientStreams,
+ 			IsServerStream:            cs.desc.ServerStreams,
+ 			IsTransparentRetryAttempt: isTransparent,
+-		}
+-		sh.HandleRPC(ctx, begin)
++		})
+ 	}
+ 
+ 	var trInfo *traceInfo
+@@ -461,7 +463,7 @@ func (cs *clientStream) newAttemptLocked(isTransparent bool) (*csAttempt, error)
+ 		beginTime:      beginTime,
+ 		cs:             cs,
+ 		decompressorV0: cs.cc.dopts.dc,
+-		statsHandlers:  shs,
++		statsHandler:   sh,
+ 		trInfo:         trInfo,
+ 	}, nil
+ }
+@@ -482,10 +484,8 @@ func (a *csAttempt) getTransport() error {
+ 	if a.trInfo != nil {
+ 		a.trInfo.firstLine.SetRemoteAddr(a.transport.RemoteAddr())
+ 	}
+-	if pick.blocked {
+-		for _, sh := range a.statsHandlers {
+-			sh.HandleRPC(a.ctx, &stats.DelayedPickComplete{})
+-		}
++	if pick.blocked && a.statsHandler != nil {
++		a.statsHandler.HandleRPC(a.ctx, &stats.DelayedPickComplete{})
+ 	}
+ 	return nil
+ }
+@@ -615,8 +615,8 @@ type csAttempt struct {
+ 	// and cleared when the finish method is called.
+ 	trInfo *traceInfo
+ 
+-	statsHandlers []stats.Handler
+-	beginTime     time.Time
++	statsHandler stats.Handler
++	beginTime    time.Time
+ 
+ 	// set for newStream errors that may be transparently retried
+ 	allowTransparentRetry bool
+@@ -1110,17 +1110,15 @@ func (a *csAttempt) sendMsg(m any, hdr []byte, payld mem.BufferSlice, dataLength
+ 		}
+ 		return io.EOF
+ 	}
+-	if len(a.statsHandlers) != 0 {
+-		for _, sh := range a.statsHandlers {
+-			sh.HandleRPC(a.ctx, outPayload(true, m, dataLength, payloadLength, time.Now()))
+-		}
++	if a.statsHandler != nil {
++		a.statsHandler.HandleRPC(a.ctx, outPayload(true, m, dataLength, payloadLength, time.Now()))
+ 	}
+ 	return nil
+ }
+ 
+ func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
+ 	cs := a.cs
+-	if len(a.statsHandlers) != 0 && payInfo == nil {
++	if a.statsHandler != nil && payInfo == nil {
+ 		payInfo = &payloadInfo{}
+ 		defer payInfo.free()
+ 	}
+@@ -1163,8 +1161,8 @@ func (a *csAttempt) recvMsg(m any, payInfo *payloadInfo) (err error) {
+ 		}
+ 		a.mu.Unlock()
+ 	}
+-	for _, sh := range a.statsHandlers {
+-		sh.HandleRPC(a.ctx, &stats.InPayload{
++	if a.statsHandler != nil {
++		a.statsHandler.HandleRPC(a.ctx, &stats.InPayload{
+ 			Client:           true,
+ 			RecvTime:         time.Now(),
+ 			Payload:          m,
+@@ -1217,15 +1215,14 @@ func (a *csAttempt) finish(err error) {
+ 			ServerLoad:    balancerload.Parse(tr),
+ 		})
+ 	}
+-	for _, sh := range a.statsHandlers {
+-		end := &stats.End{
++	if a.statsHandler != nil {
++		a.statsHandler.HandleRPC(a.ctx, &stats.End{
+ 			Client:    true,
+ 			BeginTime: a.beginTime,
+ 			EndTime:   time.Now(),
+ 			Trailer:   tr,
+ 			Error:     err,
+-		}
+-		sh.HandleRPC(a.ctx, end)
++		})
+ 	}
+ 	if a.trInfo != nil && a.trInfo.tr != nil {
+ 		if err == nil {
+@@ -1614,7 +1611,7 @@ type serverStream struct {
+ 	maxSendMessageSize    int
+ 	trInfo                *traceInfo
+ 
+-	statsHandler []stats.Handler
++	statsHandler stats.Handler
+ 
+ 	binlogs []binarylog.MethodLogger
+ 	// serverHeaderBinlogged indicates whether server header has been logged. It
+@@ -1750,10 +1747,8 @@ func (ss *serverStream) SendMsg(m any) (err error) {
+ 			binlog.Log(ss.ctx, sm)
+ 		}
+ 	}
+-	if len(ss.statsHandler) != 0 {
+-		for _, sh := range ss.statsHandler {
+-			sh.HandleRPC(ss.s.Context(), outPayload(false, m, dataLen, payloadLen, time.Now()))
+-		}
++	if ss.statsHandler != nil {
++		ss.statsHandler.HandleRPC(ss.s.Context(), outPayload(false, m, dataLen, payloadLen, time.Now()))
+ 	}
+ 	return nil
+ }
+@@ -1784,7 +1779,7 @@ func (ss *serverStream) RecvMsg(m any) (err error) {
+ 		}
+ 	}()
+ 	var payInfo *payloadInfo
+-	if len(ss.statsHandler) != 0 || len(ss.binlogs) != 0 {
++	if ss.statsHandler != nil || len(ss.binlogs) != 0 {
+ 		payInfo = &payloadInfo{}
+ 		defer payInfo.free()
+ 	}
+@@ -1808,16 +1803,14 @@ func (ss *serverStream) RecvMsg(m any) (err error) {
+ 		return toRPCErr(err)
+ 	}
+ 	ss.recvFirstMsg = true
+-	if len(ss.statsHandler) != 0 {
+-		for _, sh := range ss.statsHandler {
+-			sh.HandleRPC(ss.s.Context(), &stats.InPayload{
+-				RecvTime:         time.Now(),
+-				Payload:          m,
+-				Length:           payInfo.uncompressedBytes.Len(),
+-				WireLength:       payInfo.compressedLength + headerLen,
+-				CompressedLength: payInfo.compressedLength,
+-			})
+-		}
++	if ss.statsHandler != nil {
++		ss.statsHandler.HandleRPC(ss.s.Context(), &stats.InPayload{
++			RecvTime:         time.Now(),
++			Payload:          m,
++			Length:           payInfo.uncompressedBytes.Len(),
++			WireLength:       payInfo.compressedLength + headerLen,
++			CompressedLength: payInfo.compressedLength,
++		})
+ 	}
+ 	if len(ss.binlogs) != 0 {
+ 		cm := &binarylog.ClientMessage{

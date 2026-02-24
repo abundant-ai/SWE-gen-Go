@@ -1,0 +1,123 @@
+diff --git a/internal/xds/balancer/clusterimpl/clusterimpl.go b/internal/xds/balancer/clusterimpl/clusterimpl.go
+index cdc7bf2e..72d143a3 100644
+--- a/internal/xds/balancer/clusterimpl/clusterimpl.go
++++ b/internal/xds/balancer/clusterimpl/clusterimpl.go
+@@ -163,7 +163,6 @@ func (b *clusterImplBalancer) newPickerLocked() *picker {
+ 		counter:         b.requestCounter,
+ 		countMax:        b.requestCountMax,
+ 		telemetryLabels: b.telemetryLabels,
+-		clusterName:     b.clusterName,
+ 	}
+ }
+ 
+@@ -415,7 +414,6 @@ func (b *clusterImplBalancer) getClusterName() string {
+ // SubConn to the wrapper for this purpose.
+ type scWrapper struct {
+ 	balancer.SubConn
+-
+ 	// locality needs to be atomic because it can be updated while being read by
+ 	// the picker.
+ 	locality atomic.Pointer[clients.Locality]
+diff --git a/internal/xds/balancer/clusterimpl/picker.go b/internal/xds/balancer/clusterimpl/picker.go
+index 0c033261..fab09fa0 100644
+--- a/internal/xds/balancer/clusterimpl/picker.go
++++ b/internal/xds/balancer/clusterimpl/picker.go
+@@ -20,7 +20,6 @@ package clusterimpl
+ 
+ import (
+ 	"context"
+-	"maps"
+ 
+ 	v3orcapb "github.com/cncf/xds/go/xds/data/orca/v3"
+ 	"google.golang.org/grpc/balancer"
+@@ -88,7 +87,6 @@ type picker struct {
+ 	counter         *xdsclient.ClusterRequestsCounter
+ 	countMax        uint32
+ 	telemetryLabels map[string]string
+-	clusterName     string
+ }
+ 
+ func telemetryLabels(ctx context.Context) map[string]string {
+@@ -105,9 +103,10 @@ func telemetryLabels(ctx context.Context) map[string]string {
+ func (d *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+ 	// Unconditionally set labels if present, even dropped or queued RPC's can
+ 	// use these labels.
+-	labels := telemetryLabels(info.Ctx)
+-	if labels != nil {
+-		maps.Copy(labels, d.telemetryLabels)
++	if labels := telemetryLabels(info.Ctx); labels != nil {
++		for key, value := range d.telemetryLabels {
++			labels[key] = value
++		}
+ 	}
+ 
+ 	// Don't drop unless the inner picker is READY. Similar to
+@@ -155,9 +154,8 @@ func (d *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+ 		return pr, err
+ 	}
+ 
+-	if labels != nil {
++	if labels := telemetryLabels(info.Ctx); labels != nil {
+ 		labels["grpc.lb.locality"] = xdsinternal.LocalityString(lID)
+-		labels["grpc.lb.backend_service"] = d.clusterName
+ 	}
+ 
+ 	if d.loadStore != nil {
+diff --git a/stats/opentelemetry/client_metrics.go b/stats/opentelemetry/client_metrics.go
+index c3b77da5..d2d80494 100644
+--- a/stats/opentelemetry/client_metrics.go
++++ b/stats/opentelemetry/client_metrics.go
+@@ -174,8 +174,7 @@ func (h *clientMetricsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInf
+ 			// executes on the callpath that this OpenTelemetry component
+ 			// currently supports.
+ 			TelemetryLabels: map[string]string{
+-				"grpc.lb.locality":        "",
+-				"grpc.lb.backend_service": "",
++				"grpc.lb.locality": "",
+ 			},
+ 		}
+ 		ctx = istats.SetLabels(ctx, labels)
+diff --git a/test/xds/xds_telemetry_labels_test.go b/test/xds/xds_telemetry_labels_test.go
+index 36187419..3ed589e5 100644
+--- a/test/xds/xds_telemetry_labels_test.go
++++ b/test/xds/xds_telemetry_labels_test.go
+@@ -44,8 +44,7 @@ const serviceNamespaceKey = "service_namespace"
+ const serviceNamespaceKeyCSM = "csm.service_namespace_name"
+ const serviceNameValue = "grpc-service"
+ const serviceNamespaceValue = "grpc-service-namespace"
+-const backendServiceKey = "grpc.lb.backend_service"
+-const backendServiceValue = "cluster-my-service-client-side-xds"
++
+ const localityKey = "grpc.lb.locality"
+ const localityValue = `{region="region-1", zone="zone-1", sub_zone="subzone-1"}`
+ 
+@@ -125,23 +124,23 @@ func (fsh *fakeStatsHandler) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) co
+ 
+ func (fsh *fakeStatsHandler) HandleRPC(_ context.Context, rs stats.RPCStats) {
+ 	switch rs.(type) {
+-	// stats.Begin is called before the picker runs, so it won't have telemetry
++	// stats.Begin won't get Telemetry Labels because happens after picker
++	// picks.
++
++	// These three stats callouts trigger all metrics for OpenTelemetry that
++	// aren't started. All of these should have access to the desired telemetry
+ 	// labels.
+-	// The following three stats callouts trigger OpenTelemetry metrics and are
+-	// guaranteed to run after the picker has selected a subchannel. Therefore,
+-	// they should have access to the desired telemetry labels.
+ 	case *stats.OutPayload, *stats.InPayload, *stats.End:
+ 		want := map[string]string{
+ 			serviceNameKeyCSM:      serviceNameValue,
+ 			serviceNamespaceKeyCSM: serviceNamespaceValue,
+ 			localityKey:            localityValue,
+-			backendServiceKey:      backendServiceValue,
+ 		}
+ 		if diff := cmp.Diff(fsh.labels.TelemetryLabels, want); diff != "" {
+ 			fsh.t.Fatalf("fsh.labels.TelemetryLabels (-got +want): %v", diff)
+ 		}
+ 	default:
+ 		// Nothing to assert for the other stats.Handler callouts.
+-
+ 	}
++
+ }

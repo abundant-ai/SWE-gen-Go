@@ -1,0 +1,79 @@
+diff --git a/internal/xds/balancer/clusterimpl/clusterimpl.go b/internal/xds/balancer/clusterimpl/clusterimpl.go
+index 72d143a3..cdc7bf2e 100644
+--- a/internal/xds/balancer/clusterimpl/clusterimpl.go
++++ b/internal/xds/balancer/clusterimpl/clusterimpl.go
+@@ -163,6 +163,7 @@ func (b *clusterImplBalancer) newPickerLocked() *picker {
+ 		counter:         b.requestCounter,
+ 		countMax:        b.requestCountMax,
+ 		telemetryLabels: b.telemetryLabels,
++		clusterName:     b.clusterName,
+ 	}
+ }
+ 
+@@ -414,6 +415,7 @@ func (b *clusterImplBalancer) getClusterName() string {
+ // SubConn to the wrapper for this purpose.
+ type scWrapper struct {
+ 	balancer.SubConn
++
+ 	// locality needs to be atomic because it can be updated while being read by
+ 	// the picker.
+ 	locality atomic.Pointer[clients.Locality]
+diff --git a/internal/xds/balancer/clusterimpl/picker.go b/internal/xds/balancer/clusterimpl/picker.go
+index fab09fa0..0c033261 100644
+--- a/internal/xds/balancer/clusterimpl/picker.go
++++ b/internal/xds/balancer/clusterimpl/picker.go
+@@ -20,6 +20,7 @@ package clusterimpl
+ 
+ import (
+ 	"context"
++	"maps"
+ 
+ 	v3orcapb "github.com/cncf/xds/go/xds/data/orca/v3"
+ 	"google.golang.org/grpc/balancer"
+@@ -87,6 +88,7 @@ type picker struct {
+ 	counter         *xdsclient.ClusterRequestsCounter
+ 	countMax        uint32
+ 	telemetryLabels map[string]string
++	clusterName     string
+ }
+ 
+ func telemetryLabels(ctx context.Context) map[string]string {
+@@ -103,10 +105,9 @@ func telemetryLabels(ctx context.Context) map[string]string {
+ func (d *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+ 	// Unconditionally set labels if present, even dropped or queued RPC's can
+ 	// use these labels.
+-	if labels := telemetryLabels(info.Ctx); labels != nil {
+-		for key, value := range d.telemetryLabels {
+-			labels[key] = value
+-		}
++	labels := telemetryLabels(info.Ctx)
++	if labels != nil {
++		maps.Copy(labels, d.telemetryLabels)
+ 	}
+ 
+ 	// Don't drop unless the inner picker is READY. Similar to
+@@ -154,8 +155,9 @@ func (d *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+ 		return pr, err
+ 	}
+ 
+-	if labels := telemetryLabels(info.Ctx); labels != nil {
++	if labels != nil {
+ 		labels["grpc.lb.locality"] = xdsinternal.LocalityString(lID)
++		labels["grpc.lb.backend_service"] = d.clusterName
+ 	}
+ 
+ 	if d.loadStore != nil {
+diff --git a/stats/opentelemetry/client_metrics.go b/stats/opentelemetry/client_metrics.go
+index d2d80494..c3b77da5 100644
+--- a/stats/opentelemetry/client_metrics.go
++++ b/stats/opentelemetry/client_metrics.go
+@@ -174,7 +174,8 @@ func (h *clientMetricsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInf
+ 			// executes on the callpath that this OpenTelemetry component
+ 			// currently supports.
+ 			TelemetryLabels: map[string]string{
+-				"grpc.lb.locality": "",
++				"grpc.lb.locality":        "",
++				"grpc.lb.backend_service": "",
+ 			},
+ 		}
+ 		ctx = istats.SetLabels(ctx, labels)

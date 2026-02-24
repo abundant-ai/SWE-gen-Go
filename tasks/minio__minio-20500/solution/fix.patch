@@ -1,0 +1,87 @@
+diff --git a/cmd/erasure-healing-common.go b/cmd/erasure-healing-common.go
+index 3b10ea55e..1e39c2c26 100644
+--- a/cmd/erasure-healing-common.go
++++ b/cmd/erasure-healing-common.go
+@@ -289,7 +289,7 @@ func hasPartErr(partErrs []int) bool {
+ //   - slice of errors about the state of data files on disk - can have
+ //     a not-found error or a hash-mismatch error.
+ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetadata []FileInfo,
+-	errs []error, latestMeta FileInfo, bucket, object string,
++	errs []error, latestMeta FileInfo, filterByETag bool, bucket, object string,
+ 	scanMode madmin.HealScanMode,
+ ) (availableDisks []StorageAPI, dataErrsByDisk map[int][]int, dataErrsByPart map[int][]int) {
+ 	availableDisks = make([]StorageAPI, len(onlineDisks))
+@@ -345,7 +345,14 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
+ 		}
+ 
+ 		meta := partsMetadata[i]
+-		if !meta.ModTime.Equal(latestMeta.ModTime) || meta.DataDir != latestMeta.DataDir {
++		corrupted := false
++		if filterByETag {
++			corrupted = meta.Metadata["etag"] != latestMeta.Metadata["etag"]
++		} else {
++			corrupted = !meta.ModTime.Equal(latestMeta.ModTime) || meta.DataDir != latestMeta.DataDir
++		}
++
++		if corrupted {
+ 			metaErrs[i] = errFileCorrupt
+ 			partsMetadata[i] = FileInfo{}
+ 			continue
+@@ -408,7 +415,6 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
+ 			verifyResp *CheckPartsResp
+ 		)
+ 
+-		meta.DataDir = latestMeta.DataDir
+ 		switch scanMode {
+ 		case madmin.HealDeepScan:
+ 			// disk has a valid xl.meta but may not have all the
+diff --git a/cmd/erasure-healing.go b/cmd/erasure-healing.go
+index 6972c0e27..6f4ea4fd5 100644
+--- a/cmd/erasure-healing.go
++++ b/cmd/erasure-healing.go
+@@ -327,15 +327,18 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object
+ 
+ 	// List of disks having latest version of the object xl.meta
+ 	// (by modtime).
+-	onlineDisks, modTime, etag := listOnlineDisks(storageDisks, partsMetadata, errs, readQuorum)
++	onlineDisks, quorumModTime, quorumETag := listOnlineDisks(storageDisks, partsMetadata, errs, readQuorum)
+ 
+ 	// Latest FileInfo for reference. If a valid metadata is not
+ 	// present, it is as good as object not found.
+-	latestMeta, err := pickValidFileInfo(ctx, partsMetadata, modTime, etag, readQuorum)
++	latestMeta, err := pickValidFileInfo(ctx, partsMetadata, quorumModTime, quorumETag, readQuorum)
+ 	if err != nil {
+ 		return result, err
+ 	}
+ 
++	// No modtime quorum
++	filterDisksByETag := quorumETag != ""
++
+ 	// List of disks having all parts as per latest metadata.
+ 	// NOTE: do not pass in latestDisks to diskWithAllParts since
+ 	// the diskWithAllParts needs to reach the drive to ensure
+@@ -346,7 +349,7 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object
+ 	// we do not skip drives that have inconsistent metadata to be
+ 	// skipped from purging when they are stale.
+ 	availableDisks, dataErrsByDisk, dataErrsByPart := disksWithAllParts(ctx, onlineDisks, partsMetadata,
+-		errs, latestMeta, bucket, object, scanMode)
++		errs, latestMeta, filterDisksByETag, bucket, object, scanMode)
+ 
+ 	var erasure Erasure
+ 	if !latestMeta.Deleted && !latestMeta.IsRemote() {
+@@ -421,7 +424,14 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object
+ 		return result, nil
+ 	}
+ 
+-	if !latestMeta.XLV1 && !latestMeta.Deleted && disksToHealCount > latestMeta.Erasure.ParityBlocks {
++	cannotHeal := !latestMeta.XLV1 && !latestMeta.Deleted && disksToHealCount > latestMeta.Erasure.ParityBlocks
++	if cannotHeal && quorumETag != "" {
++		// This is an object that is supposed to be removed by the dangling code
++		// but we noticed that ETag is the same for all objects, let's give it a shot
++		cannotHeal = false
++	}
++
++	if cannotHeal {
+ 		// Allow for dangling deletes, on versions that have DataDir missing etc.
+ 		// this would end up restoring the correct readable versions.
+ 		m, err := er.deleteIfDangling(ctx, bucket, object, partsMetadata, errs, dataErrsByPart, ObjectOptions{

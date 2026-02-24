@@ -1,0 +1,1093 @@
+diff --git a/.changes/v1.14/BUG FIXES-20250926-113318.yaml b/.changes/v1.14/BUG FIXES-20250926-113318.yaml
+deleted file mode 100644
+index 3adfd48017..0000000000
+--- a/.changes/v1.14/BUG FIXES-20250926-113318.yaml	
++++ /dev/null
+@@ -1,5 +0,0 @@
+-kind: BUG FIXES
+-body: 'query: generate unique resource identifiers for results of expanded list resources'
+-time: 2025-09-26T11:33:18.241184+02:00
+-custom:
+-    Issue: "37681"
+diff --git a/.changes/v1.14/ENHANCEMENTS-20250925-151237.yaml b/.changes/v1.14/ENHANCEMENTS-20250925-151237.yaml
+deleted file mode 100644
+index 6e6c3381c7..0000000000
+--- a/.changes/v1.14/ENHANCEMENTS-20250925-151237.yaml
++++ /dev/null
+@@ -1,5 +0,0 @@
+-kind: ENHANCEMENTS
+-body: "query: support offline validation of query files via -query flag in the validate command"
+-time: 2025-09-25T15:12:37.198573+02:00
+-custom:
+-  Issue: "37671"
+diff --git a/internal/command/arguments/validate.go b/internal/command/arguments/validate.go
+index 4347f39eb1..7df4b2c5d9 100644
+--- a/internal/command/arguments/validate.go
++++ b/internal/command/arguments/validate.go
+@@ -24,9 +24,6 @@ type Validate struct {
+ 
+ 	// ViewType specifies which output format to use: human, JSON, or "raw".
+ 	ViewType ViewType
+-
+-	// Query indicates that Terraform should also validate .tfquery files.
+-	Query bool
+ }
+ 
+ // ParseValidate processes CLI arguments, returning a Validate value and errors.
+@@ -43,7 +40,6 @@ func ParseValidate(args []string) (*Validate, tfdiags.Diagnostics) {
+ 	cmdFlags.BoolVar(&jsonOutput, "json", false, "json")
+ 	cmdFlags.StringVar(&validate.TestDirectory, "test-directory", "tests", "test-directory")
+ 	cmdFlags.BoolVar(&validate.NoTests, "no-tests", false, "no-tests")
+-	cmdFlags.BoolVar(&validate.Query, "query", false, "query")
+ 
+ 	if err := cmdFlags.Parse(args); err != nil {
+ 		diags = diags.Append(tfdiags.Sourceless(
+diff --git a/internal/command/testdata/query/invalid-traversal/main.tf b/internal/command/testdata/query/invalid-traversal/main.tf
+deleted file mode 100644
+index 4a6f9760d0..0000000000
+--- a/internal/command/testdata/query/invalid-traversal/main.tf
++++ /dev/null
+@@ -1,9 +0,0 @@
+-terraform {
+-  required_providers {
+-    test = {
+-      source = "hashicorp/test"
+-    }
+-  }
+-}
+-
+-provider "test" {}
+diff --git a/internal/command/testdata/query/invalid-traversal/main.tfquery.hcl b/internal/command/testdata/query/invalid-traversal/main.tfquery.hcl
+deleted file mode 100644
+index 71139321a6..0000000000
+--- a/internal/command/testdata/query/invalid-traversal/main.tfquery.hcl
++++ /dev/null
+@@ -1,21 +0,0 @@
+-variable "input" {
+-	type = string
+-	default = "foo"
+-}
+-
+-list "test_instance" "test" {
+-	provider = test
+-
+-	config {
+-		ami = var.input
+-	}
+-}
+-
+-list "test_instance" "test2" {
+-	provider = test
+-	
+-	config {
+-  	// this traversal is invalid for a list resource
+-  	ami = list.test_instance.test.state.instance_type
+-	}
+-}
+diff --git a/internal/command/validate.go b/internal/command/validate.go
+index f679e2fae8..a574f00c0f 100644
+--- a/internal/command/validate.go
++++ b/internal/command/validate.go
+@@ -19,8 +19,6 @@ import (
+ // ValidateCommand is a Command implementation that validates the terraform files
+ type ValidateCommand struct {
+ 	Meta
+-
+-	ParsedArgs *arguments.Validate
+ }
+ 
+ func (c *ValidateCommand) Run(rawArgs []string) int {
+@@ -36,7 +34,6 @@ func (c *ValidateCommand) Run(rawArgs []string) int {
+ 		return 1
+ 	}
+ 
+-	c.ParsedArgs = args
+ 	view := views.NewValidate(args.ViewType, c.View)
+ 
+ 	// After this point, we must only produce JSON output if JSON mode is
+@@ -57,7 +54,7 @@ func (c *ValidateCommand) Run(rawArgs []string) int {
+ 		return view.Results(diags)
+ 	}
+ 
+-	validateDiags := c.validate(dir)
++	validateDiags := c.validate(dir, args.TestDirectory, args.NoTests)
+ 	diags = diags.Append(validateDiags)
+ 
+ 	// Validating with dev overrides in effect means that the result might
+@@ -69,54 +66,47 @@ func (c *ValidateCommand) Run(rawArgs []string) int {
+ 	return view.Results(diags)
+ }
+ 
+-func (c *ValidateCommand) validate(dir string) tfdiags.Diagnostics {
++func (c *ValidateCommand) validate(dir, testDir string, noTests bool) tfdiags.Diagnostics {
+ 	var diags tfdiags.Diagnostics
+ 	var cfg *configs.Config
+ 
+-	// If the query flag is set, include query files in the validation.
+-	c.includeQueryFiles = c.ParsedArgs.Query
+-
+-	if c.ParsedArgs.NoTests {
++	if noTests {
+ 		cfg, diags = c.loadConfig(dir)
+ 	} else {
+-		cfg, diags = c.loadConfigWithTests(dir, c.ParsedArgs.TestDirectory)
++		cfg, diags = c.loadConfigWithTests(dir, testDir)
+ 	}
+ 	if diags.HasErrors() {
+ 		return diags
+ 	}
+ 
+-	diags = diags.Append(c.validateConfig(cfg))
+-
+-	// Unless excluded, we'll also do a quick validation of the Terraform test files. These live
+-	// outside the Terraform graph so we have to do this separately.
+-	if !c.ParsedArgs.NoTests {
+-		diags = diags.Append(c.validateTestFiles(cfg))
+-	}
++	validate := func(cfg *configs.Config) tfdiags.Diagnostics {
++		var diags tfdiags.Diagnostics
+ 
+-	return diags
+-}
++		opts, err := c.contextOpts()
++		if err != nil {
++			diags = diags.Append(err)
++			return diags
++		}
+ 
+-func (c *ValidateCommand) validateConfig(cfg *configs.Config) tfdiags.Diagnostics {
+-	var diags tfdiags.Diagnostics
++		tfCtx, ctxDiags := terraform.NewContext(opts)
++		diags = diags.Append(ctxDiags)
++		if ctxDiags.HasErrors() {
++			return diags
++		}
+ 
+-	opts, err := c.contextOpts()
+-	if err != nil {
+-		diags = diags.Append(err)
+-		return diags
++		return diags.Append(tfCtx.Validate(cfg, nil))
+ 	}
+ 
+-	tfCtx, ctxDiags := terraform.NewContext(opts)
+-	diags = diags.Append(ctxDiags)
+-	if ctxDiags.HasErrors() {
++	diags = diags.Append(validate(cfg))
++
++	if noTests {
+ 		return diags
+ 	}
+ 
+-	return diags.Append(tfCtx.Validate(cfg, nil))
+-}
+-
+-func (c *ValidateCommand) validateTestFiles(cfg *configs.Config) tfdiags.Diagnostics {
+-	diags := tfdiags.Diagnostics{}
+ 	validatedModules := make(map[string]bool)
++
++	// We'll also do a quick validation of the Terraform test files. These live
++	// outside the Terraform graph so we have to do this separately.
+ 	for _, file := range cfg.Module.Tests {
+ 
+ 		// The file validation only returns warnings so we'll just add them
+@@ -141,7 +131,7 @@ func (c *ValidateCommand) validateTestFiles(cfg *configs.Config) tfdiags.Diagnos
+ 						// not validate the same thing multiple times.
+ 
+ 						validatedModules[run.Module.Source.String()] = true
+-						diags = diags.Append(c.validateConfig(run.ConfigUnderTest))
++						diags = diags.Append(validate(run.ConfigUnderTest))
+ 					}
+ 
+ 				}
+@@ -198,8 +188,6 @@ Options:
+   -no-tests             If specified, Terraform will not validate test files.
+ 
+   -test-directory=path	Set the Terraform test directory, defaults to "tests".
+-  
+-  -query                If specified, the command will also validate .tfquery.hcl files.
+ `
+ 	return strings.TrimSpace(helpText)
+ }
+diff --git a/internal/command/validate_test.go b/internal/command/validate_test.go
+index 3cbeb4a02b..6651b3435a 100644
+--- a/internal/command/validate_test.go
++++ b/internal/command/validate_test.go
+@@ -449,85 +449,3 @@ func TestValidate_json(t *testing.T) {
+ 		})
+ 	}
+ }
+-
+-func TestValidateWithInvalidListResource(t *testing.T) {
+-	td := t.TempDir()
+-	cases := []struct {
+-		name      string
+-		path      string
+-		wantError string
+-		args      []string
+-		code      int
+-	}{
+-		{
+-			name: "invalid-traversal with validate -query command",
+-			path: "query/invalid-traversal",
+-			wantError: `
+-Error: Invalid list resource traversal
+-
+-  on main.tfquery.hcl line 19, in list "test_instance" "test2":
+-  19:   	ami = list.test_instance.test.state.instance_type
+-
+-The first step in the traversal for a list resource must be an attribute
+-"data".
+-`,
+-			args: []string{"-query"},
+-			code: 1,
+-		},
+-		{
+-			name: "invalid-traversal with no -query",
+-			path: "query/invalid-traversal",
+-		},
+-	}
+-	for _, tc := range cases {
+-		t.Run(tc.name, func(t *testing.T) {
+-			testCopyDir(t, testFixturePath(tc.path), td)
+-			t.Chdir(td)
+-
+-			streams, done := terminal.StreamsForTesting(t)
+-			view := views.NewView(streams)
+-			ui := new(cli.MockUi)
+-
+-			provider := queryFixtureProvider()
+-			providerSource, close := newMockProviderSource(t, map[string][]string{
+-				"test": {"1.0.0"},
+-			})
+-			defer close()
+-
+-			meta := Meta{
+-				testingOverrides: metaOverridesForProvider(provider),
+-				Ui:               ui,
+-				View:             view,
+-				Streams:          streams,
+-				ProviderSource:   providerSource,
+-			}
+-
+-			init := &InitCommand{
+-				Meta: meta,
+-			}
+-
+-			if code := init.Run(nil); code != 0 {
+-				t.Fatalf("expected status code 0 but got %d: %s", code, ui.ErrorWriter)
+-			}
+-
+-			c := &ValidateCommand{
+-				Meta: meta,
+-			}
+-
+-			var args []string
+-			args = append(args, "-no-color")
+-			args = append(args, tc.args...)
+-
+-			code := c.Run(args)
+-			output := done(t)
+-
+-			if code != tc.code {
+-				t.Fatalf("Expected status code %d but got %d: %s", tc.code, code, output.Stderr())
+-			}
+-
+-			if diff := cmp.Diff(tc.wantError, output.Stderr()); diff != "" {
+-				t.Fatalf("Expected error string %q but got %q\n\ndiff: \n%s", tc.wantError, output.Stderr(), diff)
+-			}
+-		})
+-	}
+-}
+diff --git a/internal/genconfig/generate_config.go b/internal/genconfig/generate_config.go
+index 746a04220d..80a6f01734 100644
+--- a/internal/genconfig/generate_config.go
++++ b/internal/genconfig/generate_config.go
+@@ -138,9 +138,6 @@ type ResourceListElement struct {
+ 	Config cty.Value
+ 
+ 	Identity cty.Value
+-
+-	// ExpansionEnum is a unique enumeration of the list resource address relative to its expanded siblings.
+-	ExpansionEnum int
+ }
+ 
+ func GenerateListResourceContents(addr addrs.AbsResourceInstance,
+@@ -161,18 +158,12 @@ func GenerateListResourceContents(addr addrs.AbsResourceInstance,
+ 				Resource: addrs.Resource{
+ 					Mode: addrs.ManagedResourceMode,
+ 					Type: addr.Resource.Resource.Type,
++					Name: fmt.Sprintf("%s_%d", addr.Resource.Resource.Name, idx),
+ 				},
++				Key: addr.Resource.Key,
+ 			},
+ 		}
+ 
+-		// If the list resource instance is keyed, the expansion counter is included in the address
+-		// to ensure uniqueness across the entire configuration.
+-		if addr.Resource.Key == addrs.NoKey {
+-			resAddr.Resource.Resource.Name = fmt.Sprintf("%s_%d", addr.Resource.Resource.Name, idx)
+-		} else {
+-			resAddr.Resource.Resource.Name = fmt.Sprintf("%s_%d_%d", addr.Resource.Resource.Name, res.ExpansionEnum, idx)
+-		}
+-
+ 		content, gDiags := GenerateResourceContents(resAddr, schema, pc, res.Config, true)
+ 		if gDiags.HasErrors() {
+ 			diags = diags.Append(gDiags)
+diff --git a/internal/instances/expander.go b/internal/instances/expander.go
+index 93a38b4060..414ede32c5 100644
+--- a/internal/instances/expander.go
++++ b/internal/instances/expander.go
+@@ -5,7 +5,6 @@ package instances
+ 
+ import (
+ 	"fmt"
+-	"slices"
+ 	"sort"
+ 	"sync"
+ 
+@@ -339,16 +338,6 @@ func (e *Expander) ExpandResource(resourceAddr addrs.AbsResource) []addrs.AbsRes
+ 	return ret
+ }
+ 
+-// ResourceExpansionEnum returns the expansion enum for the given resource instance address
+-// within the sorted list of resource instances belonging to the same resource config within
+-// the same module instance.
+-func (e *Expander) ResourceExpansionEnum(resourceAddr addrs.AbsResourceInstance) int {
+-	res := e.ExpandResource(resourceAddr.ContainingResource())
+-	return slices.IndexFunc(res, func(addr addrs.AbsResourceInstance) bool {
+-		return addr.Equal(resourceAddr)
+-	})
+-}
+-
+ // UnknownResourceInstances finds a set of patterns that collectively cover
+ // all of the possible resource instance addresses that could appear for the
+ // given static resource once all of the intermediate module expansions are
+diff --git a/internal/terraform/context_plan_query_test.go b/internal/terraform/context_plan_query_test.go
+index 9c2b9e1469..902f6cf972 100644
+--- a/internal/terraform/context_plan_query_test.go
++++ b/internal/terraform/context_plan_query_test.go
+@@ -5,8 +5,6 @@ package terraform
+ 
+ import (
+ 	"fmt"
+-	"maps"
+-	"slices"
+ 	"sort"
+ 	"strings"
+ 	"testing"
+@@ -64,20 +62,18 @@ func TestContext2Plan_queryList(t *testing.T) {
+ 		return providers.ListResourceResponse{Result: cty.ObjectVal(ret)}
+ 	}
+ 
+-	type resources struct {
+-		list    map[string]bool // map of list resource addresses to whether they want the resource state included in the response
+-		managed []string
+-	}
+-
+ 	cases := []struct {
+ 		name                string
+ 		mainConfig          string
+ 		queryConfig         string
+ 		generatedPath       string
++		expectedErrMsg      []string
+ 		transformSchema     func(*providers.GetProviderSchemaResponse)
++		assertState         func(*states.State)
+ 		assertValidateDiags func(t *testing.T, diags tfdiags.Diagnostics)
+ 		assertPlanDiags     func(t *testing.T, diags tfdiags.Diagnostics)
+-		expectedResources   resources
++		assertChanges       func(providers.ProviderSchema, *plans.ChangesSrc)
++		listResourceFn      func(request providers.ListResourceRequest) providers.ListResourceResponse
+ 	}{
+ 		{
+ 			name: "valid list reference - generates config",
+@@ -118,13 +114,46 @@ func TestContext2Plan_queryList(t *testing.T) {
+ 					}
+ 				}
+ 				`,
+-			generatedPath: t.TempDir(),
+-			expectedResources: resources{
+-				list: map[string]bool{
+-					"list.test_resource.test":  true,
+-					"list.test_resource.test2": false,
+-				},
+-				managed: []string{},
++			generatedPath:  t.TempDir(),
++			listResourceFn: listResourceFn,
++			assertChanges: func(sch providers.ProviderSchema, changes *plans.ChangesSrc) {
++				expectedResources := []string{"list.test_resource.test", "list.test_resource.test2"}
++				actualResources := make([]string, 0)
++				generatedCfgs := make([]string, 0)
++				for _, change := range changes.Queries {
++					actualResources = append(actualResources, change.Addr.String())
++					schema := sch.ListResourceTypes[change.Addr.Resource.Resource.Type]
++					cs, err := change.Decode(schema)
++					if err != nil {
++						t.Fatalf("failed to decode change: %s", err)
++					}
++
++					obj := cs.Results.Value.GetAttr("data")
++					if obj.IsNull() {
++						t.Fatalf("Expected 'data' attribute to be present, but it is null")
++					}
++					obj.ForEachElement(func(key cty.Value, val cty.Value) bool {
++						if val.Type().HasAttribute("state") {
++							val = val.GetAttr("state")
++							if !val.IsNull() {
++								if val.GetAttr("instance_type").IsNull() {
++									t.Fatalf("Expected 'instance_type' attribute to be present, but it is missing")
++								}
++							}
++						}
++
++						return false
++					})
++					generatedCfgs = append(generatedCfgs, change.Generated.String())
++				}
++
++				if diff := cmp.Diff(expectedResources, actualResources); diff != "" {
++					t.Fatalf("Expected resources to match, but they differ: %s", diff)
++				}
++
++				if diff := cmp.Diff([]string{testResourceCfg, testResourceCfg2}, generatedCfgs); diff != "" {
++					t.Fatalf("Expected generated configs to match, but they differ: %s", diff)
++				}
+ 			},
+ 		},
+ 		{
+@@ -168,9 +197,47 @@ func TestContext2Plan_queryList(t *testing.T) {
+ 					}
+ 				}
+ 				`,
+-			expectedResources: resources{
+-				list:    map[string]bool{"list.test_resource.test[0]": true, "list.test_resource.test2": true},
+-				managed: []string{},
++			listResourceFn: listResourceFn,
++			assertChanges: func(sch providers.ProviderSchema, changes *plans.ChangesSrc) {
++				expectedResources := []string{"list.test_resource.test[0]", "list.test_resource.test2"}
++				actualResources := make([]string, 0)
++				for _, change := range changes.Queries {
++					actualResources = append(actualResources, change.Addr.String())
++					schema := sch.ListResourceTypes[change.Addr.Resource.Resource.Type]
++					cs, err := change.Decode(schema)
++					if err != nil {
++						t.Fatalf("failed to decode change: %s", err)
++					}
++
++					// Verify instance types
++					expectedTypes := []string{"ami-123456", "ami-654321", "ami-789012"}
++					actualTypes := make([]string, 0)
++					obj := cs.Results.Value.GetAttr("data")
++					if obj.IsNull() {
++						t.Fatalf("Expected 'data' attribute to be present, but it is null")
++					}
++					obj.ForEachElement(func(key cty.Value, val cty.Value) bool {
++						val = val.GetAttr("state")
++						if val.IsNull() {
++							t.Fatalf("Expected 'state' attribute to be present, but it is null")
++						}
++						if val.GetAttr("instance_type").IsNull() {
++							t.Fatalf("Expected 'instance_type' attribute to be present, but it is missing")
++						}
++						actualTypes = append(actualTypes, val.GetAttr("instance_type").AsString())
++						return false
++					})
++					sort.Strings(actualTypes)
++					sort.Strings(expectedTypes)
++					if diff := cmp.Diff(expectedTypes, actualTypes); diff != "" {
++						t.Fatalf("Expected instance types to match, but they differ: %s", diff)
++					}
++				}
++				sort.Strings(actualResources)
++				sort.Strings(expectedResources)
++				if diff := cmp.Diff(expectedResources, actualResources); diff != "" {
++					t.Fatalf("Expected resources to match, but they differ: %s", diff)
++				}
+ 			},
+ 		},
+ 		{
+@@ -279,9 +346,47 @@ func TestContext2Plan_queryList(t *testing.T) {
+ 				}
+ 
+ 			},
+-			expectedResources: resources{
+-				list:    map[string]bool{"list.test_resource.test": false},
+-				managed: []string{},
++			listResourceFn: listResourceFn,
++			assertChanges: func(sch providers.ProviderSchema, changes *plans.ChangesSrc) {
++				expectedResources := []string{"list.test_resource.test"}
++				actualResources := make([]string, 0)
++				for _, change := range changes.Queries {
++					actualResources = append(actualResources, change.Addr.String())
++					schema := sch.ListResourceTypes[change.Addr.Resource.Resource.Type]
++					cs, err := change.Decode(schema)
++					if err != nil {
++						t.Fatalf("failed to decode change: %s", err)
++					}
++
++					// Verify identities
++					expectedTypes := []string{"i-v1", "i-v2", "i-v3"}
++					actualTypes := make([]string, 0)
++					obj := cs.Results.Value.GetAttr("data")
++					if obj.IsNull() {
++						t.Fatalf("Expected 'data' attribute to be present, but it is null")
++					}
++					obj.ForEachElement(func(key cty.Value, val cty.Value) bool {
++						val = val.GetAttr("identity")
++						if val.IsNull() {
++							t.Fatalf("Expected 'identity' attribute to be present, but it is null")
++						}
++						if val.GetAttr("id").IsNull() {
++							t.Fatalf("Expected 'id' attribute to be present, but it is missing")
++						}
++						actualTypes = append(actualTypes, val.GetAttr("id").AsString())
++						return false
++					})
++					sort.Strings(actualTypes)
++					sort.Strings(expectedTypes)
++					if diff := cmp.Diff(expectedTypes, actualTypes); diff != "" {
++						t.Fatalf("Expected instance types to match, but they differ: %s", diff)
++					}
++				}
++				sort.Strings(actualResources)
++				sort.Strings(expectedResources)
++				if diff := cmp.Diff(expectedResources, actualResources); diff != "" {
++					t.Fatalf("Expected resources to match, but they differ: %s", diff)
++				}
+ 			},
+ 		},
+ 		{
+@@ -425,6 +530,7 @@ func TestContext2Plan_queryList(t *testing.T) {
+ 
+ 				tfdiags.AssertDiagnosticsMatch(t, diags, exp)
+ 			},
++			listResourceFn: listResourceFn,
+ 		},
+ 		{
+ 			name: "circular reference between list resources",
+@@ -512,9 +618,47 @@ func TestContext2Plan_queryList(t *testing.T) {
+ 					}
+ 				}
+ 				`,
+-			expectedResources: resources{
+-				list:    map[string]bool{"list.test_resource.test1": true, "list.test_resource.test2": true},
+-				managed: []string{},
++			listResourceFn: listResourceFn,
++			assertChanges: func(sch providers.ProviderSchema, changes *plans.ChangesSrc) {
++				expectedResources := []string{"list.test_resource.test1", "list.test_resource.test2"}
++				actualResources := make([]string, 0)
++				for _, change := range changes.Queries {
++					actualResources = append(actualResources, change.Addr.String())
++					schema := sch.ListResourceTypes[change.Addr.Resource.Resource.Type]
++					cs, err := change.Decode(schema)
++					if err != nil {
++						t.Fatalf("failed to decode change: %s", err)
++					}
++
++					// Verify instance types
++					expectedTypes := []string{"ami-123456", "ami-654321", "ami-789012"}
++					actualTypes := make([]string, 0)
++					obj := cs.Results.Value.GetAttr("data")
++					if obj.IsNull() {
++						t.Fatalf("Expected 'data' attribute to be present, but it is null")
++					}
++					obj.ForEachElement(func(key cty.Value, val cty.Value) bool {
++						val = val.GetAttr("state")
++						if val.IsNull() {
++							t.Fatalf("Expected 'state' attribute to be present, but it is null")
++						}
++						if val.GetAttr("instance_type").IsNull() {
++							t.Fatalf("Expected 'instance_type' attribute to be present, but it is missing")
++						}
++						actualTypes = append(actualTypes, val.GetAttr("instance_type").AsString())
++						return false
++					})
++					sort.Strings(actualTypes)
++					sort.Strings(expectedTypes)
++					if diff := cmp.Diff(expectedTypes, actualTypes); diff != "" {
++						t.Fatalf("Expected instance types to match, but they differ: %s", diff)
++					}
++				}
++				sort.Strings(actualResources)
++				sort.Strings(expectedResources)
++				if diff := cmp.Diff(expectedResources, actualResources); diff != "" {
++					t.Fatalf("Expected resources to match, but they differ: %s", diff)
++				}
+ 			},
+ 		},
+ 		{
+@@ -554,14 +698,47 @@ func TestContext2Plan_queryList(t *testing.T) {
+ 					}
+ 				}
+ 				`,
+-			expectedResources: resources{
+-				list: map[string]bool{
+-					"list.test_resource.test1[\"foo\"]": true,
+-					"list.test_resource.test1[\"bar\"]": true,
+-					"list.test_resource.test2[\"foo\"]": true,
+-					"list.test_resource.test2[\"bar\"]": true,
+-				},
+-				managed: []string{},
++			listResourceFn: listResourceFn,
++			assertChanges: func(sch providers.ProviderSchema, changes *plans.ChangesSrc) {
++				expectedResources := []string{"list.test_resource.test1[\"foo\"]", "list.test_resource.test1[\"bar\"]", "list.test_resource.test2[\"foo\"]", "list.test_resource.test2[\"bar\"]"}
++				actualResources := make([]string, 0)
++				for _, change := range changes.Queries {
++					actualResources = append(actualResources, change.Addr.String())
++					schema := sch.ListResourceTypes[change.Addr.Resource.Resource.Type]
++					cs, err := change.Decode(schema)
++					if err != nil {
++						t.Fatalf("failed to decode change: %s", err)
++					}
++
++					// Verify instance types
++					expectedTypes := []string{"ami-123456", "ami-654321", "ami-789012"}
++					actualTypes := make([]string, 0)
++					obj := cs.Results.Value.GetAttr("data")
++					if obj.IsNull() {
++						t.Fatalf("Expected 'data' attribute to be present, but it is null")
++					}
++					obj.ForEachElement(func(key cty.Value, val cty.Value) bool {
++						val = val.GetAttr("state")
++						if val.IsNull() {
++							t.Fatalf("Expected 'state' attribute to be present, but it is null")
++						}
++						if val.GetAttr("instance_type").IsNull() {
++							t.Fatalf("Expected 'instance_type' attribute to be present, but it is missing")
++						}
++						actualTypes = append(actualTypes, val.GetAttr("instance_type").AsString())
++						return false
++					})
++					sort.Strings(actualTypes)
++					sort.Strings(expectedTypes)
++					if diff := cmp.Diff(expectedTypes, actualTypes); diff != "" {
++						t.Fatalf("Expected instance types to match, but they differ: %s", diff)
++					}
++				}
++				sort.Strings(actualResources)
++				sort.Strings(expectedResources)
++				if diff := cmp.Diff(expectedResources, actualResources); diff != "" {
++					t.Fatalf("Expected resources to match, but they differ: %s", diff)
++				}
+ 			},
+ 		},
+ 		{
+@@ -608,11 +785,16 @@ func TestContext2Plan_queryList(t *testing.T) {
+ 					}
+ 				}
+ 				`,
+-			expectedResources: resources{
+-				list: map[string]bool{
+-					"list.test_resource.test": true,
+-				},
+-				managed: []string{},
++			listResourceFn: listResourceFn,
++			assertChanges: func(sch providers.ProviderSchema, changes *plans.ChangesSrc) {
++				expectedResources := []string{"list.test_resource.test"}
++				actualResources := make([]string, 0)
++				for _, change := range changes.Queries {
++					actualResources = append(actualResources, change.Addr.String())
++				}
++				if diff := cmp.Diff(expectedResources, actualResources); diff != "" {
++					t.Fatalf("Expected resources to match, but they differ: %s", diff)
++				}
+ 			},
+ 		},
+ 		{
+@@ -656,11 +838,26 @@ func TestContext2Plan_queryList(t *testing.T) {
+ 					}
+ 				}
+ 				`,
+-			expectedResources: resources{
+-				list: map[string]bool{
+-					"list.test_resource.test": true,
+-				},
+-				managed: []string{"test_resource.example"},
++			listResourceFn: listResourceFn,
++			assertChanges: func(ps providers.ProviderSchema, changes *plans.ChangesSrc) {
++				expectedListResources := []string{"list.test_resource.test"}
++				actualResources := make([]string, 0)
++				for _, change := range changes.Queries {
++					actualResources = append(actualResources, change.Addr.String())
++				}
++				if diff := cmp.Diff(expectedListResources, actualResources); diff != "" {
++					t.Fatalf("Expected resources to match, but they differ: %s", diff)
++				}
++
++				expectedManagedResources := []string{"test_resource.example"}
++				actualResources = make([]string, 0)
++				for _, change := range changes.Resources {
++					actualResources = append(actualResources, change.Addr.String())
++				}
++				if diff := cmp.Diff(expectedManagedResources, actualResources); diff != "" {
++					t.Fatalf("Expected resources to match, but they differ: %s", diff)
++				}
++
+ 			},
+ 		},
+ 	}
+@@ -686,7 +883,11 @@ func TestContext2Plan_queryList(t *testing.T) {
+ 					t.Fatalf("config should never be null, got null for %s", request.TypeName)
+ 				}
+ 				requestConfigs[request.TypeName] = request.Config
+-				return listResourceFn(request)
++				fn := tc.listResourceFn
++				if fn == nil {
++					return provider.ListResourceResponse
++				}
++				return fn(request)
+ 			}
+ 
+ 			ctx, diags := NewContext(&ContextOpts{
+@@ -719,86 +920,12 @@ func TestContext2Plan_queryList(t *testing.T) {
+ 				tfdiags.AssertNoDiagnostics(t, diags)
+ 			}
+ 
+-			// If no diags expected, assert that the plan is valid
+-			if tc.assertValidateDiags == nil && tc.assertPlanDiags == nil {
++			if tc.assertChanges != nil {
+ 				sch, err := ctx.Schemas(mod, states.NewState())
+ 				if err != nil {
+ 					t.Fatalf("failed to get schemas: %s", err)
+ 				}
+-				expectedResources := slices.Collect(maps.Keys(tc.expectedResources.list))
+-				actualResources := make([]string, 0)
+-				generatedCfgs := make([]string, 0)
+-				for _, change := range plan.Changes.Queries {
+-					actualResources = append(actualResources, change.Addr.String())
+-					schema := sch.Providers[providerAddr].ListResourceTypes[change.Addr.Resource.Resource.Type]
+-					cs, err := change.Decode(schema)
+-					if err != nil {
+-						t.Fatalf("failed to decode change: %s", err)
+-					}
+-
+-					// Verify data. If the state is included, we check that, otherwise we check the id.
+-					expectedData := []string{"ami-123456", "ami-654321", "ami-789012"}
+-					includeState := tc.expectedResources.list[change.Addr.String()]
+-					if !includeState {
+-						expectedData = []string{"i-v1", "i-v2", "i-v3"}
+-					}
+-					actualData := make([]string, 0)
+-					obj := cs.Results.Value.GetAttr("data")
+-					if obj.IsNull() {
+-						t.Fatalf("Expected 'data' attribute to be present, but it is null")
+-					}
+-					obj.ForEachElement(func(key cty.Value, val cty.Value) bool {
+-						if includeState {
+-							val = val.GetAttr("state")
+-							if val.IsNull() {
+-								t.Fatalf("Expected 'state' attribute to be present, but it is null")
+-							}
+-							if val.GetAttr("instance_type").IsNull() {
+-								t.Fatalf("Expected 'instance_type' attribute to be present, but it is missing")
+-							}
+-							actualData = append(actualData, val.GetAttr("instance_type").AsString())
+-						} else {
+-							val = val.GetAttr("identity")
+-							if val.IsNull() {
+-								t.Fatalf("Expected 'identity' attribute to be present, but it is null")
+-							}
+-							if val.GetAttr("id").IsNull() {
+-								t.Fatalf("Expected 'id' attribute to be present, but it is missing")
+-							}
+-							actualData = append(actualData, val.GetAttr("id").AsString())
+-						}
+-						return false
+-					})
+-					sort.Strings(actualData)
+-					sort.Strings(expectedData)
+-					if diff := cmp.Diff(expectedData, actualData); diff != "" {
+-						t.Fatalf("Expected instance types to match, but they differ: %s", diff)
+-					}
+-
+-					if tc.generatedPath != "" {
+-						generatedCfgs = append(generatedCfgs, change.Generated.String())
+-					}
+-				}
+-				sort.Strings(actualResources)
+-				sort.Strings(expectedResources)
+-				if diff := cmp.Diff(expectedResources, actualResources); diff != "" {
+-					t.Fatalf("Expected resources to match, but they differ: %s", diff)
+-				}
+-
+-				expectedManagedResources := tc.expectedResources.managed
+-				actualResources = make([]string, 0)
+-				for _, change := range plan.Changes.Resources {
+-					actualResources = append(actualResources, change.Addr.String())
+-				}
+-				if diff := cmp.Diff(expectedManagedResources, actualResources); diff != "" {
+-					t.Fatalf("Expected resources to match, but they differ: %s", diff)
+-				}
+-
+-				if tc.generatedPath != "" {
+-					if diff := cmp.Diff([]string{testResourceCfg, testResourceCfg2}, generatedCfgs); diff != "" {
+-						t.Fatalf("Expected generated configs to match, but they differ: %s", diff)
+-					}
+-				}
++				tc.assertChanges(sch.Providers[providerAddr], plan.Changes)
+ 			}
+ 		})
+ 	}
+@@ -1042,239 +1169,6 @@ func getListProviderSchemaResp() *providers.GetProviderSchemaResponse {
+ 	})
+ }
+ 
+-func TestContext2Plan_queryListConfigGeneration(t *testing.T) {
+-	listResourceFn := func(request providers.ListResourceRequest) providers.ListResourceResponse {
+-		instanceTypes := []string{"ami-123456", "ami-654321", "ami-789012"}
+-		madeUp := []cty.Value{}
+-		for i := range len(instanceTypes) {
+-			madeUp = append(madeUp, cty.ObjectVal(map[string]cty.Value{"instance_type": cty.StringVal(instanceTypes[i])}))
+-		}
+-
+-		ids := []cty.Value{}
+-		for i := range madeUp {
+-			ids = append(ids, cty.ObjectVal(map[string]cty.Value{
+-				"id": cty.StringVal(fmt.Sprintf("i-v%d", i+1)),
+-			}))
+-		}
+-
+-		resp := []cty.Value{}
+-		for i, v := range madeUp {
+-			mp := map[string]cty.Value{
+-				"identity":     ids[i],
+-				"display_name": cty.StringVal(fmt.Sprintf("Instance %d", i+1)),
+-			}
+-			if request.IncludeResourceObject {
+-				mp["state"] = v
+-			}
+-			resp = append(resp, cty.ObjectVal(mp))
+-		}
+-
+-		ret := map[string]cty.Value{
+-			"data": cty.TupleVal(resp),
+-		}
+-		for k, v := range request.Config.AsValueMap() {
+-			if k != "data" {
+-				ret[k] = v
+-			}
+-		}
+-
+-		return providers.ListResourceResponse{Result: cty.ObjectVal(ret)}
+-	}
+-
+-	mainConfig := `
+-		terraform {
+-			required_providers {
+-				test = {
+-					source = "hashicorp/test"
+-					version = "1.0.0"
+-				}
+-			}
+-		}
+-		`
+-	queryConfig := `
+-		variable "input" {
+-			type = string
+-			default = "foo"
+-		}
+-		
+-		list "test_resource" "test2" {
+-			for_each = toset(["§us-east-2", "§us-west-1"])
+-			provider = test
+-
+-			config {
+-				filter = {
+-					attr = var.input
+-				}
+-			}
+-		}
+-		`
+-
+-	configFiles := map[string]string{"main.tf": mainConfig}
+-	configFiles["main.tfquery.hcl"] = queryConfig
+-
+-	mod := testModuleInline(t, configFiles, configs.MatchQueryFiles())
+-	providerAddr := addrs.NewDefaultProvider("test")
+-	provider := testProvider("test")
+-	provider.ConfigureProvider(providers.ConfigureProviderRequest{})
+-	provider.GetProviderSchemaResponse = getListProviderSchemaResp()
+-
+-	var requestConfigs = make(map[string]cty.Value)
+-	provider.ListResourceFn = func(request providers.ListResourceRequest) providers.ListResourceResponse {
+-		if request.Config.IsNull() || request.Config.GetAttr("config").IsNull() {
+-			t.Fatalf("config should never be null, got null for %s", request.TypeName)
+-		}
+-		requestConfigs[request.TypeName] = request.Config
+-		return listResourceFn(request)
+-	}
+-
+-	ctx, diags := NewContext(&ContextOpts{
+-		Providers: map[addrs.Provider]providers.Factory{
+-			providerAddr: testProviderFuncFixed(provider),
+-		},
+-	})
+-	tfdiags.AssertNoDiagnostics(t, diags)
+-
+-	diags = ctx.Validate(mod, &ValidateOpts{
+-		Query: true,
+-	})
+-	tfdiags.AssertNoDiagnostics(t, diags)
+-
+-	generatedPath := t.TempDir()
+-	plan, diags := ctx.Plan(mod, states.NewState(), &PlanOpts{
+-		Mode:               plans.NormalMode,
+-		SetVariables:       testInputValuesUnset(mod.Module.Variables),
+-		Query:              true,
+-		GenerateConfigPath: generatedPath,
+-	})
+-	tfdiags.AssertNoDiagnostics(t, diags)
+-
+-	sch, err := ctx.Schemas(mod, states.NewState())
+-	if err != nil {
+-		t.Fatalf("failed to get schemas: %s", err)
+-	}
+-
+-	expectedResources := []string{
+-		`list.test_resource.test2["§us-east-2"]`,
+-		`list.test_resource.test2["§us-west-1"]`,
+-	}
+-	actualResources := make([]string, 0)
+-	generatedCfgs := make([]string, 0)
+-	uniqCfgs := make(map[string]struct{})
+-
+-	for _, change := range plan.Changes.Queries {
+-		actualResources = append(actualResources, change.Addr.String())
+-		schema := sch.Providers[providerAddr].ListResourceTypes[change.Addr.Resource.Resource.Type]
+-		cs, err := change.Decode(schema)
+-		if err != nil {
+-			t.Fatalf("failed to decode change: %s", err)
+-		}
+-
+-		// Verify data. If the state is included, we check that, otherwise we check the id.
+-		expectedData := []string{"ami-123456", "ami-654321", "ami-789012"}
+-		includeState := change.Addr.String() == "list.test_resource.test"
+-		if !includeState {
+-			expectedData = []string{"i-v1", "i-v2", "i-v3"}
+-		}
+-		actualData := make([]string, 0)
+-		obj := cs.Results.Value.GetAttr("data")
+-		if obj.IsNull() {
+-			t.Fatalf("Expected 'data' attribute to be present, but it is null")
+-		}
+-		obj.ForEachElement(func(key cty.Value, val cty.Value) bool {
+-			if includeState {
+-				val = val.GetAttr("state")
+-				if val.IsNull() {
+-					t.Fatalf("Expected 'state' attribute to be present, but it is null")
+-				}
+-				if val.GetAttr("instance_type").IsNull() {
+-					t.Fatalf("Expected 'instance_type' attribute to be present, but it is missing")
+-				}
+-				actualData = append(actualData, val.GetAttr("instance_type").AsString())
+-			} else {
+-				val = val.GetAttr("identity")
+-				if val.IsNull() {
+-					t.Fatalf("Expected 'identity' attribute to be present, but it is null")
+-				}
+-				if val.GetAttr("id").IsNull() {
+-					t.Fatalf("Expected 'id' attribute to be present, but it is missing")
+-				}
+-				actualData = append(actualData, val.GetAttr("id").AsString())
+-			}
+-			return false
+-		})
+-		sort.Strings(actualData)
+-		sort.Strings(expectedData)
+-		if diff := cmp.Diff(expectedData, actualData); diff != "" {
+-			t.Fatalf("Expected instance types to match, but they differ: %s", diff)
+-		}
+-
+-		generatedCfgs = append(generatedCfgs, change.Generated.String())
+-		uniqCfgs[change.Addr.String()] = struct{}{}
+-	}
+-
+-	sort.Strings(actualResources)
+-	sort.Strings(expectedResources)
+-	if diff := cmp.Diff(expectedResources, actualResources); diff != "" {
+-		t.Fatalf("Expected resources to match, but they differ: %s", diff)
+-	}
+-
+-	// Verify no managed resources are created
+-	if len(plan.Changes.Resources) != 0 {
+-		t.Fatalf("Expected no managed resources, but got %d", len(plan.Changes.Resources))
+-	}
+-
+-	// Verify generated configs match expected
+-	expected := `resource "test_resource" "test2_0_0" {
+-  provider      = test
+-  instance_type = "ami-123456"
+-}
+-
+-import {
+-  to       = test_resource.test2_0_0
+-  provider = test
+-  identity = {
+-    id = "i-v1"
+-  }
+-}
+-
+-resource "test_resource" "test2_0_1" {
+-  provider      = test
+-  instance_type = "ami-654321"
+-}
+-
+-import {
+-  to       = test_resource.test2_0_1
+-  provider = test
+-  identity = {
+-    id = "i-v2"
+-  }
+-}
+-
+-resource "test_resource" "test2_0_2" {
+-  provider      = test
+-  instance_type = "ami-789012"
+-}
+-
+-import {
+-  to       = test_resource.test2_0_2
+-  provider = test
+-  identity = {
+-    id = "i-v3"
+-  }
+-}
+-`
+-	joinedCfgs := strings.Join(generatedCfgs, "\n")
+-	if !strings.Contains(joinedCfgs, expected) {
+-		t.Fatalf("Expected config to contain expected resource, but it does not: %s", cmp.Diff(expected, joinedCfgs))
+-	}
+-
+-	// Verify that the generated config is valid.
+-	// The function panics if the config is invalid.
+-	testModuleInline(t, map[string]string{
+-		"main.tf": strings.Join(generatedCfgs, "\n"),
+-	})
+-}
+-
+ var (
+ 	testResourceCfg = `resource "test_resource" "test_0" {
+   provider      = test
+diff --git a/internal/terraform/node_resource_plan_instance.go b/internal/terraform/node_resource_plan_instance.go
+index e4fd8e059d..f9c790837a 100644
+--- a/internal/terraform/node_resource_plan_instance.go
++++ b/internal/terraform/node_resource_plan_instance.go
+@@ -938,9 +938,6 @@ func (n *NodePlannableResourceInstance) generateHCLListResourceDef(ctx EvalConte
+ 
+ 	var listElements []genconfig.ResourceListElement
+ 
+-	expander := ctx.InstanceExpander()
+-	enum := expander.ResourceExpansionEnum(addr)
+-
+ 	iter := state.ElementIterator()
+ 	for iter.Next() {
+ 		_, val := iter.Element()
+@@ -958,7 +955,7 @@ func (n *NodePlannableResourceInstance) generateHCLListResourceDef(ctx EvalConte
+ 		}
+ 		idVal := val.GetAttr("identity")
+ 
+-		listElements = append(listElements, genconfig.ResourceListElement{Config: config, Identity: idVal, ExpansionEnum: enum})
++		listElements = append(listElements, genconfig.ResourceListElement{Config: config, Identity: idVal})
+ 	}
+ 
+ 	return genconfig.GenerateListResourceContents(addr, schema.Body, schema.Identity, providerAddr, listElements)

@@ -1,0 +1,227 @@
+diff --git a/README.md b/README.md
+index 7ff5999..771b577 100644
+--- a/README.md
++++ b/README.md
+@@ -496,39 +496,6 @@ func main() {
+ }
+ ```
+ 
+-### Custom Recovery behavior
+-```go
+-func main() {
+-	// Creates a router without any middleware by default
+-	r := gin.New()
+-
+-	// Global middleware
+-	// Logger middleware will write the logs to gin.DefaultWriter even if you set with GIN_MODE=release.
+-	// By default gin.DefaultWriter = os.Stdout
+-	r.Use(gin.Logger())
+-
+-	// Recovery middleware recovers from any panics and writes a 500 if there was one.
+-	r.Use(gin.CustomRecovery(func(c *gin.Context, recovered interface{}) {
+-		if err, ok := recovered.(string); ok {
+-			c.String(http.StatusInternalServerError, fmt.Sprintf("error: %s", err))
+-		}
+-		c.AbortWithStatus(http.StatusInternalServerError)
+-	}))
+-
+-	r.GET("/panic", func(c *gin.Context) {
+-		// panic with a string -- the custom middleware could save this to a database or report it to the user
+-		panic("foo")
+-	})
+-
+-	r.GET("/", func(c *gin.Context) {
+-		c.String(http.StatusOK, "ohai")
+-	})
+-
+-	// Listen and serve on 0.0.0.0:8080
+-	r.Run(":8080")
+-}
+-```
+-
+ ### How to write log file
+ ```go
+ func main() {
+diff --git a/recovery.go b/recovery.go
+index d02b829..8cf0932 100644
+--- a/recovery.go
++++ b/recovery.go
+@@ -26,29 +26,13 @@ var (
+ 	slash     = []byte("/")
+ )
+ 
+-// RecoveryFunc defines the function passable to CustomRecovery.
+-type RecoveryFunc func(c *Context, err interface{})
+-
+ // Recovery returns a middleware that recovers from any panics and writes a 500 if there was one.
+ func Recovery() HandlerFunc {
+ 	return RecoveryWithWriter(DefaultErrorWriter)
+ }
+ 
+-//CustomRecovery returns a middleware that recovers from any panics and calls the provided handle func to handle it.
+-func CustomRecovery(handle RecoveryFunc) HandlerFunc {
+-	return RecoveryWithWriter(DefaultErrorWriter, handle)
+-}
+-
+ // RecoveryWithWriter returns a middleware for a given writer that recovers from any panics and writes a 500 if there was one.
+-func RecoveryWithWriter(out io.Writer, recovery ...RecoveryFunc) HandlerFunc {
+-	if len(recovery) > 0 {
+-		return CustomRecoveryWithWriter(out, recovery[0])
+-	}
+-	return CustomRecoveryWithWriter(out, defaultHandleRecovery)
+-}
+-
+-// CustomRecoveryWithWriter returns a middleware for a given writer that recovers from any panics and calls the provided handle func to handle it.
+-func CustomRecoveryWithWriter(out io.Writer, handle RecoveryFunc) HandlerFunc {
++func RecoveryWithWriter(out io.Writer) HandlerFunc {
+ 	var logger *log.Logger
+ 	if out != nil {
+ 		logger = log.New(out, "\n\n\x1b[31m", log.LstdFlags)
+@@ -86,12 +70,13 @@ func CustomRecoveryWithWriter(out io.Writer, handle RecoveryFunc) HandlerFunc {
+ 							timeFormat(time.Now()), err, stack, reset)
+ 					}
+ 				}
++
++				// If the connection is dead, we can't write a status to it.
+ 				if brokenPipe {
+-					// If the connection is dead, we can't write a status to it.
+ 					c.Error(err.(error)) // nolint: errcheck
+ 					c.Abort()
+ 				} else {
+-					handle(c, err)
++					c.AbortWithStatus(http.StatusInternalServerError)
+ 				}
+ 			}
+ 		}()
+@@ -99,10 +84,6 @@ func CustomRecoveryWithWriter(out io.Writer, handle RecoveryFunc) HandlerFunc {
+ 	}
+ }
+ 
+-func defaultHandleRecovery(c *Context, err interface{}) {
+-	c.AbortWithStatus(http.StatusInternalServerError)
+-}
+-
+ // stack returns a nicely formatted stack frame, skipping skip frames.
+ func stack(skip int) []byte {
+ 	buf := new(bytes.Buffer) // the returned data
+diff --git a/recovery_test.go b/recovery_test.go
+index 6cc2a47..21a0a48 100644
+--- a/recovery_test.go
++++ b/recovery_test.go
+@@ -62,7 +62,7 @@ func TestPanicInHandler(t *testing.T) {
+ 	assert.Equal(t, http.StatusInternalServerError, w.Code)
+ 	assert.Contains(t, buffer.String(), "panic recovered")
+ 	assert.Contains(t, buffer.String(), "Oupps, Houston, we have a problem")
+-	assert.Contains(t, buffer.String(), t.Name())
++	assert.Contains(t, buffer.String(), "TestPanicInHandler")
+ 	assert.NotContains(t, buffer.String(), "GET /recovery")
+ 
+ 	// Debug mode prints the request
+@@ -144,107 +144,3 @@ func TestPanicWithBrokenPipe(t *testing.T) {
+ 		})
+ 	}
+ }
+-
+-func TestCustomRecoveryWithWriter(t *testing.T) {
+-	errBuffer := new(bytes.Buffer)
+-	buffer := new(bytes.Buffer)
+-	router := New()
+-	handleRecovery := func(c *Context, err interface{}) {
+-		errBuffer.WriteString(err.(string))
+-		c.AbortWithStatus(http.StatusBadRequest)
+-	}
+-	router.Use(CustomRecoveryWithWriter(buffer, handleRecovery))
+-	router.GET("/recovery", func(_ *Context) {
+-		panic("Oupps, Houston, we have a problem")
+-	})
+-	// RUN
+-	w := performRequest(router, "GET", "/recovery")
+-	// TEST
+-	assert.Equal(t, http.StatusBadRequest, w.Code)
+-	assert.Contains(t, buffer.String(), "panic recovered")
+-	assert.Contains(t, buffer.String(), "Oupps, Houston, we have a problem")
+-	assert.Contains(t, buffer.String(), t.Name())
+-	assert.NotContains(t, buffer.String(), "GET /recovery")
+-
+-	// Debug mode prints the request
+-	SetMode(DebugMode)
+-	// RUN
+-	w = performRequest(router, "GET", "/recovery")
+-	// TEST
+-	assert.Equal(t, http.StatusBadRequest, w.Code)
+-	assert.Contains(t, buffer.String(), "GET /recovery")
+-
+-	assert.Equal(t, strings.Repeat("Oupps, Houston, we have a problem", 2), errBuffer.String())
+-
+-	SetMode(TestMode)
+-}
+-
+-func TestCustomRecovery(t *testing.T) {
+-	errBuffer := new(bytes.Buffer)
+-	buffer := new(bytes.Buffer)
+-	router := New()
+-	DefaultErrorWriter = buffer
+-	handleRecovery := func(c *Context, err interface{}) {
+-		errBuffer.WriteString(err.(string))
+-		c.AbortWithStatus(http.StatusBadRequest)
+-	}
+-	router.Use(CustomRecovery(handleRecovery))
+-	router.GET("/recovery", func(_ *Context) {
+-		panic("Oupps, Houston, we have a problem")
+-	})
+-	// RUN
+-	w := performRequest(router, "GET", "/recovery")
+-	// TEST
+-	assert.Equal(t, http.StatusBadRequest, w.Code)
+-	assert.Contains(t, buffer.String(), "panic recovered")
+-	assert.Contains(t, buffer.String(), "Oupps, Houston, we have a problem")
+-	assert.Contains(t, buffer.String(), t.Name())
+-	assert.NotContains(t, buffer.String(), "GET /recovery")
+-
+-	// Debug mode prints the request
+-	SetMode(DebugMode)
+-	// RUN
+-	w = performRequest(router, "GET", "/recovery")
+-	// TEST
+-	assert.Equal(t, http.StatusBadRequest, w.Code)
+-	assert.Contains(t, buffer.String(), "GET /recovery")
+-
+-	assert.Equal(t, strings.Repeat("Oupps, Houston, we have a problem", 2), errBuffer.String())
+-
+-	SetMode(TestMode)
+-}
+-
+-func TestRecoveryWithWriterWithCustomRecovery(t *testing.T) {
+-	errBuffer := new(bytes.Buffer)
+-	buffer := new(bytes.Buffer)
+-	router := New()
+-	DefaultErrorWriter = buffer
+-	handleRecovery := func(c *Context, err interface{}) {
+-		errBuffer.WriteString(err.(string))
+-		c.AbortWithStatus(http.StatusBadRequest)
+-	}
+-	router.Use(RecoveryWithWriter(DefaultErrorWriter, handleRecovery))
+-	router.GET("/recovery", func(_ *Context) {
+-		panic("Oupps, Houston, we have a problem")
+-	})
+-	// RUN
+-	w := performRequest(router, "GET", "/recovery")
+-	// TEST
+-	assert.Equal(t, http.StatusBadRequest, w.Code)
+-	assert.Contains(t, buffer.String(), "panic recovered")
+-	assert.Contains(t, buffer.String(), "Oupps, Houston, we have a problem")
+-	assert.Contains(t, buffer.String(), t.Name())
+-	assert.NotContains(t, buffer.String(), "GET /recovery")
+-
+-	// Debug mode prints the request
+-	SetMode(DebugMode)
+-	// RUN
+-	w = performRequest(router, "GET", "/recovery")
+-	// TEST
+-	assert.Equal(t, http.StatusBadRequest, w.Code)
+-	assert.Contains(t, buffer.String(), "GET /recovery")
+-
+-	assert.Equal(t, strings.Repeat("Oupps, Houston, we have a problem", 2), errBuffer.String())
+-
+-	SetMode(TestMode)
+-}

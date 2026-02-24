@@ -1,0 +1,562 @@
+diff --git a/association.go b/association.go
+index e3f51d1..f210ca0 100644
+--- a/association.go
++++ b/association.go
+@@ -19,10 +19,10 @@ type Association struct {
+ }
+ 
+ func (db *DB) Association(column string) *Association {
+-	association := &Association{DB: db}
++	association := &Association{DB: db, Unscope: db.Statement.Unscoped}
+ 	table := db.Statement.Table
+ 
+-	if err := db.Statement.Parse(db.Statement.Model); err == nil {
++	if association.Error = db.Statement.Parse(db.Statement.Model); association.Error == nil {
+ 		db.Statement.Table = table
+ 		association.Relationship = db.Statement.Schema.Relationships.Relations[column]
+ 
+@@ -34,8 +34,6 @@ func (db *DB) Association(column string) *Association {
+ 		for db.Statement.ReflectValue.Kind() == reflect.Ptr {
+ 			db.Statement.ReflectValue = db.Statement.ReflectValue.Elem()
+ 		}
+-	} else {
+-		association.Error = err
+ 	}
+ 
+ 	return association
+@@ -58,6 +56,8 @@ func (association *Association) Find(out interface{}, conds ...interface{}) erro
+ }
+ 
+ func (association *Association) Append(values ...interface{}) error {
++	values = expandValues(values)
++
+ 	if association.Error == nil {
+ 		switch association.Relationship.Type {
+ 		case schema.HasOne, schema.BelongsTo:
+@@ -73,6 +73,8 @@ func (association *Association) Append(values ...interface{}) error {
+ }
+ 
+ func (association *Association) Replace(values ...interface{}) error {
++	values = expandValues(values)
++
+ 	if association.Error == nil {
+ 		reflectValue := association.DB.Statement.ReflectValue
+ 		rel := association.Relationship
+@@ -195,6 +197,8 @@ func (association *Association) Replace(values ...interface{}) error {
+ }
+ 
+ func (association *Association) Delete(values ...interface{}) error {
++	values = expandValues(values)
++
+ 	if association.Error == nil {
+ 		var (
+ 			reflectValue  = association.DB.Statement.ReflectValue
+@@ -431,10 +435,49 @@ func (association *Association) saveAssociation(clear bool, values ...interface{
+ 				}
+ 			}
+ 
++			processMap := func(mapv reflect.Value) {
++				child := reflect.New(association.Relationship.FieldSchema.ModelType)
++
++				switch association.Relationship.Type {
++				case schema.HasMany:
++					for _, ref := range association.Relationship.References {
++						key := reflect.ValueOf(ref.ForeignKey.DBName)
++						if ref.OwnPrimaryKey {
++							v := ref.PrimaryKey.ReflectValueOf(association.DB.Statement.Context, source)
++							mapv.SetMapIndex(key, v)
++						} else if ref.PrimaryValue != "" {
++							mapv.SetMapIndex(key, reflect.ValueOf(ref.PrimaryValue))
++						}
++					}
++					association.Error = association.DB.Session(&Session{
++						NewDB: true,
++					}).Model(child.Interface()).Create(mapv.Interface()).Error
++				case schema.Many2Many:
++					association.Error = association.DB.Session(&Session{
++						NewDB: true,
++					}).Model(child.Interface()).Create(mapv.Interface()).Error
++
++					for _, key := range mapv.MapKeys() {
++						k := strings.ToLower(key.String())
++						if f, ok := association.Relationship.FieldSchema.FieldsByDBName[k]; ok {
++							_ = f.Set(association.DB.Statement.Context, child, mapv.MapIndex(key).Interface())
++						}
++					}
++					appendToFieldValues(child)
++				}
++			}
++
+ 			switch rv.Kind() {
++			case reflect.Map:
++				processMap(rv)
+ 			case reflect.Slice, reflect.Array:
+ 				for i := 0; i < rv.Len(); i++ {
+-					appendToFieldValues(reflect.Indirect(rv.Index(i)).Addr())
++					elem := reflect.Indirect(rv.Index(i))
++					if elem.Kind() == reflect.Map {
++						processMap(elem)
++						continue
++					}
++					appendToFieldValues(elem.Addr())
+ 				}
+ 			case reflect.Struct:
+ 				if !rv.CanAddr() {
+@@ -591,3 +634,32 @@ func (association *Association) buildCondition() *DB {
+ 
+ 	return tx
+ }
++
++func expandValues(values ...any) (results []any) {
++	appendToResult := func(rv reflect.Value) {
++		// unwrap interface
++		if rv.IsValid() && rv.Kind() == reflect.Interface {
++			rv = rv.Elem()
++		}
++		if rv.IsValid() && rv.Kind() == reflect.Struct {
++			p := reflect.New(rv.Type())
++			p.Elem().Set(rv)
++			results = append(results, p.Interface())
++		} else if rv.IsValid() {
++			results = append(results, rv.Interface())
++		}
++	}
++
++	// Process each argument; if an argument is a slice/array, expand its elements
++	for _, value := range values {
++		rv := reflect.ValueOf(value)
++		if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
++			for i := 0; i < rv.Len(); i++ {
++				appendToResult(rv.Index(i))
++			}
++		} else {
++			appendToResult(rv)
++		}
++	}
++	return
++}
+diff --git a/clause/association.go b/clause/association.go
+new file mode 100644
+index 0000000..a853d7c
+--- /dev/null
++++ b/clause/association.go
+@@ -0,0 +1,37 @@
++package clause
++
++// AssociationOpType represents association operation types
++type AssociationOpType int
++
++const (
++	OpUnlink       AssociationOpType = iota // Unlink association
++	OpDelete                                // Delete association records
++	OpUpdate                                // Update association records
++	OpCreate                                // Create association records with assignments
++	OpCreateValues                          // Create association records with model object
++)
++
++// Association represents an association operation
++type Association struct {
++	Association string            // Association name
++	Type        AssociationOpType // Operation type
++	Conditions  []Expression      // Filter conditions
++	Set         []Assignment      // Assignment operations (for Update and Create)
++	Model       interface{}       // Model object (for Create object)
++	Values      []interface{}     // Values for Create operation
++}
++
++// AssociationAssigner is an interface for association operation providers
++type AssociationAssigner interface {
++	AssociationAssignments() []Association
++}
++
++// Assignments implements the Assigner interface so that AssociationOperation can be used as a Set method parameter
++func (ao Association) Assignments() []Assignment {
++	return []Assignment{}
++}
++
++// AssociationAssignments implements the AssociationAssigner interface
++func (ao Association) AssociationAssignments() []Association {
++	return []Association{ao}
++}
+diff --git a/generics.go b/generics.go
+index 971bdb6..67737e4 100644
+--- a/generics.go
++++ b/generics.go
+@@ -3,12 +3,15 @@ package gorm
+ import (
+ 	"context"
+ 	"database/sql"
++	"errors"
+ 	"fmt"
++	"reflect"
+ 	"sort"
+ 	"strings"
+ 
+ 	"gorm.io/gorm/clause"
+ 	"gorm.io/gorm/logger"
++	"gorm.io/gorm/schema"
+ )
+ 
+ type result struct {
+@@ -201,7 +204,7 @@ func (c createG[T]) Table(name string, args ...interface{}) CreateInterface[T] {
+ }
+ 
+ func (c createG[T]) Set(assignments ...clause.Assigner) SetCreateOrUpdateInterface[T] {
+-	return setCreateOrUpdateG[T]{c: c.chainG, assigns: toAssignments(assignments...)}
++	return c.processSet(assignments...)
+ }
+ 
+ func (c createG[T]) Create(ctx context.Context, r *T) error {
+@@ -432,7 +435,7 @@ func (c chainG[T]) MapColumns(m map[string]string) ChainInterface[T] {
+ }
+ 
+ func (c chainG[T]) Set(assignments ...clause.Assigner) SetUpdateOnlyInterface[T] {
+-	return setCreateOrUpdateG[T]{c: c, assigns: toAssignments(assignments...)}
++	return c.processSet(assignments...)
+ }
+ 
+ func (c chainG[T]) Distinct(args ...interface{}) ChainInterface[T] {
+@@ -602,36 +605,6 @@ func (c chainG[T]) Build(builder clause.Builder) {
+ 	}
+ }
+ 
+-type setCreateOrUpdateG[T any] struct {
+-	c       chainG[T]
+-	assigns []clause.Assignment
+-}
+-
+-// toAssignments converts various supported types into []clause.Assignment.
+-// Supported inputs implement clause.Assigner.
+-func toAssignments(items ...clause.Assigner) []clause.Assignment {
+-	out := make([]clause.Assignment, 0, len(items))
+-	for _, it := range items {
+-		out = append(out, it.Assignments()...)
+-	}
+-	return out
+-}
+-
+-func (s setCreateOrUpdateG[T]) Update(ctx context.Context) (rowsAffected int, err error) {
+-	var r T
+-	res := s.c.g.apply(ctx).Model(r).Clauses(clause.Set(s.assigns)).Updates(map[string]interface{}{})
+-	return int(res.RowsAffected), res.Error
+-}
+-
+-func (s setCreateOrUpdateG[T]) Create(ctx context.Context) error {
+-	var r T
+-	data := make(map[string]interface{}, len(s.assigns))
+-	for _, a := range s.assigns {
+-		data[a.Column.Name] = a.Value
+-	}
+-	return s.c.g.apply(ctx).Model(r).Create(data).Error
+-}
+-
+ type execG[T any] struct {
+ 	g *g[T]
+ }
+@@ -680,3 +653,244 @@ func (g execG[T]) Row(ctx context.Context) *sql.Row {
+ func (g execG[T]) Rows(ctx context.Context) (*sql.Rows, error) {
+ 	return g.g.apply(ctx).Rows()
+ }
++
++func (c chainG[T]) processSet(items ...clause.Assigner) setCreateOrUpdateG[T] {
++	var (
++		assigns  []clause.Assignment
++		assocOps []clause.Association
++	)
++
++	for _, item := range items {
++		// Check if it's an AssociationAssigner
++		if assocAssigner, ok := item.(clause.AssociationAssigner); ok {
++			assocOps = append(assocOps, assocAssigner.AssociationAssignments()...)
++		} else {
++			assigns = append(assigns, item.Assignments()...)
++		}
++	}
++
++	return setCreateOrUpdateG[T]{
++		c:        c,
++		assigns:  assigns,
++		assocOps: assocOps,
++	}
++}
++
++// setCreateOrUpdateG[T] is a struct that holds operations to be executed in a batch.
++// It supports regular assignments and association operations.
++type setCreateOrUpdateG[T any] struct {
++	c        chainG[T]
++	assigns  []clause.Assignment
++	assocOps []clause.Association
++}
++
++func (s setCreateOrUpdateG[T]) Update(ctx context.Context) (rowsAffected int, err error) {
++	// Execute association operations
++	for _, assocOp := range s.assocOps {
++		if err := s.executeAssociationOperation(ctx, assocOp); err != nil {
++			return 0, err
++		}
++	}
++
++	// Execute assignment operations
++	if len(s.assigns) > 0 {
++		var r T
++		res := s.c.g.apply(ctx).Model(r).Clauses(clause.Set(s.assigns)).Updates(map[string]interface{}{})
++		return int(res.RowsAffected), res.Error
++	}
++
++	return 0, nil
++}
++
++func (s setCreateOrUpdateG[T]) Create(ctx context.Context) error {
++	// Execute association operations
++	for _, assocOp := range s.assocOps {
++		if err := s.executeAssociationOperation(ctx, assocOp); err != nil {
++			return err
++		}
++	}
++
++	// Execute assignment operations
++	if len(s.assigns) > 0 {
++		data := make(map[string]interface{}, len(s.assigns))
++		for _, a := range s.assigns {
++			data[a.Column.Name] = a.Value
++		}
++		var r T
++		return s.c.g.apply(ctx).Model(r).Create(data).Error
++	}
++
++	return nil
++}
++
++// executeAssociationOperation executes an association operation
++func (s setCreateOrUpdateG[T]) executeAssociationOperation(ctx context.Context, op clause.Association) error {
++	var r T
++	base := s.c.g.apply(ctx).Model(r)
++
++	switch op.Type {
++	case clause.OpCreate:
++		return s.handleAssociationCreate(ctx, base, op)
++	case clause.OpCreateValues:
++		return s.handleAssociationCreateValues(ctx, base, op)
++	case clause.OpUnlink, clause.OpDelete, clause.OpUpdate:
++		return s.handleAssociation(ctx, base, op)
++	default:
++		return fmt.Errorf("unknown association operation type: %v", op.Type)
++	}
++}
++
++func (s setCreateOrUpdateG[T]) handleAssociationCreate(ctx context.Context, base *DB, op clause.Association) error {
++	return s.handleAssociationForOwners(base, ctx, func(owner T, assoc *Association) error {
++		data := make(map[string]interface{}, len(op.Set))
++		for _, a := range op.Set {
++			data[a.Column.Name] = a.Value
++		}
++		return assoc.Append(data)
++	}, op.Association)
++}
++
++func (s setCreateOrUpdateG[T]) handleAssociationCreateValues(ctx context.Context, base *DB, op clause.Association) error {
++	return s.handleAssociationForOwners(base, ctx, func(owner T, assoc *Association) error {
++		return assoc.Append(op.Values...)
++	}, op.Association)
++}
++
++// handleAssociationForOwners is a helper function that handles associations for all owners
++func (s setCreateOrUpdateG[T]) handleAssociationForOwners(base *DB, ctx context.Context, handler func(owner T, association *Association) error, associationName string) error {
++	var owners []T
++	if err := base.Find(&owners).Error; err != nil {
++		return err
++	}
++
++	for _, owner := range owners {
++		assoc := base.Session(&Session{NewDB: true, Context: ctx}).Model(&owner).Association(associationName)
++		if assoc.Error != nil {
++			return assoc.Error
++		}
++
++		if err := handler(owner, assoc); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (s setCreateOrUpdateG[T]) handleAssociation(ctx context.Context, base *DB, op clause.Association) error {
++	assoc := base.Association(op.Association)
++	if assoc.Error != nil {
++		return assoc.Error
++	}
++
++	var (
++		rel            = assoc.Relationship
++		assocModel     = reflect.New(rel.FieldSchema.ModelType).Interface()
++		fkNil          = map[string]any{}
++		setMap         = make(map[string]any, len(op.Set))
++		ownerPKNames   []string
++		ownerFKNames   []string
++		primaryColumns []any
++		foreignColumns []any
++	)
++
++	for _, a := range op.Set {
++		setMap[a.Column.Name] = a.Value
++	}
++
++	for _, ref := range rel.References {
++		fkNil[ref.ForeignKey.DBName] = nil
++
++		if ref.OwnPrimaryKey && ref.PrimaryKey != nil {
++			ownerPKNames = append(ownerPKNames, ref.PrimaryKey.DBName)
++			primaryColumns = append(primaryColumns, clause.Column{Name: ref.PrimaryKey.DBName})
++			foreignColumns = append(foreignColumns, clause.Column{Name: ref.ForeignKey.DBName})
++		} else if !ref.OwnPrimaryKey && ref.PrimaryKey != nil {
++			ownerFKNames = append(ownerFKNames, ref.ForeignKey.DBName)
++			primaryColumns = append(primaryColumns, clause.Column{Name: ref.PrimaryKey.DBName})
++		}
++	}
++
++	assocDB := s.c.g.db.Session(&Session{NewDB: true, Context: ctx}).Model(assocModel).Where(op.Conditions)
++
++	switch rel.Type {
++	case schema.HasOne, schema.HasMany:
++		assocDB = assocDB.Where("? IN (?)", foreignColumns, base.Select(ownerPKNames))
++		switch op.Type {
++		case clause.OpUnlink:
++			return assocDB.Updates(fkNil).Error
++		case clause.OpDelete:
++			return assocDB.Delete(assocModel).Error
++		case clause.OpUpdate:
++			return assocDB.Updates(setMap).Error
++		}
++	case schema.BelongsTo:
++		switch op.Type {
++		case clause.OpDelete:
++			return base.Transaction(func(tx *DB) error {
++				assocDB.Statement.ConnPool = tx.Statement.ConnPool
++				base.Statement.ConnPool = tx.Statement.ConnPool
++
++				if err := assocDB.Where("? IN (?)", primaryColumns, base.Select(ownerFKNames)).Delete(assocModel).Error; err != nil {
++					return err
++				}
++				return base.Updates(fkNil).Error
++			})
++		case clause.OpUnlink:
++			return base.Updates(fkNil).Error
++		case clause.OpUpdate:
++			return assocDB.Where("? IN (?)", primaryColumns, base.Select(ownerFKNames)).Updates(setMap).Error
++		}
++	case schema.Many2Many:
++		joinModel := reflect.New(rel.JoinTable.ModelType).Interface()
++		joinDB := base.Session(&Session{NewDB: true, Context: ctx}).Model(joinModel)
++
++		// EXISTS owners: owners.pk = join.owner_fk for all owner refs
++		ownersExists := base.Session(&Session{NewDB: true, Context: ctx}).Table(rel.Schema.Table).Select("1")
++		for _, ref := range rel.References {
++			if ref.OwnPrimaryKey && ref.PrimaryKey != nil {
++				ownersExists = ownersExists.Where(clause.Eq{
++					Column: clause.Column{Table: rel.Schema.Table, Name: ref.PrimaryKey.DBName},
++					Value:  clause.Column{Table: rel.JoinTable.Table, Name: ref.ForeignKey.DBName},
++				})
++			}
++		}
++
++		// EXISTS related: related.pk = join.rel_fk for all related refs, plus optional conditions
++		relatedExists := base.Session(&Session{NewDB: true, Context: ctx}).Table(rel.FieldSchema.Table).Select("1")
++		for _, ref := range rel.References {
++			if !ref.OwnPrimaryKey && ref.PrimaryKey != nil {
++				relatedExists = relatedExists.Where(clause.Eq{
++					Column: clause.Column{Table: rel.FieldSchema.Table, Name: ref.PrimaryKey.DBName},
++					Value:  clause.Column{Table: rel.JoinTable.Table, Name: ref.ForeignKey.DBName},
++				})
++			}
++		}
++		relatedExists = relatedExists.Where(op.Conditions)
++
++		switch op.Type {
++		case clause.OpUnlink, clause.OpDelete:
++			joinDB = joinDB.Where("EXISTS (?)", ownersExists)
++			if len(op.Conditions) > 0 {
++				joinDB = joinDB.Where("EXISTS (?)", relatedExists)
++			}
++			return joinDB.Delete(nil).Error
++		case clause.OpUpdate:
++			// Update related table rows that have join rows matching owners
++			relatedDB := base.Session(&Session{NewDB: true, Context: ctx}).Table(rel.FieldSchema.Table).Where(op.Conditions)
++
++			// correlated join subquery: join.rel_fk = related.pk AND EXISTS owners
++			joinSub := base.Session(&Session{NewDB: true, Context: ctx}).Table(rel.JoinTable.Table).Select("1")
++			for _, ref := range rel.References {
++				if !ref.OwnPrimaryKey && ref.PrimaryKey != nil {
++					joinSub = joinSub.Where(clause.Eq{
++						Column: clause.Column{Table: rel.JoinTable.Table, Name: ref.ForeignKey.DBName},
++						Value:  clause.Column{Table: rel.FieldSchema.Table, Name: ref.PrimaryKey.DBName},
++					})
++				}
++			}
++			joinSub = joinSub.Where("EXISTS (?)", ownersExists)
++			return relatedDB.Where("EXISTS (?)", joinSub).Updates(setMap).Error
++		}
++	}
++	return errors.New("unsupported relationship")
++}
+diff --git a/go.mod b/go.mod
+index 3060fc8..695e872 100644
+--- a/go.mod
++++ b/go.mod
+@@ -7,3 +7,8 @@ require (
+ 	github.com/jinzhu/now v1.1.5
+ 	golang.org/x/text v0.20.0
+ )
++
++require (
++	github.com/mattn/go-sqlite3 v1.14.22 // indirect
++	gorm.io/driver/sqlite v1.6.0 // indirect
++)
+diff --git a/go.sum b/go.sum
+index 9af1157..09922ec 100644
+--- a/go.sum
++++ b/go.sum
+@@ -2,5 +2,9 @@ github.com/jinzhu/inflection v1.0.0 h1:K317FqzuhWc8YvSVlFMCCUb36O/S9MCKRDI7QkRKD
+ github.com/jinzhu/inflection v1.0.0/go.mod h1:h+uFLlag+Qp1Va5pdKtLDYj+kHp5pxUVkryuEj+Srlc=
+ github.com/jinzhu/now v1.1.5 h1:/o9tlHleP7gOFmsnYNz3RGnqzefHA47wQpKrrdTIwXQ=
+ github.com/jinzhu/now v1.1.5/go.mod h1:d3SSVoowX0Lcu0IBviAWJpolVfI5UJVZZ7cO71lE/z8=
++github.com/mattn/go-sqlite3 v1.14.22 h1:2gZY6PC6kBnID23Tichd1K+Z0oS6nE/XwU+Vz/5o4kU=
++github.com/mattn/go-sqlite3 v1.14.22/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
+ golang.org/x/text v0.20.0 h1:gK/Kv2otX8gz+wn7Rmb3vT96ZwuoxnQlY+HlJVj7Qug=
+ golang.org/x/text v0.20.0/go.mod h1:D4IsuqiFMhST5bX19pQ9ikHC2GsaKyk/oF+pn3ducp4=
++gorm.io/driver/sqlite v1.6.0 h1:WHRRrIiulaPiPFmDcod6prc4l2VGVWHz80KspNsxSfQ=
++gorm.io/driver/sqlite v1.6.0/go.mod h1:AO9V1qIQddBESngQUKWL9yoH93HIeA1X6V633rBwyT8=
+diff --git a/schema/utils.go b/schema/utils.go
+index fa1c65d..d4fe252 100644
+--- a/schema/utils.go
++++ b/schema/utils.go
+@@ -121,6 +121,17 @@ func GetIdentityFieldValuesMap(ctx context.Context, reflectValue reflect.Value,
+ 	}
+ 
+ 	switch reflectValue.Kind() {
++	case reflect.Map:
++		results = [][]interface{}{make([]interface{}, len(fields))}
++		for idx, field := range fields {
++			mapValue := reflectValue.MapIndex(reflect.ValueOf(field.DBName))
++			if mapValue.IsZero() {
++				mapValue = reflectValue.MapIndex(reflect.ValueOf(field.Name))
++			}
++			results[0][idx] = mapValue.Interface()
++		}
++
++		dataResults[utils.ToStringKey(results[0]...)] = []reflect.Value{reflectValue}
+ 	case reflect.Struct:
+ 		results = [][]interface{}{make([]interface{}, len(fields))}
+ 
+diff --git a/statement.go b/statement.go
+index cd7369e..736087d 100644
+--- a/statement.go
++++ b/statement.go
+@@ -336,6 +336,8 @@ func (stmt *Statement) BuildCondition(query interface{}, args ...interface{}) []
+ 		switch v := arg.(type) {
+ 		case clause.Expression:
+ 			conds = append(conds, v)
++		case []clause.Expression:
++			conds = append(conds, v...)
+ 		case *DB:
+ 			v.executeScopes()
+ 

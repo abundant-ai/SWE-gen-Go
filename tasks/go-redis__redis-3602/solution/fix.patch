@@ -1,0 +1,1055 @@
+diff --git a/README.md b/README.md
+index 07164035..0c67d379 100644
+--- a/README.md
++++ b/README.md
+@@ -429,6 +429,144 @@ vals, err := rdb.Eval(ctx, "return {KEYS[1],ARGV[1]}", []string{"key"}, "hello")
+ res, err := rdb.Do(ctx, "set", "key", "value").Result()
+ ```
+ 
++## Typed Errors
++
++go-redis provides typed error checking functions for common Redis errors:
++
++```go
++// Cluster and replication errors
++redis.IsLoadingError(err)        // Redis is loading the dataset
++redis.IsReadOnlyError(err)       // Write to read-only replica
++redis.IsClusterDownError(err)    // Cluster is down
++redis.IsTryAgainError(err)       // Command should be retried
++redis.IsMasterDownError(err)     // Master is down
++redis.IsMovedError(err)          // Returns (address, true) if key moved
++redis.IsAskError(err)            // Returns (address, true) if key being migrated
++
++// Connection and resource errors
++redis.IsMaxClientsError(err)     // Maximum clients reached
++redis.IsAuthError(err)           // Authentication failed (NOAUTH, WRONGPASS, unauthenticated)
++redis.IsPermissionError(err)     // Permission denied (NOPERM)
++redis.IsOOMError(err)            // Out of memory (OOM)
++
++// Transaction errors
++redis.IsExecAbortError(err)      // Transaction aborted (EXECABORT)
++```
++
++### Error Wrapping in Hooks
++
++When wrapping errors in hooks, use custom error types with `Unwrap()` method (preferred) or `fmt.Errorf` with `%w`. Always call `cmd.SetErr()` to preserve error type information:
++
++```go
++// Custom error type (preferred)
++type AppError struct {
++    Code      string
++    RequestID string
++    Err       error
++}
++
++func (e *AppError) Error() string {
++    return fmt.Sprintf("[%s] request_id=%s: %v", e.Code, e.RequestID, e.Err)
++}
++
++func (e *AppError) Unwrap() error {
++    return e.Err
++}
++
++// Hook implementation
++func (h MyHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
++    return func(ctx context.Context, cmd redis.Cmder) error {
++        err := next(ctx, cmd)
++        if err != nil {
++            // Wrap with custom error type
++            wrappedErr := &AppError{
++                Code:      "REDIS_ERROR",
++                RequestID: getRequestID(ctx),
++                Err:       err,
++            }
++            cmd.SetErr(wrappedErr)
++            return wrappedErr  // Return wrapped error to preserve it
++        }
++        return nil
++    }
++}
++
++// Typed error detection works through wrappers
++if redis.IsLoadingError(err) {
++    // Retry logic
++}
++
++// Extract custom error if needed
++var appErr *AppError
++if errors.As(err, &appErr) {
++    log.Printf("Request: %s", appErr.RequestID)
++}
++```
++
++Alternatively, use `fmt.Errorf` with `%w`:
++```go
++wrappedErr := fmt.Errorf("context: %w", err)
++cmd.SetErr(wrappedErr)
++```
++
++### Pipeline Hook Example
++
++For pipeline operations, use `ProcessPipelineHook`:
++
++```go
++type PipelineLoggingHook struct{}
++
++func (h PipelineLoggingHook) DialHook(next redis.DialHook) redis.DialHook {
++    return next
++}
++
++func (h PipelineLoggingHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
++    return next
++}
++
++func (h PipelineLoggingHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
++    return func(ctx context.Context, cmds []redis.Cmder) error {
++        start := time.Now()
++
++        // Execute the pipeline
++        err := next(ctx, cmds)
++
++        duration := time.Since(start)
++        log.Printf("Pipeline executed %d commands in %v", len(cmds), duration)
++
++        // Process individual command errors
++        // Note: Individual command errors are already set on each cmd by the pipeline execution
++        for _, cmd := range cmds {
++            if cmdErr := cmd.Err(); cmdErr != nil {
++                // Check for specific error types using typed error functions
++                if redis.IsAuthError(cmdErr) {
++                    log.Printf("Auth error in pipeline command %s: %v", cmd.Name(), cmdErr)
++                } else if redis.IsPermissionError(cmdErr) {
++                    log.Printf("Permission error in pipeline command %s: %v", cmd.Name(), cmdErr)
++                }
++
++                // Optionally wrap individual command errors to add context
++                // The wrapped error preserves type information through errors.As()
++                wrappedErr := fmt.Errorf("pipeline cmd %s failed: %w", cmd.Name(), cmdErr)
++                cmd.SetErr(wrappedErr)
++            }
++        }
++
++        // Return the pipeline-level error (connection errors, etc.)
++        // You can wrap it if needed, or return it as-is
++        return err
++    }
++}
++
++// Register the hook
++rdb.AddHook(PipelineLoggingHook{})
++
++// Use pipeline - errors are still properly typed
++pipe := rdb.Pipeline()
++pipe.Set(ctx, "key1", "value1", 0)
++pipe.Get(ctx, "key2")
++_, err := pipe.Exec(ctx)
++```
+ 
+ ## Run the test
+ 
+diff --git a/error.go b/error.go
+index 7273313b..12b5604d 100644
+--- a/error.go
++++ b/error.go
+@@ -52,34 +52,82 @@ type Error interface {
+ var _ Error = proto.RedisError("")
+ 
+ func isContextError(err error) bool {
+-	switch err {
+-	case context.Canceled, context.DeadlineExceeded:
+-		return true
+-	default:
+-		return false
++	// Check for wrapped context errors using errors.Is
++	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
++}
++
++// isTimeoutError checks if an error is a timeout error, even if wrapped.
++// Returns (isTimeout, shouldRetryOnTimeout) where:
++// - isTimeout: true if the error is any kind of timeout error
++// - shouldRetryOnTimeout: true if Timeout() method returns true
++func isTimeoutError(err error) (isTimeout bool, hasTimeoutFlag bool) {
++	// Check for timeoutError interface (works with wrapped errors)
++	var te timeoutError
++	if errors.As(err, &te) {
++		return true, te.Timeout()
++	}
++
++	// Check for net.Error specifically (common case for network timeouts)
++	var netErr net.Error
++	if errors.As(err, &netErr) {
++		return true, netErr.Timeout()
+ 	}
++
++	return false, false
+ }
+ 
+ func shouldRetry(err error, retryTimeout bool) bool {
+-	switch err {
+-	case io.EOF, io.ErrUnexpectedEOF:
++	if err == nil {
++		return false
++	}
++
++	// Check for EOF errors (works with wrapped errors)
++	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+ 		return true
+-	case nil, context.Canceled, context.DeadlineExceeded:
++	}
++
++	// Check for context errors (works with wrapped errors)
++	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+ 		return false
+-	case pool.ErrPoolTimeout:
++	}
++
++	// Check for pool timeout (works with wrapped errors)
++	if errors.Is(err, pool.ErrPoolTimeout) {
+ 		// connection pool timeout, increase retries. #3289
+ 		return true
+ 	}
+ 
+-	if v, ok := err.(timeoutError); ok {
+-		if v.Timeout() {
++	// Check for timeout errors (works with wrapped errors)
++	if isTimeout, hasTimeoutFlag := isTimeoutError(err); isTimeout {
++		if hasTimeoutFlag {
+ 			return retryTimeout
+ 		}
+ 		return true
+ 	}
+ 
++	// Check for typed Redis errors using errors.As (works with wrapped errors)
++	if proto.IsMaxClientsError(err) {
++		return true
++	}
++	if proto.IsLoadingError(err) {
++		return true
++	}
++	if proto.IsReadOnlyError(err) {
++		return true
++	}
++	if proto.IsMasterDownError(err) {
++		return true
++	}
++	if proto.IsClusterDownError(err) {
++		return true
++	}
++	if proto.IsTryAgainError(err) {
++		return true
++	}
++
++	// Fallback to string checking for backward compatibility with plain errors
+ 	s := err.Error()
+-	if s == "ERR max number of clients reached" {
++	if strings.HasPrefix(s, "ERR max number of clients reached") {
+ 		return true
+ 	}
+ 	if strings.HasPrefix(s, "LOADING ") {
+@@ -88,32 +136,43 @@ func shouldRetry(err error, retryTimeout bool) bool {
+ 	if strings.HasPrefix(s, "READONLY ") {
+ 		return true
+ 	}
+-	if strings.HasPrefix(s, "MASTERDOWN ") {
+-		return true
+-	}
+ 	if strings.HasPrefix(s, "CLUSTERDOWN ") {
+ 		return true
+ 	}
+ 	if strings.HasPrefix(s, "TRYAGAIN ") {
+ 		return true
+ 	}
++	if strings.HasPrefix(s, "MASTERDOWN ") {
++		return true
++	}
+ 
+ 	return false
+ }
+ 
+ func isRedisError(err error) bool {
+-	_, ok := err.(proto.RedisError)
+-	return ok
++	// Check if error implements the Error interface (works with wrapped errors)
++	var redisErr Error
++	if errors.As(err, &redisErr) {
++		return true
++	}
++	// Also check for proto.RedisError specifically
++	var protoRedisErr proto.RedisError
++	return errors.As(err, &protoRedisErr)
+ }
+ 
+ func isBadConn(err error, allowTimeout bool, addr string) bool {
+-	switch err {
+-		case nil:
+-			return false
+-		case context.Canceled, context.DeadlineExceeded:
+-			return true
+-		case pool.ErrConnUnusableTimeout:
+-			return true
++	if err == nil {
++		return false
++	}
++
++	// Check for context errors (works with wrapped errors)
++	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
++		return true
++	}
++
++	// Check for pool timeout errors (works with wrapped errors)
++	if errors.Is(err, pool.ErrConnUnusableTimeout) {
++		return true
+ 	}
+ 
+ 	if isRedisError(err) {
+@@ -133,7 +192,9 @@ func isBadConn(err error, allowTimeout bool, addr string) bool {
+ 	}
+ 
+ 	if allowTimeout {
+-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
++		// Check for network timeout errors (works with wrapped errors)
++		var netErr net.Error
++		if errors.As(err, &netErr) && netErr.Timeout() {
+ 			return false
+ 		}
+ 	}
+@@ -142,44 +203,143 @@ func isBadConn(err error, allowTimeout bool, addr string) bool {
+ }
+ 
+ func isMovedError(err error) (moved bool, ask bool, addr string) {
+-	if !isRedisError(err) {
+-		return
++	// Check for typed MovedError
++	if movedErr, ok := proto.IsMovedError(err); ok {
++		addr = movedErr.Addr()
++		addr = internal.GetAddr(addr)
++		return true, false, addr
+ 	}
+ 
+-	s := err.Error()
+-	switch {
+-	case strings.HasPrefix(s, "MOVED "):
+-		moved = true
+-	case strings.HasPrefix(s, "ASK "):
+-		ask = true
+-	default:
+-		return
++	// Check for typed AskError
++	if askErr, ok := proto.IsAskError(err); ok {
++		addr = askErr.Addr()
++		addr = internal.GetAddr(addr)
++		return false, true, addr
+ 	}
+ 
+-	ind := strings.LastIndex(s, " ")
+-	if ind == -1 {
+-		return false, false, ""
++	// Fallback to string checking for backward compatibility
++	s := err.Error()
++	if strings.HasPrefix(s, "MOVED ") {
++		// Parse: MOVED 3999 127.0.0.1:6381
++		parts := strings.Split(s, " ")
++		if len(parts) == 3 {
++			addr = internal.GetAddr(parts[2])
++			return true, false, addr
++		}
++	}
++	if strings.HasPrefix(s, "ASK ") {
++		// Parse: ASK 3999 127.0.0.1:6381
++		parts := strings.Split(s, " ")
++		if len(parts) == 3 {
++			addr = internal.GetAddr(parts[2])
++			return false, true, addr
++		}
+ 	}
+ 
+-	addr = s[ind+1:]
+-	addr = internal.GetAddr(addr)
+-	return
++	return false, false, ""
+ }
+ 
+ func isLoadingError(err error) bool {
+-	return strings.HasPrefix(err.Error(), "LOADING ")
++	return proto.IsLoadingError(err)
+ }
+ 
+ func isReadOnlyError(err error) bool {
+-	return strings.HasPrefix(err.Error(), "READONLY ")
++	return proto.IsReadOnlyError(err)
+ }
+ 
+ func isMovedSameConnAddr(err error, addr string) bool {
+-	redisError := err.Error()
+-	if !strings.HasPrefix(redisError, "MOVED ") {
+-		return false
++	if movedErr, ok := proto.IsMovedError(err); ok {
++		return strings.HasSuffix(movedErr.Addr(), addr)
++	}
++	return false
++}
++
++//------------------------------------------------------------------------------
++
++// Typed error checking functions for public use.
++// These functions work correctly even when errors are wrapped in hooks.
++
++// IsLoadingError checks if an error is a Redis LOADING error, even if wrapped.
++// LOADING errors occur when Redis is loading the dataset in memory.
++func IsLoadingError(err error) bool {
++	return proto.IsLoadingError(err)
++}
++
++// IsReadOnlyError checks if an error is a Redis READONLY error, even if wrapped.
++// READONLY errors occur when trying to write to a read-only replica.
++func IsReadOnlyError(err error) bool {
++	return proto.IsReadOnlyError(err)
++}
++
++// IsClusterDownError checks if an error is a Redis CLUSTERDOWN error, even if wrapped.
++// CLUSTERDOWN errors occur when the cluster is down.
++func IsClusterDownError(err error) bool {
++	return proto.IsClusterDownError(err)
++}
++
++// IsTryAgainError checks if an error is a Redis TRYAGAIN error, even if wrapped.
++// TRYAGAIN errors occur when a command cannot be processed and should be retried.
++func IsTryAgainError(err error) bool {
++	return proto.IsTryAgainError(err)
++}
++
++// IsMasterDownError checks if an error is a Redis MASTERDOWN error, even if wrapped.
++// MASTERDOWN errors occur when the master is down.
++func IsMasterDownError(err error) bool {
++	return proto.IsMasterDownError(err)
++}
++
++// IsMaxClientsError checks if an error is a Redis max clients error, even if wrapped.
++// This error occurs when the maximum number of clients has been reached.
++func IsMaxClientsError(err error) bool {
++	return proto.IsMaxClientsError(err)
++}
++
++// IsMovedError checks if an error is a Redis MOVED error, even if wrapped.
++// MOVED errors occur in cluster mode when a key has been moved to a different node.
++// Returns the address of the node where the key has been moved and a boolean indicating if it's a MOVED error.
++func IsMovedError(err error) (addr string, ok bool) {
++	if movedErr, isMovedErr := proto.IsMovedError(err); isMovedErr {
++		return movedErr.Addr(), true
++	}
++	return "", false
++}
++
++// IsAskError checks if an error is a Redis ASK error, even if wrapped.
++// ASK errors occur in cluster mode when a key is being migrated and the client should ask another node.
++// Returns the address of the node to ask and a boolean indicating if it's an ASK error.
++func IsAskError(err error) (addr string, ok bool) {
++	if askErr, isAskErr := proto.IsAskError(err); isAskErr {
++		return askErr.Addr(), true
+ 	}
+-	return strings.HasSuffix(redisError, " "+addr)
++	return "", false
++}
++
++// IsAuthError checks if an error is a Redis authentication error, even if wrapped.
++// Authentication errors occur when:
++// - NOAUTH: Redis requires authentication but none was provided
++// - WRONGPASS: Redis authentication failed due to incorrect password
++// - unauthenticated: Error returned when password changed
++func IsAuthError(err error) bool {
++	return proto.IsAuthError(err)
++}
++
++// IsPermissionError checks if an error is a Redis permission error, even if wrapped.
++// Permission errors (NOPERM) occur when a user does not have permission to execute a command.
++func IsPermissionError(err error) bool {
++	return proto.IsPermissionError(err)
++}
++
++// IsExecAbortError checks if an error is a Redis EXECABORT error, even if wrapped.
++// EXECABORT errors occur when a transaction is aborted.
++func IsExecAbortError(err error) bool {
++	return proto.IsExecAbortError(err)
++}
++
++// IsOOMError checks if an error is a Redis OOM (Out Of Memory) error, even if wrapped.
++// OOM errors occur when Redis is out of memory.
++func IsOOMError(err error) bool {
++	return proto.IsOOMError(err)
+ }
+ 
+ //------------------------------------------------------------------------------
+diff --git a/internal/proto/reader.go b/internal/proto/reader.go
+index 4e60569d..bac68f79 100644
+--- a/internal/proto/reader.go
++++ b/internal/proto/reader.go
+@@ -50,7 +50,8 @@ func (e RedisError) Error() string { return string(e) }
+ func (RedisError) RedisError() {}
+ 
+ func ParseErrorReply(line []byte) error {
+-	return RedisError(line[1:])
++	msg := string(line[1:])
++	return parseTypedRedisError(msg)
+ }
+ 
+ //------------------------------------------------------------------------------
+@@ -201,7 +202,7 @@ func (r *Reader) ReadLine() ([]byte, error) {
+ 		var blobErr string
+ 		blobErr, err = r.readStringReply(line)
+ 		if err == nil {
+-			err = RedisError(blobErr)
++			err = parseTypedRedisError(blobErr)
+ 		}
+ 		return nil, err
+ 	case RespAttr:
+diff --git a/internal/proto/redis_errors.go b/internal/proto/redis_errors.go
+new file mode 100644
+index 00000000..f553e2f9
+--- /dev/null
++++ b/internal/proto/redis_errors.go
+@@ -0,0 +1,488 @@
++package proto
++
++import (
++	"errors"
++	"strings"
++)
++
++// Typed Redis errors for better error handling with wrapping support.
++// These errors maintain backward compatibility by keeping the same error messages.
++
++// LoadingError is returned when Redis is loading the dataset in memory.
++type LoadingError struct {
++	msg string
++}
++
++func (e *LoadingError) Error() string {
++	return e.msg
++}
++
++func (e *LoadingError) RedisError() {}
++
++// NewLoadingError creates a new LoadingError with the given message.
++func NewLoadingError(msg string) *LoadingError {
++	return &LoadingError{msg: msg}
++}
++
++// ReadOnlyError is returned when trying to write to a read-only replica.
++type ReadOnlyError struct {
++	msg string
++}
++
++func (e *ReadOnlyError) Error() string {
++	return e.msg
++}
++
++func (e *ReadOnlyError) RedisError() {}
++
++// NewReadOnlyError creates a new ReadOnlyError with the given message.
++func NewReadOnlyError(msg string) *ReadOnlyError {
++	return &ReadOnlyError{msg: msg}
++}
++
++// MovedError is returned when a key has been moved to a different node in a cluster.
++type MovedError struct {
++	msg  string
++	addr string
++}
++
++func (e *MovedError) Error() string {
++	return e.msg
++}
++
++func (e *MovedError) RedisError() {}
++
++// Addr returns the address of the node where the key has been moved.
++func (e *MovedError) Addr() string {
++	return e.addr
++}
++
++// NewMovedError creates a new MovedError with the given message and address.
++func NewMovedError(msg string, addr string) *MovedError {
++	return &MovedError{msg: msg, addr: addr}
++}
++
++// AskError is returned when a key is being migrated and the client should ask another node.
++type AskError struct {
++	msg  string
++	addr string
++}
++
++func (e *AskError) Error() string {
++	return e.msg
++}
++
++func (e *AskError) RedisError() {}
++
++// Addr returns the address of the node to ask.
++func (e *AskError) Addr() string {
++	return e.addr
++}
++
++// NewAskError creates a new AskError with the given message and address.
++func NewAskError(msg string, addr string) *AskError {
++	return &AskError{msg: msg, addr: addr}
++}
++
++// ClusterDownError is returned when the cluster is down.
++type ClusterDownError struct {
++	msg string
++}
++
++func (e *ClusterDownError) Error() string {
++	return e.msg
++}
++
++func (e *ClusterDownError) RedisError() {}
++
++// NewClusterDownError creates a new ClusterDownError with the given message.
++func NewClusterDownError(msg string) *ClusterDownError {
++	return &ClusterDownError{msg: msg}
++}
++
++// TryAgainError is returned when a command cannot be processed and should be retried.
++type TryAgainError struct {
++	msg string
++}
++
++func (e *TryAgainError) Error() string {
++	return e.msg
++}
++
++func (e *TryAgainError) RedisError() {}
++
++// NewTryAgainError creates a new TryAgainError with the given message.
++func NewTryAgainError(msg string) *TryAgainError {
++	return &TryAgainError{msg: msg}
++}
++
++// MasterDownError is returned when the master is down.
++type MasterDownError struct {
++	msg string
++}
++
++func (e *MasterDownError) Error() string {
++	return e.msg
++}
++
++func (e *MasterDownError) RedisError() {}
++
++// NewMasterDownError creates a new MasterDownError with the given message.
++func NewMasterDownError(msg string) *MasterDownError {
++	return &MasterDownError{msg: msg}
++}
++
++// MaxClientsError is returned when the maximum number of clients has been reached.
++type MaxClientsError struct {
++	msg string
++}
++
++func (e *MaxClientsError) Error() string {
++	return e.msg
++}
++
++func (e *MaxClientsError) RedisError() {}
++
++// NewMaxClientsError creates a new MaxClientsError with the given message.
++func NewMaxClientsError(msg string) *MaxClientsError {
++	return &MaxClientsError{msg: msg}
++}
++
++// AuthError is returned when authentication fails.
++type AuthError struct {
++	msg string
++}
++
++func (e *AuthError) Error() string {
++	return e.msg
++}
++
++func (e *AuthError) RedisError() {}
++
++// NewAuthError creates a new AuthError with the given message.
++func NewAuthError(msg string) *AuthError {
++	return &AuthError{msg: msg}
++}
++
++// PermissionError is returned when a user lacks required permissions.
++type PermissionError struct {
++	msg string
++}
++
++func (e *PermissionError) Error() string {
++	return e.msg
++}
++
++func (e *PermissionError) RedisError() {}
++
++// NewPermissionError creates a new PermissionError with the given message.
++func NewPermissionError(msg string) *PermissionError {
++	return &PermissionError{msg: msg}
++}
++
++// ExecAbortError is returned when a transaction is aborted.
++type ExecAbortError struct {
++	msg string
++}
++
++func (e *ExecAbortError) Error() string {
++	return e.msg
++}
++
++func (e *ExecAbortError) RedisError() {}
++
++// NewExecAbortError creates a new ExecAbortError with the given message.
++func NewExecAbortError(msg string) *ExecAbortError {
++	return &ExecAbortError{msg: msg}
++}
++
++// OOMError is returned when Redis is out of memory.
++type OOMError struct {
++	msg string
++}
++
++func (e *OOMError) Error() string {
++	return e.msg
++}
++
++func (e *OOMError) RedisError() {}
++
++// NewOOMError creates a new OOMError with the given message.
++func NewOOMError(msg string) *OOMError {
++	return &OOMError{msg: msg}
++}
++
++// parseTypedRedisError parses a Redis error message and returns a typed error if applicable.
++// This function maintains backward compatibility by keeping the same error messages.
++func parseTypedRedisError(msg string) error {
++	// Check for specific error patterns and return typed errors
++	switch {
++	case strings.HasPrefix(msg, "LOADING "):
++		return NewLoadingError(msg)
++	case strings.HasPrefix(msg, "READONLY "):
++		return NewReadOnlyError(msg)
++	case strings.HasPrefix(msg, "MOVED "):
++		// Extract address from "MOVED <slot> <addr>"
++		addr := extractAddr(msg)
++		return NewMovedError(msg, addr)
++	case strings.HasPrefix(msg, "ASK "):
++		// Extract address from "ASK <slot> <addr>"
++		addr := extractAddr(msg)
++		return NewAskError(msg, addr)
++	case strings.HasPrefix(msg, "CLUSTERDOWN "):
++		return NewClusterDownError(msg)
++	case strings.HasPrefix(msg, "TRYAGAIN "):
++		return NewTryAgainError(msg)
++	case strings.HasPrefix(msg, "MASTERDOWN "):
++		return NewMasterDownError(msg)
++	case msg == "ERR max number of clients reached":
++		return NewMaxClientsError(msg)
++	case strings.HasPrefix(msg, "NOAUTH "), strings.HasPrefix(msg, "WRONGPASS "), strings.Contains(msg, "unauthenticated"):
++		return NewAuthError(msg)
++	case strings.HasPrefix(msg, "NOPERM "):
++		return NewPermissionError(msg)
++	case strings.HasPrefix(msg, "EXECABORT "):
++		return NewExecAbortError(msg)
++	case strings.HasPrefix(msg, "OOM "):
++		return NewOOMError(msg)
++	default:
++		// Return generic RedisError for unknown error types
++		return RedisError(msg)
++	}
++}
++
++// extractAddr extracts the address from MOVED/ASK error messages.
++// Format: "MOVED <slot> <addr>" or "ASK <slot> <addr>"
++func extractAddr(msg string) string {
++	ind := strings.LastIndex(msg, " ")
++	if ind == -1 {
++		return ""
++	}
++	return msg[ind+1:]
++}
++
++// IsLoadingError checks if an error is a LoadingError, even if wrapped.
++func IsLoadingError(err error) bool {
++	if err == nil {
++		return false
++	}
++	var loadingErr *LoadingError
++	if errors.As(err, &loadingErr) {
++		return true
++	}
++	// Check if wrapped error is a RedisError with LOADING prefix
++	var redisErr RedisError
++	if errors.As(err, &redisErr) && strings.HasPrefix(redisErr.Error(), "LOADING ") {
++		return true
++	}
++	// Fallback to string checking for backward compatibility
++	return strings.HasPrefix(err.Error(), "LOADING ")
++}
++
++// IsReadOnlyError checks if an error is a ReadOnlyError, even if wrapped.
++func IsReadOnlyError(err error) bool {
++	if err == nil {
++		return false
++	}
++	var readOnlyErr *ReadOnlyError
++	if errors.As(err, &readOnlyErr) {
++		return true
++	}
++	// Check if wrapped error is a RedisError with READONLY prefix
++	var redisErr RedisError
++	if errors.As(err, &redisErr) && strings.HasPrefix(redisErr.Error(), "READONLY ") {
++		return true
++	}
++	// Fallback to string checking for backward compatibility
++	return strings.HasPrefix(err.Error(), "READONLY ")
++}
++
++// IsMovedError checks if an error is a MovedError, even if wrapped.
++// Returns the error and a boolean indicating if it's a MovedError.
++func IsMovedError(err error) (*MovedError, bool) {
++	if err == nil {
++		return nil, false
++	}
++	var movedErr *MovedError
++	if errors.As(err, &movedErr) {
++		return movedErr, true
++	}
++	// Fallback to string checking for backward compatibility
++	s := err.Error()
++	if strings.HasPrefix(s, "MOVED ") {
++		// Parse: MOVED 3999 127.0.0.1:6381
++		parts := strings.Split(s, " ")
++		if len(parts) == 3 {
++			return &MovedError{msg: s, addr: parts[2]}, true
++		}
++	}
++	return nil, false
++}
++
++// IsAskError checks if an error is an AskError, even if wrapped.
++// Returns the error and a boolean indicating if it's an AskError.
++func IsAskError(err error) (*AskError, bool) {
++	if err == nil {
++		return nil, false
++	}
++	var askErr *AskError
++	if errors.As(err, &askErr) {
++		return askErr, true
++	}
++	// Fallback to string checking for backward compatibility
++	s := err.Error()
++	if strings.HasPrefix(s, "ASK ") {
++		// Parse: ASK 3999 127.0.0.1:6381
++		parts := strings.Split(s, " ")
++		if len(parts) == 3 {
++			return &AskError{msg: s, addr: parts[2]}, true
++		}
++	}
++	return nil, false
++}
++
++// IsClusterDownError checks if an error is a ClusterDownError, even if wrapped.
++func IsClusterDownError(err error) bool {
++	if err == nil {
++		return false
++	}
++	var clusterDownErr *ClusterDownError
++	if errors.As(err, &clusterDownErr) {
++		return true
++	}
++	// Check if wrapped error is a RedisError with CLUSTERDOWN prefix
++	var redisErr RedisError
++	if errors.As(err, &redisErr) && strings.HasPrefix(redisErr.Error(), "CLUSTERDOWN ") {
++		return true
++	}
++	// Fallback to string checking for backward compatibility
++	return strings.HasPrefix(err.Error(), "CLUSTERDOWN ")
++}
++
++// IsTryAgainError checks if an error is a TryAgainError, even if wrapped.
++func IsTryAgainError(err error) bool {
++	if err == nil {
++		return false
++	}
++	var tryAgainErr *TryAgainError
++	if errors.As(err, &tryAgainErr) {
++		return true
++	}
++	// Check if wrapped error is a RedisError with TRYAGAIN prefix
++	var redisErr RedisError
++	if errors.As(err, &redisErr) && strings.HasPrefix(redisErr.Error(), "TRYAGAIN ") {
++		return true
++	}
++	// Fallback to string checking for backward compatibility
++	return strings.HasPrefix(err.Error(), "TRYAGAIN ")
++}
++
++// IsMasterDownError checks if an error is a MasterDownError, even if wrapped.
++func IsMasterDownError(err error) bool {
++	if err == nil {
++		return false
++	}
++	var masterDownErr *MasterDownError
++	if errors.As(err, &masterDownErr) {
++		return true
++	}
++	// Check if wrapped error is a RedisError with MASTERDOWN prefix
++	var redisErr RedisError
++	if errors.As(err, &redisErr) && strings.HasPrefix(redisErr.Error(), "MASTERDOWN ") {
++		return true
++	}
++	// Fallback to string checking for backward compatibility
++	return strings.HasPrefix(err.Error(), "MASTERDOWN ")
++}
++
++// IsMaxClientsError checks if an error is a MaxClientsError, even if wrapped.
++func IsMaxClientsError(err error) bool {
++	if err == nil {
++		return false
++	}
++	var maxClientsErr *MaxClientsError
++	if errors.As(err, &maxClientsErr) {
++		return true
++	}
++	// Check if wrapped error is a RedisError with max clients prefix
++	var redisErr RedisError
++	if errors.As(err, &redisErr) && strings.HasPrefix(redisErr.Error(), "ERR max number of clients reached") {
++		return true
++	}
++	// Fallback to string checking for backward compatibility
++	return strings.HasPrefix(err.Error(), "ERR max number of clients reached")
++}
++
++// IsAuthError checks if an error is an AuthError, even if wrapped.
++func IsAuthError(err error) bool {
++	if err == nil {
++		return false
++	}
++	var authErr *AuthError
++	if errors.As(err, &authErr) {
++		return true
++	}
++	// Check if wrapped error is a RedisError with auth error prefix
++	var redisErr RedisError
++	if errors.As(err, &redisErr) {
++		s := redisErr.Error()
++		return strings.HasPrefix(s, "NOAUTH ") || strings.HasPrefix(s, "WRONGPASS ") || strings.Contains(s, "unauthenticated")
++	}
++	// Fallback to string checking for backward compatibility
++	s := err.Error()
++	return strings.HasPrefix(s, "NOAUTH ") || strings.HasPrefix(s, "WRONGPASS ") || strings.Contains(s, "unauthenticated")
++}
++
++// IsPermissionError checks if an error is a PermissionError, even if wrapped.
++func IsPermissionError(err error) bool {
++	if err == nil {
++		return false
++	}
++	var permErr *PermissionError
++	if errors.As(err, &permErr) {
++		return true
++	}
++	// Check if wrapped error is a RedisError with NOPERM prefix
++	var redisErr RedisError
++	if errors.As(err, &redisErr) && strings.HasPrefix(redisErr.Error(), "NOPERM ") {
++		return true
++	}
++	// Fallback to string checking for backward compatibility
++	return strings.HasPrefix(err.Error(), "NOPERM ")
++}
++
++// IsExecAbortError checks if an error is an ExecAbortError, even if wrapped.
++func IsExecAbortError(err error) bool {
++	if err == nil {
++		return false
++	}
++	var execAbortErr *ExecAbortError
++	if errors.As(err, &execAbortErr) {
++		return true
++	}
++	// Check if wrapped error is a RedisError with EXECABORT prefix
++	var redisErr RedisError
++	if errors.As(err, &redisErr) && strings.HasPrefix(redisErr.Error(), "EXECABORT ") {
++		return true
++	}
++	// Fallback to string checking for backward compatibility
++	return strings.HasPrefix(err.Error(), "EXECABORT ")
++}
++
++// IsOOMError checks if an error is an OOMError, even if wrapped.
++func IsOOMError(err error) bool {
++	if err == nil {
++		return false
++	}
++	var oomErr *OOMError
++	if errors.As(err, &oomErr) {
++		return true
++	}
++	// Check if wrapped error is a RedisError with OOM prefix
++	var redisErr RedisError
++	if errors.As(err, &redisErr) && strings.HasPrefix(redisErr.Error(), "OOM ") {
++		return true
++	}
++	// Fallback to string checking for backward compatibility
++	return strings.HasPrefix(err.Error(), "OOM ")
++}
+diff --git a/options.go b/options.go
+index e0dcb5eb..9773e86f 100644
+--- a/options.go
++++ b/options.go
+@@ -355,6 +355,10 @@ func (opt *Options) init() {
+ 		opt.MaxRetryBackoff = 512 * time.Millisecond
+ 	}
+ 
++	if opt.FailingTimeoutSeconds == 0 {
++		opt.FailingTimeoutSeconds = 15
++	}
++
+ 	opt.MaintNotificationsConfig = opt.MaintNotificationsConfig.ApplyDefaultsWithPoolConfig(opt.PoolSize, opt.MaxActiveConns)
+ 
+ 	// auto-detect endpoint type if not specified
+diff --git a/push/errors.go b/push/errors.go
+index 9eda92dd..c10c98aa 100644
+--- a/push/errors.go
++++ b/push/errors.go
+@@ -145,25 +145,31 @@ func IsHandlerNilError(err error) bool {
+ 	return errors.Is(err, ErrHandlerNil)
+ }
+ 
+-// IsHandlerExistsError checks if an error is due to attempting to overwrite an existing handler
++// IsHandlerExistsError checks if an error is due to attempting to overwrite an existing handler.
++// This function works correctly even when the error is wrapped.
+ func IsHandlerExistsError(err error) bool {
+-	if handlerErr, ok := err.(*HandlerError); ok {
++	var handlerErr *HandlerError
++	if errors.As(err, &handlerErr) {
+ 		return handlerErr.Operation == ProcessorOperationRegister && handlerErr.Reason == ReasonHandlerExists
+ 	}
+ 	return false
+ }
+ 
+-// IsProtectedHandlerError checks if an error is due to attempting to unregister a protected handler
++// IsProtectedHandlerError checks if an error is due to attempting to unregister a protected handler.
++// This function works correctly even when the error is wrapped.
+ func IsProtectedHandlerError(err error) bool {
+-	if handlerErr, ok := err.(*HandlerError); ok {
++	var handlerErr *HandlerError
++	if errors.As(err, &handlerErr) {
+ 		return handlerErr.Operation == ProcessorOperationUnregister && handlerErr.Reason == ReasonHandlerProtected
+ 	}
+ 	return false
+ }
+ 
+-// IsVoidProcessorError checks if an error is due to void processor operations
++// IsVoidProcessorError checks if an error is due to void processor operations.
++// This function works correctly even when the error is wrapped.
+ func IsVoidProcessorError(err error) bool {
+-	if procErr, ok := err.(*ProcessorError); ok {
++	var procErr *ProcessorError
++	if errors.As(err, &procErr) {
+ 		return procErr.ProcessorType == ProcessorTypeVoidProcessor && procErr.Reason == ReasonPushNotificationsDisabled
+ 	}
+ 	return false

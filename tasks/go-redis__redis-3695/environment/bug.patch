@@ -1,0 +1,736 @@
+diff --git a/.github/actions/run-tests/action.yml b/.github/actions/run-tests/action.yml
+index 94fbe222..94d8248e 100644
+--- a/.github/actions/run-tests/action.yml
++++ b/.github/actions/run-tests/action.yml
+@@ -24,7 +24,7 @@ runs:
+ 
+         # Mapping of redis version to redis testing containers
+         declare -A redis_version_mapping=(
+-          ["8.6.x"]="custom-21860421418-debian-amd64"
++          ["8.6.x"]="custom-21183968220-debian-amd64"
+           ["8.4.x"]="8.4.0"
+           ["8.2.x"]="8.2.1-pre"
+           ["8.0.x"]="8.0.2"
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index c7763881..59c16754 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -47,7 +47,7 @@ jobs:
+           
+           # Mapping of redis version to redis testing containers
+           declare -A redis_version_mapping=(
+-            ["8.6.x"]="custom-21860421418-debian-amd64"
++            ["8.6.x"]="custom-21183968220-debian-amd64"
+             ["8.4.x"]="8.4.0"
+             ["8.2.x"]="8.2.1-pre"
+             ["8.0.x"]="8.0.2"
+diff --git a/.github/workflows/doctests.yaml b/.github/workflows/doctests.yaml
+index 7e3833ed..4944cc91 100644
+--- a/.github/workflows/doctests.yaml
++++ b/.github/workflows/doctests.yaml
+@@ -16,7 +16,7 @@ jobs:
+ 
+     services:
+       redis-stack:
+-        image: redislabs/client-libs-test:custom-21860421418-debian-amd64
++        image: redislabs/client-libs-test:custom-21183968220-debian-amd64
+         env:
+           TLS_ENABLED: no
+           REDIS_CLUSTER: no
+diff --git a/Makefile b/Makefile
+index 453eff5f..b4994c8c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@ GO_MOD_DIRS := $(shell find . -type f -name 'go.mod' -exec dirname {} \; | sort)
+ REDIS_VERSION ?= 8.6
+ RE_CLUSTER ?= false
+ RCE_DOCKER ?= true
+-CLIENT_LIBS_TEST_IMAGE ?= redislabs/client-libs-test:custom-21860421418-debian-amd64
++CLIENT_LIBS_TEST_IMAGE ?= redislabs/client-libs-test:custom-21183968220-debian-amd64
+ 
+ docker.start:
+ 	export RE_CLUSTER=$(RE_CLUSTER) && \
+diff --git a/command.go b/command.go
+index a2a2f051..8364f67e 100644
+--- a/command.go
++++ b/command.go
+@@ -37,7 +37,6 @@ var keylessCommands = map[string]struct{}{
+ 	"failover":     {},
+ 	"function":     {},
+ 	"hello":        {},
+-	"hotkeys":      {},
+ 	"latency":      {},
+ 	"lolwut":       {},
+ 	"module":       {},
+@@ -152,7 +151,6 @@ const (
+ 	CmdTypeFTSearch
+ 	CmdTypeTSTimestampValue
+ 	CmdTypeTSTimestampValueSlice
+-	CmdTypeHotKeys
+ )
+ 
+ type (
+@@ -4912,243 +4910,6 @@ func (cmd *LatencyCmd) Clone() Cmder {
+ 
+ //-----------------------------------------------------------------------
+ 
+-// HotKeysSlotRange represents a slot or slot range in the response.
+-// Single element slice = individual slot, two element slice = slot range [start, end].
+-type HotKeysSlotRange []int64
+-
+-// HotKeysKeyEntry represents a hot key entry with its metric value.
+-type HotKeysKeyEntry struct {
+-	Key   string
+-	Value interface{} // Can be int64 or string
+-}
+-
+-// HotKeysResult represents the response data from HOTKEYS GET command.
+-// Field names match the Redis response format.
+-type HotKeysResult struct {
+-	TrackingActive                       bool
+-	SampleRatio                          uint8
+-	SelectedSlots                        []HotKeysSlotRange
+-	SampledCommandsSelectedSlots         time.Duration // Present when sample-ratio > 1 and selected-slots is not empty
+-	AllCommandsSelectedSlots             time.Duration // Present when selected-slots is not empty
+-	AllCommandsAllSlots                  time.Duration
+-	NetBytesSampledCommandsSelectedSlots int64 // Present when sample-ratio > 1 and selected-slots is not empty
+-	NetBytesAllCommandsSelectedSlots     int64 // Present when selected-slots is not empty
+-	NetBytesAllCommandsAllSlots          int64
+-	CollectionStartTime                  time.Time
+-	CollectionDuration                   time.Duration
+-	UsedCPUSys                           time.Duration
+-	UsedCPUUser                          time.Duration
+-	TotalNetBytes                        int64
+-	ByCPUTime                            []HotKeysKeyEntry
+-	ByNetBytes                           []HotKeysKeyEntry
+-}
+-
+-type HotKeysCmd struct {
+-	baseCmd
+-
+-	val *HotKeysResult
+-}
+-
+-var _ Cmder = (*HotKeysCmd)(nil)
+-
+-func NewHotKeysCmd(ctx context.Context, args ...interface{}) *HotKeysCmd {
+-	return &HotKeysCmd{
+-		baseCmd: baseCmd{
+-			ctx:     ctx,
+-			args:    args,
+-			cmdType: CmdTypeHotKeys,
+-		},
+-	}
+-}
+-
+-func (cmd *HotKeysCmd) SetVal(val *HotKeysResult) {
+-	cmd.val = val
+-}
+-
+-func (cmd *HotKeysCmd) Val() *HotKeysResult {
+-	return cmd.val
+-}
+-
+-func (cmd *HotKeysCmd) Result() (*HotKeysResult, error) {
+-	return cmd.val, cmd.err
+-}
+-
+-func (cmd *HotKeysCmd) String() string {
+-	return cmdString(cmd, cmd.val)
+-}
+-
+-func (cmd *HotKeysCmd) readReply(rd *proto.Reader) error {
+-	// HOTKEYS GET response is wrapped in an array for aggregation support
+-	arrayLen, err := rd.ReadArrayLen()
+-	if err != nil {
+-		return err
+-	}
+-
+-	if arrayLen == 0 {
+-		// Empty array means no tracking was started or after reset
+-		cmd.val = nil
+-		return nil
+-	}
+-
+-	// Read the first (and typically only) element which is a map
+-	n, err := rd.ReadMapLen()
+-	if err != nil {
+-		return err
+-	}
+-
+-	result := &HotKeysResult{}
+-	data := make(map[string]interface{}, n)
+-
+-	for i := 0; i < n; i++ {
+-		k, err := rd.ReadString()
+-		if err != nil {
+-			return err
+-		}
+-		v, err := rd.ReadReply()
+-		if err != nil {
+-			if err == Nil {
+-				data[k] = Nil
+-				continue
+-			}
+-			if err, ok := err.(proto.RedisError); ok {
+-				data[k] = err
+-				continue
+-			}
+-			return err
+-		}
+-		data[k] = v
+-	}
+-
+-	if v, ok := data["tracking-active"].(int64); ok {
+-		result.TrackingActive = v == 1
+-	}
+-	if v, ok := data["sample-ratio"].(int64); ok {
+-		result.SampleRatio = uint8(v)
+-	}
+-	if v, ok := data["selected-slots"].([]interface{}); ok {
+-		result.SelectedSlots = make([]HotKeysSlotRange, 0, len(v))
+-		for _, slot := range v {
+-			switch s := slot.(type) {
+-			case int64:
+-				// Single slot
+-				result.SelectedSlots = append(result.SelectedSlots, HotKeysSlotRange{s})
+-			case []interface{}:
+-				// Slot range
+-				slotRange := make(HotKeysSlotRange, 0, len(s))
+-				for _, sr := range s {
+-					if val, ok := sr.(int64); ok {
+-						slotRange = append(slotRange, val)
+-					}
+-				}
+-				result.SelectedSlots = append(result.SelectedSlots, slotRange)
+-			}
+-		}
+-	}
+-	if v, ok := data["sampled-commands-selected-slots-us"].(int64); ok {
+-		result.SampledCommandsSelectedSlots = time.Duration(v) * time.Microsecond
+-	}
+-	if v, ok := data["all-commands-selected-slots-us"].(int64); ok {
+-		result.AllCommandsSelectedSlots = time.Duration(v) * time.Microsecond
+-	}
+-	if v, ok := data["all-commands-all-slots-us"].(int64); ok {
+-		result.AllCommandsAllSlots = time.Duration(v) * time.Microsecond
+-	}
+-	if v, ok := data["net-bytes-sampled-commands-selected-slots"].(int64); ok {
+-		result.NetBytesSampledCommandsSelectedSlots = v
+-	}
+-	if v, ok := data["net-bytes-all-commands-selected-slots"].(int64); ok {
+-		result.NetBytesAllCommandsSelectedSlots = v
+-	}
+-	if v, ok := data["net-bytes-all-commands-all-slots"].(int64); ok {
+-		result.NetBytesAllCommandsAllSlots = v
+-	}
+-	if v, ok := data["collection-start-time-unix-ms"].(int64); ok {
+-		result.CollectionStartTime = time.UnixMilli(v)
+-	}
+-	if v, ok := data["collection-duration-ms"].(int64); ok {
+-		result.CollectionDuration = time.Duration(v) * time.Millisecond
+-	}
+-	if v, ok := data["used-cpu-sys-ms"].(int64); ok {
+-		result.UsedCPUSys = time.Duration(v) * time.Millisecond
+-	}
+-	if v, ok := data["used-cpu-user-ms"].(int64); ok {
+-		result.UsedCPUUser = time.Duration(v) * time.Millisecond
+-	}
+-	if v, ok := data["total-net-bytes"].(int64); ok {
+-		result.TotalNetBytes = v
+-	}
+-
+-	if v, ok := data["by-cpu-time-us"].([]interface{}); ok {
+-		result.ByCPUTime = parseHotKeysKeyEntries(v)
+-	}
+-
+-	if v, ok := data["by-net-bytes"].([]interface{}); ok {
+-		result.ByNetBytes = parseHotKeysKeyEntries(v)
+-	}
+-
+-	cmd.val = result
+-	return nil
+-}
+-
+-// parseHotKeysKeyEntries parses the key-value pairs from HOTKEYS GET response.
+-func parseHotKeysKeyEntries(v []interface{}) []HotKeysKeyEntry {
+-	entries := make([]HotKeysKeyEntry, 0, len(v)/2)
+-	for i := 0; i < len(v); i += 2 {
+-		if i+1 < len(v) {
+-			key, keyOk := v[i].(string)
+-			if keyOk {
+-				entries = append(entries, HotKeysKeyEntry{
+-					Key:   key,
+-					Value: v[i+1], // Can be int64 or string
+-				})
+-			}
+-		}
+-	}
+-	return entries
+-}
+-
+-func (cmd *HotKeysCmd) Clone() Cmder {
+-	var val *HotKeysResult
+-	if cmd.val != nil {
+-		val = &HotKeysResult{
+-			TrackingActive:                       cmd.val.TrackingActive,
+-			SampleRatio:                          cmd.val.SampleRatio,
+-			SampledCommandsSelectedSlots:         cmd.val.SampledCommandsSelectedSlots,
+-			AllCommandsSelectedSlots:             cmd.val.AllCommandsSelectedSlots,
+-			AllCommandsAllSlots:                  cmd.val.AllCommandsAllSlots,
+-			NetBytesSampledCommandsSelectedSlots: cmd.val.NetBytesSampledCommandsSelectedSlots,
+-			NetBytesAllCommandsSelectedSlots:     cmd.val.NetBytesAllCommandsSelectedSlots,
+-			NetBytesAllCommandsAllSlots:          cmd.val.NetBytesAllCommandsAllSlots,
+-			CollectionStartTime:                  cmd.val.CollectionStartTime,
+-			CollectionDuration:                   cmd.val.CollectionDuration,
+-			UsedCPUSys:                           cmd.val.UsedCPUSys,
+-			UsedCPUUser:                          cmd.val.UsedCPUUser,
+-			TotalNetBytes:                        cmd.val.TotalNetBytes,
+-		}
+-		if cmd.val.SelectedSlots != nil {
+-			val.SelectedSlots = make([]HotKeysSlotRange, len(cmd.val.SelectedSlots))
+-			for i, sr := range cmd.val.SelectedSlots {
+-				val.SelectedSlots[i] = make(HotKeysSlotRange, len(sr))
+-				copy(val.SelectedSlots[i], sr)
+-			}
+-		}
+-		if cmd.val.ByCPUTime != nil {
+-			val.ByCPUTime = make([]HotKeysKeyEntry, len(cmd.val.ByCPUTime))
+-			copy(val.ByCPUTime, cmd.val.ByCPUTime)
+-		}
+-		if cmd.val.ByNetBytes != nil {
+-			val.ByNetBytes = make([]HotKeysKeyEntry, len(cmd.val.ByNetBytes))
+-			copy(val.ByNetBytes, cmd.val.ByNetBytes)
+-		}
+-	}
+-	return &HotKeysCmd{
+-		baseCmd: cmd.cloneBaseCmd(),
+-		val:     val,
+-	}
+-}
+-
+-//-----------------------------------------------------------------------
+-
+ type MapStringInterfaceCmd struct {
+ 	baseCmd
+ 
+@@ -7720,13 +7481,6 @@ func ExtractCommandValue(cmd interface{}) (interface{}, error) {
+ 			}); ok {
+ 				return slowLogCmd.Val(), slowLogCmd.Err()
+ 			}
+-		case CmdTypeHotKeys:
+-			if hotKeysCmd, ok := cmd.(interface {
+-				Val() *HotKeysResult
+-				Err() error
+-			}); ok {
+-				return hotKeysCmd.Val(), hotKeysCmd.Err()
+-			}
+ 		case CmdTypeKeyValues:
+ 			if keyValuesCmd, ok := cmd.(interface {
+ 				Val() (string, []string)
+diff --git a/docker-compose.yml b/docker-compose.yml
+index ed88d1ed..70bb1819 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -2,7 +2,7 @@
+ 
+ services:
+   redis:
+-    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:custom-21860421418-debian-amd64}
++    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:custom-21183968220-debian-amd64}
+     platform: linux/amd64
+     container_name: redis-standalone
+     environment:
+@@ -23,7 +23,7 @@ services:
+       - all
+ 
+   osscluster:
+-    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:custom-21860421418-debian-amd64}
++    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:custom-21183968220-debian-amd64}
+     platform: linux/amd64
+     container_name: redis-osscluster
+     environment:
+@@ -40,7 +40,7 @@ services:
+       - all
+ 
+   sentinel-cluster:
+-    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:custom-21860421418-debian-amd64}
++    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:custom-21183968220-debian-amd64}
+     platform: linux/amd64
+     container_name: redis-sentinel-cluster
+     network_mode: "host"
+@@ -60,7 +60,7 @@ services:
+       - all
+ 
+   sentinel:
+-    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:custom-21860421418-debian-amd64}
++    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:custom-21183968220-debian-amd64}
+     platform: linux/amd64
+     container_name: redis-sentinel
+     depends_on:
+@@ -84,7 +84,7 @@ services:
+       - all
+ 
+   ring-cluster:
+-    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:custom-21860421418-debian-amd64}
++    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:custom-21183968220-debian-amd64}
+     platform: linux/amd64
+     container_name: redis-ring-cluster
+     environment:
+diff --git a/helper/helper_test.go b/helper/helper_test.go
+index 7fa1f19d..00d921e4 100644
+--- a/helper/helper_test.go
++++ b/helper/helper_test.go
+@@ -93,3 +93,4 @@ func BenchmarkDigestBytes(b *testing.B) {
+ 		})
+ 	}
+ }
++
+diff --git a/hotkeys_commands.go b/hotkeys_commands.go
+deleted file mode 100644
+index 024db3ff..00000000
+--- a/hotkeys_commands.go
++++ /dev/null
+@@ -1,122 +0,0 @@
+-package redis
+-
+-import (
+-	"context"
+-	"errors"
+-	"strings"
+-)
+-
+-// HOTKEYS commands are only available on standalone *Client instances.
+-// They are NOT available on ClusterClient, Ring, or UniversalClient because
+-// HOTKEYS is a stateful command requiring session affinity - all operations
+-// (START, GET, STOP, RESET) must be sent to the same Redis node.
+-//
+-// If you are using UniversalClient and need HOTKEYS functionality, you must
+-// type assert to *Client first:
+-//
+-//	if client, ok := universalClient.(*redis.Client); ok {
+-//	    result, err := client.HotKeysStart(ctx, args)
+-//	    // ...
+-//	}
+-
+-// HotKeysMetric represents the metrics that can be tracked by the HOTKEYS command.
+-type HotKeysMetric string
+-
+-const (
+-	// HotKeysMetricCPU tracks CPU time spent on the key (in microseconds).
+-	HotKeysMetricCPU HotKeysMetric = "CPU"
+-	// HotKeysMetricNET tracks network bytes used by the key (ingress + egress + replication).
+-	HotKeysMetricNET HotKeysMetric = "NET"
+-)
+-
+-// HotKeysStartArgs contains the arguments for the HOTKEYS START command.
+-// This command is only available on standalone clients due to its stateful nature
+-// requiring session affinity. It must NOT be used on cluster or pooled clients.
+-type HotKeysStartArgs struct {
+-	// Metrics to track. At least one must be specified.
+-	Metrics []HotKeysMetric
+-	// Count is the number of top keys to report.
+-	// Default: 10, Min: 10, Max: 64
+-	Count uint8
+-	// Duration is the auto-stop tracking after this many seconds.
+-	// Default: 0 (no auto-stop)
+-	Duration int64
+-	// Sample is the sample ratio - track keys with probability 1/sample.
+-	// Default: 1 (track every key), Min: 1
+-	Sample int64
+-	// Slots specifies specific hash slots to track (0-16383).
+-	// All specified slots must be hosted by the receiving node.
+-	// If not specified, all slots are tracked.
+-	Slots []uint16
+-}
+-
+-// ErrHotKeysNoMetrics is returned when HotKeysStart is called without any metrics specified.
+-var ErrHotKeysNoMetrics = errors.New("redis: at least one metric must be specified for HOTKEYS START")
+-
+-// HotKeysStart starts collecting hotkeys data.
+-// At least one metric must be specified in args.Metrics.
+-// This command is only available on standalone clients.
+-func (c *Client) HotKeysStart(ctx context.Context, args *HotKeysStartArgs) *StatusCmd {
+-	cmdArgs := make([]interface{}, 0, 16)
+-	cmdArgs = append(cmdArgs, "hotkeys", "start")
+-
+-	// Validate that at least one metric is specified
+-	if len(args.Metrics) == 0 {
+-		cmd := NewStatusCmd(ctx, cmdArgs...)
+-		cmd.SetErr(ErrHotKeysNoMetrics)
+-		return cmd
+-	}
+-
+-	cmdArgs = append(cmdArgs, "metrics", len(args.Metrics))
+-	for _, metric := range args.Metrics {
+-		cmdArgs = append(cmdArgs, strings.ToLower(string(metric)))
+-	}
+-
+-	if args.Count > 0 {
+-		cmdArgs = append(cmdArgs, "count", args.Count)
+-	}
+-
+-	if args.Duration > 0 {
+-		cmdArgs = append(cmdArgs, "duration", args.Duration)
+-	}
+-
+-	if args.Sample > 0 {
+-		cmdArgs = append(cmdArgs, "sample", args.Sample)
+-	}
+-
+-	if len(args.Slots) > 0 {
+-		cmdArgs = append(cmdArgs, "slots", len(args.Slots))
+-		for _, slot := range args.Slots {
+-			cmdArgs = append(cmdArgs, slot)
+-		}
+-	}
+-
+-	cmd := NewStatusCmd(ctx, cmdArgs...)
+-	_ = c.Process(ctx, cmd)
+-	return cmd
+-}
+-
+-// HotKeysStop stops the ongoing hotkeys collection session.
+-// This command is only available on standalone clients.
+-func (c *Client) HotKeysStop(ctx context.Context) *StatusCmd {
+-	cmd := NewStatusCmd(ctx, "hotkeys", "stop")
+-	_ = c.Process(ctx, cmd)
+-	return cmd
+-}
+-
+-// HotKeysReset discards the last hotkeys collection session results.
+-// Returns an error if tracking is currently active.
+-// This command is only available on standalone clients.
+-func (c *Client) HotKeysReset(ctx context.Context) *StatusCmd {
+-	cmd := NewStatusCmd(ctx, "hotkeys", "reset")
+-	_ = c.Process(ctx, cmd)
+-	return cmd
+-}
+-
+-// HotKeysGet retrieves the results of the ongoing or last hotkeys collection session.
+-// This command is only available on standalone clients.
+-func (c *Client) HotKeysGet(ctx context.Context) *HotKeysCmd {
+-	cmd := NewHotKeysCmd(ctx, "hotkeys", "get")
+-	_ = c.Process(ctx, cmd)
+-	return cmd
+-}
+diff --git a/hotkeys_commands_test.go b/hotkeys_commands_test.go
+deleted file mode 100644
+index 6ec17eb2..00000000
+--- a/hotkeys_commands_test.go
++++ /dev/null
+@@ -1,214 +0,0 @@
+-package redis_test
+-
+-import (
+-	"context"
+-	"time"
+-
+-	. "github.com/bsm/ginkgo/v2"
+-	. "github.com/bsm/gomega"
+-
+-	"github.com/redis/go-redis/v9"
+-)
+-
+-var _ = Describe("HotKeys Commands", func() {
+-	ctx := context.TODO()
+-	var client *redis.Client
+-
+-	BeforeEach(func() {
+-		client = redis.NewClient(redisOptions())
+-		Expect(client.FlushDB(ctx).Err()).NotTo(HaveOccurred())
+-	})
+-
+-	AfterEach(func() {
+-		Expect(client.Close()).NotTo(HaveOccurred())
+-	})
+-
+-	Describe("HOTKEYS", func() {
+-		It("should start, get, stop, and reset hotkeys tracking", func() {
+-			SkipBeforeRedisVersion(8.6, "HOTKEYS commands require Redis >= 8.6")
+-
+-			startArgs := &redis.HotKeysStartArgs{
+-				Metrics:  []redis.HotKeysMetric{redis.HotKeysMetricCPU, redis.HotKeysMetricNET},
+-				Count:    10,
+-				Duration: 0,
+-				Sample:   1,
+-			}
+-			start := client.HotKeysStart(ctx, startArgs)
+-			Expect(start.Err()).NotTo(HaveOccurred())
+-			Expect(start.Val()).To(Equal("OK"))
+-
+-			for i := 0; i < 100; i++ {
+-				client.Set(ctx, "hotkey1", "value1", 0)
+-				client.Get(ctx, "hotkey1")
+-			}
+-			for i := 0; i < 50; i++ {
+-				client.Set(ctx, "hotkey2", "value2", 0)
+-				client.Get(ctx, "hotkey2")
+-			}
+-			for i := 0; i < 25; i++ {
+-				client.Set(ctx, "hotkey3", "value3", 0)
+-				client.Get(ctx, "hotkey3")
+-			}
+-
+-			time.Sleep(100 * time.Millisecond)
+-
+-			get := client.HotKeysGet(ctx)
+-			Expect(get.Err()).NotTo(HaveOccurred())
+-			result := get.Val()
+-			Expect(result).NotTo(BeNil())
+-			Expect(result.TrackingActive).To(BeTrue())
+-			Expect(result.SampleRatio).To(Equal(uint8(1)))
+-			// Verify that collection start time is set (not zero)
+-			Expect(result.CollectionStartTime.IsZero()).To(BeFalse())
+-			// Verify that we have some CPU time data after running commands
+-			Expect(result.AllCommandsAllSlots).To(BeNumerically(">", 0))
+-			// Verify that we have hot keys data (we ran 350 commands on 3 keys)
+-			Expect(len(result.ByCPUTime)).To(BeNumerically(">", 0))
+-			Expect(len(result.ByNetBytes)).To(BeNumerically(">", 0))
+-			// Verify that the first hot key entry has a non-empty key
+-			if len(result.ByCPUTime) > 0 {
+-				Expect(result.ByCPUTime[0].Key).NotTo(BeEmpty())
+-				Expect(result.ByCPUTime[0].Value).NotTo(BeNil())
+-			}
+-
+-			stop := client.HotKeysStop(ctx)
+-			Expect(stop.Err()).NotTo(HaveOccurred())
+-			Expect(stop.Val()).To(Equal("OK"))
+-
+-			get2 := client.HotKeysGet(ctx)
+-			Expect(get2.Err()).NotTo(HaveOccurred())
+-			result2 := get2.Val()
+-			Expect(result2).NotTo(BeNil())
+-			Expect(result2.TrackingActive).To(BeFalse())
+-			// After stopping, collection duration should be set
+-			Expect(result2.CollectionDuration).To(BeNumerically(">", 0))
+-
+-			reset := client.HotKeysReset(ctx)
+-			Expect(reset.Err()).NotTo(HaveOccurred())
+-			Expect(reset.Val()).To(Equal("OK"))
+-		})
+-
+-		It("should start hotkeys tracking with CPU metric only", func() {
+-			SkipBeforeRedisVersion(8.6, "HOTKEYS commands require Redis >= 8.6")
+-
+-			startArgs := &redis.HotKeysStartArgs{
+-				Metrics: []redis.HotKeysMetric{redis.HotKeysMetricCPU},
+-				Count:   5,
+-			}
+-			start := client.HotKeysStart(ctx, startArgs)
+-			Expect(start.Err()).NotTo(HaveOccurred())
+-			Expect(start.Val()).To(Equal("OK"))
+-
+-			stop := client.HotKeysStop(ctx)
+-			Expect(stop.Err()).NotTo(HaveOccurred())
+-		})
+-
+-		It("should start hotkeys tracking with NET metric only", func() {
+-			SkipBeforeRedisVersion(8.6, "HOTKEYS commands require Redis >= 8.6")
+-
+-			startArgs := &redis.HotKeysStartArgs{
+-				Metrics: []redis.HotKeysMetric{redis.HotKeysMetricNET},
+-				Count:   5,
+-			}
+-			start := client.HotKeysStart(ctx, startArgs)
+-			Expect(start.Err()).NotTo(HaveOccurred())
+-			Expect(start.Val()).To(Equal("OK"))
+-
+-			stop := client.HotKeysStop(ctx)
+-			Expect(stop.Err()).NotTo(HaveOccurred())
+-		})
+-
+-		It("should start hotkeys tracking with duration", func() {
+-			SkipBeforeRedisVersion(8.6, "HOTKEYS commands require Redis >= 8.6")
+-
+-			startArgs := &redis.HotKeysStartArgs{
+-				Metrics:  []redis.HotKeysMetric{redis.HotKeysMetricCPU, redis.HotKeysMetricNET},
+-				Count:    10,
+-				Duration: 2,
+-			}
+-			start := client.HotKeysStart(ctx, startArgs)
+-			Expect(start.Err()).NotTo(HaveOccurred())
+-			Expect(start.Val()).To(Equal("OK"))
+-
+-			time.Sleep(3 * time.Second)
+-
+-			get := client.HotKeysGet(ctx)
+-			Expect(get.Err()).NotTo(HaveOccurred())
+-			result := get.Val()
+-			Expect(result).NotTo(BeNil())
+-			Expect(result.TrackingActive).To(BeFalse())
+-		})
+-
+-		It("should start hotkeys tracking with sampling", func() {
+-			SkipBeforeRedisVersion(8.6, "HOTKEYS commands require Redis >= 8.6")
+-
+-			startArgs := &redis.HotKeysStartArgs{
+-				Metrics: []redis.HotKeysMetric{redis.HotKeysMetricCPU, redis.HotKeysMetricNET},
+-				Count:   10,
+-				Sample:  10,
+-			}
+-			start := client.HotKeysStart(ctx, startArgs)
+-			Expect(start.Err()).NotTo(HaveOccurred())
+-			Expect(start.Val()).To(Equal("OK"))
+-
+-			stop := client.HotKeysStop(ctx)
+-			Expect(stop.Err()).NotTo(HaveOccurred())
+-		})
+-
+-		It("should error when using slots in non-cluster mode", func() {
+-			SkipBeforeRedisVersion(8.6, "HOTKEYS commands require Redis >= 8.6")
+-
+-			startArgs := &redis.HotKeysStartArgs{
+-				Metrics: []redis.HotKeysMetric{redis.HotKeysMetricCPU, redis.HotKeysMetricNET},
+-				Count:   10,
+-				Slots:   []uint16{0, 1, 2, 100, 200},
+-			}
+-			start := client.HotKeysStart(ctx, startArgs)
+-			Expect(start.Err()).To(HaveOccurred())
+-			Expect(start.Err().Error()).To(ContainSubstring("SLOTS parameter cannot be used in non-cluster mode"))
+-		})
+-
+-		It("should error when no metrics are specified", func() {
+-			startArgs := &redis.HotKeysStartArgs{
+-				Count: 10,
+-			}
+-			start := client.HotKeysStart(ctx, startArgs)
+-			Expect(start.Err()).To(HaveOccurred())
+-			Expect(start.Err()).To(Equal(redis.ErrHotKeysNoMetrics))
+-		})
+-
+-		It("should error when starting tracking while already active", func() {
+-			SkipBeforeRedisVersion(8.6, "HOTKEYS commands require Redis >= 8.6")
+-
+-			startArgs := &redis.HotKeysStartArgs{
+-				Metrics: []redis.HotKeysMetric{redis.HotKeysMetricCPU},
+-				Count:   10,
+-			}
+-			start1 := client.HotKeysStart(ctx, startArgs)
+-			Expect(start1.Err()).NotTo(HaveOccurred())
+-
+-			start2 := client.HotKeysStart(ctx, startArgs)
+-			Expect(start2.Err()).To(HaveOccurred())
+-
+-			stop := client.HotKeysStop(ctx)
+-			Expect(stop.Err()).NotTo(HaveOccurred())
+-		})
+-
+-		It("should error when resetting while tracking is active", func() {
+-			SkipBeforeRedisVersion(8.6, "HOTKEYS commands require Redis >= 8.6")
+-
+-			startArgs := &redis.HotKeysStartArgs{
+-				Metrics: []redis.HotKeysMetric{redis.HotKeysMetricCPU},
+-				Count:   10,
+-			}
+-			start := client.HotKeysStart(ctx, startArgs)
+-			Expect(start.Err()).NotTo(HaveOccurred())
+-
+-			reset := client.HotKeysReset(ctx)
+-			Expect(reset.Err()).To(HaveOccurred())
+-
+-			stop := client.HotKeysStop(ctx)
+-			Expect(stop.Err()).NotTo(HaveOccurred())
+-		})
+-	})
+-})

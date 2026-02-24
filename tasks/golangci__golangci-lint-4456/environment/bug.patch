@@ -1,0 +1,612 @@
+diff --git a/pkg/lint/runner.go b/pkg/lint/runner.go
+index dc6b2e73..150e6c7f 100644
+--- a/pkg/lint/runner.go
++++ b/pkg/lint/runner.go
+@@ -254,15 +254,20 @@ func (r *Runner) processIssues(issues []result.Issue, sw *timeutils.Stopwatch, s
+ }
+ 
+ func getExcludeProcessor(cfg *config.Issues) processors.Processor {
+-	opts := processors.ExcludeOptions{
+-		CaseSensitive: cfg.ExcludeCaseSensitive,
+-	}
++	var excludeTotalPattern string
+ 
+ 	if len(cfg.ExcludePatterns) != 0 {
+-		opts.Pattern = fmt.Sprintf("(%s)", strings.Join(cfg.ExcludePatterns, "|"))
++		excludeTotalPattern = fmt.Sprintf("(%s)", strings.Join(cfg.ExcludePatterns, "|"))
++	}
++
++	var excludeProcessor processors.Processor
++	if cfg.ExcludeCaseSensitive {
++		excludeProcessor = processors.NewExcludeCaseSensitive(excludeTotalPattern)
++	} else {
++		excludeProcessor = processors.NewExclude(excludeTotalPattern)
+ 	}
+ 
+-	return processors.NewExclude(opts)
++	return excludeProcessor
+ }
+ 
+ func getExcludeRulesProcessor(cfg *config.Issues, log logutils.Log, files *fsutils.Files) processors.Processor {
+@@ -290,12 +295,22 @@ func getExcludeRulesProcessor(cfg *config.Issues, log logutils.Log, files *fsuti
+ 		}
+ 	}
+ 
+-	opts := processors.ExcludeRulesOptions{
+-		Rules:         excludeRules,
+-		CaseSensitive: cfg.ExcludeCaseSensitive,
++	var excludeRulesProcessor processors.Processor
++	if cfg.ExcludeCaseSensitive {
++		excludeRulesProcessor = processors.NewExcludeRulesCaseSensitive(
++			excludeRules,
++			files,
++			log.Child(logutils.DebugKeyExcludeRules),
++		)
++	} else {
++		excludeRulesProcessor = processors.NewExcludeRules(
++			excludeRules,
++			files,
++			log.Child(logutils.DebugKeyExcludeRules),
++		)
+ 	}
+ 
+-	return processors.NewExcludeRules(log.Child(logutils.DebugKeyExcludeRules), files, opts)
++	return excludeRulesProcessor
+ }
+ 
+ func getSeverityRulesProcessor(cfg *config.Severity, log logutils.Log, files *fsutils.Files) processors.Processor {
+diff --git a/pkg/result/processors/base_rule.go b/pkg/result/processors/base_rule.go
+index 88140bfa..b5e13880 100644
+--- a/pkg/result/processors/base_rule.go
++++ b/pkg/result/processors/base_rule.go
+@@ -8,8 +8,6 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+-const caseInsensitivePrefix = "(?i)"
+-
+ type BaseRule struct {
+ 	Text       string
+ 	Source     string
+diff --git a/pkg/result/processors/exclude.go b/pkg/result/processors/exclude.go
+index ad684299..92959a32 100644
+--- a/pkg/result/processors/exclude.go
++++ b/pkg/result/processors/exclude.go
+@@ -6,37 +6,24 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+-var _ Processor = Exclude{}
+-
+ type Exclude struct {
+-	name string
+-
+ 	pattern *regexp.Regexp
+ }
+ 
+-type ExcludeOptions struct {
+-	Pattern       string
+-	CaseSensitive bool
+-}
+-
+-func NewExclude(opts ExcludeOptions) *Exclude {
+-	p := &Exclude{name: "exclude"}
++var _ Processor = Exclude{}
+ 
+-	prefix := caseInsensitivePrefix
+-	if opts.CaseSensitive {
+-		p.name = "exclude-case-sensitive"
+-		prefix = ""
++func NewExclude(pattern string) *Exclude {
++	var patternRe *regexp.Regexp
++	if pattern != "" {
++		patternRe = regexp.MustCompile("(?i)" + pattern)
+ 	}
+-
+-	if opts.Pattern != "" {
+-		p.pattern = regexp.MustCompile(prefix + opts.Pattern)
++	return &Exclude{
++		pattern: patternRe,
+ 	}
+-
+-	return p
+ }
+ 
+ func (p Exclude) Name() string {
+-	return p.name
++	return "exclude"
+ }
+ 
+ func (p Exclude) Process(issues []result.Issue) ([]result.Issue, error) {
+@@ -50,3 +37,23 @@ func (p Exclude) Process(issues []result.Issue) ([]result.Issue, error) {
+ }
+ 
+ func (p Exclude) Finish() {}
++
++type ExcludeCaseSensitive struct {
++	*Exclude
++}
++
++var _ Processor = ExcludeCaseSensitive{}
++
++func NewExcludeCaseSensitive(pattern string) *ExcludeCaseSensitive {
++	var patternRe *regexp.Regexp
++	if pattern != "" {
++		patternRe = regexp.MustCompile(pattern)
++	}
++	return &ExcludeCaseSensitive{
++		&Exclude{pattern: patternRe},
++	}
++}
++
++func (p ExcludeCaseSensitive) Name() string {
++	return "exclude-case-sensitive"
++}
+diff --git a/pkg/result/processors/exclude_rules.go b/pkg/result/processors/exclude_rules.go
+index c2eba63d..2f7e30b4 100644
+--- a/pkg/result/processors/exclude_rules.go
++++ b/pkg/result/processors/exclude_rules.go
+@@ -8,8 +8,6 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+-var _ Processor = ExcludeRules{}
+-
+ type excludeRule struct {
+ 	baseRule
+ }
+@@ -19,35 +17,43 @@ type ExcludeRule struct {
+ }
+ 
+ type ExcludeRules struct {
+-	name string
+-
+-	log   logutils.Log
+-	files *fsutils.Files
+-
+ 	rules []excludeRule
++	files *fsutils.Files
++	log   logutils.Log
+ }
+ 
+-type ExcludeRulesOptions struct {
+-	Rules         []ExcludeRule
+-	CaseSensitive bool
+-}
+-
+-func NewExcludeRules(log logutils.Log, files *fsutils.Files, opts ExcludeRulesOptions) *ExcludeRules {
+-	p := &ExcludeRules{
+-		name:  "exclude-rules",
++func NewExcludeRules(rules []ExcludeRule, files *fsutils.Files, log logutils.Log) *ExcludeRules {
++	r := &ExcludeRules{
+ 		files: files,
+ 		log:   log,
+ 	}
++	r.rules = createRules(rules, "(?i)")
+ 
+-	prefix := caseInsensitivePrefix
+-	if opts.CaseSensitive {
+-		prefix = ""
+-		p.name = "exclude-rules-case-sensitive"
+-	}
+-
+-	p.rules = createRules(opts.Rules, prefix)
++	return r
++}
+ 
+-	return p
++func createRules(rules []ExcludeRule, prefix string) []excludeRule {
++	parsedRules := make([]excludeRule, 0, len(rules))
++	for _, rule := range rules {
++		parsedRule := excludeRule{}
++		parsedRule.linters = rule.Linters
++		if rule.Text != "" {
++			parsedRule.text = regexp.MustCompile(prefix + rule.Text)
++		}
++		if rule.Source != "" {
++			parsedRule.source = regexp.MustCompile(prefix + rule.Source)
++		}
++		if rule.Path != "" {
++			path := fsutils.NormalizePathInRegex(rule.Path)
++			parsedRule.path = regexp.MustCompile(path)
++		}
++		if rule.PathExcept != "" {
++			pathExcept := fsutils.NormalizePathInRegex(rule.PathExcept)
++			parsedRule.pathExcept = regexp.MustCompile(pathExcept)
++		}
++		parsedRules = append(parsedRules, parsedRule)
++	}
++	return parsedRules
+ }
+ 
+ func (p ExcludeRules) Process(issues []result.Issue) ([]result.Issue, error) {
+@@ -65,35 +71,25 @@ func (p ExcludeRules) Process(issues []result.Issue) ([]result.Issue, error) {
+ 	}), nil
+ }
+ 
+-func (p ExcludeRules) Name() string { return p.name }
+-
+-func (ExcludeRules) Finish() {}
+-
+-func createRules(rules []ExcludeRule, prefix string) []excludeRule {
+-	parsedRules := make([]excludeRule, 0, len(rules))
++func (ExcludeRules) Name() string { return "exclude-rules" }
++func (ExcludeRules) Finish()      {}
+ 
+-	for _, rule := range rules {
+-		parsedRule := excludeRule{}
+-		parsedRule.linters = rule.Linters
+-
+-		if rule.Text != "" {
+-			parsedRule.text = regexp.MustCompile(prefix + rule.Text)
+-		}
+-
+-		if rule.Source != "" {
+-			parsedRule.source = regexp.MustCompile(prefix + rule.Source)
+-		}
+-
+-		if rule.Path != "" {
+-			parsedRule.path = regexp.MustCompile(fsutils.NormalizePathInRegex(rule.Path))
+-		}
++var _ Processor = ExcludeRules{}
+ 
+-		if rule.PathExcept != "" {
+-			parsedRule.pathExcept = regexp.MustCompile(fsutils.NormalizePathInRegex(rule.PathExcept))
+-		}
++type ExcludeRulesCaseSensitive struct {
++	*ExcludeRules
++}
+ 
+-		parsedRules = append(parsedRules, parsedRule)
++func NewExcludeRulesCaseSensitive(rules []ExcludeRule, files *fsutils.Files, log logutils.Log) *ExcludeRulesCaseSensitive {
++	r := &ExcludeRules{
++		files: files,
++		log:   log,
+ 	}
++	r.rules = createRules(rules, "")
+ 
+-	return parsedRules
++	return &ExcludeRulesCaseSensitive{r}
+ }
++
++func (ExcludeRulesCaseSensitive) Name() string { return "exclude-rules-case-sensitive" }
++
++var _ Processor = ExcludeCaseSensitive{}
+diff --git a/pkg/result/processors/exclude_rules_test.go b/pkg/result/processors/exclude_rules_test.go
+index 96f6788e..247cb320 100644
+--- a/pkg/result/processors/exclude_rules_test.go
++++ b/pkg/result/processors/exclude_rules_test.go
+@@ -11,11 +11,11 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+-func TestExcludeRules_multiple(t *testing.T) {
++func TestExcludeRulesMultiple(t *testing.T) {
+ 	lineCache := fsutils.NewLineCache(fsutils.NewFileCache())
+ 	files := fsutils.NewFiles(lineCache, "")
+ 
+-	opts := ExcludeRulesOptions{Rules: []ExcludeRule{
++	p := NewExcludeRules([]ExcludeRule{
+ 		{
+ 			BaseRule: BaseRule{
+ 				Text:    "^exclude$",
+@@ -46,9 +46,7 @@ func TestExcludeRules_multiple(t *testing.T) {
+ 				Linters: []string{"lll"},
+ 			},
+ 		},
+-	}}
+-
+-	p := NewExcludeRules(nil, files, opts)
++	}, files, nil)
+ 
+ 	//nolint:dupl
+ 	cases := []issueTestCase{
+@@ -62,14 +60,11 @@ func TestExcludeRules_multiple(t *testing.T) {
+ 		{Path: "e_test.go", Text: "nontestonly", Linter: "linter"},
+ 		{Path: filepath.Join("testdata", "exclude_rules.go"), Line: 3, Linter: "lll"},
+ 	}
+-
+ 	var issues []result.Issue
+ 	for _, c := range cases {
+ 		issues = append(issues, newIssueFromIssueTestCase(c))
+ 	}
+-
+ 	processedIssues := process(t, p, issues...)
+-
+ 	var resultingCases []issueTestCase
+ 	for _, i := range processedIssues {
+ 		resultingCases = append(resultingCases, issueTestCase{
+@@ -79,46 +74,37 @@ func TestExcludeRules_multiple(t *testing.T) {
+ 			Line:   i.Line(),
+ 		})
+ 	}
+-
+ 	expectedCases := []issueTestCase{
+ 		{Path: "e.go", Text: "some", Linter: "linter"},
+ 		{Path: "e_Test.go", Text: "normal", Linter: "testlinter"},
+ 		{Path: "e_test.go", Text: "another", Linter: "linter"},
+ 		{Path: "e_test.go", Text: "nontestonly", Linter: "linter"},
+ 	}
+-
+ 	assert.Equal(t, expectedCases, resultingCases)
+ }
+ 
+-func TestExcludeRules_pathPrefix(t *testing.T) {
++func TestExcludeRulesPathPrefix(t *testing.T) {
+ 	lineCache := fsutils.NewLineCache(fsutils.NewFileCache())
+ 	pathPrefix := path.Join("some", "dir")
+ 	files := fsutils.NewFiles(lineCache, pathPrefix)
+ 
+-	opts := ExcludeRulesOptions{
+-		Rules: []ExcludeRule{
+-			{
+-				BaseRule: BaseRule{
+-					Path: `some/dir/e\.go`,
+-				},
++	p := NewExcludeRules([]ExcludeRule{
++		{
++			BaseRule: BaseRule{
++				Path: `some/dir/e\.go`,
+ 			},
+ 		},
+-	}
+-
+-	p := NewExcludeRules(nil, files, opts)
++	}, files, nil)
+ 
+ 	cases := []issueTestCase{
+ 		{Path: "e.go"},
+ 		{Path: "other.go"},
+ 	}
+-
+ 	var issues []result.Issue
+ 	for _, c := range cases {
+ 		issues = append(issues, newIssueFromIssueTestCase(c))
+ 	}
+-
+ 	processedIssues := process(t, p, issues...)
+-
+ 	var resultingCases []issueTestCase
+ 	for _, i := range processedIssues {
+ 		resultingCases = append(resultingCases, issueTestCase{
+@@ -128,28 +114,21 @@ func TestExcludeRules_pathPrefix(t *testing.T) {
+ 			Line:   i.Line(),
+ 		})
+ 	}
+-
+ 	expectedCases := []issueTestCase{
+ 		{Path: "other.go"},
+ 	}
+-
+ 	assert.Equal(t, expectedCases, resultingCases)
+ }
+ 
+-func TestExcludeRules_text(t *testing.T) {
+-	opts := ExcludeRulesOptions{
+-		Rules: []ExcludeRule{
+-			{
+-				BaseRule: BaseRule{
+-					Text:    "^exclude$",
+-					Linters: []string{"linter"},
+-				},
++func TestExcludeRulesText(t *testing.T) {
++	p := NewExcludeRules([]ExcludeRule{
++		{
++			BaseRule: BaseRule{
++				Text:    "^exclude$",
++				Linters: []string{"linter"},
+ 			},
+ 		},
+-	}
+-
+-	p := NewExcludeRules(nil, nil, opts)
+-
++	}, nil, nil)
+ 	texts := []string{"excLude", "1", "", "exclud", "notexclude"}
+ 	var issues []result.Issue
+ 	for _, t := range texts {
+@@ -166,49 +145,42 @@ func TestExcludeRules_text(t *testing.T) {
+ 	for _, i := range processedIssues {
+ 		processedTexts = append(processedTexts, i.Text)
+ 	}
+-
+ 	assert.Equal(t, texts[1:], processedTexts)
+ }
+ 
+-func TestExcludeRules_empty(t *testing.T) {
+-	processAssertSame(t, NewExcludeRules(nil, nil, ExcludeRulesOptions{}), newIssueFromTextTestCase("test"))
++func TestExcludeRulesEmpty(t *testing.T) {
++	processAssertSame(t, NewExcludeRules(nil, nil, nil), newIssueFromTextTestCase("test"))
+ }
+ 
+-func TestExcludeRules_caseSensitive_multiple(t *testing.T) {
++func TestExcludeRulesCaseSensitiveMultiple(t *testing.T) {
+ 	lineCache := fsutils.NewLineCache(fsutils.NewFileCache())
+ 	files := fsutils.NewFiles(lineCache, "")
+-
+-	opts := ExcludeRulesOptions{
+-		CaseSensitive: true,
+-		Rules: []ExcludeRule{
+-			{
+-				BaseRule: BaseRule{
+-					Text:    "^exclude$",
+-					Linters: []string{"linter"},
+-				},
++	p := NewExcludeRulesCaseSensitive([]ExcludeRule{
++		{
++			BaseRule: BaseRule{
++				Text:    "^exclude$",
++				Linters: []string{"linter"},
+ 			},
+-			{
+-				BaseRule: BaseRule{
+-					Linters: []string{"testlinter"},
+-					Path:    `_test\.go`,
+-				},
++		},
++		{
++			BaseRule: BaseRule{
++				Linters: []string{"testlinter"},
++				Path:    `_test\.go`,
+ 			},
+-			{
+-				BaseRule: BaseRule{
+-					Text: "^testonly$",
+-					Path: `_test\.go`,
+-				},
++		},
++		{
++			BaseRule: BaseRule{
++				Text: "^testonly$",
++				Path: `_test\.go`,
+ 			},
+-			{
+-				BaseRule: BaseRule{
+-					Source:  "^//go:generate ",
+-					Linters: []string{"lll"},
+-				},
++		},
++		{
++			BaseRule: BaseRule{
++				Source:  "^//go:generate ",
++				Linters: []string{"lll"},
+ 			},
+ 		},
+-	}
+-
+-	p := NewExcludeRules(nil, files, opts)
++	}, files, nil)
+ 
+ 	//nolint:dupl
+ 	cases := []issueTestCase{
+@@ -222,14 +194,11 @@ func TestExcludeRules_caseSensitive_multiple(t *testing.T) {
+ 		{Path: "e_test.go", Text: "testOnly", Linter: "linter"},
+ 		{Path: filepath.Join("testdata", "exclude_rules_case_sensitive.go"), Line: 3, Linter: "lll"},
+ 	}
+-
+ 	var issues []result.Issue
+ 	for _, c := range cases {
+ 		issues = append(issues, newIssueFromIssueTestCase(c))
+ 	}
+-
+ 	processedIssues := process(t, p, issues...)
+-
+ 	var resultingCases []issueTestCase
+ 	for _, i := range processedIssues {
+ 		resultingCases = append(resultingCases, issueTestCase{
+@@ -239,7 +208,6 @@ func TestExcludeRules_caseSensitive_multiple(t *testing.T) {
+ 			Line:   i.Line(),
+ 		})
+ 	}
+-
+ 	expectedCases := []issueTestCase{
+ 		{Path: "e.go", Text: "excLude", Linter: "linter"},
+ 		{Path: "e.go", Text: "some", Linter: "linter"},
+@@ -248,27 +216,19 @@ func TestExcludeRules_caseSensitive_multiple(t *testing.T) {
+ 		{Path: "e_test.go", Text: "testOnly", Linter: "linter"},
+ 		{Path: filepath.Join("testdata", "exclude_rules_case_sensitive.go"), Line: 3, Linter: "lll"},
+ 	}
+-
+ 	assert.Equal(t, expectedCases, resultingCases)
+ }
+ 
+-func TestExcludeRules_caseSensitive_text(t *testing.T) {
+-	opts := ExcludeRulesOptions{
+-		CaseSensitive: true,
+-		Rules: []ExcludeRule{
+-			{
+-				BaseRule: BaseRule{
+-					Text:    "^exclude$",
+-					Linters: []string{"linter"},
+-				},
++func TestExcludeRulesCaseSensitiveText(t *testing.T) {
++	p := NewExcludeRulesCaseSensitive([]ExcludeRule{
++		{
++			BaseRule: BaseRule{
++				Text:    "^exclude$",
++				Linters: []string{"linter"},
+ 			},
+ 		},
+-	}
+-
+-	p := NewExcludeRules(nil, nil, opts)
+-
++	}, nil, nil)
+ 	texts := []string{"exclude", "excLude", "1", "", "exclud", "notexclude"}
+-
+ 	var issues []result.Issue
+ 	for _, t := range texts {
+ 		issues = append(issues, result.Issue{
+@@ -284,10 +244,9 @@ func TestExcludeRules_caseSensitive_text(t *testing.T) {
+ 	for _, i := range processedIssues {
+ 		processedTexts = append(processedTexts, i.Text)
+ 	}
+-
+ 	assert.Equal(t, texts[1:], processedTexts)
+ }
+ 
+-func TestExcludeRules_caseSensitive_empty(t *testing.T) {
+-	processAssertSame(t, NewExcludeRules(nil, nil, ExcludeRulesOptions{CaseSensitive: true}), newIssueFromTextTestCase("test"))
++func TestExcludeRulesCaseSensitiveEmpty(t *testing.T) {
++	processAssertSame(t, NewExcludeRulesCaseSensitive(nil, nil, nil), newIssueFromTextTestCase("test"))
+ }
+diff --git a/pkg/result/processors/exclude_test.go b/pkg/result/processors/exclude_test.go
+index a62f4ef5..3b92ccd7 100644
+--- a/pkg/result/processors/exclude_test.go
++++ b/pkg/result/processors/exclude_test.go
+@@ -9,10 +9,8 @@ import (
+ )
+ 
+ func TestExclude(t *testing.T) {
+-	p := NewExclude(ExcludeOptions{Pattern: "^exclude$"})
+-
++	p := NewExclude("^exclude$")
+ 	texts := []string{"excLude", "1", "", "exclud", "notexclude"}
+-
+ 	var issues []result.Issue
+ 	for _, t := range texts {
+ 		issues = append(issues, newIssueFromTextTestCase(t))
+@@ -25,19 +23,16 @@ func TestExclude(t *testing.T) {
+ 	for _, i := range processedIssues {
+ 		processedTexts = append(processedTexts, i.Text)
+ 	}
+-
+ 	assert.Equal(t, texts[1:], processedTexts)
+ }
+ 
+-func TestExclude_empty(t *testing.T) {
+-	processAssertSame(t, NewExclude(ExcludeOptions{}), newIssueFromTextTestCase("test"))
++func TestNoExclude(t *testing.T) {
++	processAssertSame(t, NewExclude(""), newIssueFromTextTestCase("test"))
+ }
+ 
+-func TestExclude_caseSensitive(t *testing.T) {
+-	p := NewExclude(ExcludeOptions{Pattern: "^exclude$", CaseSensitive: true})
+-
++func TestExcludeCaseSensitive(t *testing.T) {
++	p := NewExcludeCaseSensitive("^exclude$")
+ 	texts := []string{"excLude", "1", "", "exclud", "exclude"}
+-
+ 	var issues []result.Issue
+ 	for _, t := range texts {
+ 		issues = append(issues, newIssueFromTextTestCase(t))
+@@ -50,6 +45,5 @@ func TestExclude_caseSensitive(t *testing.T) {
+ 	for _, i := range processedIssues {
+ 		processedTexts = append(processedTexts, i.Text)
+ 	}
+-
+ 	assert.Equal(t, texts[:len(texts)-1], processedTexts)
+ }
+diff --git a/pkg/result/processors/severity.go b/pkg/result/processors/severity.go
+index 2a21e9e5..fdbbe322 100644
+--- a/pkg/result/processors/severity.go
++++ b/pkg/result/processors/severity.go
+@@ -48,7 +48,7 @@ func NewSeverity(log logutils.Log, files *fsutils.Files, opts SeverityOptions) *
+ 		override:        opts.Override,
+ 	}
+ 
+-	prefix := caseInsensitivePrefix
++	prefix := "(?i)"
+ 	if opts.CaseSensitive {
+ 		prefix = ""
+ 		p.name = "severity-rules-case-sensitive"

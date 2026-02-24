@@ -1,0 +1,423 @@
+diff --git a/README.md b/README.md
+index 092e91f..2737e9a 100644
+--- a/README.md
++++ b/README.md
+@@ -252,11 +252,6 @@ func main() {
+ 		c.String(http.StatusOK, message)
+ 	})
+ 
+-	// For each matched request Context will hold the route definition
+-	router.POST("/user/:name/*action", func(c *gin.Context) {
+-		c.FullPath() == "/user/:name/*action" // true
+-	})
+-
+ 	router.Run(":8080")
+ }
+ ```
+diff --git a/context.go b/context.go
+index 425b627..a3a7bc4 100644
+--- a/context.go
++++ b/context.go
+@@ -48,7 +48,6 @@ type Context struct {
+ 	Params   Params
+ 	handlers HandlersChain
+ 	index    int8
+-	fullPath string
+ 
+ 	engine *Engine
+ 
+@@ -71,7 +70,6 @@ func (c *Context) reset() {
+ 	c.Params = c.Params[0:0]
+ 	c.handlers = nil
+ 	c.index = -1
+-	c.fullPath = ""
+ 	c.Keys = nil
+ 	c.Errors = c.Errors[0:0]
+ 	c.Accepted = nil
+@@ -113,15 +111,6 @@ func (c *Context) Handler() HandlerFunc {
+ 	return c.handlers.Last()
+ }
+ 
+-// FullPath returns a matched route full path. For not found routes
+-// returns an empty string.
+-//     router.GET("/user/:id", func(c *gin.Context) {
+-//         c.FullPath() == "/user/:id" // true
+-//     })
+-func (c *Context) FullPath() string {
+-	return c.fullPath
+-}
+-
+ /************************************/
+ /*********** FLOW CONTROL ***********/
+ /************************************/
+diff --git a/gin.go b/gin.go
+index 220f040..4dbe983 100644
+--- a/gin.go
++++ b/gin.go
+@@ -252,7 +252,6 @@ func (engine *Engine) addRoute(method, path string, handlers HandlersChain) {
+ 	root := engine.trees.get(method)
+ 	if root == nil {
+ 		root = new(node)
+-		root.fullPath = "/"
+ 		engine.trees = append(engine.trees, methodTree{method: method, root: root})
+ 	}
+ 	root.addRoute(path, handlers)
+@@ -383,17 +382,16 @@ func (engine *Engine) handleHTTPRequest(c *Context) {
+ 		}
+ 		root := t[i].root
+ 		// Find route in tree
+-		value := root.getValue(rPath, c.Params, unescape)
+-		if value.handlers != nil {
+-			c.handlers = value.handlers
+-			c.Params = value.params
+-			c.fullPath = value.fullPath
++		handlers, params, tsr := root.getValue(rPath, c.Params, unescape)
++		if handlers != nil {
++			c.handlers = handlers
++			c.Params = params
+ 			c.Next()
+ 			c.writermem.WriteHeaderNow()
+ 			return
+ 		}
+ 		if httpMethod != "CONNECT" && rPath != "/" {
+-			if value.tsr && engine.RedirectTrailingSlash {
++			if tsr && engine.RedirectTrailingSlash {
+ 				redirectTrailingSlash(c)
+ 				return
+ 			}
+@@ -409,7 +407,7 @@ func (engine *Engine) handleHTTPRequest(c *Context) {
+ 			if tree.method == httpMethod {
+ 				continue
+ 			}
+-			if value := tree.root.getValue(rPath, nil, unescape); value.handlers != nil {
++			if handlers, _, _ := tree.root.getValue(rPath, nil, unescape); handlers != nil {
+ 				c.handlers = engine.allNoMethod
+ 				serveError(c, http.StatusMethodNotAllowed, default405Body)
+ 				return
+diff --git a/routes_test.go b/routes_test.go
+index 457c923..e16c137 100644
+--- a/routes_test.go
++++ b/routes_test.go
+@@ -554,38 +554,3 @@ func TestRouteServeErrorWithWriteHeader(t *testing.T) {
+ 	assert.Equal(t, 421, w.Code)
+ 	assert.Equal(t, 0, w.Body.Len())
+ }
+-
+-func TestRouteContextHoldsFullPath(t *testing.T) {
+-	router := New()
+-
+-	// Test routes
+-	routes := []string{
+-		"/",
+-		"/simple",
+-		"/project/:name",
+-		"/project/:name/build/*params",
+-	}
+-
+-	for _, route := range routes {
+-		actualRoute := route
+-		router.GET(route, func(c *Context) {
+-			// For each defined route context should contain its full path
+-			assert.Equal(t, actualRoute, c.FullPath())
+-			c.AbortWithStatus(http.StatusOK)
+-		})
+-	}
+-
+-	for _, route := range routes {
+-		w := performRequest(router, "GET", route)
+-		assert.Equal(t, http.StatusOK, w.Code)
+-	}
+-
+-	// Test not found
+-	router.Use(func(c *Context) {
+-		// For not found routes full path is empty
+-		assert.Equal(t, "", c.FullPath())
+-	})
+-
+-	w := performRequest(router, "GET", "/not-found")
+-	assert.Equal(t, http.StatusNotFound, w.Code)
+-}
+diff --git a/tree.go b/tree.go
+index 9a789f2..07d6b4b 100644
+--- a/tree.go
++++ b/tree.go
+@@ -94,7 +94,6 @@ type node struct {
+ 	nType     nodeType
+ 	maxParams uint8
+ 	wildChild bool
+-	fullPath  string
+ }
+ 
+ // increments priority of the given child and reorders if necessary.
+@@ -155,7 +154,6 @@ func (n *node) addRoute(path string, handlers HandlersChain) {
+ 					children:  n.children,
+ 					handlers:  n.handlers,
+ 					priority:  n.priority - 1,
+-					fullPath:  fullPath,
+ 				}
+ 
+ 				// Update maxParams (max of all children)
+@@ -231,7 +229,6 @@ func (n *node) addRoute(path string, handlers HandlersChain) {
+ 					n.indices += string([]byte{c})
+ 					child := &node{
+ 						maxParams: numParams,
+-						fullPath:  fullPath,
+ 					}
+ 					n.children = append(n.children, child)
+ 					n.incrementChildPrio(len(n.indices) - 1)
+@@ -299,7 +296,6 @@ func (n *node) insertChild(numParams uint8, path string, fullPath string, handle
+ 			child := &node{
+ 				nType:     param,
+ 				maxParams: numParams,
+-				fullPath:  fullPath,
+ 			}
+ 			n.children = []*node{child}
+ 			n.wildChild = true
+@@ -316,7 +312,6 @@ func (n *node) insertChild(numParams uint8, path string, fullPath string, handle
+ 				child := &node{
+ 					maxParams: numParams,
+ 					priority:  1,
+-					fullPath:  fullPath,
+ 				}
+ 				n.children = []*node{child}
+ 				n = child
+@@ -344,7 +339,6 @@ func (n *node) insertChild(numParams uint8, path string, fullPath string, handle
+ 				wildChild: true,
+ 				nType:     catchAll,
+ 				maxParams: 1,
+-				fullPath:  fullPath,
+ 			}
+ 			n.children = []*node{child}
+ 			n.indices = string(path[i])
+@@ -358,7 +352,6 @@ func (n *node) insertChild(numParams uint8, path string, fullPath string, handle
+ 				maxParams: 1,
+ 				handlers:  handlers,
+ 				priority:  1,
+-				fullPath:  fullPath,
+ 			}
+ 			n.children = []*node{child}
+ 
+@@ -371,21 +364,13 @@ func (n *node) insertChild(numParams uint8, path string, fullPath string, handle
+ 	n.handlers = handlers
+ }
+ 
+-// nodeValue holds return values of (*Node).getValue method
+-type nodeValue struct {
+-	handlers HandlersChain
+-	params   Params
+-	tsr      bool
+-	fullPath string
+-}
+-
+ // getValue returns the handle registered with the given path (key). The values of
+ // wildcards are saved to a map.
+ // If no handle can be found, a TSR (trailing slash redirect) recommendation is
+ // made if a handle exists with an extra (without the) trailing slash for the
+ // given path.
+-func (n *node) getValue(path string, po Params, unescape bool) (value nodeValue) {
+-	value.params = po
++func (n *node) getValue(path string, po Params, unescape bool) (handlers HandlersChain, p Params, tsr bool) {
++	p = po
+ walk: // Outer loop for walking the tree
+ 	for {
+ 		if len(path) > len(n.path) {
+@@ -406,7 +391,7 @@ walk: // Outer loop for walking the tree
+ 					// Nothing found.
+ 					// We can recommend to redirect to the same URL without a
+ 					// trailing slash if a leaf exists for that path.
+-					value.tsr = path == "/" && n.handlers != nil
++					tsr = path == "/" && n.handlers != nil
+ 					return
+ 				}
+ 
+@@ -421,20 +406,20 @@ walk: // Outer loop for walking the tree
+ 					}
+ 
+ 					// save param value
+-					if cap(value.params) < int(n.maxParams) {
+-						value.params = make(Params, 0, n.maxParams)
++					if cap(p) < int(n.maxParams) {
++						p = make(Params, 0, n.maxParams)
+ 					}
+-					i := len(value.params)
+-					value.params = value.params[:i+1] // expand slice within preallocated capacity
+-					value.params[i].Key = n.path[1:]
++					i := len(p)
++					p = p[:i+1] // expand slice within preallocated capacity
++					p[i].Key = n.path[1:]
+ 					val := path[:end]
+ 					if unescape {
+ 						var err error
+-						if value.params[i].Value, err = url.QueryUnescape(val); err != nil {
+-							value.params[i].Value = val // fallback, in case of error
++						if p[i].Value, err = url.QueryUnescape(val); err != nil {
++							p[i].Value = val // fallback, in case of error
+ 						}
+ 					} else {
+-						value.params[i].Value = val
++						p[i].Value = val
+ 					}
+ 
+ 					// we need to go deeper!
+@@ -446,42 +431,40 @@ walk: // Outer loop for walking the tree
+ 						}
+ 
+ 						// ... but we can't
+-						value.tsr = len(path) == end+1
++						tsr = len(path) == end+1
+ 						return
+ 					}
+ 
+-					if value.handlers = n.handlers; value.handlers != nil {
+-						value.fullPath = n.fullPath
++					if handlers = n.handlers; handlers != nil {
+ 						return
+ 					}
+ 					if len(n.children) == 1 {
+ 						// No handle found. Check if a handle for this path + a
+ 						// trailing slash exists for TSR recommendation
+ 						n = n.children[0]
+-						value.tsr = n.path == "/" && n.handlers != nil
++						tsr = n.path == "/" && n.handlers != nil
+ 					}
+ 
+ 					return
+ 
+ 				case catchAll:
+ 					// save param value
+-					if cap(value.params) < int(n.maxParams) {
+-						value.params = make(Params, 0, n.maxParams)
++					if cap(p) < int(n.maxParams) {
++						p = make(Params, 0, n.maxParams)
+ 					}
+-					i := len(value.params)
+-					value.params = value.params[:i+1] // expand slice within preallocated capacity
+-					value.params[i].Key = n.path[2:]
++					i := len(p)
++					p = p[:i+1] // expand slice within preallocated capacity
++					p[i].Key = n.path[2:]
+ 					if unescape {
+ 						var err error
+-						if value.params[i].Value, err = url.QueryUnescape(path); err != nil {
+-							value.params[i].Value = path // fallback, in case of error
++						if p[i].Value, err = url.QueryUnescape(path); err != nil {
++							p[i].Value = path // fallback, in case of error
+ 						}
+ 					} else {
+-						value.params[i].Value = path
++						p[i].Value = path
+ 					}
+ 
+-					value.handlers = n.handlers
+-					value.fullPath = n.fullPath
++					handlers = n.handlers
+ 					return
+ 
+ 				default:
+@@ -491,13 +474,12 @@ walk: // Outer loop for walking the tree
+ 		} else if path == n.path {
+ 			// We should have reached the node containing the handle.
+ 			// Check if this node has a handle registered.
+-			if value.handlers = n.handlers; value.handlers != nil {
+-				value.fullPath = n.fullPath
++			if handlers = n.handlers; handlers != nil {
+ 				return
+ 			}
+ 
+ 			if path == "/" && n.wildChild && n.nType != root {
+-				value.tsr = true
++				tsr = true
+ 				return
+ 			}
+ 
+@@ -506,7 +488,7 @@ walk: // Outer loop for walking the tree
+ 			for i := 0; i < len(n.indices); i++ {
+ 				if n.indices[i] == '/' {
+ 					n = n.children[i]
+-					value.tsr = (len(n.path) == 1 && n.handlers != nil) ||
++					tsr = (len(n.path) == 1 && n.handlers != nil) ||
+ 						(n.nType == catchAll && n.children[0].handlers != nil)
+ 					return
+ 				}
+@@ -517,7 +499,7 @@ walk: // Outer loop for walking the tree
+ 
+ 		// Nothing found. We can recommend to redirect to the same URL with an
+ 		// extra trailing slash if a leaf exists for that path
+-		value.tsr = (path == "/") ||
++		tsr = (path == "/") ||
+ 			(len(n.path) == len(path)+1 && n.path[len(path)] == '/' &&
+ 				path == n.path[:len(n.path)-1] && n.handlers != nil)
+ 		return
+diff --git a/tree_test.go b/tree_test.go
+index e6e2886..dbb0352 100644
+--- a/tree_test.go
++++ b/tree_test.go
+@@ -35,22 +35,22 @@ func checkRequests(t *testing.T, tree *node, requests testRequests, unescapes ..
+ 	}
+ 
+ 	for _, request := range requests {
+-		value := tree.getValue(request.path, nil, unescape)
++		handler, ps, _ := tree.getValue(request.path, nil, unescape)
+ 
+-		if value.handlers == nil {
++		if handler == nil {
+ 			if !request.nilHandler {
+ 				t.Errorf("handle mismatch for route '%s': Expected non-nil handle", request.path)
+ 			}
+ 		} else if request.nilHandler {
+ 			t.Errorf("handle mismatch for route '%s': Expected nil handle", request.path)
+ 		} else {
+-			value.handlers[0](nil)
++			handler[0](nil)
+ 			if fakeHandlerValue != request.route {
+ 				t.Errorf("handle mismatch for route '%s': Wrong handle (%s != %s)", request.path, fakeHandlerValue, request.route)
+ 			}
+ 		}
+ 
+-		if !reflect.DeepEqual(value.params, request.ps) {
++		if !reflect.DeepEqual(ps, request.ps) {
+ 			t.Errorf("Params mismatch for route '%s'", request.path)
+ 		}
+ 	}
+@@ -454,10 +454,10 @@ func TestTreeTrailingSlashRedirect(t *testing.T) {
+ 		"/doc/",
+ 	}
+ 	for _, route := range tsrRoutes {
+-		value := tree.getValue(route, nil, false)
+-		if value.handlers != nil {
++		handler, _, tsr := tree.getValue(route, nil, false)
++		if handler != nil {
+ 			t.Fatalf("non-nil handler for TSR route '%s", route)
+-		} else if !value.tsr {
++		} else if !tsr {
+ 			t.Errorf("expected TSR recommendation for route '%s'", route)
+ 		}
+ 	}
+@@ -471,10 +471,10 @@ func TestTreeTrailingSlashRedirect(t *testing.T) {
+ 		"/api/world/abc",
+ 	}
+ 	for _, route := range noTsrRoutes {
+-		value := tree.getValue(route, nil, false)
+-		if value.handlers != nil {
++		handler, _, tsr := tree.getValue(route, nil, false)
++		if handler != nil {
+ 			t.Fatalf("non-nil handler for No-TSR route '%s", route)
+-		} else if value.tsr {
++		} else if tsr {
+ 			t.Errorf("expected no TSR recommendation for route '%s'", route)
+ 		}
+ 	}
+@@ -490,10 +490,10 @@ func TestTreeRootTrailingSlashRedirect(t *testing.T) {
+ 		t.Fatalf("panic inserting test route: %v", recv)
+ 	}
+ 
+-	value := tree.getValue("/", nil, false)
+-	if value.handlers != nil {
++	handler, _, tsr := tree.getValue("/", nil, false)
++	if handler != nil {
+ 		t.Fatalf("non-nil handler")
+-	} else if value.tsr {
++	} else if tsr {
+ 		t.Errorf("expected no TSR recommendation")
+ 	}
+ }

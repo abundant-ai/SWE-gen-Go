@@ -1,0 +1,247 @@
+diff --git a/.golangci.next.reference.yml b/.golangci.next.reference.yml
+index db04d57e..361b92c2 100644
+--- a/.golangci.next.reference.yml
++++ b/.golangci.next.reference.yml
+@@ -71,7 +71,6 @@ output:
+   # - `junit-xml`
+   # - `github-actions`
+   # - `teamcity`
+-  # - `sarif`
+   # Output path can be either `stdout`, `stderr` or path to the file to write to.
+   #
+   # For the CLI flag (`--out-format`), multiple formats can be specified by separating them by comma.
+diff --git a/jsonschema/golangci.next.jsonschema.json b/jsonschema/golangci.next.jsonschema.json
+index ff0e6f4d..5b008275 100644
+--- a/jsonschema/golangci.next.jsonschema.json
++++ b/jsonschema/golangci.next.jsonschema.json
+@@ -432,8 +432,7 @@
+                   "code-climate",
+                   "junit-xml",
+                   "github-actions",
+-                  "teamcity",
+-                  "sarif"
++                  "teamcity"
+                 ]
+               }
+             },
+diff --git a/pkg/config/output.go b/pkg/config/output.go
+index 19d30694..a005213c 100644
+--- a/pkg/config/output.go
++++ b/pkg/config/output.go
+@@ -19,7 +19,6 @@ const (
+ 	OutFormatJunitXML          = "junit-xml"
+ 	OutFormatGithubActions     = "github-actions"
+ 	OutFormatTeamCity          = "teamcity"
+-	OutFormatSarif             = "sarif"
+ )
+ 
+ var AllOutputFormats = []string{
+@@ -34,7 +33,6 @@ var AllOutputFormats = []string{
+ 	OutFormatJunitXML,
+ 	OutFormatGithubActions,
+ 	OutFormatTeamCity,
+-	OutFormatSarif,
+ }
+ 
+ type Output struct {
+diff --git a/pkg/printers/printer.go b/pkg/printers/printer.go
+index 53db0122..d2944340 100644
+--- a/pkg/printers/printer.go
++++ b/pkg/printers/printer.go
+@@ -135,8 +135,6 @@ func (c *Printer) createPrinter(format string, w io.Writer) (issuePrinter, error
+ 		p = NewGitHubAction(w)
+ 	case config.OutFormatTeamCity:
+ 		p = NewTeamCity(w)
+-	case config.OutFormatSarif:
+-		p = NewSarif(w)
+ 	default:
+ 		return nil, fmt.Errorf("unknown output format %q", format)
+ 	}
+diff --git a/pkg/printers/sarif.go b/pkg/printers/sarif.go
+deleted file mode 100644
+index 378ee008..00000000
+--- a/pkg/printers/sarif.go
++++ /dev/null
+@@ -1,109 +0,0 @@
+-package printers
+-
+-import (
+-	"encoding/json"
+-	"io"
+-
+-	"github.com/golangci/golangci-lint/pkg/result"
+-)
+-
+-const (
+-	sarifVersion   = "2.1.0"
+-	sarifSchemaURI = "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.6.json"
+-)
+-
+-type SarifOutput struct {
+-	Version string     `json:"version"`
+-	Schema  string     `json:"$schema"`
+-	Runs    []sarifRun `json:"runs"`
+-}
+-
+-type sarifRun struct {
+-	Tool    sarifTool     `json:"tool"`
+-	Results []sarifResult `json:"results"`
+-}
+-
+-type sarifTool struct {
+-	Driver struct {
+-		Name string `json:"name"`
+-	} `json:"driver"`
+-}
+-
+-type sarifResult struct {
+-	RuleID    string          `json:"ruleId"`
+-	Level     string          `json:"level"`
+-	Message   sarifMessage    `json:"message"`
+-	Locations []sarifLocation `json:"locations"`
+-}
+-
+-type sarifMessage struct {
+-	Text string `json:"text"`
+-}
+-
+-type sarifLocation struct {
+-	PhysicalLocation sarifPhysicalLocation `json:"physicalLocation"`
+-}
+-
+-type sarifPhysicalLocation struct {
+-	ArtifactLocation sarifArtifactLocation `json:"artifactLocation"`
+-	Region           sarifRegion           `json:"region"`
+-}
+-
+-type sarifArtifactLocation struct {
+-	URI   string `json:"uri"`
+-	Index int    `json:"index"`
+-}
+-
+-type sarifRegion struct {
+-	StartLine   int `json:"startLine"`
+-	StartColumn int `json:"startColumn"`
+-}
+-
+-type Sarif struct {
+-	w io.Writer
+-}
+-
+-func NewSarif(w io.Writer) *Sarif {
+-	return &Sarif{w: w}
+-}
+-
+-func (p Sarif) Print(issues []result.Issue) error {
+-	run := sarifRun{}
+-	run.Tool.Driver.Name = "golangci-lint"
+-
+-	for i := range issues {
+-		issue := issues[i]
+-
+-		severity := issue.Severity
+-		if severity == "" {
+-			severity = "error"
+-		}
+-
+-		sr := sarifResult{
+-			RuleID:  issue.FromLinter,
+-			Level:   severity,
+-			Message: sarifMessage{Text: issue.Text},
+-			Locations: []sarifLocation{
+-				{
+-					PhysicalLocation: sarifPhysicalLocation{
+-						ArtifactLocation: sarifArtifactLocation{URI: issue.FilePath()},
+-						Region: sarifRegion{
+-							StartLine:   issue.Line(),
+-							StartColumn: issue.Column(),
+-						},
+-					},
+-				},
+-			},
+-		}
+-
+-		run.Results = append(run.Results, sr)
+-	}
+-
+-	output := SarifOutput{
+-		Version: sarifVersion,
+-		Schema:  sarifSchemaURI,
+-		Runs:    []sarifRun{run},
+-	}
+-
+-	return json.NewEncoder(p.w).Encode(output)
+-}
+diff --git a/pkg/printers/sarif_test.go b/pkg/printers/sarif_test.go
+deleted file mode 100644
+index 7ebda121..00000000
+--- a/pkg/printers/sarif_test.go
++++ /dev/null
+@@ -1,67 +0,0 @@
+-package printers
+-
+-import (
+-	"bytes"
+-	"go/token"
+-	"testing"
+-
+-	"github.com/stretchr/testify/assert"
+-	"github.com/stretchr/testify/require"
+-
+-	"github.com/golangci/golangci-lint/pkg/result"
+-)
+-
+-func TestSarif_Print(t *testing.T) {
+-	issues := []result.Issue{
+-		{
+-			FromLinter: "linter-a",
+-			Severity:   "warning",
+-			Text:       "some issue",
+-			Pos: token.Position{
+-				Filename: "path/to/filea.go",
+-				Offset:   2,
+-				Line:     10,
+-				Column:   4,
+-			},
+-		},
+-		{
+-			FromLinter: "linter-b",
+-			Severity:   "error",
+-			Text:       "another issue",
+-			SourceLines: []string{
+-				"func foo() {",
+-				"\tfmt.Println(\"bar\")",
+-				"}",
+-			},
+-			Pos: token.Position{
+-				Filename: "path/to/fileb.go",
+-				Offset:   5,
+-				Line:     300,
+-				Column:   9,
+-			},
+-		},
+-		{
+-			FromLinter: "linter-a",
+-			Severity:   "error",
+-			Text:       "some issue 2",
+-			Pos: token.Position{
+-				Filename: "path/to/filec.go",
+-				Offset:   3,
+-				Line:     11,
+-				Column:   5,
+-			},
+-		},
+-	}
+-
+-	buf := new(bytes.Buffer)
+-
+-	printer := NewSarif(buf)
+-
+-	err := printer.Print(issues)
+-	require.NoError(t, err)
+-
+-	expected := `{"version":"2.1.0","$schema":"https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.6.json","runs":[{"tool":{"driver":{"name":"golangci-lint"}},"results":[{"ruleId":"linter-a","level":"warning","message":{"text":"some issue"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"path/to/filea.go","index":0},"region":{"startLine":10,"startColumn":4}}}]},{"ruleId":"linter-b","level":"error","message":{"text":"another issue"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"path/to/fileb.go","index":0},"region":{"startLine":300,"startColumn":9}}}]},{"ruleId":"linter-a","level":"error","message":{"text":"some issue 2"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"path/to/filec.go","index":0},"region":{"startLine":11,"startColumn":5}}}]}]}]}
+-`
+-
+-	assert.Equal(t, expected, buf.String())
+-}

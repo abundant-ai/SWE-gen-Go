@@ -1,0 +1,234 @@
+diff --git a/internal/command/jsonstate/state.go b/internal/command/jsonstate/state.go
+index a29e0ebba5..ca98e98bae 100644
+--- a/internal/command/jsonstate/state.go
++++ b/internal/command/jsonstate/state.go
+@@ -620,6 +620,7 @@ func SensitiveAsBool(val cty.Value) cty.Value {
+ func unmarkValueForMarshaling(v cty.Value) (unmarkedV cty.Value, sensitivePaths []cty.Path, err error) {
+ 	val, pvms := v.UnmarkDeepWithPaths()
+ 	sensitivePaths, otherMarks := marks.PathsWithMark(pvms, marks.Sensitive)
++	_, otherMarks = marks.PathsWithMark(otherMarks, marks.Deprecation)
+ 	if len(otherMarks) != 0 {
+ 		return cty.NilVal, nil, fmt.Errorf(
+ 			"%s: cannot serialize value marked as %#v for inclusion in a state snapshot (this is a bug in Terraform)",
+diff --git a/internal/lang/marks/marks.go b/internal/lang/marks/marks.go
+index 7ba2752d22..54850ca00d 100644
+--- a/internal/lang/marks/marks.go
++++ b/internal/lang/marks/marks.go
+@@ -17,16 +17,30 @@ func (m valueMark) GoString() string {
+ }
+ 
+ // Has returns true if and only if the cty.Value has the given mark.
+-func Has(val cty.Value, mark valueMark) bool {
+-	return val.HasMark(mark)
++func Has(val cty.Value, mark interface{}) bool {
++	switch m := mark.(type) {
++	case valueMark:
++		return val.HasMark(m)
++
++	// For value marks Has returns true if a mark of the type is present
++	case DeprecationMark:
++		for depMark := range val.Marks() {
++			if _, ok := depMark.(DeprecationMark); ok {
++				return true
++			}
++		}
++		return false
++	default:
++		panic("Unknown mark type")
++	}
+ }
+ 
+ // Contains returns true if the cty.Value or any any value within it contains
+ // the given mark.
+-func Contains(val cty.Value, mark valueMark) bool {
++func Contains(val cty.Value, mark interface{}) bool {
+ 	ret := false
+ 	cty.Walk(val, func(_ cty.Path, v cty.Value) (bool, error) {
+-		if v.HasMark(mark) {
++		if Has(v, mark) {
+ 			ret = true
+ 			return false, nil
+ 		}
+@@ -35,6 +49,33 @@ func Contains(val cty.Value, mark valueMark) bool {
+ 	return ret
+ }
+ 
++// FilterDeprecationMarks returns all deprecation marks present in the given
++// cty.ValueMarks.
++func FilterDeprecationMarks(marks cty.ValueMarks) []DeprecationMark {
++	depMarks := []DeprecationMark{}
++	for mark := range marks {
++		if d, ok := mark.(DeprecationMark); ok {
++			depMarks = append(depMarks, d)
++		}
++	}
++	return depMarks
++}
++
++// GetDeprecationMarks returns all deprecation marks present on the given
++// cty.Value.
++func GetDeprecationMarks(val cty.Value) []DeprecationMark {
++	_, marks := val.UnmarkDeep()
++	return FilterDeprecationMarks(marks)
++}
++
++// RemoveDeprecationMarks returns a copy of the given cty.Value with all
++// deprecation marks removed.
++func RemoveDeprecationMarks(val cty.Value) cty.Value {
++	newVal, pvms := val.UnmarkDeepWithPaths()
++	otherPvms := RemoveAll(pvms, Deprecation)
++	return newVal.MarkWithPaths(otherPvms)
++}
++
+ // Sensitive indicates that this value is marked as sensitive in the context of
+ // Terraform.
+ const Sensitive = valueMark("Sensitive")
+@@ -51,3 +92,22 @@ const Ephemeral = valueMark("Ephemeral")
+ // another value's type. This is part of the implementation of the console-only
+ // `type` function.
+ const TypeType = valueMark("TypeType")
++
++// DeprecationMark is a mark indicating that a value is deprecated. It is a struct
++// rather than a primitive type so that it can carry a deprecation message.
++type DeprecationMark struct {
++	Message string
++}
++
++func (d DeprecationMark) GoString() string {
++	return "marks.deprecation<" + d.Message + ">"
++}
++
++// Empty deprecation mark for usage in marks.Has / Contains / etc
++var Deprecation = NewDeprecation("")
++
++func NewDeprecation(message string) DeprecationMark {
++	return DeprecationMark{
++		Message: message,
++	}
++}
+diff --git a/internal/lang/marks/paths.go b/internal/lang/marks/paths.go
+index 0bb81ae43b..4cdcde85ed 100644
+--- a/internal/lang/marks/paths.go
++++ b/internal/lang/marks/paths.go
+@@ -4,6 +4,7 @@
+ package marks
+ 
+ import (
++	"fmt"
+ 	"sort"
+ 	"strings"
+ 
+@@ -28,16 +29,36 @@ func PathsWithMark(pvms []cty.PathValueMarks, wantMark any) (withWanted []cty.Pa
+ 	}
+ 
+ 	for _, pvm := range pvms {
+-		if _, ok := pvm.Marks[wantMark]; ok {
++		pathHasMark := false
++		pathHasOtherMarks := false
++		for mark := range pvm.Marks {
++			switch wantMark.(type) {
++			case valueMark, string:
++				if mark == wantMark {
++					pathHasMark = true
++				} else {
++					pathHasOtherMarks = true
++				}
++
++			// For data marks we check if a mark of the type exists
++			case DeprecationMark:
++				if _, ok := mark.(DeprecationMark); ok {
++					pathHasMark = true
++				} else {
++					pathHasOtherMarks = true
++				}
++
++			default:
++				panic(fmt.Sprintf("unexpected mark type %T", wantMark))
++			}
++		}
++
++		if pathHasMark {
+ 			withWanted = append(withWanted, pvm.Path)
+ 		}
+ 
+-		for mark := range pvm.Marks {
+-			if mark != wantMark {
+-				withOthers = append(withOthers, pvm)
+-				// only add a path with unwanted marks a single time
+-				break
+-			}
++		if pathHasOtherMarks {
++			withOthers = append(withOthers, pvm)
+ 		}
+ 	}
+ 
+@@ -57,7 +78,21 @@ func RemoveAll(pvms []cty.PathValueMarks, remove any) []cty.PathValueMarks {
+ 	var res []cty.PathValueMarks
+ 
+ 	for _, pvm := range pvms {
+-		delete(pvm.Marks, remove)
++		switch remove.(type) {
++		case valueMark, string:
++			delete(pvm.Marks, remove)
++
++		case DeprecationMark:
++			// We want to delete all marks of this type
++			for mark := range pvm.Marks {
++				if _, ok := mark.(DeprecationMark); ok {
++					delete(pvm.Marks, mark)
++				}
++			}
++
++		default:
++			panic(fmt.Sprintf("unexpected mark type %T", remove))
++		}
+ 		if len(pvm.Marks) > 0 {
+ 			res = append(res, pvm)
+ 		}
+diff --git a/internal/plans/changes.go b/internal/plans/changes.go
+index ca362054b7..29b5b80d39 100644
+--- a/internal/plans/changes.go
++++ b/internal/plans/changes.go
+@@ -743,6 +743,7 @@ type Change struct {
+ func (c *Change) Encode(schema *providers.Schema) (*ChangeSrc, error) {
+ 	// We can't serialize value marks directly so we'll need to extract the
+ 	// sensitive marks and store them in a separate field.
++	// We ignore Deprecation marks.
+ 	//
+ 	// We don't accept any other marks here. The caller should have dealt
+ 	// with those somehow and replaced them with unmarked placeholders before
+@@ -751,6 +752,10 @@ func (c *Change) Encode(schema *providers.Schema) (*ChangeSrc, error) {
+ 	unmarkedAfter, marksesAfter := c.After.UnmarkDeepWithPaths()
+ 	sensitiveAttrsBefore, unsupportedMarksesBefore := marks.PathsWithMark(marksesBefore, marks.Sensitive)
+ 	sensitiveAttrsAfter, unsupportedMarksesAfter := marks.PathsWithMark(marksesAfter, marks.Sensitive)
++
++	_, unsupportedMarksesBefore = marks.PathsWithMark(unsupportedMarksesBefore, marks.Deprecation)
++	_, unsupportedMarksesAfter = marks.PathsWithMark(unsupportedMarksesAfter, marks.Deprecation)
++
+ 	if len(unsupportedMarksesBefore) != 0 {
+ 		return nil, fmt.Errorf(
+ 			"prior value %s: can't serialize value marked with %#v (this is a bug in Terraform)",
+diff --git a/internal/stacks/stackplan/planned_change.go b/internal/stacks/stackplan/planned_change.go
+index 7cb8888ca9..fb458d685d 100644
+--- a/internal/stacks/stackplan/planned_change.go
++++ b/internal/stacks/stackplan/planned_change.go
+@@ -499,6 +499,7 @@ func (pc *PlannedChangeResourceInstancePlanned) ChangeDescription() (*stacks.Pla
+ func DynamicValueToTerraform1(val cty.Value, ty cty.Type) (*stacks.DynamicValue, error) {
+ 	unmarkedVal, markPaths := val.UnmarkDeepWithPaths()
+ 	sensitivePaths, withOtherMarks := marks.PathsWithMark(markPaths, marks.Sensitive)
++	_, withOtherMarks = marks.PathsWithMark(withOtherMarks, marks.Sensitive)
+ 	if len(withOtherMarks) != 0 {
+ 		return nil, withOtherMarks[0].Path.NewErrorf(
+ 			"can't serialize value marked with %#v (this is a bug in Terraform)",
+diff --git a/internal/states/instance_object.go b/internal/states/instance_object.go
+index 82a4ab1e25..f9ce435b68 100644
+--- a/internal/states/instance_object.go
++++ b/internal/states/instance_object.go
+@@ -205,6 +205,7 @@ func (o *ResourceInstanceObject) AsTainted() *ResourceInstanceObject {
+ func unmarkValueForStorage(v cty.Value) (unmarkedV cty.Value, sensitivePaths []cty.Path, err error) {
+ 	val, pvms := v.UnmarkDeepWithPaths()
+ 	sensitivePaths, withOtherMarks := marks.PathsWithMark(pvms, marks.Sensitive)
++	_, withOtherMarks = marks.PathsWithMark(withOtherMarks, marks.Deprecation)
+ 	if len(withOtherMarks) != 0 {
+ 		return cty.NilVal, nil, fmt.Errorf(
+ 			"%s: cannot serialize value marked as %#v for inclusion in a state snapshot (this is a bug in Terraform)",

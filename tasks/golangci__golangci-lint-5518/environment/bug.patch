@@ -1,0 +1,492 @@
+diff --git a/pkg/fsutils/files.go b/pkg/fsutils/files.go
+new file mode 100644
+index 00000000..4398ab9f
+--- /dev/null
++++ b/pkg/fsutils/files.go
+@@ -0,0 +1,33 @@
++package fsutils
++
++import "path/filepath"
++
++// Files combines different operations related to handling file paths and content.
++type Files struct {
++	*LineCache
++	pathPrefix string
++}
++
++func NewFiles(lc *LineCache, pathPrefix string) *Files {
++	return &Files{
++		LineCache:  lc,
++		pathPrefix: pathPrefix,
++	}
++}
++
++// WithPathPrefix takes a path that is relative to the current directory (as used in issues)
++// and adds the configured path prefix, if there is one.
++// The resulting path then can be shown to the user or compared against paths specified in the configuration.
++func (f *Files) WithPathPrefix(relativePath string) string {
++	return WithPathPrefix(f.pathPrefix, relativePath)
++}
++
++// WithPathPrefix takes a path that is relative to the current directory (as used in issues)
++// and adds the configured path prefix, if there is one.
++// The resulting path then can be shown to the user or compared against paths specified in the configuration.
++func WithPathPrefix(pathPrefix, relativePath string) string {
++	if pathPrefix == "" {
++		return relativePath
++	}
++	return filepath.Join(pathPrefix, relativePath)
++}
+diff --git a/pkg/lint/runner.go b/pkg/lint/runner.go
+index a0928a41..0795a35e 100644
+--- a/pkg/lint/runner.go
++++ b/pkg/lint/runner.go
+@@ -37,6 +37,11 @@ func NewRunner(log logutils.Log, cfg *config.Config, goenv *goutil.Env,
+ 	lineCache *fsutils.LineCache, fileCache *fsutils.FileCache,
+ 	dbManager *lintersdb.Manager, lintCtx *linter.Context,
+ ) (*Runner, error) {
++	// Beware that some processors need to add the path prefix when working with paths
++	// because they get invoked before the path prefixer (exclude and severity rules)
++	// or process other paths (skip files).
++	files := fsutils.NewFiles(lineCache, cfg.Output.PathPrefix)
++
+ 	pathRelativity, err := processors.NewPathRelativity(log, cfg.GetBasePath())
+ 	if err != nil {
+ 		return nil, fmt.Errorf("error creating path relativity processor: %w", err)
+@@ -93,7 +98,7 @@ func NewRunner(log logutils.Log, cfg *config.Config, goenv *goutil.Env,
+ 			// Must be before exclude because users see already marked output and configure excluding by it.
+ 			processors.NewIdentifierMarker(),
+ 
+-			processors.NewExclusionRules(log.Child(logutils.DebugKeyExclusionRules), lineCache,
++			processors.NewExclusionRules(log.Child(logutils.DebugKeyExclusionRules), files,
+ 				&cfg.Linters.Exclusions),
+ 
+ 			processors.NewNolintFilter(log.Child(logutils.DebugKeyNolintFilter), dbManager, enabledLinters),
+@@ -112,7 +117,7 @@ func NewRunner(log logutils.Log, cfg *config.Config, goenv *goutil.Env,
+ 			// Now we can modify the issues for output.
+ 			processors.NewSourceCode(lineCache, log.Child(logutils.DebugKeySourceCode)),
+ 			processors.NewPathShortener(),
+-			processors.NewSeverity(log.Child(logutils.DebugKeySeverityRules), lineCache, &cfg.Severity),
++			processors.NewSeverity(log.Child(logutils.DebugKeySeverityRules), files, &cfg.Severity),
+ 			processors.NewPathPrettifier(log, cfg.Output.PathPrefix),
+ 			processors.NewSortResults(&cfg.Output),
+ 		},
+diff --git a/pkg/result/processors/base_rule.go b/pkg/result/processors/base_rule.go
+index 6a6f112a..6fb15597 100644
+--- a/pkg/result/processors/base_rule.go
++++ b/pkg/result/processors/base_rule.go
+@@ -47,14 +47,14 @@ func (r *baseRule) isEmpty() bool {
+ 	return r.text == nil && r.source == nil && r.path == nil && r.pathExcept == nil && len(r.linters) == 0
+ }
+ 
+-func (r *baseRule) match(issue *result.Issue, lines *fsutils.LineCache, log logutils.Log) bool {
++func (r *baseRule) match(issue *result.Issue, files *fsutils.Files, log logutils.Log) bool {
+ 	if r.isEmpty() {
+ 		return false
+ 	}
+ 	if r.text != nil && !r.text.MatchString(issue.Text) {
+ 		return false
+ 	}
+-	if r.path != nil && !r.path.MatchString(issue.RelativePath) {
++	if r.path != nil && !r.path.MatchString(files.WithPathPrefix(issue.RelativePath)) {
+ 		return false
+ 	}
+ 	if r.pathExcept != nil && r.pathExcept.MatchString(issue.RelativePath) {
+@@ -65,7 +65,7 @@ func (r *baseRule) match(issue *result.Issue, lines *fsutils.LineCache, log logu
+ 	}
+ 
+ 	// the most heavyweight checking last
+-	if r.source != nil && !r.matchSource(issue, lines, log) {
++	if r.source != nil && !r.matchSource(issue, files.LineCache, log) {
+ 		return false
+ 	}
+ 
+diff --git a/pkg/result/processors/exclusion_rules.go b/pkg/result/processors/exclusion_rules.go
+index 7a9673ac..098b34a0 100644
+--- a/pkg/result/processors/exclusion_rules.go
++++ b/pkg/result/processors/exclusion_rules.go
+@@ -14,9 +14,8 @@ import (
+ var _ Processor = (*ExclusionRules)(nil)
+ 
+ type ExclusionRules struct {
+-	log logutils.Log
+-
+-	lines *fsutils.LineCache
++	log   logutils.Log
++	files *fsutils.Files
+ 
+ 	warnUnused     bool
+ 	skippedCounter map[string]int
+@@ -24,10 +23,11 @@ type ExclusionRules struct {
+ 	rules []excludeRule
+ }
+ 
+-func NewExclusionRules(log logutils.Log, lines *fsutils.LineCache, cfg *config.LinterExclusions) *ExclusionRules {
++func NewExclusionRules(log logutils.Log, files *fsutils.Files,
++	cfg *config.LinterExclusions) *ExclusionRules {
+ 	p := &ExclusionRules{
+ 		log:            log,
+-		lines:          lines,
++		files:          files,
+ 		warnUnused:     cfg.WarnUnused,
+ 		skippedCounter: map[string]int{},
+ 	}
+@@ -56,7 +56,7 @@ func (p *ExclusionRules) Process(issues []result.Issue) ([]result.Issue, error)
+ 
+ 	return filterIssues(issues, func(issue *result.Issue) bool {
+ 		for _, rule := range p.rules {
+-			if !rule.match(issue, p.lines, p.log) {
++			if !rule.match(issue, p.files, p.log) {
+ 				continue
+ 			}
+ 
+diff --git a/pkg/result/processors/exclusion_rules_test.go b/pkg/result/processors/exclusion_rules_test.go
+index 9e110536..512246c3 100644
+--- a/pkg/result/processors/exclusion_rules_test.go
++++ b/pkg/result/processors/exclusion_rules_test.go
+@@ -1,6 +1,7 @@
+ package processors
+ 
+ import (
++	"path"
+ 	"path/filepath"
+ 	"testing"
+ 
+@@ -12,7 +13,7 @@ import (
+ )
+ 
+ func TestExclusionRules_Process_multiple(t *testing.T) {
+-	lines := fsutils.NewLineCache(fsutils.NewFileCache())
++	files := fsutils.NewFiles(fsutils.NewLineCache(fsutils.NewFileCache()), "")
+ 
+ 	cfg := &config.LinterExclusions{
+ 		Rules: []config.ExcludeRule{
+@@ -49,7 +50,7 @@ func TestExclusionRules_Process_multiple(t *testing.T) {
+ 		},
+ 	}
+ 
+-	p := NewExclusionRules(nil, lines, cfg)
++	p := NewExclusionRules(nil, files, cfg)
+ 
+ 	cases := []issueTestCase{
+ 		{Path: "e.go", Text: "exclude", Linter: "linter"},
+@@ -90,8 +91,52 @@ func TestExclusionRules_Process_multiple(t *testing.T) {
+ 	assert.Equal(t, expectedCases, resultingCases)
+ }
+ 
++func TestExclusionRules_Process_pathPrefix(t *testing.T) {
++	files := fsutils.NewFiles(fsutils.NewLineCache(fsutils.NewFileCache()), path.Join("some", "dir"))
++
++	cfg := &config.LinterExclusions{
++		Rules: []config.ExcludeRule{
++			{
++				BaseRule: config.BaseRule{
++					Path: `some/dir/e\.go`,
++				},
++			},
++		},
++	}
++
++	p := NewExclusionRules(nil, files, cfg)
++
++	cases := []issueTestCase{
++		{Path: "e.go"},
++		{Path: "other.go"},
++	}
++
++	var issues []result.Issue
++	for _, c := range cases {
++		issues = append(issues, newIssueFromIssueTestCase(c))
++	}
++
++	processedIssues := process(t, p, issues...)
++
++	var resultingCases []issueTestCase
++	for _, i := range processedIssues {
++		resultingCases = append(resultingCases, issueTestCase{
++			Path:   i.FilePath(),
++			Linter: i.FromLinter,
++			Text:   i.Text,
++			Line:   i.Line(),
++		})
++	}
++
++	expectedCases := []issueTestCase{
++		{Path: "other.go"},
++	}
++
++	assert.Equal(t, expectedCases, resultingCases)
++}
++
+ func TestExclusionRules_Process_text(t *testing.T) {
+-	lines := fsutils.NewLineCache(fsutils.NewFileCache())
++	files := fsutils.NewFiles(fsutils.NewLineCache(fsutils.NewFileCache()), "")
+ 
+ 	cfg := &config.LinterExclusions{
+ 		Rules: []config.ExcludeRule{{
+@@ -102,7 +147,7 @@ func TestExclusionRules_Process_text(t *testing.T) {
+ 		}},
+ 	}
+ 
+-	p := NewExclusionRules(nil, lines, cfg)
++	p := NewExclusionRules(nil, files, cfg)
+ 
+ 	texts := []string{"exclude", "1", "", "exclud", "notexclude"}
+ 	var issues []result.Issue
+@@ -125,15 +170,15 @@ func TestExclusionRules_Process_text(t *testing.T) {
+ }
+ 
+ func TestExclusionRules_Process_empty(t *testing.T) {
+-	lines := fsutils.NewLineCache(fsutils.NewFileCache())
++	files := fsutils.NewFiles(fsutils.NewLineCache(fsutils.NewFileCache()), "")
+ 
+-	p := NewExclusionRules(nil, lines, &config.LinterExclusions{})
++	p := NewExclusionRules(nil, files, &config.LinterExclusions{})
+ 
+ 	processAssertSame(t, p, newIssueFromTextTestCase("test"))
+ }
+ 
+ func TestExclusionRules_Process_caseSensitive_multiple(t *testing.T) {
+-	lines := fsutils.NewLineCache(fsutils.NewFileCache())
++	files := fsutils.NewFiles(fsutils.NewLineCache(fsutils.NewFileCache()), "")
+ 
+ 	cfg := &config.LinterExclusions{
+ 		Rules: []config.ExcludeRule{
+@@ -164,7 +209,7 @@ func TestExclusionRules_Process_caseSensitive_multiple(t *testing.T) {
+ 		},
+ 	}
+ 
+-	p := NewExclusionRules(nil, lines, cfg)
++	p := NewExclusionRules(nil, files, cfg)
+ 
+ 	cases := []issueTestCase{
+ 		{Path: "e.go", Text: "exclude", Linter: "linter"},
+@@ -208,7 +253,7 @@ func TestExclusionRules_Process_caseSensitive_multiple(t *testing.T) {
+ }
+ 
+ func TestExclusionRules_Process_caseSensitive_text(t *testing.T) {
+-	lines := fsutils.NewLineCache(fsutils.NewFileCache())
++	files := fsutils.NewFiles(fsutils.NewLineCache(fsutils.NewFileCache()), "")
+ 
+ 	cfg := &config.LinterExclusions{
+ 		Rules: []config.ExcludeRule{
+@@ -221,7 +266,7 @@ func TestExclusionRules_Process_caseSensitive_text(t *testing.T) {
+ 		},
+ 	}
+ 
+-	p := NewExclusionRules(nil, lines, cfg)
++	p := NewExclusionRules(nil, files, cfg)
+ 
+ 	texts := []string{"exclude", "excLude", "1", "", "exclud", "notexclude"}
+ 
+@@ -245,9 +290,9 @@ func TestExclusionRules_Process_caseSensitive_text(t *testing.T) {
+ }
+ 
+ func TestExclusionRules_Process_caseSensitive_empty(t *testing.T) {
+-	lines := fsutils.NewLineCache(fsutils.NewFileCache())
++	files := fsutils.NewFiles(fsutils.NewLineCache(fsutils.NewFileCache()), "")
+ 
+-	p := NewExclusionRules(nil, lines, &config.LinterExclusions{})
++	p := NewExclusionRules(nil, files, &config.LinterExclusions{})
+ 
+ 	processAssertSame(t, p, newIssueFromTextTestCase("test"))
+ }
+diff --git a/pkg/result/processors/path_prettifier.go b/pkg/result/processors/path_prettifier.go
+index ad9a5663..6a04b1c3 100644
+--- a/pkg/result/processors/path_prettifier.go
++++ b/pkg/result/processors/path_prettifier.go
+@@ -1,8 +1,7 @@
+ package processors
+ 
+ import (
+-	"path/filepath"
+-
++	"github.com/golangci/golangci-lint/pkg/fsutils"
+ 	"github.com/golangci/golangci-lint/pkg/logutils"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+@@ -31,11 +30,7 @@ func (p *PathPrettifier) Process(issues []result.Issue) ([]result.Issue, error)
+ 	return transformIssues(issues, func(issue *result.Issue) *result.Issue {
+ 		newIssue := issue
+ 
+-		if p.prefix == "" {
+-			newIssue.Pos.Filename = issue.RelativePath
+-		} else {
+-			newIssue.Pos.Filename = filepath.Join(p.prefix, issue.RelativePath)
+-		}
++		newIssue.Pos.Filename = fsutils.WithPathPrefix(p.prefix, issue.RelativePath)
+ 
+ 		return newIssue
+ 	}), nil
+diff --git a/pkg/result/processors/severity.go b/pkg/result/processors/severity.go
+index c0514110..4c9a978b 100644
+--- a/pkg/result/processors/severity.go
++++ b/pkg/result/processors/severity.go
+@@ -22,16 +22,16 @@ type Severity struct {
+ 
+ 	log logutils.Log
+ 
+-	lines *fsutils.LineCache
++	files *fsutils.Files
+ 
+ 	defaultSeverity string
+ 	rules           []severityRule
+ }
+ 
+-func NewSeverity(log logutils.Log, lines *fsutils.LineCache, cfg *config.Severity) *Severity {
++func NewSeverity(log logutils.Log, files *fsutils.Files, cfg *config.Severity) *Severity {
+ 	p := &Severity{
+ 		name:            "severity-rules",
+-		lines:           lines,
++		files:           files,
+ 		log:             log,
+ 		defaultSeverity: cfg.Default,
+ 	}
+@@ -55,7 +55,7 @@ func (*Severity) Finish() {}
+ 
+ func (p *Severity) transform(issue *result.Issue) *result.Issue {
+ 	for _, rule := range p.rules {
+-		if rule.match(issue, p.lines, p.log) {
++		if rule.match(issue, p.files, p.log) {
+ 			if rule.severity == severityFromLinter || (rule.severity == "" && p.defaultSeverity == severityFromLinter) {
+ 				return issue
+ 			}
+diff --git a/pkg/result/processors/severity_test.go b/pkg/result/processors/severity_test.go
+index dcd3974f..b5c36700 100644
+--- a/pkg/result/processors/severity_test.go
++++ b/pkg/result/processors/severity_test.go
+@@ -1,6 +1,7 @@
+ package processors
+ 
+ import (
++	"path"
+ 	"path/filepath"
+ 	"testing"
+ 
+@@ -14,6 +15,7 @@ import (
+ 
+ func TestSeverity_multiple(t *testing.T) {
+ 	lineCache := fsutils.NewLineCache(fsutils.NewFileCache())
++	files := fsutils.NewFiles(lineCache, "")
+ 	log := logutils.NewStderrLog(logutils.DebugKeyEmpty)
+ 
+ 	opts := &config.Severity{
+@@ -77,7 +79,7 @@ func TestSeverity_multiple(t *testing.T) {
+ 		},
+ 	}
+ 
+-	p := NewSeverity(log, lineCache, opts)
++	p := NewSeverity(log, files, opts)
+ 
+ 	cases := []issueTestCase{
+ 		{Path: "ssl.go", Text: "ssl", Linter: "gosec"},
+@@ -126,6 +128,58 @@ func TestSeverity_multiple(t *testing.T) {
+ 	assert.Equal(t, expectedCases, resultingCases)
+ }
+ 
++func TestSeverity_pathPrefix(t *testing.T) {
++	lineCache := fsutils.NewLineCache(fsutils.NewFileCache())
++	pathPrefix := path.Join("some", "dir")
++	files := fsutils.NewFiles(lineCache, pathPrefix)
++	log := logutils.NewStderrLog(logutils.DebugKeyEmpty)
++
++	opts := &config.Severity{
++		Default: "error",
++		Rules: []config.SeverityRule{
++			{
++				Severity: "info",
++				BaseRule: config.BaseRule{
++					Text: "some",
++					Path: `some/dir/e\.go`,
++				},
++			},
++		},
++	}
++
++	p := NewSeverity(log, files, opts)
++
++	cases := []issueTestCase{
++		{Path: "e.go", Text: "some", Linter: "linter"},
++		{Path: "other.go", Text: "some", Linter: "linter"},
++	}
++
++	var issues []result.Issue
++	for _, c := range cases {
++		issues = append(issues, newIssueFromIssueTestCase(c))
++	}
++
++	processedIssues := process(t, p, issues...)
++
++	var resultingCases []issueTestCase
++	for _, i := range processedIssues {
++		resultingCases = append(resultingCases, issueTestCase{
++			Path:     i.FilePath(),
++			Linter:   i.FromLinter,
++			Text:     i.Text,
++			Line:     i.Line(),
++			Severity: i.Severity,
++		})
++	}
++
++	expectedCases := []issueTestCase{
++		{Path: "e.go", Text: "some", Linter: "linter", Severity: "info"},
++		{Path: "other.go", Text: "some", Linter: "linter", Severity: "error"},
++	}
++
++	assert.Equal(t, expectedCases, resultingCases)
++}
++
+ func TestSeverity_text(t *testing.T) {
+ 	opts := &config.Severity{
+ 		Rules: []config.SeverityRule{
+@@ -162,6 +216,7 @@ func TestSeverity_text(t *testing.T) {
+ 
+ func TestSeverity_onlyDefault(t *testing.T) {
+ 	lineCache := fsutils.NewLineCache(fsutils.NewFileCache())
++	files := fsutils.NewFiles(lineCache, "")
+ 	log := logutils.NewStderrLog(logutils.DebugKeyEmpty)
+ 
+ 	opts := config.Severity{
+@@ -169,7 +224,7 @@ func TestSeverity_onlyDefault(t *testing.T) {
+ 		Rules:   []config.SeverityRule{},
+ 	}
+ 
+-	p := NewSeverity(log, lineCache, &opts)
++	p := NewSeverity(log, files, &opts)
+ 
+ 	cases := []issueTestCase{
+ 		{Path: "ssl.go", Text: "ssl", Linter: "gosec"},
+@@ -210,6 +265,7 @@ func TestSeverity_empty(t *testing.T) {
+ 
+ func TestSeverity_caseSensitive(t *testing.T) {
+ 	lineCache := fsutils.NewLineCache(fsutils.NewFileCache())
++	files := fsutils.NewFiles(lineCache, "")
+ 
+ 	opts := &config.Severity{
+ 		Default: "error",
+@@ -224,7 +280,7 @@ func TestSeverity_caseSensitive(t *testing.T) {
+ 		},
+ 	}
+ 
+-	p := NewSeverity(nil, lineCache, opts)
++	p := NewSeverity(nil, files, opts)
+ 
+ 	cases := []issueTestCase{
+ 		{Path: "e.go", Text: "ssL", Linter: "gosec"},
+@@ -257,6 +313,7 @@ func TestSeverity_caseSensitive(t *testing.T) {
+ 
+ func TestSeverity_transform(t *testing.T) {
+ 	lineCache := fsutils.NewLineCache(fsutils.NewFileCache())
++	files := fsutils.NewFiles(lineCache, "")
+ 
+ 	testCases := []struct {
+ 		desc     string
+@@ -428,7 +485,7 @@ func TestSeverity_transform(t *testing.T) {
+ 		t.Run(test.desc, func(t *testing.T) {
+ 			t.Parallel()
+ 
+-			p := NewSeverity(nil, lineCache, test.opts)
++			p := NewSeverity(nil, files, test.opts)
+ 
+ 			newIssue := p.transform(test.issue)
+ 

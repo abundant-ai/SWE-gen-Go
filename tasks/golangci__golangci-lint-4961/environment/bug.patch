@@ -1,0 +1,518 @@
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 93b331be..14c684d4 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -1,7 +1,11 @@
+ package config
+ 
+ import (
++	"fmt"
++	"go/version"
+ 	"os"
++	"regexp"
++	"runtime"
+ 	"strings"
+ 
+ 	hcversion "github.com/hashicorp/go-version"
+@@ -88,3 +92,56 @@ func detectGoVersion() string {
+ 
+ 	return "1.17"
+ }
++
++// Trims the Go version to keep only M.m.
++// Since Go 1.21 the version inside the go.mod can be a patched version (ex: 1.21.0).
++// The version can also include information which we want to remove (ex: 1.21alpha1)
++// https://go.dev/doc/toolchain#versions
++// This a problem with staticcheck and gocritic.
++func trimGoVersion(v string) string {
++	if v == "" {
++		return ""
++	}
++
++	exp := regexp.MustCompile(`(\d\.\d+)(?:\.\d+|[a-z]+\d)`)
++
++	if exp.MatchString(v) {
++		return exp.FindStringSubmatch(v)[1]
++	}
++
++	return v
++}
++
++func getRuntimeGoVersion() string {
++	goVersion := runtime.Version()
++
++	parts := strings.Fields(goVersion)
++
++	if len(parts) == 0 {
++		return goVersion
++	}
++
++	// When using GOEXPERIMENT, the version returned might look something like "go1.23.0 X:boringcrypto".
++	return parts[0]
++}
++
++func checkGoVersion(goVersion string) error {
++	langVersion := version.Lang(getRuntimeGoVersion())
++
++	runtimeVersion, err := hcversion.NewVersion(strings.TrimPrefix(langVersion, "go"))
++	if err != nil {
++		return err
++	}
++
++	targetedVersion, err := hcversion.NewVersion(trimGoVersion(goVersion))
++	if err != nil {
++		return err
++	}
++
++	if runtimeVersion.LessThan(targetedVersion) {
++		return fmt.Errorf("the Go language version (%s) used to build golangci-lint is lower than the targeted Go version (%s)",
++			langVersion, goVersion)
++	}
++
++	return nil
++}
+diff --git a/pkg/config/config_test.go b/pkg/config/config_test.go
+index fa99bdf0..6819a2a4 100644
+--- a/pkg/config/config_test.go
++++ b/pkg/config/config_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ )
+ 
+ func TestIsGoGreaterThanOrEqual(t *testing.T) {
+@@ -83,3 +84,104 @@ func TestIsGoGreaterThanOrEqual(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func Test_trimGoVersion(t *testing.T) {
++	testCases := []struct {
++		desc     string
++		version  string
++		expected string
++	}{
++		{
++			desc:     "patched version",
++			version:  "1.22.0",
++			expected: "1.22",
++		},
++		{
++			desc:     "minor version",
++			version:  "1.22",
++			expected: "1.22",
++		},
++		{
++			desc:     "RC version",
++			version:  "1.22rc1",
++			expected: "1.22",
++		},
++		{
++			desc:     "alpha version",
++			version:  "1.22alpha1",
++			expected: "1.22",
++		},
++		{
++			desc:     "beta version",
++			version:  "1.22beta1",
++			expected: "1.22",
++		},
++		{
++			desc:     "semver RC version",
++			version:  "1.22.0-rc1",
++			expected: "1.22",
++		},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			version := trimGoVersion(test.version)
++			assert.Equal(t, test.expected, version)
++		})
++	}
++}
++
++func Test_checkGoVersion(t *testing.T) {
++	testCases := []struct {
++		desc    string
++		version string
++		require require.ErrorAssertionFunc
++	}{
++		{
++			desc:    "version greater than runtime version (patch)",
++			version: "1.30.1",
++			require: require.Error,
++		},
++		{
++			desc:    "version greater than runtime version (family)",
++			version: "1.30",
++			require: require.Error,
++		},
++		{
++			desc:    "version greater than runtime version (RC)",
++			version: "1.30.0-rc1",
++			require: require.Error,
++		},
++		{
++			desc:    "version equals to runtime version",
++			version: getRuntimeGoVersion(),
++			require: require.NoError,
++		},
++		{
++			desc:    "version lower than runtime version (patch)",
++			version: "1.19.1",
++			require: require.NoError,
++		},
++		{
++			desc:    "version lower than runtime version (family)",
++			version: "1.19",
++			require: require.NoError,
++		},
++		{
++			desc:    "version lower than runtime version (RC)",
++			version: "1.19.0-rc1",
++			require: require.NoError,
++		},
++	}
++
++	for _, test := range testCases {
++		t.Run(test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			err := checkGoVersion(test.version)
++			test.require(t, err)
++		})
++	}
++}
+diff --git a/pkg/config/loader.go b/pkg/config/loader.go
+index efdbfce1..05f32433 100644
+--- a/pkg/config/loader.go
++++ b/pkg/config/loader.go
+@@ -14,7 +14,6 @@ import (
+ 
+ 	"github.com/golangci/golangci-lint/pkg/exitcodes"
+ 	"github.com/golangci/golangci-lint/pkg/fsutils"
+-	"github.com/golangci/golangci-lint/pkg/goutil"
+ 	"github.com/golangci/golangci-lint/pkg/logutils"
+ )
+ 
+@@ -75,7 +74,7 @@ func (l *Loader) Load(opts LoadOptions) error {
+ 
+ 	l.handleGoVersion()
+ 
+-	err = goutil.CheckGoVersion(l.cfg.Run.Go)
++	err = checkGoVersion(l.cfg.Run.Go)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -296,7 +295,7 @@ func (l *Loader) handleGoVersion() {
+ 		l.cfg.LintersSettings.Gofumpt.LangVersion = l.cfg.Run.Go
+ 	}
+ 
+-	trimmedGoVersion := goutil.TrimGoVersion(l.cfg.Run.Go)
++	trimmedGoVersion := trimGoVersion(l.cfg.Run.Go)
+ 
+ 	l.cfg.LintersSettings.Revive.Go = trimmedGoVersion
+ 
+diff --git a/pkg/goanalysis/runner_loadingpackage.go b/pkg/goanalysis/runner_loadingpackage.go
+index 8abe2b6c..f0ffd4cb 100644
+--- a/pkg/goanalysis/runner_loadingpackage.go
++++ b/pkg/goanalysis/runner_loadingpackage.go
+@@ -9,6 +9,8 @@ import (
+ 	"go/types"
+ 	"os"
+ 	"reflect"
++	"runtime"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 
+@@ -16,7 +18,6 @@ import (
+ 	"golang.org/x/tools/go/packages"
+ 
+ 	"github.com/golangci/golangci-lint/pkg/goanalysis/load"
+-	"github.com/golangci/golangci-lint/pkg/goutil"
+ 	"github.com/golangci/golangci-lint/pkg/logutils"
+ )
+ 
+@@ -152,18 +153,12 @@ func (lp *loadingPackage) loadFromSource(loadMode LoadMode) error {
+ 		return imp.Types, nil
+ 	}
+ 
+-	// TODO(ldez) temporary workaround
+-	rv, err := goutil.CleanRuntimeVersion()
+-	if err != nil {
+-		return err
+-	}
+-
+ 	tc := &types.Config{
+ 		Importer: importerFunc(importer),
+ 		Error: func(err error) {
+ 			pkg.Errors = append(pkg.Errors, lp.convertError(err)...)
+ 		},
+-		GoVersion: rv, // TODO(ldez) temporary workaround
++		GoVersion: getGoVersion(),
+ 	}
+ 
+ 	_ = types.NewChecker(tc, pkg.Fset, pkg.Types, pkg.TypesInfo).Files(pkg.Syntax)
+@@ -507,3 +502,17 @@ func sizeOfReflectValueTreeBytes(rv reflect.Value, visitedPtrs map[uintptr]struc
+ 		panic("unknown rv of type " + rv.String())
+ 	}
+ }
++
++// TODO(ldez) temporary workaround
++func getGoVersion() string {
++	goVersion := runtime.Version()
++
++	parts := strings.Fields(goVersion)
++
++	if len(parts) == 0 {
++		return goVersion
++	}
++
++	// When using GOEXPERIMENT, the version returned might look something like "go1.23.0 X:boringcrypto".
++	return parts[0]
++}
+diff --git a/pkg/goutil/version.go b/pkg/goutil/version.go
+deleted file mode 100644
+index 4f42ebd1..00000000
+--- a/pkg/goutil/version.go
++++ /dev/null
+@@ -1,75 +0,0 @@
+-package goutil
+-
+-import (
+-	"fmt"
+-	"go/version"
+-	"regexp"
+-	"runtime"
+-	"strings"
+-
+-	hcversion "github.com/hashicorp/go-version"
+-)
+-
+-func CheckGoVersion(goVersion string) error {
+-	rv, err := CleanRuntimeVersion()
+-	if err != nil {
+-		return fmt.Errorf("clean runtime version: %w", err)
+-	}
+-
+-	langVersion := version.Lang(rv)
+-
+-	runtimeVersion, err := hcversion.NewVersion(strings.TrimPrefix(langVersion, "go"))
+-	if err != nil {
+-		return err
+-	}
+-
+-	targetedVersion, err := hcversion.NewVersion(TrimGoVersion(goVersion))
+-	if err != nil {
+-		return err
+-	}
+-
+-	if runtimeVersion.LessThan(targetedVersion) {
+-		return fmt.Errorf("the Go language version (%s) used to build golangci-lint is lower than the targeted Go version (%s)",
+-			langVersion, goVersion)
+-	}
+-
+-	return nil
+-}
+-
+-// TrimGoVersion Trims the Go version to keep only M.m.
+-// Since Go 1.21 the version inside the go.mod can be a patched version (ex: 1.21.0).
+-// The version can also include information which we want to remove (ex: 1.21alpha1)
+-// https://go.dev/doc/toolchain#versions
+-// This a problem with staticcheck and gocritic.
+-func TrimGoVersion(v string) string {
+-	if v == "" {
+-		return ""
+-	}
+-
+-	exp := regexp.MustCompile(`(\d\.\d+)(?:\.\d+|[a-z]+\d)`)
+-
+-	if exp.MatchString(v) {
+-		return exp.FindStringSubmatch(v)[1]
+-	}
+-
+-	return v
+-}
+-
+-func CleanRuntimeVersion() (string, error) {
+-	return cleanRuntimeVersion(runtime.Version())
+-}
+-
+-func cleanRuntimeVersion(rv string) (string, error) {
+-	parts := strings.Fields(rv)
+-
+-	for _, part := range parts {
+-		// Allow to handle:
+-		// - GOEXPERIMENT -> "go1.23.0 X:boringcrypto"
+-		// - devel -> "devel go1.24-e705a2d Wed Aug 7 01:16:42 2024 +0000 linux/amd64"
+-		if strings.HasPrefix(part, "go1.") {
+-			return part, nil
+-		}
+-	}
+-
+-	return "", fmt.Errorf("invalid Go runtime version: %s", rv)
+-}
+diff --git a/pkg/goutil/version_test.go b/pkg/goutil/version_test.go
+deleted file mode 100644
+index 91212e32..00000000
+--- a/pkg/goutil/version_test.go
++++ /dev/null
+@@ -1,152 +0,0 @@
+-package goutil
+-
+-import (
+-	"testing"
+-
+-	"github.com/stretchr/testify/assert"
+-	"github.com/stretchr/testify/require"
+-)
+-
+-func TestCheckGoVersion(t *testing.T) {
+-	testCases := []struct {
+-		desc    string
+-		version string
+-		require require.ErrorAssertionFunc
+-	}{
+-		{
+-			desc:    "version greater than runtime version (patch)",
+-			version: "1.30.1",
+-			require: require.Error,
+-		},
+-		{
+-			desc:    "version greater than runtime version (family)",
+-			version: "1.30",
+-			require: require.Error,
+-		},
+-		{
+-			desc:    "version greater than runtime version (RC)",
+-			version: "1.30.0-rc1",
+-			require: require.Error,
+-		},
+-		{
+-			desc: "version equals to runtime version",
+-			version: func() string {
+-				rv, _ := CleanRuntimeVersion()
+-				return rv
+-			}(),
+-			require: require.NoError,
+-		},
+-		{
+-			desc:    "version lower than runtime version (patch)",
+-			version: "1.19.1",
+-			require: require.NoError,
+-		},
+-		{
+-			desc:    "version lower than runtime version (family)",
+-			version: "1.19",
+-			require: require.NoError,
+-		},
+-		{
+-			desc:    "version lower than runtime version (RC)",
+-			version: "1.19.0-rc1",
+-			require: require.NoError,
+-		},
+-	}
+-
+-	for _, test := range testCases {
+-		t.Run(test.desc, func(t *testing.T) {
+-			t.Parallel()
+-
+-			err := CheckGoVersion(test.version)
+-			test.require(t, err)
+-		})
+-	}
+-}
+-
+-func TestTrimGoVersion(t *testing.T) {
+-	testCases := []struct {
+-		desc     string
+-		version  string
+-		expected string
+-	}{
+-		{
+-			desc:     "patched version",
+-			version:  "1.22.0",
+-			expected: "1.22",
+-		},
+-		{
+-			desc:     "minor version",
+-			version:  "1.22",
+-			expected: "1.22",
+-		},
+-		{
+-			desc:     "RC version",
+-			version:  "1.22rc1",
+-			expected: "1.22",
+-		},
+-		{
+-			desc:     "alpha version",
+-			version:  "1.22alpha1",
+-			expected: "1.22",
+-		},
+-		{
+-			desc:     "beta version",
+-			version:  "1.22beta1",
+-			expected: "1.22",
+-		},
+-		{
+-			desc:     "semver RC version",
+-			version:  "1.22.0-rc1",
+-			expected: "1.22",
+-		},
+-	}
+-
+-	for _, test := range testCases {
+-		t.Run(test.desc, func(t *testing.T) {
+-			t.Parallel()
+-
+-			version := TrimGoVersion(test.version)
+-			assert.Equal(t, test.expected, version)
+-		})
+-	}
+-}
+-
+-func Test_cleanRuntimeVersion(t *testing.T) {
+-	testCases := []struct {
+-		desc     string
+-		version  string
+-		expected string
+-	}{
+-		{
+-			desc:     "go version",
+-			version:  "go1.22.0",
+-			expected: "go1.22.0",
+-		},
+-		{
+-			desc:     "language version",
+-			version:  "go1.22",
+-			expected: "go1.22",
+-		},
+-		{
+-			desc:     "GOEXPERIMENT",
+-			version:  "go1.23.0 X:boringcrypto",
+-			expected: "go1.23.0",
+-		},
+-		{
+-			desc:     "devel",
+-			version:  "devel go1.24-e705a2d Wed Aug 7 01:16:42 2024 +0000 linux/amd64",
+-			expected: "go1.24-e705a2d",
+-		},
+-	}
+-
+-	for _, test := range testCases {
+-		t.Run(test.desc, func(t *testing.T) {
+-			t.Parallel()
+-
+-			v, err := cleanRuntimeVersion(test.version)
+-			require.NoError(t, err)
+-
+-			assert.Equal(t, test.expected, v)
+-		})
+-	}
+-}

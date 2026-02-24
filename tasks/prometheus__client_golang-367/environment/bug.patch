@@ -1,0 +1,533 @@
+diff --git a/prometheus/counter.go b/prometheus/counter.go
+index 765e455..02ea9a6 100644
+--- a/prometheus/counter.go
++++ b/prometheus/counter.go
+@@ -15,10 +15,6 @@ package prometheus
+ 
+ import (
+ 	"errors"
+-	"math"
+-	"sync/atomic"
+-
+-	dto "github.com/prometheus/client_model/go"
+ )
+ 
+ // Counter is a Metric that represents a single numerical value that only ever
+@@ -46,14 +42,6 @@ type Counter interface {
+ type CounterOpts Opts
+ 
+ // NewCounter creates a new Counter based on the provided CounterOpts.
+-//
+-// The returned implementation tracks the counter value in two separate
+-// variables, a float64 and a uint64. The latter is used to track calls of the
+-// Inc method and calls of the Add method with a value that can be represented
+-// as a uint64. This allows atomic increments of the counter with optimal
+-// performance. (It is common to have an Inc call in very hot execution paths.)
+-// Both internal tracking values are added up in the Write method. This has to
+-// be taken into account when it comes to precision and overflow behavior.
+ func NewCounter(opts CounterOpts) Counter {
+ 	desc := NewDesc(
+ 		BuildFQName(opts.Namespace, opts.Subsystem, opts.Name),
+@@ -61,58 +49,20 @@ func NewCounter(opts CounterOpts) Counter {
+ 		nil,
+ 		opts.ConstLabels,
+ 	)
+-	result := &counter{desc: desc, labelPairs: desc.constLabelPairs}
++	result := &counter{value: value{desc: desc, valType: CounterValue, labelPairs: desc.constLabelPairs}}
+ 	result.init(result) // Init self-collection.
+ 	return result
+ }
+ 
+ type counter struct {
+-	// valBits contains the bits of the represented float64 value, while
+-	// valInt stores values that are exact integers. Both have to go first
+-	// in the struct to guarantee alignment for atomic operations.
+-	// http://golang.org/pkg/sync/atomic/#pkg-note-BUG
+-	valBits uint64
+-	valInt  uint64
+-
+-	selfCollector
+-	desc *Desc
+-
+-	labelPairs []*dto.LabelPair
+-}
+-
+-func (c *counter) Desc() *Desc {
+-	return c.desc
++	value
+ }
+ 
+ func (c *counter) Add(v float64) {
+ 	if v < 0 {
+ 		panic(errors.New("counter cannot decrease in value"))
+ 	}
+-	ival := uint64(v)
+-	if float64(ival) == v {
+-		atomic.AddUint64(&c.valInt, ival)
+-		return
+-	}
+-
+-	for {
+-		oldBits := atomic.LoadUint64(&c.valBits)
+-		newBits := math.Float64bits(math.Float64frombits(oldBits) + v)
+-		if atomic.CompareAndSwapUint64(&c.valBits, oldBits, newBits) {
+-			return
+-		}
+-	}
+-}
+-
+-func (c *counter) Inc() {
+-	atomic.AddUint64(&c.valInt, 1)
+-}
+-
+-func (c *counter) Write(out *dto.Metric) error {
+-	fval := math.Float64frombits(atomic.LoadUint64(&c.valBits))
+-	ival := atomic.LoadUint64(&c.valInt)
+-	val := fval + float64(ival)
+-
+-	return populateMetric(CounterValue, val, c.labelPairs, out)
++	c.value.Add(v)
+ }
+ 
+ // CounterVec is a Collector that bundles a set of Counters that all share the
+@@ -135,10 +85,11 @@ func NewCounterVec(opts CounterOpts, labelNames []string) *CounterVec {
+ 	)
+ 	return &CounterVec{
+ 		metricVec: newMetricVec(desc, func(lvs ...string) Metric {
+-			if len(lvs) != len(desc.variableLabels) {
+-				panic(errInconsistentCardinality)
+-			}
+-			result := &counter{desc: desc, labelPairs: makeLabelPairs(desc, lvs)}
++			result := &counter{value: value{
++				desc:       desc,
++				valType:    CounterValue,
++				labelPairs: makeLabelPairs(desc, lvs),
++			}}
+ 			result.init(result) // Init self-collection.
+ 			return result
+ 		}),
+diff --git a/prometheus/counter_test.go b/prometheus/counter_test.go
+index 5062f51..8d5cd0b 100644
+--- a/prometheus/counter_test.go
++++ b/prometheus/counter_test.go
+@@ -28,27 +28,13 @@ func TestCounterAdd(t *testing.T) {
+ 		ConstLabels: Labels{"a": "1", "b": "2"},
+ 	}).(*counter)
+ 	counter.Inc()
+-	if expected, got := 0.0, math.Float64frombits(counter.valBits); expected != got {
++	if expected, got := 1., math.Float64frombits(counter.valBits); expected != got {
+ 		t.Errorf("Expected %f, got %f.", expected, got)
+ 	}
+-	if expected, got := uint64(1), counter.valInt; expected != got {
+-		t.Errorf("Expected %d, got %d.", expected, got)
+-	}
+ 	counter.Add(42)
+-	if expected, got := 0.0, math.Float64frombits(counter.valBits); expected != got {
++	if expected, got := 43., math.Float64frombits(counter.valBits); expected != got {
+ 		t.Errorf("Expected %f, got %f.", expected, got)
+ 	}
+-	if expected, got := uint64(43), counter.valInt; expected != got {
+-		t.Errorf("Expected %d, got %d.", expected, got)
+-	}
+-
+-	counter.Add(24.42)
+-	if expected, got := 24.42, math.Float64frombits(counter.valBits); expected != got {
+-		t.Errorf("Expected %f, got %f.", expected, got)
+-	}
+-	if expected, got := uint64(43), counter.valInt; expected != got {
+-		t.Errorf("Expected %d, got %d.", expected, got)
+-	}
+ 
+ 	if expected, got := "counter cannot decrease in value", decreaseCounter(counter).Error(); expected != got {
+ 		t.Errorf("Expected error %q, got %q.", expected, got)
+@@ -57,7 +43,7 @@ func TestCounterAdd(t *testing.T) {
+ 	m := &dto.Metric{}
+ 	counter.Write(m)
+ 
+-	if expected, got := `label:<name:"a" value:"1" > label:<name:"b" value:"2" > counter:<value:67.42 > `, m.String(); expected != got {
++	if expected, got := `label:<name:"a" value:"1" > label:<name:"b" value:"2" > counter:<value:43 > `, m.String(); expected != got {
+ 		t.Errorf("expected %q, got %q", expected, got)
+ 	}
+ }
+@@ -126,87 +112,3 @@ func expectPanic(t *testing.T, op func(), errorMsg string) {
+ 
+ 	op()
+ }
+-
+-func TestCounterAddInf(t *testing.T) {
+-	counter := NewCounter(CounterOpts{
+-		Name: "test",
+-		Help: "test help",
+-	}).(*counter)
+-
+-	counter.Inc()
+-	if expected, got := 0.0, math.Float64frombits(counter.valBits); expected != got {
+-		t.Errorf("Expected %f, got %f.", expected, got)
+-	}
+-	if expected, got := uint64(1), counter.valInt; expected != got {
+-		t.Errorf("Expected %d, got %d.", expected, got)
+-	}
+-
+-	counter.Add(math.Inf(1))
+-	if expected, got := math.Inf(1), math.Float64frombits(counter.valBits); expected != got {
+-		t.Errorf("valBits expected %f, got %f.", expected, got)
+-	}
+-	if expected, got := uint64(1), counter.valInt; expected != got {
+-		t.Errorf("valInts expected %d, got %d.", expected, got)
+-	}
+-
+-	counter.Inc()
+-	if expected, got := math.Inf(1), math.Float64frombits(counter.valBits); expected != got {
+-		t.Errorf("Expected %f, got %f.", expected, got)
+-	}
+-	if expected, got := uint64(2), counter.valInt; expected != got {
+-		t.Errorf("Expected %d, got %d.", expected, got)
+-	}
+-
+-	m := &dto.Metric{}
+-	counter.Write(m)
+-
+-	if expected, got := `counter:<value:inf > `, m.String(); expected != got {
+-		t.Errorf("expected %q, got %q", expected, got)
+-	}
+-}
+-
+-func TestCounterAddLarge(t *testing.T) {
+-	counter := NewCounter(CounterOpts{
+-		Name: "test",
+-		Help: "test help",
+-	}).(*counter)
+-
+-	// large overflows the underlying type and should therefore be stored in valBits.
+-	large := float64(math.MaxUint64 + 1)
+-	counter.Add(large)
+-	if expected, got := large, math.Float64frombits(counter.valBits); expected != got {
+-		t.Errorf("valBits expected %f, got %f.", expected, got)
+-	}
+-	if expected, got := uint64(0), counter.valInt; expected != got {
+-		t.Errorf("valInts expected %d, got %d.", expected, got)
+-	}
+-
+-	m := &dto.Metric{}
+-	counter.Write(m)
+-
+-	if expected, got := fmt.Sprintf("counter:<value:%0.16e > ", large), m.String(); expected != got {
+-		t.Errorf("expected %q, got %q", expected, got)
+-	}
+-}
+-
+-func TestCounterAddSmall(t *testing.T) {
+-	counter := NewCounter(CounterOpts{
+-		Name: "test",
+-		Help: "test help",
+-	}).(*counter)
+-	small := 0.000000000001
+-	counter.Add(small)
+-	if expected, got := small, math.Float64frombits(counter.valBits); expected != got {
+-		t.Errorf("valBits expected %f, got %f.", expected, got)
+-	}
+-	if expected, got := uint64(0), counter.valInt; expected != got {
+-		t.Errorf("valInts expected %d, got %d.", expected, got)
+-	}
+-
+-	m := &dto.Metric{}
+-	counter.Write(m)
+-
+-	if expected, got := fmt.Sprintf("counter:<value:%0.0e > ", small), m.String(); expected != got {
+-		t.Errorf("expected %q, got %q", expected, got)
+-	}
+-}
+diff --git a/prometheus/gauge.go b/prometheus/gauge.go
+index 17c72d7..b47d70a 100644
+--- a/prometheus/gauge.go
++++ b/prometheus/gauge.go
+@@ -13,14 +13,6 @@
+ 
+ package prometheus
+ 
+-import (
+-	"math"
+-	"sync/atomic"
+-	"time"
+-
+-	dto "github.com/prometheus/client_model/go"
+-)
+-
+ // Gauge is a Metric that represents a single numerical value that can
+ // arbitrarily go up and down.
+ //
+@@ -56,74 +48,13 @@ type Gauge interface {
+ type GaugeOpts Opts
+ 
+ // NewGauge creates a new Gauge based on the provided GaugeOpts.
+-//
+-// The returned implementation is optimized for a fast Set method. If you have a
+-// choice for managing the value of a Gauge via Set vs. Inc/Dec/Add/Sub, pick
+-// the former. For example, the Inc method of the returned Gauge is slower than
+-// the Inc method of a Counter returned by NewCounter. This matches the typical
+-// scenarios for Gauges and Counters, where the former tends to be Set-heavy and
+-// the latter Inc-heavy.
+ func NewGauge(opts GaugeOpts) Gauge {
+-	desc := NewDesc(
++	return newValue(NewDesc(
+ 		BuildFQName(opts.Namespace, opts.Subsystem, opts.Name),
+ 		opts.Help,
+ 		nil,
+ 		opts.ConstLabels,
+-	)
+-	result := &gauge{desc: desc, labelPairs: desc.constLabelPairs}
+-	result.init(result) // Init self-collection.
+-	return result
+-}
+-
+-type gauge struct {
+-	// valBits contains the bits of the represented float64 value. It has
+-	// to go first in the struct to guarantee alignment for atomic
+-	// operations.  http://golang.org/pkg/sync/atomic/#pkg-note-BUG
+-	valBits uint64
+-
+-	selfCollector
+-
+-	desc       *Desc
+-	labelPairs []*dto.LabelPair
+-}
+-
+-func (g *gauge) Desc() *Desc {
+-	return g.desc
+-}
+-
+-func (g *gauge) Set(val float64) {
+-	atomic.StoreUint64(&g.valBits, math.Float64bits(val))
+-}
+-
+-func (g *gauge) SetToCurrentTime() {
+-	g.Set(float64(time.Now().UnixNano()) / 1e9)
+-}
+-
+-func (g *gauge) Inc() {
+-	g.Add(1)
+-}
+-
+-func (g *gauge) Dec() {
+-	g.Add(-1)
+-}
+-
+-func (g *gauge) Add(val float64) {
+-	for {
+-		oldBits := atomic.LoadUint64(&g.valBits)
+-		newBits := math.Float64bits(math.Float64frombits(oldBits) + val)
+-		if atomic.CompareAndSwapUint64(&g.valBits, oldBits, newBits) {
+-			return
+-		}
+-	}
+-}
+-
+-func (g *gauge) Sub(val float64) {
+-	g.Add(val * -1)
+-}
+-
+-func (g *gauge) Write(out *dto.Metric) error {
+-	val := math.Float64frombits(atomic.LoadUint64(&g.valBits))
+-	return populateMetric(GaugeValue, val, g.labelPairs, out)
++	), GaugeValue, 0)
+ }
+ 
+ // GaugeVec is a Collector that bundles a set of Gauges that all share the same
+@@ -146,12 +77,7 @@ func NewGaugeVec(opts GaugeOpts, labelNames []string) *GaugeVec {
+ 	)
+ 	return &GaugeVec{
+ 		metricVec: newMetricVec(desc, func(lvs ...string) Metric {
+-			if len(lvs) != len(desc.variableLabels) {
+-				panic(errInconsistentCardinality)
+-			}
+-			result := &gauge{desc: desc, labelPairs: makeLabelPairs(desc, lvs)}
+-			result.init(result) // Init self-collection.
+-			return result
++			return newValue(desc, GaugeValue, 0, lvs...)
+ 		}),
+ 	}
+ }
+diff --git a/prometheus/gauge_test.go b/prometheus/gauge_test.go
+index a2e3c14..8e5f002 100644
+--- a/prometheus/gauge_test.go
++++ b/prometheus/gauge_test.go
+@@ -83,7 +83,7 @@ func TestGaugeConcurrency(t *testing.T) {
+ 		}
+ 		start.Done()
+ 
+-		if expected, got := <-result, math.Float64frombits(gge.(*gauge).valBits); math.Abs(expected-got) > 0.000001 {
++		if expected, got := <-result, math.Float64frombits(gge.(*value).valBits); math.Abs(expected-got) > 0.000001 {
+ 			t.Fatalf("expected approx. %f, got %f", expected, got)
+ 			return false
+ 		}
+@@ -147,7 +147,7 @@ func TestGaugeVecConcurrency(t *testing.T) {
+ 		start.Done()
+ 
+ 		for i := range sStreams {
+-			if expected, got := <-results[i], math.Float64frombits(gge.WithLabelValues(string('A'+i)).(*gauge).valBits); math.Abs(expected-got) > 0.000001 {
++			if expected, got := <-results[i], math.Float64frombits(gge.WithLabelValues(string('A'+i)).(*value).valBits); math.Abs(expected-got) > 0.000001 {
+ 				t.Fatalf("expected approx. %f, got %f", expected, got)
+ 				return false
+ 			}
+diff --git a/prometheus/go_collector_test.go b/prometheus/go_collector_test.go
+index 72264da..2d05118 100644
+--- a/prometheus/go_collector_test.go
++++ b/prometheus/go_collector_test.go
+@@ -89,33 +89,37 @@ func TestGCCollector(t *testing.T) {
+ 	for {
+ 		select {
+ 		case metric := <-ch:
+-			pb := &dto.Metric{}
+-			metric.Write(pb)
+-			if pb.GetSummary() == nil {
+-				continue
+-			}
+-			if len(pb.GetSummary().Quantile) != 5 {
+-				t.Errorf("expected 4 buckets, got %d", len(pb.GetSummary().Quantile))
+-			}
+-			for idx, want := range []float64{0.0, 0.25, 0.5, 0.75, 1.0} {
+-				if *pb.GetSummary().Quantile[idx].Quantile != want {
+-					t.Errorf("bucket #%d is off, got %f, want %f", idx, *pb.GetSummary().Quantile[idx].Quantile, want)
++			switch m := metric.(type) {
++			case *constSummary, *value:
++				pb := &dto.Metric{}
++				m.Write(pb)
++				if pb.GetSummary() == nil {
++					continue
+ 				}
++
++				if len(pb.GetSummary().Quantile) != 5 {
++					t.Errorf("expected 4 buckets, got %d", len(pb.GetSummary().Quantile))
++				}
++				for idx, want := range []float64{0.0, 0.25, 0.5, 0.75, 1.0} {
++					if *pb.GetSummary().Quantile[idx].Quantile != want {
++						t.Errorf("bucket #%d is off, got %f, want %f", idx, *pb.GetSummary().Quantile[idx].Quantile, want)
++					}
++				}
++				if first {
++					first = false
++					oldGC = *pb.GetSummary().SampleCount
++					oldPause = *pb.GetSummary().SampleSum
++					close(waitc)
++					continue
++				}
++				if diff := *pb.GetSummary().SampleCount - oldGC; diff != 1 {
++					t.Errorf("want 1 new garbage collection run, got %d", diff)
++				}
++				if diff := *pb.GetSummary().SampleSum - oldPause; diff <= 0 {
++					t.Errorf("want moar pause, got %f", diff)
++				}
++				return
+ 			}
+-			if first {
+-				first = false
+-				oldGC = *pb.GetSummary().SampleCount
+-				oldPause = *pb.GetSummary().SampleSum
+-				close(waitc)
+-				continue
+-			}
+-			if diff := *pb.GetSummary().SampleCount - oldGC; diff != 1 {
+-				t.Errorf("want 1 new garbage collection run, got %d", diff)
+-			}
+-			if diff := *pb.GetSummary().SampleSum - oldPause; diff <= 0 {
+-				t.Errorf("want moar pause, got %f", diff)
+-			}
+-			return
+ 		case <-time.After(1 * time.Second):
+ 			t.Fatalf("expected collect timed out")
+ 		}
+diff --git a/prometheus/value.go b/prometheus/value.go
+index 543b57c..4a9cca6 100644
+--- a/prometheus/value.go
++++ b/prometheus/value.go
+@@ -15,7 +15,10 @@ package prometheus
+ 
+ import (
+ 	"fmt"
++	"math"
+ 	"sort"
++	"sync/atomic"
++	"time"
+ 
+ 	dto "github.com/prometheus/client_model/go"
+ 
+@@ -33,6 +36,79 @@ const (
+ 	UntypedValue
+ )
+ 
++// value is a generic metric for simple values. It implements Metric, Collector,
++// Counter, Gauge, and Untyped. Its effective type is determined by
++// ValueType. This is a low-level building block used by the library to back the
++// implementations of Counter, Gauge, and Untyped.
++type value struct {
++	// valBits contains the bits of the represented float64 value. It has
++	// to go first in the struct to guarantee alignment for atomic
++	// operations.  http://golang.org/pkg/sync/atomic/#pkg-note-BUG
++	valBits uint64
++
++	selfCollector
++
++	desc       *Desc
++	valType    ValueType
++	labelPairs []*dto.LabelPair
++}
++
++// newValue returns a newly allocated value with the given Desc, ValueType,
++// sample value and label values. It panics if the number of label
++// values is different from the number of variable labels in Desc.
++func newValue(desc *Desc, valueType ValueType, val float64, labelValues ...string) *value {
++	if len(labelValues) != len(desc.variableLabels) {
++		panic(errInconsistentCardinality)
++	}
++	result := &value{
++		desc:       desc,
++		valType:    valueType,
++		valBits:    math.Float64bits(val),
++		labelPairs: makeLabelPairs(desc, labelValues),
++	}
++	result.init(result)
++	return result
++}
++
++func (v *value) Desc() *Desc {
++	return v.desc
++}
++
++func (v *value) Set(val float64) {
++	atomic.StoreUint64(&v.valBits, math.Float64bits(val))
++}
++
++func (v *value) SetToCurrentTime() {
++	v.Set(float64(time.Now().UnixNano()) / 1e9)
++}
++
++func (v *value) Inc() {
++	v.Add(1)
++}
++
++func (v *value) Dec() {
++	v.Add(-1)
++}
++
++func (v *value) Add(val float64) {
++	for {
++		oldBits := atomic.LoadUint64(&v.valBits)
++		newBits := math.Float64bits(math.Float64frombits(oldBits) + val)
++		if atomic.CompareAndSwapUint64(&v.valBits, oldBits, newBits) {
++			return
++		}
++	}
++}
++
++func (v *value) Sub(val float64) {
++	v.Add(val * -1)
++}
++
++func (v *value) Write(out *dto.Metric) error {
++	val := math.Float64frombits(atomic.LoadUint64(&v.valBits))
++	return populateMetric(v.valType, val, v.labelPairs, out)
++}
++
+ // valueFunc is a generic metric for simple values retrieved on collect time
+ // from a function. It implements Metric and Collector. Its effective type is
+ // determined by ValueType. This is a low-level building block used by the

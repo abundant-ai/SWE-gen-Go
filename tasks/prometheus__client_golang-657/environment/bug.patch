@@ -1,0 +1,255 @@
+diff --git a/go.mod b/go.mod
+index 51311fc..99d0457 100644
+--- a/go.mod
++++ b/go.mod
+@@ -2,7 +2,6 @@ module github.com/prometheus/client_golang
+ 
+ require (
+ 	github.com/beorn7/perks v1.0.1
+-	github.com/cespare/xxhash/v2 v2.1.0
+ 	github.com/golang/protobuf v1.3.2
+ 	github.com/json-iterator/go v1.1.7
+ 	github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4
+diff --git a/go.sum b/go.sum
+index a0e4eff..5f52411 100644
+--- a/go.sum
++++ b/go.sum
+@@ -8,8 +8,6 @@ github.com/beorn7/perks v1.0.0 h1:HWo1m869IqiPhD389kmkxeTalrjNbbJTC8LXupb+sl0=
+ github.com/beorn7/perks v1.0.0/go.mod h1:KWe93zE9D1o94FZ5RNwFwVgaQK1VOXiVxmqh+CedLV8=
+ github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
+ github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
+-github.com/cespare/xxhash/v2 v2.1.0 h1:yTUvW7Vhb89inJ+8irsUqiWjh8iT6sQPZiQzI6ReGkA=
+-github.com/cespare/xxhash/v2 v2.1.0/go.mod h1:dgIUBU3pDso/gPgZ1osOZ0iQf77oPR28Tjxl5dIMyVM=
+ github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
+ github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+diff --git a/prometheus/desc.go b/prometheus/desc.go
+index e3232d7..1d034f8 100644
+--- a/prometheus/desc.go
++++ b/prometheus/desc.go
+@@ -19,7 +19,6 @@ import (
+ 	"sort"
+ 	"strings"
+ 
+-	"github.com/cespare/xxhash/v2"
+ 	"github.com/golang/protobuf/proto"
+ 	"github.com/prometheus/common/model"
+ 
+@@ -127,24 +126,24 @@ func NewDesc(fqName, help string, variableLabels []string, constLabels Labels) *
+ 		return d
+ 	}
+ 
+-	xxh := xxhash.New()
++	vh := hashNew()
+ 	for _, val := range labelValues {
+-		xxh.WriteString(val)
+-		xxh.Write(separatorByteSlice)
++		vh = hashAdd(vh, val)
++		vh = hashAddByte(vh, separatorByte)
+ 	}
+-	d.id = xxh.Sum64()
++	d.id = vh
+ 	// Sort labelNames so that order doesn't matter for the hash.
+ 	sort.Strings(labelNames)
+ 	// Now hash together (in this order) the help string and the sorted
+ 	// label names.
+-	xxh.Reset()
+-	xxh.WriteString(help)
+-	xxh.Write(separatorByteSlice)
++	lh := hashNew()
++	lh = hashAdd(lh, help)
++	lh = hashAddByte(lh, separatorByte)
+ 	for _, labelName := range labelNames {
+-		xxh.WriteString(labelName)
+-		xxh.Write(separatorByteSlice)
++		lh = hashAdd(lh, labelName)
++		lh = hashAddByte(lh, separatorByte)
+ 	}
+-	d.dimHash = xxh.Sum64()
++	d.dimHash = lh
+ 
+ 	d.constLabelPairs = make([]*dto.LabelPair, 0, len(constLabels))
+ 	for n, v := range constLabels {
+diff --git a/prometheus/metric.go b/prometheus/metric.go
+index 5bb7f80..55e6d86 100644
+--- a/prometheus/metric.go
++++ b/prometheus/metric.go
+@@ -24,8 +24,6 @@ import (
+ 
+ const separatorByte byte = 255
+ 
+-var separatorByteSlice = []byte{255} // For convenient use with xxhash.
+-
+ // A Metric models a single sample value with its meta data being exported to
+ // Prometheus. Implementations of Metric in this package are Gauge, Counter,
+ // Histogram, Summary, and Untyped.
+diff --git a/prometheus/registry.go b/prometheus/registry.go
+index b1f8ed8..f4e9a99 100644
+--- a/prometheus/registry.go
++++ b/prometheus/registry.go
+@@ -25,7 +25,6 @@ import (
+ 	"sync"
+ 	"unicode/utf8"
+ 
+-	"github.com/cespare/xxhash/v2"
+ 	"github.com/golang/protobuf/proto"
+ 	"github.com/prometheus/common/expfmt"
+ 
+@@ -267,7 +266,7 @@ func (r *Registry) Register(c Collector) error {
+ 		descChan           = make(chan *Desc, capDescChan)
+ 		newDescIDs         = map[uint64]struct{}{}
+ 		newDimHashesByName = map[string]uint64{}
+-		collectorID        uint64 // All desc IDs XOR'd together.
++		collectorID        uint64 // Just a sum of all desc IDs.
+ 		duplicateDescErr   error
+ 	)
+ 	go func() {
+@@ -294,12 +293,12 @@ func (r *Registry) Register(c Collector) error {
+ 		if _, exists := r.descIDs[desc.id]; exists {
+ 			duplicateDescErr = fmt.Errorf("descriptor %s already exists with the same fully-qualified name and const label values", desc)
+ 		}
+-		// If it is not a duplicate desc in this collector, XOR it to
++		// If it is not a duplicate desc in this collector, add it to
+ 		// the collectorID.  (We allow duplicate descs within the same
+ 		// collector, but their existence must be a no-op.)
+ 		if _, exists := newDescIDs[desc.id]; !exists {
+ 			newDescIDs[desc.id] = struct{}{}
+-			collectorID ^= desc.id
++			collectorID += desc.id
+ 		}
+ 
+ 		// Are all the label names and the help string consistent with
+@@ -876,9 +875,9 @@ func checkMetricConsistency(
+ 	}
+ 
+ 	// Is the metric unique (i.e. no other metric with the same name and the same labels)?
+-	h := xxhash.New()
+-	h.WriteString(name)
+-	h.Write(separatorByteSlice)
++	h := hashNew()
++	h = hashAdd(h, name)
++	h = hashAddByte(h, separatorByte)
+ 	// Make sure label pairs are sorted. We depend on it for the consistency
+ 	// check.
+ 	if !sort.IsSorted(labelPairSorter(dtoMetric.Label)) {
+@@ -889,19 +888,18 @@ func checkMetricConsistency(
+ 		dtoMetric.Label = copiedLabels
+ 	}
+ 	for _, lp := range dtoMetric.Label {
+-		h.WriteString(lp.GetName())
+-		h.Write(separatorByteSlice)
+-		h.WriteString(lp.GetValue())
+-		h.Write(separatorByteSlice)
++		h = hashAdd(h, lp.GetName())
++		h = hashAddByte(h, separatorByte)
++		h = hashAdd(h, lp.GetValue())
++		h = hashAddByte(h, separatorByte)
+ 	}
+-	hSum := h.Sum64()
+-	if _, exists := metricHashes[hSum]; exists {
++	if _, exists := metricHashes[h]; exists {
+ 		return fmt.Errorf(
+ 			"collected metric %q { %s} was collected before with the same name and label values",
+ 			name, dtoMetric,
+ 		)
+ 	}
+-	metricHashes[hSum] = struct{}{}
++	metricHashes[h] = struct{}{}
+ 	return nil
+ }
+ 
+diff --git a/prometheus/registry_test.go b/prometheus/registry_test.go
+index c06ee4b..2062e67 100644
+--- a/prometheus/registry_test.go
++++ b/prometheus/registry_test.go
+@@ -1070,90 +1070,3 @@ test_summary_count{name="foo"} 2
+ 		)
+ 	}
+ }
+-
+-// collidingCollector is a collection of prometheus.Collectors,
+-// and is itself a prometheus.Collector.
+-type collidingCollector struct {
+-	i    int
+-	name string
+-
+-	a, b, c, d prometheus.Collector
+-}
+-
+-// Describe satisifies part of the prometheus.Collector interface.
+-func (m *collidingCollector) Describe(desc chan<- *prometheus.Desc) {
+-	m.a.Describe(desc)
+-	m.b.Describe(desc)
+-	m.c.Describe(desc)
+-	m.d.Describe(desc)
+-}
+-
+-// Collect satisifies part of the prometheus.Collector interface.
+-func (m *collidingCollector) Collect(metric chan<- prometheus.Metric) {
+-	m.a.Collect(metric)
+-	m.b.Collect(metric)
+-	m.c.Collect(metric)
+-	m.d.Collect(metric)
+-}
+-
+-// TestAlreadyRegistered will fail with the old, weaker hash function.  It is
+-// taken from https://play.golang.org/p/HpV7YE6LI_4 , authored by @awilliams.
+-func TestAlreadyRegisteredCollision(t *testing.T) {
+-
+-	reg := prometheus.NewRegistry()
+-
+-	for i := 0; i < 10000; i++ {
+-		// A collector should be considered unique if its name and const
+-		// label values are unique.
+-
+-		name := fmt.Sprintf("test-collector-%010d", i)
+-
+-		collector := collidingCollector{
+-			i:    i,
+-			name: name,
+-
+-			a: prometheus.NewCounter(prometheus.CounterOpts{
+-				Name: "my_collector_a",
+-				ConstLabels: prometheus.Labels{
+-					"name": name,
+-					"type": "test",
+-				},
+-			}),
+-			b: prometheus.NewCounter(prometheus.CounterOpts{
+-				Name: "my_collector_b",
+-				ConstLabels: prometheus.Labels{
+-					"name": name,
+-					"type": "test",
+-				},
+-			}),
+-			c: prometheus.NewCounter(prometheus.CounterOpts{
+-				Name: "my_collector_c",
+-				ConstLabels: prometheus.Labels{
+-					"name": name,
+-					"type": "test",
+-				},
+-			}),
+-			d: prometheus.NewCounter(prometheus.CounterOpts{
+-				Name: "my_collector_d",
+-				ConstLabels: prometheus.Labels{
+-					"name": name,
+-					"type": "test",
+-				},
+-			}),
+-		}
+-
+-		// Register should not fail, since each collector has a unique
+-		// set of sub-collectors, determined by their names and const label values.
+-		if err := reg.Register(&collector); err != nil {
+-			alreadyRegErr, ok := err.(prometheus.AlreadyRegisteredError)
+-			if !ok {
+-				t.Fatal(err)
+-			}
+-
+-			previous := alreadyRegErr.ExistingCollector.(*collidingCollector)
+-			current := alreadyRegErr.NewCollector.(*collidingCollector)
+-
+-			t.Errorf("Unexpected registration error: %q\nprevious collector: %s (i=%d)\ncurrent collector %s (i=%d)", alreadyRegErr, previous.name, previous.i, current.name, current.i)
+-		}
+-	}
+-}

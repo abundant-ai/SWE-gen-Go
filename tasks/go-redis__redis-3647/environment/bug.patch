@@ -1,0 +1,188 @@
+diff --git a/error.go b/error.go
+index d2462a49..12b5604d 100644
+--- a/error.go
++++ b/error.go
+@@ -124,9 +124,6 @@ func shouldRetry(err error, retryTimeout bool) bool {
+ 	if proto.IsTryAgainError(err) {
+ 		return true
+ 	}
+-	if proto.IsNoReplicasError(err) {
+-		return true
+-	}
+ 
+ 	// Fallback to string checking for backward compatibility with plain errors
+ 	s := err.Error()
+@@ -148,9 +145,6 @@ func shouldRetry(err error, retryTimeout bool) bool {
+ 	if strings.HasPrefix(s, "MASTERDOWN ") {
+ 		return true
+ 	}
+-	if strings.HasPrefix(s, "NOREPLICAS ") {
+-		return true
+-	}
+ 
+ 	return false
+ }
+@@ -348,14 +342,6 @@ func IsOOMError(err error) bool {
+ 	return proto.IsOOMError(err)
+ }
+ 
+-// IsNoReplicasError checks if an error is a Redis NOREPLICAS error, even if wrapped.
+-// NOREPLICAS errors occur when not enough replicas acknowledge a write operation.
+-// This typically happens with WAIT/WAITAOF commands or CLUSTER SETSLOT with synchronous
+-// replication when the required number of replicas cannot confirm the write within the timeout.
+-func IsNoReplicasError(err error) bool {
+-	return proto.IsNoReplicasError(err)
+-}
+-
+ //------------------------------------------------------------------------------
+ 
+ type timeoutError interface {
+diff --git a/error_test.go b/error_test.go
+index 5accb0e0..6c130d38 100644
+--- a/error_test.go
++++ b/error_test.go
+@@ -45,8 +45,7 @@ var _ = Describe("error", func() {
+ 			proto.ParseErrorReply([]byte("-READONLY You can't write against a read only replica")):   true,
+ 			proto.ParseErrorReply([]byte("-CLUSTERDOWN The cluster is down")):                        true,
+ 			proto.ParseErrorReply([]byte("-TRYAGAIN Command cannot be processed, please try again")): true,
+-			proto.ParseErrorReply([]byte("-NOREPLICAS Not enough good replicas to write")):           true,
+-			proto.ParseErrorReply([]byte("-ERR other")):                                              false,
++			proto.ParseErrorReply([]byte("-ERR other")): false,
+ 		}
+ 
+ 		for err, expected := range data {
+diff --git a/error_wrapping_test.go b/error_wrapping_test.go
+index 757aa1da..574d1379 100644
+--- a/error_wrapping_test.go
++++ b/error_wrapping_test.go
+@@ -239,10 +239,10 @@ func TestErrorWrappingInHookScenario(t *testing.T) {
+ // TestShouldRetryWithTypedErrors tests that shouldRetry works with typed errors
+ func TestShouldRetryWithTypedErrors(t *testing.T) {
+ 	tests := []struct {
+-		name         string
+-		errorMsg     string
+-		shouldRetry  bool
+-		retryTimeout bool
++		name          string
++		errorMsg      string
++		shouldRetry   bool
++		retryTimeout  bool
+ 	}{
+ 		{
+ 			name:         "LOADING error should retry",
+@@ -280,12 +280,6 @@ func TestShouldRetryWithTypedErrors(t *testing.T) {
+ 			shouldRetry:  true,
+ 			retryTimeout: false,
+ 		},
+-		{
+-			name:         "NOREPLICAS error should retry",
+-			errorMsg:     "NOREPLICAS Not enough good replicas to write",
+-			shouldRetry:  true,
+-			retryTimeout: false,
+-		},
+ 	}
+ 
+ 	for _, tt := range tests {
+diff --git a/internal/proto/redis_errors.go b/internal/proto/redis_errors.go
+index a28240f5..f553e2f9 100644
+--- a/internal/proto/redis_errors.go
++++ b/internal/proto/redis_errors.go
+@@ -212,25 +212,6 @@ func NewOOMError(msg string) *OOMError {
+ 	return &OOMError{msg: msg}
+ }
+ 
+-// NoReplicasError is returned when not enough replicas acknowledge a write.
+-// This error occurs when using WAIT/WAITAOF commands or CLUSTER SETSLOT with
+-// synchronous replication, and the required number of replicas cannot confirm
+-// the write within the timeout period.
+-type NoReplicasError struct {
+-	msg string
+-}
+-
+-func (e *NoReplicasError) Error() string {
+-	return e.msg
+-}
+-
+-func (e *NoReplicasError) RedisError() {}
+-
+-// NewNoReplicasError creates a new NoReplicasError with the given message.
+-func NewNoReplicasError(msg string) *NoReplicasError {
+-	return &NoReplicasError{msg: msg}
+-}
+-
+ // parseTypedRedisError parses a Redis error message and returns a typed error if applicable.
+ // This function maintains backward compatibility by keeping the same error messages.
+ func parseTypedRedisError(msg string) error {
+@@ -254,8 +235,6 @@ func parseTypedRedisError(msg string) error {
+ 		return NewTryAgainError(msg)
+ 	case strings.HasPrefix(msg, "MASTERDOWN "):
+ 		return NewMasterDownError(msg)
+-	case strings.HasPrefix(msg, "NOREPLICAS "):
+-		return NewNoReplicasError(msg)
+ 	case msg == "ERR max number of clients reached":
+ 		return NewMaxClientsError(msg)
+ 	case strings.HasPrefix(msg, "NOAUTH "), strings.HasPrefix(msg, "WRONGPASS "), strings.Contains(msg, "unauthenticated"):
+@@ -507,21 +486,3 @@ func IsOOMError(err error) bool {
+ 	// Fallback to string checking for backward compatibility
+ 	return strings.HasPrefix(err.Error(), "OOM ")
+ }
+-
+-// IsNoReplicasError checks if an error is a NoReplicasError, even if wrapped.
+-func IsNoReplicasError(err error) bool {
+-	if err == nil {
+-		return false
+-	}
+-	var noReplicasErr *NoReplicasError
+-	if errors.As(err, &noReplicasErr) {
+-		return true
+-	}
+-	// Check if wrapped error is a RedisError with NOREPLICAS prefix
+-	var redisErr RedisError
+-	if errors.As(err, &redisErr) && strings.HasPrefix(redisErr.Error(), "NOREPLICAS ") {
+-		return true
+-	}
+-	// Fallback to string checking for backward compatibility
+-	return strings.HasPrefix(err.Error(), "NOREPLICAS ")
+-}
+diff --git a/internal/proto/redis_errors_test.go b/internal/proto/redis_errors_test.go
+index ba7eeb50..452a4524 100644
+--- a/internal/proto/redis_errors_test.go
++++ b/internal/proto/redis_errors_test.go
+@@ -9,12 +9,12 @@ import (
+ // TestTypedRedisErrors tests that typed Redis errors are created correctly
+ func TestTypedRedisErrors(t *testing.T) {
+ 	tests := []struct {
+-		name         string
+-		errorMsg     string
+-		expectedType interface{}
+-		expectedMsg  string
+-		checkFunc    func(error) bool
+-		extractAddr  func(error) string
++		name          string
++		errorMsg      string
++		expectedType  interface{}
++		expectedMsg   string
++		checkFunc     func(error) bool
++		extractAddr   func(error) string
+ 	}{
+ 		{
+ 			name:         "LOADING error",
+@@ -132,13 +132,6 @@ func TestTypedRedisErrors(t *testing.T) {
+ 			expectedMsg:  "OOM command not allowed when used memory > 'maxmemory'",
+ 			checkFunc:    IsOOMError,
+ 		},
+-		{
+-			name:         "NOREPLICAS error",
+-			errorMsg:     "NOREPLICAS Not enough good replicas to write",
+-			expectedType: &NoReplicasError{},
+-			expectedMsg:  "NOREPLICAS Not enough good replicas to write",
+-			checkFunc:    IsNoReplicasError,
+-		},
+ 	}
+ 
+ 	for _, tt := range tests {
+@@ -396,3 +389,4 @@ func TestBackwardCompatibility(t *testing.T) {
+ 		})
+ 	}
+ }
++

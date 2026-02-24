@@ -1,0 +1,445 @@
+diff --git a/internal/backend/pluggable/chunks/chunks.go b/internal/backend/pluggable/chunks/chunks.go
+new file mode 100644
+index 0000000000..52527652b0
+--- /dev/null
++++ b/internal/backend/pluggable/chunks/chunks.go
+@@ -0,0 +1,18 @@
++// Copyright (c) HashiCorp, Inc.
++// SPDX-License-Identifier: BUSL-1.1
++
++package chunks
++
++const (
++	// DefaultStateStoreChunkSize is the default chunk size proposed
++	// to the provider.
++	// This can be tweaked but should provide reasonable performance
++	// trade-offs for average network conditions and state file sizes.
++	DefaultStateStoreChunkSize int64 = 8 << 20 // 8 MB
++
++	// MaxStateStoreChunkSize is the highest chunk size provider may choose
++	// which we still consider reasonable/safe.
++	// This reflects terraform-plugin-go's max. RPC message size of 256MB
++	// and leaves plenty of space for other variable data like diagnostics.
++	MaxStateStoreChunkSize int64 = 128 << 20 // 128 MB
++)
+diff --git a/internal/backend/pluggable/pluggable.go b/internal/backend/pluggable/pluggable.go
+index 61bdcc404d..ac99895ec7 100644
+--- a/internal/backend/pluggable/pluggable.go
++++ b/internal/backend/pluggable/pluggable.go
+@@ -5,8 +5,11 @@ package pluggable
+ 
+ import (
+ 	"errors"
++	"fmt"
++	"log"
+ 
+ 	"github.com/hashicorp/terraform/internal/backend"
++	"github.com/hashicorp/terraform/internal/backend/pluggable/chunks"
+ 	"github.com/hashicorp/terraform/internal/configs/configschema"
+ 	"github.com/hashicorp/terraform/internal/providers"
+ 	"github.com/hashicorp/terraform/internal/states/remote"
+@@ -15,19 +18,22 @@ import (
+ 	"github.com/zclconf/go-cty/cty"
+ )
+ 
+-// NewPluggable returns an instance of the backend.Backend interface that
+-// contains a provider interface. These are the assumptions about that
+-// provider:
++// NewPluggable returns a Pluggable. A Pluggable fulfils the
++// backend.Backend interface and allows management of state via
++// a state store implemented in the provider that's within the Pluggable.
+ //
++// These are the assumptions about that
++// provider:
+ // * The provider implements at least one state store.
+-// * The provider has already been configured before using NewPluggable.
++// * The provider has already been fully configured before using NewPluggable.
+ //
+ // The state store could also be configured prior to using NewPluggable,
+-// or it could be configured using the relevant backend.Backend methods.
++// but preferably it will be configured via the Pluggable,
++// using the relevant backend.Backend methods.
+ //
+ // By wrapping a configured provider in a Pluggable we allow calling code
+ // to use the provider's gRPC methods when interacting with state.
+-func NewPluggable(p providers.Interface, typeName string) (backend.Backend, error) {
++func NewPluggable(p providers.Interface, typeName string) (*Pluggable, error) {
+ 	if p == nil {
+ 		return nil, errors.New("Attempted to initialize pluggable state with a nil provider interface. This is a bug in Terraform and should be reported")
+ 	}
+@@ -102,14 +108,47 @@ func (p *Pluggable) PrepareConfig(config cty.Value) (cty.Value, tfdiags.Diagnost
+ //
+ // Configure implements backend.Backend
+ func (p *Pluggable) Configure(config cty.Value) tfdiags.Diagnostics {
++	var diags tfdiags.Diagnostics
+ 	req := providers.ConfigureStateStoreRequest{
+ 		TypeName: p.typeName,
+ 		Config:   config,
+ 		Capabilities: providers.StateStoreClientCapabilities{
+-			ChunkSize: DefaultStateStoreChunkSize,
++			// The core binary will always request the default chunk size from the provider to start
++			ChunkSize: chunks.DefaultStateStoreChunkSize,
+ 		},
+ 	}
+ 	resp := p.provider.ConfigureStateStore(req)
++	diags = diags.Append(resp.Diagnostics)
++	if diags.HasErrors() {
++		return diags
++	}
++
++	// Validate the returned value from chunk size negotiation
++	chunkSize := resp.Capabilities.ChunkSize
++	if chunkSize == 0 || chunkSize > chunks.MaxStateStoreChunkSize {
++		diags = diags.Append(fmt.Errorf("Failed to negotiate acceptable chunk size. "+
++			"Expected size > 0 and <= %d bytes, provider wants %d bytes",
++			chunks.MaxStateStoreChunkSize, chunkSize,
++		))
++		return diags
++	}
++
++	// Negotiated chunk size is valid, so set it in the provider server
++	// that will use the value for future RPCs to read/write state.
++	if cs, ok := p.provider.(providers.StateStoreChunkSizeSetter); ok {
++		cs.SetStateStoreChunkSize(p.typeName, int(chunkSize))
++	} else {
++		// TODO: Remove
++		// I've put this here to try and fish for types of test setup that
++		// use other things that should implement SetStateStoreChunkSize but
++		// don't yet.
++		panic("provider does not implement providers.StateStoreChunkSizeSetter interface. This is a bug in Terraform and should be reported.")
++	}
++	log.Printf("[TRACE] Pluggable.Configure: negotiated a chunk size of %v when configuring state store %s",
++		chunkSize,
++		p.typeName,
++	)
++
+ 	return resp.Diagnostics
+ }
+ 
+diff --git a/internal/command/meta_backend.go b/internal/command/meta_backend.go
+index e3d3bd9de9..19db34521b 100644
+--- a/internal/command/meta_backend.go
++++ b/internal/command/meta_backend.go
+@@ -1945,7 +1945,6 @@ func (m *Meta) savedStateStore(sMgr *clistate.LocalState, factory providers.Fact
+ 	// The provider and state store will be configured using the backend state file.
+ 
+ 	var diags tfdiags.Diagnostics
+-	var b backend.Backend
+ 
+ 	if factory == nil {
+ 		diags = diags.Append(&hcl.Diagnostic{
+@@ -2053,57 +2052,24 @@ func (m *Meta) savedStateStore(sMgr *clistate.LocalState, factory providers.Fact
+ 		return nil, diags
+ 	}
+ 
+-	// Validate and configure the state store
+-	//
+-	// NOTE: there are no marks we need to remove at this point.
+-	// We haven't added marks since the state store config from the backend state was used
+-	// because the state store's config isn't going to be presented to the user via terminal output or diags.
+-	validateStoreResp := provider.ValidateStateStoreConfig(providers.ValidateStateStoreConfigRequest{
+-		TypeName: s.StateStore.Type,
+-		Config:   stateStoreConfigVal,
+-	})
+-	diags = diags.Append(validateStoreResp.Diagnostics)
+-	if diags.HasErrors() {
+-		return nil, diags
+-	}
+-
+-	cfgStoreResp := provider.ConfigureStateStore(providers.ConfigureStateStoreRequest{
+-		TypeName: s.StateStore.Type,
+-		Config:   stateStoreConfigVal,
+-		Capabilities: providers.StateStoreClientCapabilities{
+-			ChunkSize: backendPluggable.DefaultStateStoreChunkSize,
+-		},
+-	})
+-	diags = diags.Append(cfgStoreResp.Diagnostics)
+-	if diags.HasErrors() {
+-		return nil, diags
+-	}
+-
+-	chunkSize := cfgStoreResp.Capabilities.ChunkSize
+-	if chunkSize == 0 || chunkSize > backendPluggable.MaxStateStoreChunkSize {
+-		diags = diags.Append(fmt.Errorf("Failed to negotiate acceptable chunk size. "+
+-			"Expected size > 0 and <= %d bytes, provider wants %d bytes",
+-			backendPluggable.MaxStateStoreChunkSize, chunkSize,
+-		))
+-		return nil, diags
+-	}
+-
+-	p, ok := provider.(providers.StateStoreChunkSizeSetter)
+-	if !ok {
+-		msg := fmt.Sprintf("Unable to set chunk size for provider %s; this is a bug in Terraform - please report it", s.StateStore.Type)
+-		panic(msg)
+-	}
+-	// casting to int here is okay because the number should never exceed int32
+-	p.SetStateStoreChunkSize(s.StateStore.Type, int(chunkSize))
+-
+-	// Now we have a fully configured state store, ready to be used.
+-	// To make it usable we need to return it in a backend.Backend interface.
+-	b, err = backendPluggable.NewPluggable(provider, s.StateStore.Type)
++	// Now that the provider is configured we can begin using the state store through
++	// the backend.Backend interface.
++	p, err := backendPluggable.NewPluggable(provider, s.StateStore.Type)
+ 	if err != nil {
+ 		diags = diags.Append(err)
+ 	}
+ 
+-	return b, diags
++	// Validate and configure the state store
++	//
++	// Note: we do not use the value returned from PrepareConfig for state stores,
++	// however that old approach is still used with backends for compatibility reasons.
++	_, validateDiags := p.PrepareConfig(stateStoreConfigVal)
++	diags = diags.Append(validateDiags)
++
++	configureDiags := p.Configure(stateStoreConfigVal)
++	diags = diags.Append(configureDiags)
++
++	return p, diags
+ }
+ 
+ //-------------------------------------------------------------------
+@@ -2330,58 +2296,24 @@ func (m *Meta) stateStoreInitFromConfig(c *configs.StateStore, factory providers
+ 		return nil, cty.NilVal, cty.NilVal, diags
+ 	}
+ 
+-	// Validate state store config and configure the state store
+-	//
+-	// NOTE: there are no marks we need to remove at this point.
+-	// We haven't added marks since the provider config from the backend state was used
+-	// because the state-storage provider's config isn't going to be presented to the user via terminal output or diags.
+-	validateStoreResp := provider.ValidateStateStoreConfig(providers.ValidateStateStoreConfigRequest{
+-		TypeName: c.Type,
+-		Config:   stateStoreConfigVal,
+-	})
+-	diags = diags.Append(validateStoreResp.Diagnostics)
+-	if validateStoreResp.Diagnostics.HasErrors() {
+-		return nil, cty.NilVal, cty.NilVal, diags
+-	}
+-
+-	cfgStoreResp := provider.ConfigureStateStore(providers.ConfigureStateStoreRequest{
+-		TypeName: c.Type,
+-		Config:   stateStoreConfigVal,
+-		Capabilities: providers.StateStoreClientCapabilities{
+-			ChunkSize: backendPluggable.DefaultStateStoreChunkSize,
+-		},
+-	})
+-	diags = diags.Append(cfgStoreResp.Diagnostics)
+-	if cfgStoreResp.Diagnostics.HasErrors() {
+-		return nil, cty.NilVal, cty.NilVal, diags
+-	}
+-
+-	chunkSize := cfgStoreResp.Capabilities.ChunkSize
+-	if chunkSize == 0 || chunkSize > backendPluggable.MaxStateStoreChunkSize {
+-		diags = diags.Append(fmt.Errorf("Failed to negotiate acceptable chunk size. "+
+-			"Expected size > 0 and <= %d bytes, provider wants %d bytes",
+-			backendPluggable.MaxStateStoreChunkSize, chunkSize,
+-		))
+-		return nil, cty.NilVal, cty.NilVal, diags
+-	}
+-
+-	p, ok := provider.(providers.StateStoreChunkSizeSetter)
+-	if !ok {
+-		msg := fmt.Sprintf("Unable to set chunk size for provider %s; this is a bug in Terraform - please report it", c.Type)
+-		panic(msg)
+-	}
+-	// casting to int here is okay because the number should never exceed int32
+-	p.SetStateStoreChunkSize(c.Type, int(chunkSize))
+-
+-	// Now we have a fully configured state store, ready to be used.
+-	// To make it usable we need to return it in a backend.Backend interface.
+-	b, err := backendPluggable.NewPluggable(provider, c.Type)
++	// Now that the provider is configured we can begin using the state store through
++	// the backend.Backend interface.
++	p, err := backendPluggable.NewPluggable(provider, c.Type)
+ 	if err != nil {
+ 		diags = diags.Append(err)
+-		return nil, cty.NilVal, cty.NilVal, diags
+ 	}
+ 
+-	return b, stateStoreConfigVal, providerConfigVal, diags
++	// Validate and configure the state store
++	//
++	// Note: we do not use the value returned from PrepareConfig for state stores,
++	// however that old approach is still used with backends for compatibility reasons.
++	_, validateDiags := p.PrepareConfig(stateStoreConfigVal)
++	diags = diags.Append(validateDiags)
++
++	configureDiags := p.Configure(stateStoreConfigVal)
++	diags = diags.Append(configureDiags)
++
++	return p, stateStoreConfigVal, providerConfigVal, diags
+ }
+ 
+ // Helper method to get aliases from the enhanced backend and alias them
+diff --git a/internal/grpcwrap/provider6.go b/internal/grpcwrap/provider6.go
+index 9f38f41567..2f0d0f7395 100644
+--- a/internal/grpcwrap/provider6.go
++++ b/internal/grpcwrap/provider6.go
+@@ -18,9 +18,9 @@ import (
+ 	"google.golang.org/grpc/status"
+ 	"google.golang.org/protobuf/types/known/timestamppb"
+ 
++	"github.com/hashicorp/terraform/internal/backend/pluggable/chunks"
+ 	proto6 "github.com/hashicorp/terraform/internal/tfplugin6"
+ 
+-	backendPluggable "github.com/hashicorp/terraform/internal/backend/pluggable"
+ 	"github.com/hashicorp/terraform/internal/plugin6/convert"
+ 	"github.com/hashicorp/terraform/internal/providers"
+ 	"github.com/hashicorp/terraform/internal/tfplugin6"
+@@ -966,22 +966,21 @@ func (p *provider6) ConfigureStateStore(ctx context.Context, req *tfplugin6.Conf
+ 		TypeName: req.TypeName,
+ 		Config:   configVal,
+ 		Capabilities: providers.StateStoreClientCapabilities{
+-			ChunkSize: backendPluggable.DefaultStateStoreChunkSize,
++			ChunkSize: chunks.DefaultStateStoreChunkSize,
+ 		},
+ 	})
+ 
+ 	// Validate the returned chunk size value
+-	if configureResp.Capabilities.ChunkSize == 0 || configureResp.Capabilities.ChunkSize > backendPluggable.MaxStateStoreChunkSize {
++	if configureResp.Capabilities.ChunkSize == 0 || configureResp.Capabilities.ChunkSize > chunks.MaxStateStoreChunkSize {
+ 		diag := &tfplugin6.Diagnostic{
+ 			Severity: tfplugin6.Diagnostic_ERROR,
+ 			Summary:  "Failed to negotiate acceptable chunk size",
+ 			Detail: fmt.Sprintf("Expected size > 0 and <= %d bytes, provider wants %d bytes",
+-				backendPluggable.MaxStateStoreChunkSize, configureResp.Capabilities.ChunkSize),
++				chunks.MaxStateStoreChunkSize, configureResp.Capabilities.ChunkSize),
+ 		}
+ 		resp.Diagnostics = append(resp.Diagnostics, diag)
+ 		return resp, nil
+ 	}
+-	p.chunkSize = configureResp.Capabilities.ChunkSize
+ 
+ 	resp.Diagnostics = convert.AppendProtoDiag(resp.Diagnostics, configureResp.Diagnostics)
+ 	resp.Capabilities = &tfplugin6.StateStoreServerCapabilities{
+diff --git a/internal/plugin6/grpc_provider.go b/internal/plugin6/grpc_provider.go
+index 0339cefeee..52470d14d2 100644
+--- a/internal/plugin6/grpc_provider.go
++++ b/internal/plugin6/grpc_provider.go
+@@ -1520,6 +1520,11 @@ func (p *GRPCProvider) ConfigureStateStore(r providers.ConfigureStateStoreReques
+ 	logger.Trace("GRPCProvider.v6: ConfigureStateStore: received server capabilities", resp.Capabilities)
+ 
+ 	resp.Diagnostics = resp.Diagnostics.Append(convert.ProtoToDiagnostics(protoResp.Diagnostics))
++
++	// Note: validation of chunk size will happen in the calling code, and if the data is valid
++	// (p *GRPCProvider) SetStateStoreChunkSize should be used to make the value accessible in
++	// the instance of GRPCProvider.
++
+ 	return resp
+ }
+ 
+diff --git a/internal/provider-simple-v6/provider.go b/internal/provider-simple-v6/provider.go
+index 95764755a3..4a927bdfcf 100644
+--- a/internal/provider-simple-v6/provider.go
++++ b/internal/provider-simple-v6/provider.go
+@@ -27,6 +27,8 @@ type simple struct {
+ 	fs    *FsStore
+ }
+ 
++var _ providers.StateStoreChunkSizeSetter = &simple{}
++
+ // Provider returns an instance of providers.Interface
+ func Provider() providers.Interface {
+ 	return provider()
+@@ -478,3 +480,14 @@ func (s simple) ValidateActionConfig(providers.ValidateActionConfigRequest) prov
+ func (s simple) Close() error {
+ 	return nil
+ }
++
++func (s simple) SetStateStoreChunkSize(typeName string, size int) {
++	switch typeName {
++	case inMemStoreName:
++		s.inMem.SetStateStoreChunkSize(typeName, size)
++	case fsStoreName:
++		s.fs.SetStateStoreChunkSize(typeName, size)
++	default:
++		panic("SetStateStoreChunkSize called with unrecognized state store type name.")
++	}
++}
+diff --git a/internal/provider-simple-v6/state_store_fs.go b/internal/provider-simple-v6/state_store_fs.go
+index 3c69da0881..2e74b2a867 100644
+--- a/internal/provider-simple-v6/state_store_fs.go
++++ b/internal/provider-simple-v6/state_store_fs.go
+@@ -38,6 +38,8 @@ type FsStore struct {
+ 	states map[string]*statemgr.Filesystem
+ }
+ 
++var _ providers.StateStoreChunkSizeSetter = &FsStore{}
++
+ func stateStoreFsGetSchema() providers.Schema {
+ 	return providers.Schema{
+ 		Body: &configschema.Block{
+@@ -261,3 +263,15 @@ func (f *FsStore) WriteStateBytes(req providers.WriteStateBytesRequest) provider
+ 
+ 	return resp
+ }
++
++func (f *FsStore) SetStateStoreChunkSize(typeName string, size int) {
++	if typeName != fsStoreName {
++		// If we hit this code it suggests someone's refactoring the PSS implementations used for testing
++		panic(fmt.Sprintf("calling code tried to set the state store size on %s state store but the request reached the %s store implementation.",
++			typeName,
++			fsStoreName,
++		))
++	}
++
++	f.chunkSize = int64(size)
++}
+diff --git a/internal/provider-simple-v6/state_store_inmem.go b/internal/provider-simple-v6/state_store_inmem.go
+index d15ae0f0d8..762268a776 100644
+--- a/internal/provider-simple-v6/state_store_inmem.go
++++ b/internal/provider-simple-v6/state_store_inmem.go
+@@ -29,8 +29,12 @@ const inMemStoreName = "simple6_inmem"
+ type InMemStoreSingle struct {
+ 	states stateMap
+ 	locks  lockMap
++
++	chunkSize int
+ }
+ 
++var _ providers.StateStoreChunkSizeSetter = &InMemStoreSingle{}
++
+ func stateStoreInMemGetSchema() providers.Schema {
+ 	return providers.Schema{
+ 		Body: &configschema.Block{
+@@ -174,6 +178,18 @@ func (m *InMemStoreSingle) DeleteState(req providers.DeleteStateRequest) provide
+ 	return resp
+ }
+ 
++func (m *InMemStoreSingle) SetStateStoreChunkSize(typeName string, size int) {
++	if typeName != inMemStoreName {
++		// If we hit this code it suggests someone's refactoring the PSS implementations used for testing
++		panic(fmt.Sprintf("calling code tried to set the state store size on %s state store but the request reached the %s store implementation.",
++			typeName,
++			inMemStoreName,
++		))
++	}
++
++	m.chunkSize = size
++}
++
+ type stateMap struct {
+ 	sync.Mutex
+ 	m map[string][]byte // key=state id, value=state
+diff --git a/internal/providers/provider.go b/internal/providers/provider.go
+index 793e268578..54ec2b0ae7 100644
+--- a/internal/providers/provider.go
++++ b/internal/providers/provider.go
+@@ -151,6 +151,15 @@ type Interface interface {
+ 	Close() error
+ }
+ 
++// StateStoreChunkSizeSetter interface indicates that a struct wants to record
++// the negotiated chunk size (from the ConfigureStateStore RPC) internally for
++// future use. The future use is likely to be ReadStateBytes/WriteStateBytes RPCs.
++//
++// We let calling code set the chunk size on that struct from outside, to ensure that
++// the value is persisted. The alternative is relying on anything that might fulfil the
++// providers.Interface interface (mock providers used in integration tests, grpcwrap
++// logic used in E2E tests, GRPCProvider logic) to know it needs to implement
++// stateful-ness when processing chunk size negotiation in the ConfigureStateStore RPC.
+ type StateStoreChunkSizeSetter interface {
+ 	SetStateStoreChunkSize(typeName string, size int)
+ }

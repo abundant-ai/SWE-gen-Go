@@ -1,0 +1,220 @@
+diff --git a/internal/command/test_test.go b/internal/command/test_test.go
+index 4b8e4c5380..fbf9272dc4 100644
+--- a/internal/command/test_test.go
++++ b/internal/command/test_test.go
+@@ -412,9 +412,6 @@ func TestTest_Runs(t *testing.T) {
+ 		"ephemeral_output": {
+ 			code: 0,
+ 		},
+-		"ephemeral_output_referenced": {
+-			code: 0,
+-		},
+ 		"no-tests": {
+ 			code: 0,
+ 		},
+@@ -4004,6 +4001,7 @@ Error: Test assertion failed
+   on main.tftest.hcl line 8, in run "first":
+    8:     condition     = test_resource.resource.value == output.null_output
+     ├────────────────
++    │ Warning: LHS and RHS values are of different types
+     │ Diff:
+     │ --- actual
+     │ +++ expected
+@@ -4056,7 +4054,6 @@ Error: Unknown condition value
+    8:     condition = output.destroy_fail == run.one.destroy_fail
+     ├────────────────
+     │ output.destroy_fail is false
+-    │ run.one.destroy_fail is a bool
+ 
+ Condition expression could not be evaluated at this time. This means you have
+ executed a %s block with %s and one of the values your
+diff --git a/internal/command/testdata/test/ephemeral_output_referenced/main.tf b/internal/command/testdata/test/ephemeral_output_referenced/main.tf
+deleted file mode 100644
+index 6c92380f33..0000000000
+--- a/internal/command/testdata/test/ephemeral_output_referenced/main.tf
++++ /dev/null
+@@ -1,8 +0,0 @@
+-variable "foo" {
+-    ephemeral = true
+-    type = string
+-}
+-output "value" {
+-  value = var.foo
+-  ephemeral = true
+-}
+diff --git a/internal/command/testdata/test/ephemeral_output_referenced/main.tftest.hcl b/internal/command/testdata/test/ephemeral_output_referenced/main.tftest.hcl
+deleted file mode 100644
+index a84a20195e..0000000000
+--- a/internal/command/testdata/test/ephemeral_output_referenced/main.tftest.hcl
++++ /dev/null
+@@ -1,20 +0,0 @@
+-run "validate_ephemeral_output_plan" {
+-  command = plan
+-  variables {
+-    foo = "whaaat"
+-  }
+-  assert {
+-    condition = output.value == "whaaat"
+-    error_message = "wrong value"
+-  }
+-}
+-run "validate_ephemeral_output_apply" {
+-  command = apply
+-  variables {
+-    foo = "whaaat"
+-  }
+-  assert {
+-    condition = output.value == "whaaat"
+-    error_message = "wrong value"
+-  }
+-}
+diff --git a/internal/terraform/evaluate.go b/internal/terraform/evaluate.go
+index 343be4034a..68c9d8aba5 100644
+--- a/internal/terraform/evaluate.go
++++ b/internal/terraform/evaluate.go
+@@ -1115,21 +1115,27 @@ func (d *evaluationStateData) GetOutput(addr addrs.OutputValue, rng tfdiags.Sour
+ 		return cty.DynamicVal, diags
+ 	}
+ 
+-	var value cty.Value
+-	if !d.Evaluator.NamedValues.HasOutputValue(addr.Absolute(d.ModulePath)) {
+-		value = cty.DynamicVal
+-	} else {
+-		value = d.Evaluator.NamedValues.GetOutputValue(addr.Absolute(d.ModulePath))
++	output := d.Evaluator.State.OutputValue(addr.Absolute(d.ModulePath))
++	if output == nil {
++		// Then the output itself returned null, so we'll package that up and
++		// pass it on.
++		output = &states.OutputValue{
++			Addr:      addr.Absolute(d.ModulePath),
++			Value:     cty.NilVal,
++			Sensitive: config.Sensitive,
++		}
++	} else if output.Value == cty.NilVal || output.Value.IsNull() {
++		// Then we did get a value but Terraform itself thought it was NilVal
++		// so we treat this as if the value isn't yet known.
++		output.Value = cty.DynamicVal
+ 	}
+ 
+-	if config.Sensitive {
+-		value = value.Mark(marks.Sensitive)
+-	}
+-	if config.Ephemeral {
+-		value = value.Mark(marks.Ephemeral)
++	val := output.Value
++	if output.Sensitive {
++		val = val.Mark(marks.Sensitive)
+ 	}
+ 
+-	return value, diags
++	return val, diags
+ }
+ 
+ // moduleDisplayAddr returns a string describing the given module instance
+diff --git a/internal/terraform/evaluate_test.go b/internal/terraform/evaluate_test.go
+index 05285ca00b..db984755b7 100644
+--- a/internal/terraform/evaluate_test.go
++++ b/internal/terraform/evaluate_test.go
+@@ -99,11 +99,6 @@ func TestEvaluatorGetPathAttr(t *testing.T) {
+ }
+ 
+ func TestEvaluatorGetOutputValue(t *testing.T) {
+-	nvs := namedvals.NewState()
+-	nvs.SetOutputValue(mustAbsOutputValue("output.some_output"), cty.StringVal("first"))
+-	nvs.SetOutputValue(mustAbsOutputValue("output.some_other_output"), cty.StringVal("second"))
+-	nvs.SetOutputValue(mustAbsOutputValue("output.some_third_output"), cty.StringVal("third").Mark(marks.Sensitive))
+-
+ 	evaluator := &Evaluator{
+ 		Meta: &ContextMeta{
+ 			Env: "foo",
+@@ -118,13 +113,23 @@ func TestEvaluatorGetOutputValue(t *testing.T) {
+ 					"some_other_output": {
+ 						Name: "some_other_output",
+ 					},
+-					"some_third_output": {
+-						Name: "some_third_output",
+-					},
+ 				},
+ 			},
+ 		},
+-		NamedValues: nvs,
++		State: states.BuildState(func(state *states.SyncState) {
++			state.SetOutputValue(addrs.AbsOutputValue{
++				Module: addrs.RootModuleInstance,
++				OutputValue: addrs.OutputValue{
++					Name: "some_output",
++				},
++			}, cty.StringVal("first"), true)
++			state.SetOutputValue(addrs.AbsOutputValue{
++				Module: addrs.RootModuleInstance,
++				OutputValue: addrs.OutputValue{
++					Name: "some_other_output",
++				},
++			}, cty.StringVal("second"), false)
++		}).SyncWrapper(),
+ 	}
+ 
+ 	data := &evaluationStateData{
+@@ -157,18 +162,6 @@ func TestEvaluatorGetOutputValue(t *testing.T) {
+ 	if !got.RawEquals(want) {
+ 		t.Errorf("wrong result %#v; want %#v", got, want)
+ 	}
+-
+-	want = cty.StringVal("third").Mark(marks.Sensitive)
+-	got, diags = scope.Data.GetOutput(addrs.OutputValue{
+-		Name: "some_third_output",
+-	}, tfdiags.SourceRange{})
+-
+-	if len(diags) != 0 {
+-		t.Errorf("unexpected diagnostics %s", spew.Sdump(diags))
+-	}
+-	if !got.RawEquals(want) {
+-		t.Errorf("wrong result %#v; want %#v", got, want)
+-	}
+ }
+ 
+ // This particularly tests that a sensitive attribute in config
+diff --git a/internal/terraform/node_output.go b/internal/terraform/node_output.go
+index 3e505a28fb..98fc1ba7bb 100644
+--- a/internal/terraform/node_output.go
++++ b/internal/terraform/node_output.go
+@@ -757,6 +757,15 @@ func (n *NodeApplyableOutput) setValue(namedVals *namedvals.State, state *states
+ 		changes.RemoveOutputChange(n.Addr)
+ 	}
+ 
++	// Null outputs must be saved for modules so that they can still be
++	// evaluated. Null root outputs are removed entirely, which is always fine
++	// because they can't be referenced by anything else in the configuration.
++	if n.Addr.Module.IsRoot() && val.IsNull() {
++		log.Printf("[TRACE] setValue: Removing %s from state (it is now null)", n.Addr)
++		state.RemoveOutputValue(n.Addr)
++		return
++	}
++
+ 	// caller leaves namedVals nil if they've already called this function
+ 	// with a different state, since we only have one namedVals regardless
+ 	// of how many states are involved in an operation.
+@@ -770,15 +779,6 @@ func (n *NodeApplyableOutput) setValue(namedVals *namedvals.State, state *states
+ 		namedVals.SetOutputValue(n.Addr, saveVal)
+ 	}
+ 
+-	// Null outputs must be saved for modules so that they can still be
+-	// evaluated. Null root outputs are removed entirely, which is always fine
+-	// because they can't be referenced by anything else in the configuration.
+-	if n.Addr.Module.IsRoot() && val.IsNull() {
+-		log.Printf("[TRACE] setValue: Removing %s from state (it is now null)", n.Addr)
+-		state.RemoveOutputValue(n.Addr)
+-		return
+-	}
+-
+ 	// Non-ephemeral output values get saved in the state too
+ 	if !n.Config.Ephemeral {
+ 		// The state itself doesn't represent unknown values, so we null them
+@@ -798,6 +798,6 @@ func (n *NodeApplyableOutput) setValue(namedVals *namedvals.State, state *states
+ 				val = cty.UnknownAsNull(val)
+ 			}
+ 		}
+-		state.SetOutputValue(n.Addr, val, n.Config.Sensitive)
+ 	}
++	state.SetOutputValue(n.Addr, val, n.Config.Sensitive)
+ }

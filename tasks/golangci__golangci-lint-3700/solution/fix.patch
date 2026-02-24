@@ -1,0 +1,104 @@
+diff --git a/pkg/commands/run.go b/pkg/commands/run.go
+index a9971f5e..20106b44 100644
+--- a/pkg/commands/run.go
++++ b/pkg/commands/run.go
+@@ -23,7 +23,6 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/packages"
+ 	"github.com/golangci/golangci-lint/pkg/printers"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+-	"github.com/golangci/golangci-lint/pkg/result/processors"
+ )
+ 
+ const defaultFileMode = 0644
+@@ -360,18 +359,12 @@ func (e *Executor) runAnalysis(ctx context.Context, args []string) ([]result.Iss
+ 	lintCtx.Log = e.log.Child(logutils.DebugKeyLintersContext)
+ 
+ 	runner, err := lint.NewRunner(e.cfg, e.log.Child(logutils.DebugKeyRunner),
+-		e.goenv, e.EnabledLintersSet, e.lineCache, e.DBManager, lintCtx.Packages)
++		e.goenv, e.EnabledLintersSet, e.lineCache, e.fileCache, e.DBManager, lintCtx.Packages)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	issues, err := runner.Run(ctx, lintersToRun, lintCtx)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	fixer := processors.NewFixer(e.cfg, e.log, e.fileCache)
+-	return fixer.Process(issues), nil
++	return runner.Run(ctx, lintersToRun, lintCtx)
+ }
+ 
+ func (e *Executor) setOutputToDevNull() (savedStdout, savedStderr *os.File) {
+diff --git a/pkg/lint/runner.go b/pkg/lint/runner.go
+index 1d527711..b1180438 100644
+--- a/pkg/lint/runner.go
++++ b/pkg/lint/runner.go
+@@ -27,8 +27,10 @@ type Runner struct {
+ 	Log        logutils.Log
+ }
+ 
+-func NewRunner(cfg *config.Config, log logutils.Log, goenv *goutil.Env, es *lintersdb.EnabledSet,
+-	lineCache *fsutils.LineCache, dbManager *lintersdb.Manager, pkgs []*gopackages.Package) (*Runner, error) {
++func NewRunner(cfg *config.Config, log logutils.Log, goenv *goutil.Env,
++	es *lintersdb.EnabledSet,
++	lineCache *fsutils.LineCache, fileCache *fsutils.FileCache,
++	dbManager *lintersdb.Manager, pkgs []*gopackages.Package) (*Runner, error) {
+ 	// Beware that some processors need to add the path prefix when working with paths
+ 	// because they get invoked before the path prefixer (exclude and severity rules)
+ 	// or process other paths (skip files).
+@@ -98,6 +100,11 @@ func NewRunner(cfg *config.Config, log logutils.Log, goenv *goutil.Env, es *lint
+ 			processors.NewSourceCode(lineCache, log.Child(logutils.DebugKeySourceCode)),
+ 			processors.NewPathShortener(),
+ 			getSeverityRulesProcessor(&cfg.Severity, log, files),
++
++			// The fixer still needs to see paths for the issues that are relative to the current directory.
++			processors.NewFixer(cfg, log, fileCache),
++
++			// Now we can modify the issues for output.
+ 			processors.NewPathPrefixer(cfg.Output.PathPrefix),
+ 			processors.NewSortResults(cfg),
+ 		},
+diff --git a/pkg/result/processors/fixer.go b/pkg/result/processors/fixer.go
+index 3a31a33e..a79a8462 100644
+--- a/pkg/result/processors/fixer.go
++++ b/pkg/result/processors/fixer.go
+@@ -16,6 +16,8 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/timeutils"
+ )
+ 
++var _ Processor = Fixer{}
++
+ type Fixer struct {
+ 	cfg       *config.Config
+ 	log       logutils.Log
+@@ -36,9 +38,9 @@ func (f Fixer) printStat() {
+ 	f.sw.PrintStages()
+ }
+ 
+-func (f Fixer) Process(issues []result.Issue) []result.Issue {
++func (f Fixer) Process(issues []result.Issue) ([]result.Issue, error) {
+ 	if !f.cfg.Issues.NeedFix {
+-		return issues
++		return issues, nil
+ 	}
+ 
+ 	outIssues := make([]result.Issue, 0, len(issues))
+@@ -67,9 +69,15 @@ func (f Fixer) Process(issues []result.Issue) []result.Issue {
+ 	}
+ 
+ 	f.printStat()
+-	return outIssues
++	return outIssues, nil
++}
++
++func (f Fixer) Name() string {
++	return "fixer"
+ }
+ 
++func (f Fixer) Finish() {}
++
+ func (f Fixer) fixIssuesInFile(filePath string, issues []result.Issue) error {
+ 	// TODO: don't read the whole file into memory: read line by line;
+ 	// can't just use bufio.scanner: it has a line length limit

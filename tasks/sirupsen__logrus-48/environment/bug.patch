@@ -1,0 +1,222 @@
+diff --git a/README.md b/README.md
+index e1ff807..318c2a9 100644
+--- a/README.md
++++ b/README.md
+@@ -191,10 +191,10 @@ that severity or anything above it:
+ 
+ ```go
+ // Will log anything that is info or above (warn, error, fatal, panic). Default.
+-log.Level = logrus.InfoLevel
++log.Level = logrus.Info
+ ```
+ 
+-It may be useful to set `log.Level = logrus.DebugLevel` in a debug or verbose
++It may be useful to set `log.Level = logrus.Debug` in a debug or verbose
+ environment if your application has that.
+ 
+ #### Entries
+@@ -261,9 +261,6 @@ type MyJSONFormatter struct {
+ log.Formatter = new(MyJSONFormatter)
+ 
+ func (f *JSONFormatter) Format(entry *Entry) ([]byte, error) {
+-  // Note this doesn't include Time, Level and Message which are available on
+-  // the Entry. Consult `godoc` on information about those fields or read the
+-  // source of the official loggers.
+   serialized, err := json.Marshal(entry.Data)
+     if err != nil {
+       return nil, fmt.Errorf("Failed to marshal fields to JSON, %v", err)
+diff --git a/entry.go b/entry.go
+index 44ff056..8292ded 100644
+--- a/entry.go
++++ b/entry.go
+@@ -8,24 +8,9 @@ import (
+ 	"time"
+ )
+ 
+-// An entry is the final or intermediate Logrus logging entry. It containts all
+-// the fields passed with WithField{,s}. It's finally logged when Debug, Info,
+-// Warn, Error, Fatal or Panic is called on it. These objects can be reused and
+-// passed around as much as you wish to avoid field duplication.
+ type Entry struct {
+ 	Logger *Logger
+-
+-	// Contains all the fields set by the user.
+-	Data Fields
+-
+-	// Time at which the log entry was created
+-	Time time.Time
+-
+-	// Level the log entry was logged at: Debug, Info, Warn, Error, Fatal or Panic
+-	Level Level
+-
+-	// Message passed to Debug, Info, Warn, Error, Fatal or Panic
+-	Message string
++	Data   Fields
+ }
+ 
+ var baseTimestamp time.Time
+@@ -38,14 +23,11 @@ func NewEntry(logger *Logger) *Entry {
+ 	}
+ }
+ 
+-// Returns a reader for the entry, which is a proxy to the formatter.
+ func (entry *Entry) Reader() (*bytes.Buffer, error) {
+ 	serialized, err := entry.Logger.Formatter.Format(entry)
+ 	return bytes.NewBuffer(serialized), err
+ }
+ 
+-// Returns the string representation from the reader and ultimately the
+-// formatter.
+ func (entry *Entry) String() (string, error) {
+ 	reader, err := entry.Reader()
+ 	if err != nil {
+@@ -55,12 +37,10 @@ func (entry *Entry) String() (string, error) {
+ 	return reader.String(), err
+ }
+ 
+-// Add a single field to the Entry.
+ func (entry *Entry) WithField(key string, value interface{}) *Entry {
+ 	return entry.WithFields(Fields{key: value})
+ }
+ 
+-// Add a map of fields to the Entry.
+ func (entry *Entry) WithFields(fields Fields) *Entry {
+ 	data := Fields{}
+ 	for k, v := range entry.Data {
+@@ -73,9 +53,9 @@ func (entry *Entry) WithFields(fields Fields) *Entry {
+ }
+ 
+ func (entry *Entry) log(level Level, msg string) string {
+-	entry.Time = time.Now()
+-	entry.Level = level
+-	entry.Message = msg
++	entry.Data["time"] = time.Now().String()
++	entry.Data["level"] = level.String()
++	entry.Data["msg"] = msg
+ 
+ 	if err := entry.Logger.Hooks.Fire(level, entry); err != nil {
+ 		fmt.Fprintf(os.Stderr, "Failed to fire hook", err)
+diff --git a/formatter.go b/formatter.go
+index fc0ebd7..3a2eff5 100644
+--- a/formatter.go
++++ b/formatter.go
+@@ -1,9 +1,5 @@
+ package logrus
+ 
+-import (
+-	"time"
+-)
+-
+ // The Formatter interface is used to implement a custom Formatter. It takes an
+ // `Entry`. It exposes all the fields, including the default ones:
+ //
+@@ -17,38 +13,3 @@ import (
+ type Formatter interface {
+ 	Format(*Entry) ([]byte, error)
+ }
+-
+-// This is to not silently overwrite `time`, `msg` and `level` fields when
+-// dumping it. If this code wasn't there doing:
+-//
+-//  logrus.WithField("level", 1).Info("hello")
+-//
+-// Would just silently drop the user provided level. Instead with this code
+-// it'll logged as:
+-//
+-//  {"level": "info", "fields.level": 1, "msg": "hello", "time": "..."}
+-//
+-// It's not exported because it's still using Data in an opionated way. It's to
+-// avoid code duplication between the two default formatters.
+-func prefixFieldClashes(entry *Entry) {
+-	_, ok := entry.Data["time"]
+-	if ok {
+-		entry.Data["fields.time"] = entry.Data["time"]
+-	}
+-
+-	entry.Data["time"] = entry.Time.Format(time.RFC3339)
+-
+-	_, ok = entry.Data["msg"]
+-	if ok {
+-		entry.Data["fields.msg"] = entry.Data["msg"]
+-	}
+-
+-	entry.Data["msg"] = entry.Message
+-
+-	_, ok = entry.Data["level"]
+-	if ok {
+-		entry.Data["fields.level"] = entry.Data["level"]
+-	}
+-
+-	entry.Data["level"] = entry.Level.String()
+-}
+diff --git a/json_formatter.go b/json_formatter.go
+index c0e2d18..cb3489e 100644
+--- a/json_formatter.go
++++ b/json_formatter.go
+@@ -9,8 +9,6 @@ type JSONFormatter struct {
+ }
+ 
+ func (f *JSONFormatter) Format(entry *Entry) ([]byte, error) {
+-	prefixFieldClashes(entry)
+-
+ 	serialized, err := json.Marshal(entry.Data)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("Failed to marshal fields to JSON, %v", err)
+diff --git a/logrus_test.go b/logrus_test.go
+index 6202300..f14445c 100644
+--- a/logrus_test.go
++++ b/logrus_test.go
+@@ -129,40 +129,6 @@ func TestWithFieldsShouldAllowAssignments(t *testing.T) {
+ 	assert.Equal(t, "value1", fields["key1"])
+ }
+ 
+-func TestUserSuppliedFieldDoesNotOverwriteDefaults(t *testing.T) {
+-	LogAndAssertJSON(t, func(log *Logger) {
+-		log.WithField("msg", "hello").Info("test")
+-	}, func(fields Fields) {
+-		assert.Equal(t, fields["msg"], "test")
+-	})
+-}
+-
+-func TestUserSuppliedMsgFieldHasPrefix(t *testing.T) {
+-	LogAndAssertJSON(t, func(log *Logger) {
+-		log.WithField("msg", "hello").Info("test")
+-	}, func(fields Fields) {
+-		assert.Equal(t, fields["msg"], "test")
+-		assert.Equal(t, fields["fields.msg"], "hello")
+-	})
+-}
+-
+-func TestUserSuppliedTimeFieldHasPrefix(t *testing.T) {
+-	LogAndAssertJSON(t, func(log *Logger) {
+-		log.WithField("time", "hello").Info("test")
+-	}, func(fields Fields) {
+-		assert.Equal(t, fields["fields.time"], "hello")
+-	})
+-}
+-
+-func TestUserSuppliedLevelFieldHasPrefix(t *testing.T) {
+-	LogAndAssertJSON(t, func(log *Logger) {
+-		log.WithField("level", 1).Info("test")
+-	}, func(fields Fields) {
+-		assert.Equal(t, fields["level"], "info")
+-		assert.Equal(t, fields["fields.level"], 1)
+-	})
+-}
+-
+ func TestConvertLevelToString(t *testing.T) {
+ 	assert.Equal(t, "debug", DebugLevel.String())
+ 	assert.Equal(t, "info", InfoLevel.String())
+diff --git a/text_formatter.go b/text_formatter.go
+index d71eba1..06b4970 100644
+--- a/text_formatter.go
++++ b/text_formatter.go
+@@ -32,8 +32,6 @@ type TextFormatter struct {
+ func (f *TextFormatter) Format(entry *Entry) ([]byte, error) {
+ 	b := &bytes.Buffer{}
+ 
+-	prefixFieldClashes(entry)
+-
+ 	if f.ForceColors || IsTerminal() {
+ 		levelText := strings.ToUpper(entry.Data["level"].(string))[0:4]
+ 

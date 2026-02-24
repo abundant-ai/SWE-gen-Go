@@ -1,0 +1,179 @@
+diff --git a/internal/backend/local/backend_local.go b/internal/backend/local/backend_local.go
+index 962663af35..4e900de9ef 100644
+--- a/internal/backend/local/backend_local.go
++++ b/internal/backend/local/backend_local.go
+@@ -132,7 +132,9 @@ func (b *Local) localRun(op *backendrun.Operation) (*backendrun.LocalRun, *confi
+ 		// If validation is enabled, validate
+ 		if b.OpValidation {
+ 			log.Printf("[TRACE] backend/local: running validation operation")
+-			validateDiags := ret.Core.Validate(ret.Config, nil)
++			// TODO: Implement query validate command. op.Query is false when running the command "terraform validate"
++			opts := &terraform.ValidateOpts{Query: op.Query}
++			validateDiags := ret.Core.Validate(ret.Config, opts)
+ 			diags = diags.Append(validateDiags)
+ 		}
+ 	}
+diff --git a/internal/terraform/context_validate.go b/internal/terraform/context_validate.go
+index 5d22330e75..d154590afc 100644
+--- a/internal/terraform/context_validate.go
++++ b/internal/terraform/context_validate.go
+@@ -34,6 +34,9 @@ type ValidateOpts struct {
+ 	// not available to this function. Therefore, it is the responsibility of
+ 	// the caller to ensure that the provider configurations are valid.
+ 	ExternalProviders map[addrs.RootProviderConfig]providers.Interface
++
++	// When true, query files will also be validated.
++	Query bool
+ }
+ 
+ // Validate performs semantic validation of a configuration, and returns
+@@ -105,6 +108,7 @@ func (c *Context) Validate(config *configs.Config, opts *ValidateOpts) tfdiags.D
+ 		Operation:               walkValidate,
+ 		ExternalProviderConfigs: opts.ExternalProviders,
+ 		ImportTargets:           c.findImportTargets(config),
++		queryPlan:               opts.Query,
+ 	}).Build(addrs.RootModuleInstance)
+ 	diags = diags.Append(moreDiags)
+ 	if moreDiags.HasErrors() {
+diff --git a/internal/terraform/graph_builder_apply.go b/internal/terraform/graph_builder_apply.go
+index b81f1b6f2a..326a05a2dc 100644
+--- a/internal/terraform/graph_builder_apply.go
++++ b/internal/terraform/graph_builder_apply.go
+@@ -122,10 +122,6 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
+ 		&ConfigTransformer{
+ 			Concrete: concreteResource,
+ 			Config:   b.Config,
+-			resourceMatcher: func(mode addrs.ResourceMode) bool {
+-				// list resources are not added to the graph during apply
+-				return mode != addrs.ListResourceMode
+-			},
+ 		},
+ 
+ 		// Add dynamic values
+diff --git a/internal/terraform/graph_builder_plan.go b/internal/terraform/graph_builder_plan.go
+index 87a8dab985..479db64030 100644
+--- a/internal/terraform/graph_builder_plan.go
++++ b/internal/terraform/graph_builder_plan.go
+@@ -159,14 +159,6 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
+ 			ConcreteAction: b.ConcreteAction,
+ 			Config:         b.Config,
+ 			destroy:        b.Operation == walkDestroy || b.Operation == walkPlanDestroy,
+-			resourceMatcher: func(mode addrs.ResourceMode) bool {
+-				// all resources are included during validation.
+-				if b.Operation == walkValidate {
+-					return true
+-				}
+-
+-				return b.queryPlan == (mode == addrs.ListResourceMode)
+-			},
+ 
+ 			importTargets: b.ImportTargets,
+ 
+@@ -290,6 +282,9 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
+ 		// Target
+ 		&TargetsTransformer{Targets: b.Targets},
+ 
++		// Filter the graph to only include nodes that are relevant to the query operation.
++		&QueryTransformer{queryPlan: b.queryPlan, validate: b.Operation == walkValidate},
++
+ 		// Detect when create_before_destroy must be forced on for a particular
+ 		// node due to dependency edges, to avoid graph cycles during apply.
+ 		&ForcedCBDTransformer{},
+diff --git a/internal/terraform/transform_config.go b/internal/terraform/transform_config.go
+index 236e8ee6a9..8198faad96 100644
+--- a/internal/terraform/transform_config.go
++++ b/internal/terraform/transform_config.go
+@@ -53,8 +53,6 @@ type ConfigTransformer struct {
+ 	// try to delete the imported resource unless the config is updated
+ 	// manually.
+ 	generateConfigPathForImportTargets string
+-
+-	resourceMatcher func(addrs.ResourceMode) bool
+ }
+ 
+ func (t *ConfigTransformer) Transform(g *Graph) error {
+@@ -163,11 +161,6 @@ func (t *ConfigTransformer) transformSingle(g *Graph, config *configs.Config) er
+ 			continue
+ 		}
+ 
+-		if t.resourceMatcher != nil && !t.resourceMatcher(r.Mode) {
+-			// Skip resources that do not match the filter
+-			continue
+-		}
+-
+ 		// Verify that any actions referenced in the resource's ActionTriggers exist in this module
+ 		var diags tfdiags.Diagnostics
+ 		if r.Managed != nil && r.Managed.ActionTriggers != nil {
+@@ -262,10 +255,6 @@ func (t *ConfigTransformer) transformSingle(g *Graph, config *configs.Config) er
+ 	// If any import targets were not claimed by resources we may be
+ 	// generating configuration. Add them to the graph for validation.
+ 	for _, i := range importTargets {
+-		if t.resourceMatcher != nil && !t.resourceMatcher(i.Config.ToResource.Resource.Mode) {
+-			// Skip resources that do not match the filter
+-			continue
+-		}
+ 
+ 		log.Printf("[DEBUG] ConfigTransformer: adding config generation node for %s", i.Config.ToResource)
+ 
+diff --git a/internal/terraform/transform_query.go b/internal/terraform/transform_query.go
+new file mode 100644
+index 0000000000..64c725772f
+--- /dev/null
++++ b/internal/terraform/transform_query.go
+@@ -0,0 +1,56 @@
++// Copyright (c) HashiCorp, Inc.
++// SPDX-License-Identifier: BUSL-1.1
++
++package terraform
++
++import (
++	"github.com/hashicorp/terraform/internal/addrs"
++	"github.com/hashicorp/terraform/internal/dag"
++)
++
++type QueryTransformer struct {
++	// queryPlan is true when we are planning list resources.
++	queryPlan bool
++
++	// if validate is true, we are in validate mode and should not exclude any resources.
++	validate bool
++}
++
++func (t *QueryTransformer) Transform(g *Graph) error {
++	if !t.queryPlan {
++		// if we are not running a query-specific operation, we don't need to transform the graph
++		// as query-related files would not have been part of the parsed config.
++		return nil
++	}
++
++	if t.validate {
++		// if we are validating query files, we validate all resources
++		return nil
++	}
++
++	// a set to hold the resources that we want to keep and vertices along its path.
++	keep := dag.Set{}
++
++	for v := range dag.SelectSeq[GraphNodeConfigResource](g.VerticesSeq()) {
++		// we only get here if we are building a query plan, but not validating.
++		//
++		// By now, the graph already contains all resources from the config, including non-list resources.
++		// We start from each list resource node, look at its ancestors, and keep all vertices along its path.
++		if v.ResourceAddr().Resource.Mode == addrs.ListResourceMode {
++			keep.Add(v)
++			deps := g.Ancestors(v)
++			for node := range deps {
++				keep.Add(node)
++			}
++		}
++	}
++
++	// Remove all nodes that are not in the keep set.
++	for v := range g.VerticesSeq() {
++		if _, ok := keep[v]; !ok {
++			g.Remove(v)
++		}
++	}
++
++	return nil
++}

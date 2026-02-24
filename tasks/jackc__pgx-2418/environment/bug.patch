@@ -1,0 +1,549 @@
+diff --git a/batch_test.go b/batch_test.go
+index d45ff526..b4c421e5 100644
+--- a/batch_test.go
++++ b/batch_test.go
+@@ -4,16 +4,12 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
+-	"io"
+-	"net"
+ 	"os"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/jackc/pgx/v5"
+-	"github.com/jackc/pgx/v5/internal/faultyconn"
+ 	"github.com/jackc/pgx/v5/pgconn"
+-	"github.com/jackc/pgx/v5/pgproto3"
+ 	"github.com/jackc/pgx/v5/pgxtest"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+@@ -1064,73 +1060,6 @@ func TestSendBatchStatementTimeout(t *testing.T) {
+ 
+ }
+ 
+-func TestSendBatchHandlesTimeoutBetweenParseAndDescribe(t *testing.T) {
+-	// Not parallel because it is a timing sensitive test.
+-
+-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+-	defer cancel()
+-
+-	var faultyConn *faultyconn.Conn
+-	faultyConnTestRunner := pgxtest.DefaultConnTestRunner()
+-	faultyConnTestRunner.CreateConfig = func(ctx context.Context, t testing.TB) *pgx.ConnConfig {
+-		config, err := pgx.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+-		require.NoError(t, err)
+-		config.AfterNetConnect = func(ctx context.Context, config *pgconn.Config, conn net.Conn) (net.Conn, error) {
+-			faultyConn = faultyconn.New(conn)
+-			return faultyConn, nil
+-		}
+-		return config
+-	}
+-
+-	// Only need to test modes that use Parse/Describe.
+-	extendedQueryModes := []pgx.QueryExecMode{
+-		pgx.QueryExecModeCacheStatement,
+-		pgx.QueryExecModeCacheDescribe,
+-		pgx.QueryExecModeDescribeExec,
+-		pgx.QueryExecModeExec,
+-	}
+-
+-	pgxtest.RunWithQueryExecModes(ctx, t, faultyConnTestRunner, extendedQueryModes, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+-		pgxtest.SkipCockroachDB(t, conn, "Induced error does not occur on CockroachDB")
+-
+-		_, err := conn.Exec(ctx, "set statement_timeout = '100ms'")
+-		require.NoError(t, err)
+-
+-		batch := &pgx.Batch{}
+-		batch.Queue("select 1")
+-		batch.Queue("select 2")
+-
+-		faultyConn.HandleFrontendMessage = func(backendWriter io.Writer, msg pgproto3.FrontendMessage) error {
+-			if _, ok := msg.(*pgproto3.Describe); ok {
+-				time.Sleep(200 * time.Millisecond)
+-			}
+-			buf, err := msg.Encode(nil)
+-			if err != nil {
+-				return err
+-			}
+-			_, err = backendWriter.Write(buf)
+-			return err
+-		}
+-
+-		err = conn.SendBatch(ctx, batch).Close()
+-		require.Error(t, err)
+-		var pgErr *pgconn.PgError
+-		require.True(t, errors.As(err, &pgErr))
+-		require.Equal(t, "57014", pgErr.Code)
+-
+-		faultyConn.HandleFrontendMessage = nil
+-
+-		_, err = conn.Exec(ctx, "set statement_timeout = default")
+-		require.NoError(t, err)
+-
+-		batch = &pgx.Batch{}
+-		batch.Queue("select 1")
+-		batch.Queue("select 2")
+-		err = conn.SendBatch(ctx, batch).Close()
+-		require.NoError(t, err)
+-	})
+-}
+-
+ func ExampleConn_SendBatch() {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+ 	defer cancel()
+diff --git a/conn.go b/conn.go
+index 42e955fc..340bca5a 100644
+--- a/conn.go
++++ b/conn.go
+@@ -65,12 +65,11 @@ func (cc *ConnConfig) ConnString() string { return cc.connString }
+ // Conn is a PostgreSQL connection handle. It is not safe for concurrent usage. Use a connection pool to manage access
+ // to multiple database connections from multiple goroutines.
+ type Conn struct {
+-	pgConn                  *pgconn.PgConn
+-	config                  *ConnConfig // config used when establishing this connection
+-	preparedStatements      map[string]*pgconn.StatementDescription
+-	failedDescribeStatement string
+-	statementCache          stmtcache.Cache
+-	descriptionCache        stmtcache.Cache
++	pgConn             *pgconn.PgConn
++	config             *ConnConfig // config used when establishing this connection
++	preparedStatements map[string]*pgconn.StatementDescription
++	statementCache     stmtcache.Cache
++	descriptionCache   stmtcache.Cache
+ 
+ 	queryTracer    QueryTracer
+ 	batchTracer    BatchTracer
+@@ -315,14 +314,6 @@ func (c *Conn) Close(ctx context.Context) error {
+ // Prepare is idempotent; i.e. it is safe to call Prepare multiple times with the same name and sql arguments. This
+ // allows a code path to Prepare and Query/Exec without concern for if the statement has already been prepared.
+ func (c *Conn) Prepare(ctx context.Context, name, sql string) (sd *pgconn.StatementDescription, err error) {
+-	if c.failedDescribeStatement != "" {
+-		err = c.Deallocate(ctx, c.failedDescribeStatement)
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to deallocate previously failed statement %q: %w", c.failedDescribeStatement, err)
+-		}
+-		c.failedDescribeStatement = ""
+-	}
+-
+ 	if c.prepareTracer != nil {
+ 		ctx = c.prepareTracer.TracePrepareStart(ctx, c, TracePrepareStartData{Name: name, SQL: sql})
+ 	}
+@@ -355,10 +346,6 @@ func (c *Conn) Prepare(ctx context.Context, name, sql string) (sd *pgconn.Statem
+ 
+ 	sd, err = c.pgConn.Prepare(ctx, psName, sql, nil)
+ 	if err != nil {
+-		var pErr *pgconn.PrepareError
+-		if errors.As(err, &pErr) {
+-			c.failedDescribeStatement = psKey
+-		}
+ 		return nil, err
+ 	}
+ 
+diff --git a/conn_test.go b/conn_test.go
+index d570ad8b..10959f06 100644
+--- a/conn_test.go
++++ b/conn_test.go
+@@ -4,8 +4,6 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"database/sql"
+-	"io"
+-	"net"
+ 	"os"
+ 	"strings"
+ 	"sync"
+@@ -13,9 +11,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/jackc/pgx/v5"
+-	"github.com/jackc/pgx/v5/internal/faultyconn"
+ 	"github.com/jackc/pgx/v5/pgconn"
+-	"github.com/jackc/pgx/v5/pgproto3"
+ 	"github.com/jackc/pgx/v5/pgtype"
+ 	"github.com/jackc/pgx/v5/pgxtest"
+ 	"github.com/stretchr/testify/assert"
+@@ -470,69 +466,6 @@ func TestPrepare(t *testing.T) {
+ 	}
+ }
+ 
+-// https://github.com/jackc/pgx/issues/2223
+-func TestPrepareHandlesTimeoutBetweenParseAndDescribe(t *testing.T) {
+-	// Not parallel because it is a timing sensitive test.
+-
+-	config, err := pgx.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+-	require.NoError(t, err)
+-
+-	var faultyConn *faultyconn.Conn
+-	config.AfterNetConnect = func(ctx context.Context, config *pgconn.Config, conn net.Conn) (net.Conn, error) {
+-		faultyConn = faultyconn.New(conn)
+-		return faultyConn, nil
+-	}
+-
+-	ctx := context.Background()
+-	conn, err := pgx.ConnectConfig(ctx, config)
+-	require.NoError(t, err)
+-	defer closeConn(t, conn)
+-	require.NotNil(t, faultyConn)
+-
+-	pgxtest.SkipCockroachDB(t, conn, "Induced error does not occur on CockroachDB")
+-
+-	_, err = conn.Exec(ctx, "set statement_timeout = '100ms'")
+-	require.NoError(t, err)
+-
+-	faultyConn.HandleFrontendMessage = func(backendWriter io.Writer, msg pgproto3.FrontendMessage) error {
+-		if _, ok := msg.(*pgproto3.Describe); ok {
+-			time.Sleep(200 * time.Millisecond)
+-		}
+-		buf, err := msg.Encode(nil)
+-		if err != nil {
+-			return err
+-		}
+-		_, err = backendWriter.Write(buf)
+-		return err
+-	}
+-
+-	psd, err := conn.Prepare(ctx, "test", "select $1::varchar")
+-	var pgErr *pgconn.PgError
+-	require.ErrorAs(t, err, &pgErr)
+-	require.Equal(t, "57014", pgErr.Code)
+-	require.Nil(t, psd)
+-
+-	faultyConn.HandleFrontendMessage = nil
+-
+-	_, err = conn.Exec(ctx, "set statement_timeout = default")
+-	require.NoError(t, err)
+-
+-	var existsOnServer bool
+-	err = conn.QueryRow(
+-		ctx,
+-		"select exists(select 1 from pg_prepared_statements where name = 'test')",
+-		// Avoid using the prepared statement cache or it will clear the broken statement before we can check for its
+-		// existence.
+-		pgx.QueryExecModeExec,
+-	).Scan(&existsOnServer)
+-	require.NoError(t, err)
+-	require.True(t, existsOnServer)
+-
+-	psd, err = conn.Prepare(ctx, "test", "select $1::varchar")
+-	require.NoError(t, err)
+-	require.NotNil(t, psd)
+-}
+-
+ func TestPrepareBadSQLFailure(t *testing.T) {
+ 	t.Parallel()
+ 
+diff --git a/internal/faultyconn/faultyconn.go b/internal/faultyconn/faultyconn.go
+deleted file mode 100644
+index 73d4a067..00000000
+--- a/internal/faultyconn/faultyconn.go
++++ /dev/null
+@@ -1,99 +0,0 @@
+-package faultyconn
+-
+-import (
+-	"bytes"
+-	"io"
+-	"net"
+-	"time"
+-
+-	"github.com/jackc/pgx/v5/pgproto3"
+-)
+-
+-// Conn is a wrapper for a net.Conn that allows inspection and modification of messages between a PostgreSQL client and
+-// server. It is designed to be used in tests that use a *pgx.Conn or *pgconn.PgConn connected to a real PostgreSQL
+-// server. Instead of mocking an entire server connection, this is used to specify and modify only the particular
+-// aspects of a connection that are necessary. This can be easier to setup and is more true to real world conditions.
+-//
+-// It currently only supports handling frontend messages.
+-type Conn struct {
+-	// HandleFrontendMessage is called for each frontend message received. It should use backendWriter to write to the
+-	// backend.
+-	HandleFrontendMessage func(backendWriter io.Writer, msg pgproto3.FrontendMessage) error
+-
+-	// TODO: Implement this if we need to handle backend messages.
+-	// HandleBackendMessage  func(w io.Writer, msg pgproto3.BackendMessage) error
+-
+-	conn            net.Conn
+-	fromFrontendBuf *bytes.Buffer
+-	fromBackendBuf  *bytes.Buffer
+-	backend         *pgproto3.Backend
+-	frontend        *pgproto3.Frontend
+-}
+-
+-// NewConn creates a new Conn that proxies the messages sent to and from the given net.Conn. New can be used with
+-// pgconn.Config.AfterNetConnect to wrap a net.Conn for testing purposes.
+-func New(c net.Conn) *Conn {
+-	fromFrontendBuf := &bytes.Buffer{}
+-	fromBackendBuf := &bytes.Buffer{}
+-
+-	return &Conn{
+-		conn:            c,
+-		fromFrontendBuf: fromFrontendBuf,
+-		fromBackendBuf:  fromBackendBuf,
+-		backend:         pgproto3.NewBackend(fromFrontendBuf, c),
+-		frontend:        pgproto3.NewFrontend(fromBackendBuf, c),
+-	}
+-}
+-
+-func (c *Conn) Read(b []byte) (n int, err error) {
+-	return c.conn.Read(b)
+-}
+-
+-func (c *Conn) Write(b []byte) (n int, err error) {
+-	if c.HandleFrontendMessage == nil {
+-		return c.conn.Write(b)
+-	}
+-
+-	c.fromFrontendBuf.Write(b)
+-
+-	for {
+-		msg, err := c.backend.Receive()
+-		if err != nil {
+-			if err == io.ErrUnexpectedEOF {
+-				break
+-			}
+-			return len(b), err
+-		}
+-
+-		err = c.HandleFrontendMessage(c.conn, msg)
+-		if err != nil {
+-			return len(b), err
+-		}
+-	}
+-
+-	return len(b), nil
+-}
+-
+-func (c *Conn) Close() error {
+-	return c.conn.Close()
+-}
+-
+-func (c *Conn) LocalAddr() net.Addr {
+-	return c.conn.LocalAddr()
+-}
+-
+-func (c *Conn) RemoteAddr() net.Addr {
+-	return c.conn.RemoteAddr()
+-}
+-
+-func (c *Conn) SetDeadline(t time.Time) error {
+-	return c.conn.SetDeadline(t)
+-}
+-
+-func (c *Conn) SetReadDeadline(t time.Time) error {
+-	return c.conn.SetReadDeadline(t)
+-}
+-
+-func (c *Conn) SetWriteDeadline(t time.Time) error {
+-	return c.conn.SetWriteDeadline(t)
+-}
+diff --git a/pgconn/config.go b/pgconn/config.go
+index 3cd5d877..3937dc40 100644
+--- a/pgconn/config.go
++++ b/pgconn/config.go
+@@ -55,13 +55,6 @@ type Config struct {
+ 
+ 	SSLNegotiation string // sslnegotiation=postgres or sslnegotiation=direct
+ 
+-	// AfterNetConnect is called after the network connection, including TLS if applicable, is established but before any
+-	// PostgreSQL protocol communication. It takes the established net.Conn and returns a net.Conn that will be used in
+-	// its place. It can be used to wrap the net.Conn (e.g. for logging, diagnostics, or testing). Its functionality has
+-	// some overlap with DialFunc. However, DialFunc takes place before TLS is established and cannot be used to control
+-	// the final net.Conn used for PostgreSQL protocol communication while AfterNetConnect can.
+-	AfterNetConnect func(ctx context.Context, config *Config, conn net.Conn) (net.Conn, error)
+-
+ 	// ValidateConnect is called during a connection attempt after a successful authentication with the PostgreSQL server.
+ 	// It can be used to validate that the server is acceptable. If this returns an error the connection is closed and the next
+ 	// fallback config is tried. This allows implementing high availability behavior such as libpq does with target_session_attrs.
+diff --git a/pgconn/errors.go b/pgconn/errors.go
+index bc1e31e3..d968d3f0 100644
+--- a/pgconn/errors.go
++++ b/pgconn/errors.go
+@@ -254,20 +254,3 @@ func (e *NotPreferredError) SafeToRetry() bool {
+ func (e *NotPreferredError) Unwrap() error {
+ 	return e.err
+ }
+-
+-type PrepareError struct {
+-	err error
+-
+-	ParseComplete bool // Indicates whether the error occurred after a ParseComplete message was received.
+-}
+-
+-func (e *PrepareError) Error() string {
+-	if e.ParseComplete {
+-		return fmt.Sprintf("prepare failed after ParseComplete: %s", e.err.Error())
+-	}
+-	return e.err.Error()
+-}
+-
+-func (e *PrepareError) Unwrap() error {
+-	return e.err
+-}
+diff --git a/pgconn/pgconn.go b/pgconn/pgconn.go
+index 5c77a836..321656f9 100644
+--- a/pgconn/pgconn.go
++++ b/pgconn/pgconn.go
+@@ -343,14 +343,6 @@ func connectOne(ctx context.Context, config *Config, connectConfig *connectOneCo
+ 		pgConn.conn = tlsConn
+ 	}
+ 
+-	if config.AfterNetConnect != nil {
+-		pgConn.conn, err = config.AfterNetConnect(ctx, config, pgConn.conn)
+-		if err != nil {
+-			pgConn.conn.Close()
+-			return nil, newPerDialConnectError("AfterNetConnect failed", err)
+-		}
+-	}
+-
+ 	pgConn.contextWatcher = ctxwatch.NewContextWatcher(config.BuildContextWatcherHandler(pgConn))
+ 	pgConn.contextWatcher.Watch(ctx)
+ 	defer pgConn.contextWatcher.Unwatch()
+@@ -866,10 +858,6 @@ type StatementDescription struct {
+ //
+ // Prepare does not send a PREPARE statement to the server. It uses the PostgreSQL Parse and Describe protocol messages
+ // directly.
+-//
+-// In extremely rare cases, Prepare may fail after the Parse is successful, but before the Describe is complete. In this
+-// case, the returned error will be an error where errors.As with a *PrepareError succeeds and the *PrepareError has
+-// ParseComplete set to true.
+ func (pgConn *PgConn) Prepare(ctx context.Context, name, sql string, paramOIDs []uint32) (*StatementDescription, error) {
+ 	if err := pgConn.lock(); err != nil {
+ 		return nil, err
+@@ -897,8 +885,7 @@ func (pgConn *PgConn) Prepare(ctx context.Context, name, sql string, paramOIDs [
+ 
+ 	psd := &StatementDescription{Name: name, SQL: sql}
+ 
+-	var ParseComplete bool
+-	var pgErr *PgError
++	var parseErr error
+ 
+ readloop:
+ 	for {
+@@ -909,22 +896,20 @@ readloop:
+ 		}
+ 
+ 		switch msg := msg.(type) {
+-		case *pgproto3.ParseComplete:
+-			ParseComplete = true
+ 		case *pgproto3.ParameterDescription:
+ 			psd.ParamOIDs = make([]uint32, len(msg.ParameterOIDs))
+ 			copy(psd.ParamOIDs, msg.ParameterOIDs)
+ 		case *pgproto3.RowDescription:
+ 			psd.Fields = pgConn.convertRowDescription(nil, msg)
+ 		case *pgproto3.ErrorResponse:
+-			pgErr = ErrorResponseToPgError(msg)
++			parseErr = ErrorResponseToPgError(msg)
+ 		case *pgproto3.ReadyForQuery:
+ 			break readloop
+ 		}
+ 	}
+ 
+-	if pgErr != nil {
+-		return nil, &PrepareError{err: pgErr, ParseComplete: ParseComplete}
++	if parseErr != nil {
++		return nil, parseErr
+ 	}
+ 	return psd, nil
+ }
+diff --git a/pgconn/pgconn_test.go b/pgconn/pgconn_test.go
+index 9d0ff8c3..4d6770f8 100644
+--- a/pgconn/pgconn_test.go
++++ b/pgconn/pgconn_test.go
+@@ -544,63 +544,6 @@ func TestConnectFailsWithResolveFailureAndFailedConnectionAttempts(t *testing.T)
+ 	require.ErrorContains(t, err, ":2 (127.0.0.1): dial error:")
+ }
+ 
+-type testConnWrapper struct {
+-	conn net.Conn
+-}
+-
+-func (w *testConnWrapper) Read(b []byte) (n int, err error) {
+-	return w.conn.Read(b)
+-}
+-
+-func (w *testConnWrapper) Write(b []byte) (n int, err error) {
+-	return w.conn.Write(b)
+-}
+-
+-func (w *testConnWrapper) Close() error {
+-	return w.conn.Close()
+-}
+-
+-func (w *testConnWrapper) LocalAddr() net.Addr {
+-	return w.conn.LocalAddr()
+-}
+-
+-func (w *testConnWrapper) RemoteAddr() net.Addr {
+-	return w.conn.RemoteAddr()
+-}
+-
+-func (w *testConnWrapper) SetDeadline(t time.Time) error {
+-	return w.conn.SetDeadline(t)
+-}
+-
+-func (w *testConnWrapper) SetReadDeadline(t time.Time) error {
+-	return w.conn.SetReadDeadline(t)
+-}
+-
+-func (w *testConnWrapper) SetWriteDeadline(t time.Time) error {
+-	return w.conn.SetWriteDeadline(t)
+-}
+-
+-func TestConnectWithAfterNetConnect(t *testing.T) {
+-	t.Parallel()
+-
+-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+-	defer cancel()
+-
+-	config, err := pgconn.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+-	require.NoError(t, err)
+-
+-	var wrappedConn net.Conn
+-	config.AfterNetConnect = func(ctx context.Context, config *pgconn.Config, conn net.Conn) (net.Conn, error) {
+-		wrappedConn = &testConnWrapper{conn: conn}
+-		return wrappedConn, nil
+-	}
+-	conn, err := pgconn.ConnectConfig(ctx, config)
+-	require.NoError(t, err)
+-
+-	require.Equal(t, wrappedConn, conn.Conn())
+-	closeConn(t, conn)
+-}
+-
+ func TestConnectWithValidateConnect(t *testing.T) {
+ 	t.Parallel()
+ 
+diff --git a/stdlib/sql_test.go b/stdlib/sql_test.go
+index f9d441fe..84f48f6c 100644
+--- a/stdlib/sql_test.go
++++ b/stdlib/sql_test.go
+@@ -5,7 +5,6 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"encoding/json"
+-	"errors"
+ 	"fmt"
+ 	"math"
+ 	"os"
+@@ -512,7 +511,7 @@ func TestConnQueryFailure(t *testing.T) {
+ 	testWithAllQueryExecModes(t, func(t *testing.T, db *sql.DB) {
+ 		_, err := db.Query("select 'foo")
+ 		require.Error(t, err)
+-		require.ErrorAs(t, err, new(*pgconn.PgError))
++		require.IsType(t, new(pgconn.PgError), err)
+ 	})
+ }
+ 
+@@ -756,8 +755,7 @@ func TestBeginTxContextCancel(t *testing.T) {
+ 
+ 		var n int
+ 		err = db.QueryRow("select count(*) from t").Scan(&n)
+-		var pgErr *pgconn.PgError
+-		if !errors.As(err, &pgErr) || pgErr.Code != "42P01" {
++		if pgErr, ok := err.(*pgconn.PgError); !ok || pgErr.Code != "42P01" {
+ 			t.Fatalf(`err => %v, want PgError{Code: "42P01"}`, err)
+ 		}
+ 	})

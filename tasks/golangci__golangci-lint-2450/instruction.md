@@ -1,0 +1,9 @@
+golangci-lint’s gocritic integration does not currently apply automatic fixes suggested by go-critic/ruleguard rules. Some gocritic checks (notably ruleguard-based checks) can provide a “suggestion”/quick-fix replacement for a specific AST location, but running golangci-lint with autofix enabled does not rewrite the source accordingly.
+
+The linter should support applying gocritic-provided fixes when autofix is enabled, including fixes coming from ruleguard rules that specify a suggestion. For example, when a ruleguard rule reports that ranging over a large addressable value copies data and provides a suggestion to use `&$x`, golangci-lint should rewrite `for _, v := range xs { ... }` into `for _, v := range &xs { ... }` (when the rule’s conditions match). Similarly, when a ruleguard rule suggests simplifying `strings.Count("foo", "bar") == 0` into `!strings.Contains("foo", "bar")`, golangci-lint should apply that transformation.
+
+Expected behavior: when running golangci-lint with gocritic enabled (with the `ruleguard` check enabled and ruleguard rules configured) and autofix turned on, the tool should modify files by applying the suggested replacements emitted by gocritic/ruleguard diagnostics.
+
+Actual behavior: golangci-lint reports the gocritic issues but leaves the source unchanged even though the diagnostics include fix/suggestion information.
+
+Implement support for translating gocritic’s suggested replacements into golangci-lint fixes so that the rewritten output matches the suggested code (including correct insertion of operators like `&` and complete expression rewrites such as `strings.Count(...) == 0` to `!strings.Contains(...)`).

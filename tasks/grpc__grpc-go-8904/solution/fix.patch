@@ -1,0 +1,149 @@
+diff --git a/internal/transport/client_stream.go b/internal/transport/client_stream.go
+index 98045251..cd8152ef 100644
+--- a/internal/transport/client_stream.go
++++ b/internal/transport/client_stream.go
+@@ -24,6 +24,7 @@ import (
+ 	"golang.org/x/net/http2"
+ 	"google.golang.org/grpc/mem"
+ 	"google.golang.org/grpc/metadata"
++	"google.golang.org/grpc/stats"
+ 	"google.golang.org/grpc/status"
+ )
+ 
+@@ -46,10 +47,11 @@ type ClientStream struct {
+ 	// meaningful after headerChan is closed (always call waitOnHeader() before
+ 	// reading its value).
+ 	headerValid      bool
+-	noHeaders        bool        // set if the client never received headers (set only after the stream is done).
+-	headerChanClosed uint32      // set when headerChan is closed. Used to avoid closing headerChan multiple times.
+-	bytesReceived    atomic.Bool // indicates whether any bytes have been received on this stream
+-	unprocessed      atomic.Bool // set if the server sends a refused stream or GOAWAY including this stream
++	noHeaders        bool          // set if the client never received headers (set only after the stream is done).
++	headerChanClosed uint32        // set when headerChan is closed. Used to avoid closing headerChan multiple times.
++	bytesReceived    atomic.Bool   // indicates whether any bytes have been received on this stream
++	unprocessed      atomic.Bool   // set if the server sends a refused stream or GOAWAY including this stream
++	statsHandler     stats.Handler // nil for internal streams (e.g., health check, ORCA) where telemetry is not supported.
+ }
+ 
+ // Read reads an n byte message from the input stream.
+diff --git a/internal/transport/http2_client.go b/internal/transport/http2_client.go
+index 38ca031a..37b1acc3 100644
+--- a/internal/transport/http2_client.go
++++ b/internal/transport/http2_client.go
+@@ -478,7 +478,7 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
+ 	return t, nil
+ }
+ 
+-func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr) *ClientStream {
++func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) *ClientStream {
+ 	// TODO(zhaoq): Handle uint32 overflow of Stream.id.
+ 	s := &ClientStream{
+ 		Stream: Stream{
+@@ -486,10 +486,11 @@ func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr) *ClientSt
+ 			sendCompress:   callHdr.SendCompress,
+ 			contentSubtype: callHdr.ContentSubtype,
+ 		},
+-		ct:         t,
+-		done:       make(chan struct{}),
+-		headerChan: make(chan struct{}),
+-		doneFunc:   callHdr.DoneFunc,
++		ct:           t,
++		done:         make(chan struct{}),
++		headerChan:   make(chan struct{}),
++		doneFunc:     callHdr.DoneFunc,
++		statsHandler: handler,
+ 	}
+ 	s.Stream.buf.init()
+ 	s.Stream.wq.init(defaultWriteQuota, s.done)
+@@ -744,7 +745,7 @@ func (e NewStreamError) Error() string {
+ 
+ // NewStream creates a stream and registers it into the transport as "active"
+ // streams.  All non-nil errors returned will be *NewStreamError.
+-func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientStream, error) {
++func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) (*ClientStream, error) {
+ 	ctx = peer.NewContext(ctx, t.Peer())
+ 
+ 	// ServerName field of the resolver returned address takes precedence over
+@@ -781,7 +782,7 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientS
+ 	if err != nil {
+ 		return nil, &NewStreamError{Err: err, AllowTransparentRetry: false}
+ 	}
+-	s := t.newStream(ctx, callHdr)
++	s := t.newStream(ctx, callHdr, handler)
+ 	cleanup := func(err error) {
+ 		if s.swapState(streamDone) == streamDone {
+ 			// If it was already done, return.
+@@ -902,7 +903,7 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientS
+ 			return nil, &NewStreamError{Err: ErrConnClosing, AllowTransparentRetry: true}
+ 		}
+ 	}
+-	if t.statsHandler != nil {
++	if s.statsHandler != nil {
+ 		header, ok := metadata.FromOutgoingContext(ctx)
+ 		if ok {
+ 			header.Set("user-agent", t.userAgent)
+@@ -911,7 +912,7 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientS
+ 		}
+ 		// Note: The header fields are compressed with hpack after this call returns.
+ 		// No WireLength field is set here.
+-		t.statsHandler.HandleRPC(s.ctx, &stats.OutHeader{
++		s.statsHandler.HandleRPC(s.ctx, &stats.OutHeader{
+ 			Client:      true,
+ 			FullMethod:  callHdr.Method,
+ 			RemoteAddr:  t.remoteAddr,
+@@ -1587,16 +1588,16 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
+ 		}
+ 	}
+ 
+-	if t.statsHandler != nil {
++	if s.statsHandler != nil {
+ 		if !endStream {
+-			t.statsHandler.HandleRPC(s.ctx, &stats.InHeader{
++			s.statsHandler.HandleRPC(s.ctx, &stats.InHeader{
+ 				Client:      true,
+ 				WireLength:  int(frame.Header().Length),
+ 				Header:      metadata.MD(mdata).Copy(),
+ 				Compression: s.recvCompress,
+ 			})
+ 		} else {
+-			t.statsHandler.HandleRPC(s.ctx, &stats.InTrailer{
++			s.statsHandler.HandleRPC(s.ctx, &stats.InTrailer{
+ 				Client:     true,
+ 				WireLength: int(frame.Header().Length),
+ 				Trailer:    metadata.MD(mdata).Copy(),
+diff --git a/internal/transport/transport.go b/internal/transport/transport.go
+index 10b9155f..b86094da 100644
+--- a/internal/transport/transport.go
++++ b/internal/transport/transport.go
+@@ -617,7 +617,7 @@ type ClientTransport interface {
+ 	GracefulClose()
+ 
+ 	// NewStream creates a Stream for an RPC.
+-	NewStream(ctx context.Context, callHdr *CallHdr) (*ClientStream, error)
++	NewStream(ctx context.Context, callHdr *CallHdr, handler stats.Handler) (*ClientStream, error)
+ 
+ 	// Error returns a channel that is closed when some I/O error
+ 	// happens. Typically the caller should have a goroutine to monitor
+diff --git a/stream.go b/stream.go
+index f92102fb..eedb5f9b 100644
+--- a/stream.go
++++ b/stream.go
+@@ -548,7 +548,7 @@ func (a *csAttempt) newStream() error {
+ 			}
+ 		}
+ 	}
+-	s, err := a.transport.NewStream(a.ctx, cs.callHdr)
++	s, err := a.transport.NewStream(a.ctx, cs.callHdr, a.statsHandler)
+ 	if err != nil {
+ 		nse, ok := err.(*transport.NewStreamError)
+ 		if !ok {
+@@ -1354,7 +1354,8 @@ func newNonRetryClientStream(ctx context.Context, desc *StreamDesc, method strin
+ 		transport:        t,
+ 	}
+ 
+-	s, err := as.transport.NewStream(as.ctx, as.callHdr)
++	// nil stats handler: internal streams like health and ORCA do not support telemetry.
++	s, err := as.transport.NewStream(as.ctx, as.callHdr, nil)
+ 	if err != nil {
+ 		err = toRPCErr(err)
+ 		return nil, err

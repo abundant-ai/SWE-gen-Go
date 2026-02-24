@@ -1,0 +1,337 @@
+diff --git a/Makefile b/Makefile
+index 7ecdb4a76..ff88bfda2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -101,6 +101,10 @@ test-iam-import-with-missing-entities: install-race ## test import of external i
+ 	@echo "Test IAM import configurations with missing entities"
+ 	@env bash $(PWD)/docs/distributed/iam-import-with-missing-entities.sh
+ 
++test-iam-import-with-openid: install-race
++	@echo "Test IAM import configurations with openid"
++	@env bash $(PWD)/docs/distributed/iam-import-with-openid.sh
++
+ test-sio-error:
+ 	@(env bash $(PWD)/docs/bucket/replication/sio-error.sh)
+ 
+diff --git a/cmd/auth-handler.go b/cmd/auth-handler.go
+index 7f363957b..3ba46d35e 100644
+--- a/cmd/auth-handler.go
++++ b/cmd/auth-handler.go
+@@ -222,7 +222,7 @@ func mustGetClaimsFromToken(r *http.Request) map[string]interface{} {
+ 	return claims
+ }
+ 
+-func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{}, error) {
++func getClaimsFromTokenWithSecret(token, secret string) (*xjwt.MapClaims, error) {
+ 	// JWT token for x-amz-security-token is signed with admin
+ 	// secret key, temporary credentials become invalid if
+ 	// server admin credentials change. This is done to ensure
+@@ -244,7 +244,7 @@ func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{},
+ 
+ 	// If AuthZPlugin is set, return without any further checks.
+ 	if newGlobalAuthZPluginFn() != nil {
+-		return claims.Map(), nil
++		return claims, nil
+ 	}
+ 
+ 	// Check if a session policy is set. If so, decode it here.
+@@ -263,12 +263,16 @@ func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{},
+ 		claims.MapClaims[sessionPolicyNameExtracted] = string(spBytes)
+ 	}
+ 
+-	return claims.Map(), nil
++	return claims, nil
+ }
+ 
+ // Fetch claims in the security token returned by the client.
+ func getClaimsFromToken(token string) (map[string]interface{}, error) {
+-	return getClaimsFromTokenWithSecret(token, globalActiveCred.SecretKey)
++	jwtClaims, err := getClaimsFromTokenWithSecret(token, globalActiveCred.SecretKey)
++	if err != nil {
++		return nil, err
++	}
++	return jwtClaims.Map(), nil
+ }
+ 
+ // Fetch claims in the security token returned by the client and validate the token.
+@@ -319,7 +323,7 @@ func checkClaimsFromToken(r *http.Request, cred auth.Credentials) (map[string]in
+ 		if err != nil {
+ 			return nil, toAPIErrorCode(r.Context(), err)
+ 		}
+-		return claims, ErrNone
++		return claims.Map(), ErrNone
+ 	}
+ 
+ 	claims := xjwt.NewMapClaims()
+diff --git a/cmd/iam-store.go b/cmd/iam-store.go
+index df4ea08b7..956a41bcb 100644
+--- a/cmd/iam-store.go
++++ b/cmd/iam-store.go
+@@ -2031,7 +2031,7 @@ func (store *IAMStoreSys) getParentUsers(cache *iamCache) map[string]ParentUserI
+ 
+ 		var (
+ 			err    error
+-			claims map[string]interface{} = cred.Claims
++			claims *jwt.MapClaims
+ 		)
+ 
+ 		if cred.IsServiceAccount() {
+@@ -2053,24 +2053,17 @@ func (store *IAMStoreSys) getParentUsers(cache *iamCache) map[string]ParentUserI
+ 		}
+ 
+ 		subClaimValue := cred.ParentUser
+-		if v, ok := claims[subClaim]; ok {
+-			subFromToken, ok := v.(string)
+-			if ok {
+-				subClaimValue = subFromToken
+-			}
++		if v, ok := claims.Lookup(subClaim); ok {
++			subClaimValue = v
+ 		}
+-		if v, ok := claims[ldapActualUser]; ok {
+-			subFromToken, ok := v.(string)
+-			if ok {
+-				subClaimValue = subFromToken
+-			}
++		if v, ok := claims.Lookup(ldapActualUser); ok {
++			subClaimValue = v
+ 		}
+ 
+ 		roleArn := openid.DummyRoleARN.String()
+-		s, ok := claims[roleArnClaim]
+-		val, ok2 := s.(string)
+-		if ok && ok2 {
+-			roleArn = val
++		s, ok := claims.Lookup(roleArnClaim)
++		if ok {
++			roleArn = s
+ 		}
+ 		v, ok := res[cred.ParentUser]
+ 		if ok {
+@@ -2537,13 +2530,15 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
+ 
+ 	// Extracted session policy name string can be removed as its not useful
+ 	// at this point.
+-	delete(m, sessionPolicyNameExtracted)
++	m.Delete(sessionPolicyNameExtracted)
++
++	nosp := opts.sessionPolicy == nil || opts.sessionPolicy.Version == "" && len(opts.sessionPolicy.Statements) == 0
+ 
+ 	// sessionPolicy is nil and there is embedded policy attached we remove
+ 	// embedded policy at that point.
+-	if _, ok := m[policy.SessionPolicyName]; ok && opts.sessionPolicy == nil {
+-		delete(m, policy.SessionPolicyName)
+-		m[iamPolicyClaimNameSA()] = inheritedPolicyType
++	if _, ok := m.Lookup(policy.SessionPolicyName); ok && nosp {
++		m.Delete(policy.SessionPolicyName)
++		m.Set(iamPolicyClaimNameSA(), inheritedPolicyType)
+ 	}
+ 
+ 	if opts.sessionPolicy != nil { // session policies is being updated
+@@ -2551,21 +2546,23 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
+ 			return updatedAt, err
+ 		}
+ 
+-		policyBuf, err := json.Marshal(opts.sessionPolicy)
+-		if err != nil {
+-			return updatedAt, err
+-		}
++		if opts.sessionPolicy.Version != "" && len(opts.sessionPolicy.Statements) > 0 {
++			policyBuf, err := json.Marshal(opts.sessionPolicy)
++			if err != nil {
++				return updatedAt, err
++			}
+ 
+-		if len(policyBuf) > maxSVCSessionPolicySize {
+-			return updatedAt, errSessionPolicyTooLarge
+-		}
++			if len(policyBuf) > maxSVCSessionPolicySize {
++				return updatedAt, errSessionPolicyTooLarge
++			}
+ 
+-		// Overwrite session policy claims.
+-		m[policy.SessionPolicyName] = base64.StdEncoding.EncodeToString(policyBuf)
+-		m[iamPolicyClaimNameSA()] = embeddedPolicyType
++			// Overwrite session policy claims.
++			m.Set(policy.SessionPolicyName, base64.StdEncoding.EncodeToString(policyBuf))
++			m.Set(iamPolicyClaimNameSA(), embeddedPolicyType)
++		}
+ 	}
+ 
+-	cr.SessionToken, err = auth.JWTSignWithAccessKey(accessKey, m, cr.SecretKey)
++	cr.SessionToken, err = auth.JWTSignWithAccessKey(accessKey, m.Map(), cr.SecretKey)
+ 	if err != nil {
+ 		return updatedAt, err
+ 	}
+@@ -2892,22 +2889,22 @@ func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) error
+ 
+ func extractJWTClaims(u UserIdentity) (jwtClaims *jwt.MapClaims, err error) {
+ 	keys := make([]string, 0, 3)
++
+ 	// Append credentials secret key itself
+ 	keys = append(keys, u.Credentials.SecretKey)
++
+ 	// Use site-replication credentials if found
+ 	if globalSiteReplicationSys.isEnabled() {
+-		siteReplSecretKey, e := globalSiteReplicatorCred.Get(GlobalContext)
+-		if e != nil {
+-			return nil, e
++		secretKey, err := getTokenSigningKey()
++		if err != nil {
++			return nil, err
+ 		}
+-		keys = append(keys, siteReplSecretKey)
++		keys = append(keys, secretKey)
+ 	}
+-	// Use root credentials for credentials created with older deployments
+-	keys = append(keys, globalActiveCred.SecretKey)
+ 
+ 	// Iterate over all keys and return with the first successful claim extraction
+ 	for _, key := range keys {
+-		jwtClaims, err = auth.ExtractClaims(u.Credentials.SessionToken, key)
++		jwtClaims, err = getClaimsFromTokenWithSecret(u.Credentials.SessionToken, key)
+ 		if err == nil {
+ 			break
+ 		}
+diff --git a/cmd/iam.go b/cmd/iam.go
+index 9a6167ecd..569c5b424 100644
+--- a/cmd/iam.go
++++ b/cmd/iam.go
+@@ -1294,10 +1294,6 @@ func (sys *IAMSys) GetClaimsForSvcAcc(ctx context.Context, accessKey string) (ma
+ 		return nil, errServerNotInitialized
+ 	}
+ 
+-	if sys.usersSysType != LDAPUsersSysType {
+-		return nil, nil
+-	}
+-
+ 	sa, ok := sys.store.GetUser(accessKey)
+ 	if !ok || !sa.Credentials.IsServiceAccount() {
+ 		return nil, errNoSuchServiceAccount
+@@ -2179,7 +2175,6 @@ func (sys *IAMSys) IsAllowedServiceAccount(args policy.Args, parentUser string)
+ 			return false
+ 		}
+ 		svcPolicies = newMappedPolicy(sys.rolesMap[arn]).toSlice()
+-
+ 	default:
+ 		// Check policy for parent user of service account.
+ 		svcPolicies, err = sys.PolicyDBGet(parentUser, args.Groups...)
+diff --git a/docs/distributed/iam-import-with-openid.sh b/docs/distributed/iam-import-with-openid.sh
+new file mode 100755
+index 000000000..ca703aa5e
+--- /dev/null
++++ b/docs/distributed/iam-import-with-openid.sh
+@@ -0,0 +1,82 @@
++#!/bin/bash
++
++if [ -n "$TEST_DEBUG" ]; then
++	set -x
++fi
++
++pkill minio
++docker rm -f $(docker ps -aq)
++rm -rf /tmp/openid{1..4}
++
++export MC_HOST_myminio="http://minioadmin:minioadmin@localhost:22000"
++# The service account used below is already present in iam configuration getting imported
++export MC_HOST_myminio1="http://dillon-service-2:dillon-service-2@localhost:22000"
++
++# Start MinIO instance
++export CI=true
++
++if [ ! -f ./mc ]; then
++	wget --quiet -O mc https://dl.minio.io/client/mc/release/linux-amd64/mc &&
++		chmod +x mc
++fi
++
++mc -v
++
++# Start openid server
++(
++	cd ./minio-iam-testing
++	make docker-images
++	make docker-run
++	cd -
++)
++
++(minio server --address :22000 --console-address :10000 http://localhost:22000/tmp/openid{1...4} 2>&1 >/tmp/server.log) &
++./mc ready myminio
++./mc mb myminio/test-bucket
++./mc cp /etc/hosts myminio/test-bucket
++
++./mc idp openid add myminio \
++	config_url="http://localhost:5556/dex/.well-known/openid-configuration" \
++	client_id="minio-client-app" \
++	client_secret="minio-client-app-secret" \
++	scopes="openid,groups,email,profile" \
++	redirect_uri="http://127.0.0.1:10000/oauth_callback" \
++	display_name="Login via dex1" \
++	role_policy="consoleAdmin"
++
++./mc admin service restart myminio --json
++./mc ready myminio
++./mc admin cluster iam import myminio docs/distributed/samples/myminio-iam-info-openid.zip
++
++# Verify if buckets / objects accessible using service account
++echo "Verifying buckets and objects access for the imported service account"
++
++./mc ls myminio1/ --json
++BKT_COUNT=$(./mc ls myminio1/ --json | jq '.key' | wc -l)
++if [ "${BKT_COUNT}" -ne 1 ]; then
++	echo "BUG: Expected no of bucket: 1, Found: ${BKT_COUNT}"
++	exit 1
++fi
++
++BKT_NAME=$(./mc ls myminio1/ --json | jq '.key' | sed 's/"//g' | sed 's\/\\g')
++if [[ ${BKT_NAME} != "test-bucket" ]]; then
++	echo "BUG: Expected bucket: test-bucket, Found: ${BKT_NAME}"
++	exit 1
++fi
++
++./mc ls myminio1/test-bucket
++OBJ_COUNT=$(./mc ls myminio1/test-bucket --json | jq '.key' | wc -l)
++if [ "${OBJ_COUNT}" -ne 1 ]; then
++	echo "BUG: Expected no of objects: 1, Found: ${OBJ_COUNT}"
++	exit 1
++fi
++
++OBJ_NAME=$(./mc ls myminio1/test-bucket --json | jq '.key' | sed 's/"//g')
++if [[ ${OBJ_NAME} != "hosts" ]]; then
++	echo "BUG: Expected object: hosts, Found: ${BKT_NAME}"
++	exit 1
++fi
++
++# Finally kill running processes
++pkill minio
++docker rm -f $(docker ps -aq)
+diff --git a/docs/distributed/samples/myminio-iam-info-openid.zip b/docs/distributed/samples/myminio-iam-info-openid.zip
+new file mode 100644
+index 000000000..aec4ca70e
+Binary files /dev/null and b/docs/distributed/samples/myminio-iam-info-openid.zip differ
+diff --git a/internal/jwt/parser.go b/internal/jwt/parser.go
+index 44c29c284..7c5811250 100644
+--- a/internal/jwt/parser.go
++++ b/internal/jwt/parser.go
+@@ -245,6 +245,22 @@ func NewMapClaims() *MapClaims {
+ 	return &MapClaims{MapClaims: jwtgo.MapClaims{}}
+ }
+ 
++// Set Adds new arbitrary claim keys and values.
++func (c *MapClaims) Set(key string, val interface{}) {
++	if c == nil {
++		return
++	}
++	c.MapClaims[key] = val
++}
++
++// Delete deletes a key named key.
++func (c *MapClaims) Delete(key string) {
++	if c == nil {
++		return
++	}
++	delete(c.MapClaims, key)
++}
++
+ // Lookup returns the value and if the key is found.
+ func (c *MapClaims) Lookup(key string) (value string, ok bool) {
+ 	if c == nil {

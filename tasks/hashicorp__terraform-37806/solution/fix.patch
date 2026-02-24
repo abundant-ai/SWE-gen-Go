@@ -1,0 +1,77 @@
+diff --git a/.changes/v1.15/BUG FIXES-20251024-042900.yaml b/.changes/v1.15/BUG FIXES-20251024-042900.yaml
+new file mode 100644
+index 0000000000..989ac31a94
+--- /dev/null
++++ b/.changes/v1.15/BUG FIXES-20251024-042900.yaml	
+@@ -0,0 +1,5 @@
++kind: BUG FIXES
++body: 'testing: File-level error diagnostics are now included in JUnit XML skipped test elements, ensuring CI/CD pipelines can detect validation failures'
++time: 2025-10-24T04:29:00.000000Z
++custom:
++    Issue: "37801"
+diff --git a/internal/command/junit/junit.go b/internal/command/junit/junit.go
+index c62c51d581..0d7f4ffabd 100644
+--- a/internal/command/junit/junit.go
++++ b/internal/command/junit/junit.go
+@@ -188,6 +188,9 @@ func junitXMLTestReport(suite *moduletest.Suite, suiteRunnerStopped bool, source
+ 			},
+ 		})
+ 
++		// Check if there are file-level errors that will be reported at suite level
++		hasFileLevelErrors := file.Status == moduletest.Error && file.Diagnostics.HasErrors()
++
+ 		for i, run := range file.Runs {
+ 			// Each run is a "test case".
+ 
+@@ -209,7 +212,7 @@ func junitXMLTestReport(suite *moduletest.Suite, suiteRunnerStopped bool, source
+ 			// Depending on run status, add either of: "skipped", "failure", or "error" elements
+ 			switch run.Status {
+ 			case moduletest.Skip:
+-				testCase.Skipped = skipDetails(i, file, suiteRunnerStopped)
++				testCase.Skipped = skipDetails(i, file, suiteRunnerStopped, hasFileLevelErrors)
+ 
+ 			case moduletest.Fail:
+ 				// When the test fails we only use error diags that originate from failing assertions
+@@ -275,6 +278,16 @@ func junitXMLTestReport(suite *moduletest.Suite, suiteRunnerStopped bool, source
+ 			})
+ 		}
+ 
++		// Add suite-level system-err if there are file-level errors
++		if hasFileLevelErrors {
++			systemErr := &withMessage{
++				Body: getDiagString(file.Diagnostics, sources),
++			}
++			enc.EncodeElement(systemErr, xml.StartElement{
++				Name: xml.Name{Local: "system-err"},
++			})
++		}
++
+ 		enc.EncodeToken(xml.EndElement{Name: suiteName})
+ 	}
+ 	enc.EncodeToken(xml.EndElement{Name: suitesName})
+@@ -300,8 +313,9 @@ func failureMessage(failedAssertions tfdiags.Diagnostics, checkCount int) string
+ // Test can be skipped due to:
+ // 1. terraform test recieving an interrupt from users; all unstarted tests will be skipped
+ // 2. A previous run in a file has failed, causing subsequent run blocks to be skipped
++// 3. File-level errors (e.g., invalid variable references) causing all tests to be skipped
+ // The returned value is used to set content in the "skipped" element
+-func skipDetails(runIndex int, file *moduletest.File, suiteStopped bool) *withMessage {
++func skipDetails(runIndex int, file *moduletest.File, suiteStopped bool, hasFileLevelErrors bool) *withMessage {
+ 	if suiteStopped {
+ 		// Test suite experienced an interrupt
+ 		// This block only handles graceful Stop interrupts, as Cancel interrupts will prevent a JUnit file being produced at all
+@@ -323,6 +337,14 @@ func skipDetails(runIndex int, file *moduletest.File, suiteStopped bool) *withMe
+ 				}
+ 			}
+ 		}
++
++		// Check for file-level error diagnostics that caused tests to be skipped
++		// Note: Full diagnostic details are included in suite-level <system-err> element
++		if hasFileLevelErrors {
++			return &withMessage{
++				Message: "Testcase skipped due to file-level errors",
++			}
++		}
+ 	}
+ 
+ 	// Unhandled case: This results in <skipped></skipped> with no attributes or body

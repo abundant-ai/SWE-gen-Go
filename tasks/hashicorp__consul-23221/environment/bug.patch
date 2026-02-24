@@ -1,0 +1,469 @@
+diff --git a/.changelog/23212.txt b/.changelog/23212.txt
+deleted file mode 100644
+index 34a1748f95..0000000000
+--- a/.changelog/23212.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-```release-note:bug
+-api-gateway: Fixed xDS listener generation for multiple file-system-certificate entries. Previously, using multiple file-system certificates on a single TLS listener caused Envoy to reject the configuration with "duplicate matcher" errors. The fix consolidates all file-system certificates into a single filter chain with multiple SDS configs, allowing Envoy to automatically select the correct certificate based on SNI.
+-```
+\ No newline at end of file
+diff --git a/agent/xds/listeners_apigateway.go b/agent/xds/listeners_apigateway.go
+index 6839ee196e..506ee0d054 100644
+--- a/agent/xds/listeners_apigateway.go
++++ b/agent/xds/listeners_apigateway.go
+@@ -446,58 +446,7 @@ func (s *ResourceGenerator) makeInlineOverrideFilterChains(cfgSnap *proxycfg.Con
+ 		return nil
+ 	}
+ 
+-	// Separate file-system and inline certificates
+-	var fileSystemCerts []*structs.FileSystemCertificateConfigEntry
+-	var inlineCerts []*structs.InlineCertificateConfigEntry
+-
+-	for _, cert := range certs {
+-		switch tce := cert.(type) {
+-		case *structs.FileSystemCertificateConfigEntry:
+-			fileSystemCerts = append(fileSystemCerts, tce)
+-		case *structs.InlineCertificateConfigEntry:
+-			inlineCerts = append(inlineCerts, tce)
+-		}
+-	}
+-
+-	// Handle file-system certificates: consolidate into ONE filter chain with multiple SDS configs
+-	// This prevents duplicate empty filter chain matchers that Envoy rejects
+-	if len(fileSystemCerts) > 0 {
+-		var sdsConfigs []*envoy_tls_v3.SdsSecretConfig
+-		for _, cert := range fileSystemCerts {
+-			sdsConfigs = append(sdsConfigs, &envoy_tls_v3.SdsSecretConfig{
+-				// Reference the secret returned in xds/secrets.go by name
+-				Name: cert.GetName(),
+-				SdsConfig: &envoy_core_v3.ConfigSource{
+-					// Use ADS (Aggregated Discovery Service) to fetch secrets from Consul
+-					ConfigSourceSpecifier: &envoy_core_v3.ConfigSource_Ads{
+-						Ads: &envoy_core_v3.AggregatedConfigSource{},
+-					},
+-					ResourceApiVersion: envoy_core_v3.ApiVersion_V3,
+-				},
+-			})
+-		}
+-
+-		tlsContext := &envoy_tls_v3.CommonTlsContext{
+-			TlsParams:                      makeTLSParametersFromGatewayTLSConfig(tlsCfg),
+-			TlsCertificateSdsSecretConfigs: sdsConfigs,
+-		}
+-
+-		// Create a single filter chain for all file-system certificates
+-		// Envoy will automatically select the correct certificate based on SNI
+-		if err := constructChain("file-system-certificates", nil, tlsContext); err != nil {
+-			return nil, err
+-		}
+-
+-		// If we only have file-system certs, return early
+-		if len(inlineCerts) == 0 {
+-			return chains, nil
+-		}
+-	}
+-
+-	// Handle inline certificates with the existing logic
+-	// When we have file-system certs, we need to treat single inline cert as multiple
+-	// to avoid duplicate catch-all filter chains
+-	multipleCerts := len(inlineCerts) > 1 || len(fileSystemCerts) > 0
++	multipleCerts := len(certs) > 1
+ 
+ 	allCertHosts := map[string]struct{}{}
+ 	overlappingHosts := map[string]struct{}{}
+@@ -505,53 +454,73 @@ func (s *ResourceGenerator) makeInlineOverrideFilterChains(cfgSnap *proxycfg.Con
+ 	if multipleCerts {
+ 		// we only need to prune out overlapping hosts if we have more than
+ 		// one certificate
+-		for _, cert := range inlineCerts {
+-			hosts, err := cert.Hosts()
+-			if err != nil {
+-				return nil, fmt.Errorf("unable to parse hosts from x509 certificate: %v", hosts)
+-			}
+-			for _, host := range hosts {
+-				if _, ok := allCertHosts[host]; ok {
+-					overlappingHosts[host] = struct{}{}
++		for _, cert := range certs {
++			switch tce := cert.(type) {
++			case *structs.InlineCertificateConfigEntry:
++				hosts, err := tce.Hosts()
++				if err != nil {
++					return nil, fmt.Errorf("unable to parse hosts from x509 certificate: %v", hosts)
++				}
++				for _, host := range hosts {
++					if _, ok := allCertHosts[host]; ok {
++						overlappingHosts[host] = struct{}{}
++					}
++					allCertHosts[host] = struct{}{}
+ 				}
+-				allCertHosts[host] = struct{}{}
++			default:
++				// do nothing for FileSystemCertificates because we don't actually have the certificate available
+ 			}
+ 		}
+ 	}
+ 
+-	for _, cert := range inlineCerts {
++	constructTLSContext := func(certConfig structs.ConfigEntry) (*envoy_tls_v3.CommonTlsContext, error) {
++		switch tce := certConfig.(type) {
++		case *structs.InlineCertificateConfigEntry:
++			return makeInlineTLSContextFromGatewayTLSConfig(tlsCfg, tce), nil
++		case *structs.FileSystemCertificateConfigEntry:
++			return makeFileSystemTLSContextFromGatewayTLSConfig(tlsCfg, tce), nil
++		default:
++			return nil, fmt.Errorf("unsupported config entry kind %s", tce.GetKind())
++		}
++	}
++
++	for _, cert := range certs {
+ 		var hosts []string
+ 
+ 		// if we only have one cert, we just use it for all ingress
+ 		if multipleCerts {
+-			certHosts, err := cert.Hosts()
+-			if err != nil {
+-				return nil, fmt.Errorf("unable to parse hosts from x509 certificate: %v", hosts)
+-			}
+-			// filter out any overlapping hosts so we don't have collisions in our filter chains
+-			for _, host := range certHosts {
+-				if _, ok := overlappingHosts[host]; !ok {
+-					hosts = append(hosts, host)
++			switch tce := cert.(type) {
++			case *structs.InlineCertificateConfigEntry:
++				certHosts, err := tce.Hosts()
++				if err != nil {
++					return nil, fmt.Errorf("unable to parse hosts from x509 certificate: %v", hosts)
++				}
++				// filter out any overlapping hosts so we don't have collisions in our filter chains
++				for _, host := range certHosts {
++					if _, ok := overlappingHosts[host]; !ok {
++						hosts = append(hosts, host)
++					}
+ 				}
+-			}
+ 
+-			if len(hosts) == 0 {
+-				// all of our hosts are overlapping, so we just skip this filter and it'll be
+-				// handled by the default filter chain
+-				continue
++				if len(hosts) == 0 {
++					// all of our hosts are overlapping, so we just skip this filter and it'll be
++					// handled by the default filter chain
++					continue
++				}
+ 			}
+ 		}
+ 
+-		tlsContext := makeInlineTLSContextFromGatewayTLSConfig(tlsCfg, cert)
++		tlsContext, err := constructTLSContext(cert)
++		if err != nil {
++			continue
++		}
+ 
+ 		if err := constructChain(cert.GetName(), hosts, tlsContext); err != nil {
+ 			return nil, err
+ 		}
+ 	}
+ 
+-	// Only add default chain if we have multiple inline certs AND no file-system certs
+-	// If we have file-system certs, they already provide the catch-all behavior
+-	if len(inlineCerts) > 1 && len(fileSystemCerts) == 0 {
++	if len(certs) > 1 {
+ 		// if we have more than one cert, add a default handler that uses the leaf cert from connect
+ 		if err := constructChain("default", nil, makeCommonTLSContext(cfgSnap.Leaf(), cfgSnap.RootPEMs(), makeTLSParametersFromGatewayTLSConfig(tlsCfg))); err != nil {
+ 			return nil, err
+diff --git a/agent/xds/listeners_apigateway_test.go b/agent/xds/listeners_apigateway_test.go
+deleted file mode 100644
+index 8172299d7b..0000000000
+--- a/agent/xds/listeners_apigateway_test.go
++++ /dev/null
+@@ -1,288 +0,0 @@
+-// Copyright (c) HashiCorp, Inc.
+-// SPDX-License-Identifier: BUSL-1.1
+-
+-package xds
+-
+-import (
+-	"testing"
+-
+-	"github.com/stretchr/testify/require"
+-
+-	"github.com/hashicorp/consul/agent/proxycfg"
+-	"github.com/hashicorp/consul/agent/structs"
+-	"github.com/hashicorp/consul/types"
+-)
+-
+-func TestMakeInlineOverrideFilterChains_FileSystemCertificates(t *testing.T) {
+-	// This test verifies the fix for the bug where multiple file-system-certificate
+-	// entries would create duplicate filter chain matchers, causing Envoy to reject
+-	// the configuration with: "duplicate matcher is: {}"
+-
+-	snap := &proxycfg.ConfigSnapshot{}
+-	snap.APIGateway.TLSConfig = structs.GatewayTLSConfig{}
+-
+-	// Create multiple file-system certificate entries
+-	certs := []structs.ConfigEntry{
+-		&structs.FileSystemCertificateConfigEntry{
+-			Kind:        structs.FileSystemCertificate,
+-			Name:        "cert1",
+-			Certificate: "/path/to/cert1.pem",
+-			PrivateKey:  "/path/to/key1.pem",
+-		},
+-		&structs.FileSystemCertificateConfigEntry{
+-			Kind:        structs.FileSystemCertificate,
+-			Name:        "cert2",
+-			Certificate: "/path/to/cert2.pem",
+-			PrivateKey:  "/path/to/key2.pem",
+-		},
+-	}
+-
+-	s := ResourceGenerator{}
+-	filterOpts := listenerFilterOpts{
+-		protocol:   "http",
+-		routeName:  "test-route",
+-		cluster:    "test-cluster",
+-		statPrefix: "test",
+-	}
+-
+-	chains, err := s.makeInlineOverrideFilterChains(
+-		snap,
+-		snap.APIGateway.TLSConfig,
+-		"http",
+-		filterOpts,
+-		certs,
+-	)
+-
+-	require.NoError(t, err)
+-	require.Len(t, chains, 1, "Should create exactly one filter chain for multiple file-system certificates")
+-
+-	// Verify the filter chain has no SNI match (matches all)
+-	chain := chains[0]
+-	if chain.FilterChainMatch != nil {
+-		require.Empty(t, chain.FilterChainMatch.ServerNames, "Filter chain should not have SNI matching for file-system certificates")
+-	}
+-
+-	// Verify the TLS context has multiple SDS secret configs
+-	require.NotNil(t, chain.TransportSocket)
+-	// The transport socket should contain the TLS context with multiple SDS configs
+-	// This is the key fix: multiple certificates in ONE filter chain via SDS
+-}
+-
+-func TestMakeInlineOverrideFilterChains_SingleFileSystemCertificate(t *testing.T) {
+-	snap := &proxycfg.ConfigSnapshot{}
+-	snap.APIGateway.TLSConfig = structs.GatewayTLSConfig{}
+-
+-	certs := []structs.ConfigEntry{
+-		&structs.FileSystemCertificateConfigEntry{
+-			Kind:        structs.FileSystemCertificate,
+-			Name:        "cert1",
+-			Certificate: "/path/to/cert1.pem",
+-			PrivateKey:  "/path/to/key1.pem",
+-		},
+-	}
+-
+-	s := ResourceGenerator{}
+-	filterOpts := listenerFilterOpts{
+-		protocol:   "http",
+-		routeName:  "test-route",
+-		cluster:    "test-cluster",
+-		statPrefix: "test",
+-	}
+-
+-	chains, err := s.makeInlineOverrideFilterChains(
+-		snap,
+-		snap.APIGateway.TLSConfig,
+-		"http",
+-		filterOpts,
+-		certs,
+-	)
+-
+-	require.NoError(t, err)
+-	require.Len(t, chains, 1, "Should create one filter chain for single file-system certificate")
+-}
+-
+-func TestMakeInlineOverrideFilterChains_NoDuplicateMatchers(t *testing.T) {
+-	// This is the core test for the bug fix
+-	// Before the fix, multiple file-system certificates would create filter chains
+-	// with identical empty FilterChainMatch objects, causing Envoy errors
+-
+-	snap := &proxycfg.ConfigSnapshot{}
+-	snap.APIGateway.TLSConfig = structs.GatewayTLSConfig{}
+-
+-	certs := []structs.ConfigEntry{
+-		&structs.FileSystemCertificateConfigEntry{
+-			Kind:        structs.FileSystemCertificate,
+-			Name:        "first-cert",
+-			Certificate: "/certs/first.pem",
+-			PrivateKey:  "/certs/first-key.pem",
+-		},
+-		&structs.FileSystemCertificateConfigEntry{
+-			Kind:        structs.FileSystemCertificate,
+-			Name:        "second-cert",
+-			Certificate: "/certs/second.pem",
+-			PrivateKey:  "/certs/second-key.pem",
+-		},
+-	}
+-
+-	s := ResourceGenerator{}
+-	filterOpts := listenerFilterOpts{
+-		protocol:   "http",
+-		routeName:  "test-route",
+-		cluster:    "test-cluster",
+-		statPrefix: "test",
+-	}
+-
+-	chains, err := s.makeInlineOverrideFilterChains(
+-		snap,
+-		snap.APIGateway.TLSConfig,
+-		"http",
+-		filterOpts,
+-		certs,
+-	)
+-
+-	require.NoError(t, err)
+-
+-	// Verify no duplicate matchers
+-	// With the fix, we should have exactly 1 filter chain
+-	require.Len(t, chains, 1, "Should consolidate file-system certificates into one filter chain")
+-
+-	// Verify the filter chain match is either nil or has no server names
+-	// (meaning it matches all traffic, and Envoy will select cert based on SNI)
+-	chain := chains[0]
+-	if chain.FilterChainMatch != nil {
+-		require.Empty(t, chain.FilterChainMatch.ServerNames,
+-			"File-system certificate filter chain should not have SNI restrictions")
+-	}
+-}
+-func TestMakeInlineOverrideFilterChains_EmptyCertificates(t *testing.T) {
+-	// Test with no certificates
+-	snap := &proxycfg.ConfigSnapshot{}
+-	snap.APIGateway.TLSConfig = structs.GatewayTLSConfig{}
+-
+-	certs := []structs.ConfigEntry{}
+-
+-	s := ResourceGenerator{}
+-	filterOpts := listenerFilterOpts{
+-		protocol:   "http",
+-		routeName:  "test-route",
+-		cluster:    "test-cluster",
+-		statPrefix: "test",
+-	}
+-
+-	chains, err := s.makeInlineOverrideFilterChains(
+-		snap,
+-		snap.APIGateway.TLSConfig,
+-		"http",
+-		filterOpts,
+-		certs,
+-	)
+-
+-	require.NoError(t, err)
+-	require.Empty(t, chains, "Should return empty chains for no certificates")
+-}
+-
+-func TestMakeInlineOverrideFilterChains_ManyFileSystemCertificates(t *testing.T) {
+-	// Test with more than 2 file-system certificates
+-	snap := &proxycfg.ConfigSnapshot{}
+-	snap.APIGateway.TLSConfig = structs.GatewayTLSConfig{}
+-
+-	certs := []structs.ConfigEntry{
+-		&structs.FileSystemCertificateConfigEntry{
+-			Kind:        structs.FileSystemCertificate,
+-			Name:        "cert1",
+-			Certificate: "/path/to/cert1.pem",
+-			PrivateKey:  "/path/to/key1.pem",
+-		},
+-		&structs.FileSystemCertificateConfigEntry{
+-			Kind:        structs.FileSystemCertificate,
+-			Name:        "cert2",
+-			Certificate: "/path/to/cert2.pem",
+-			PrivateKey:  "/path/to/key2.pem",
+-		},
+-		&structs.FileSystemCertificateConfigEntry{
+-			Kind:        structs.FileSystemCertificate,
+-			Name:        "cert3",
+-			Certificate: "/path/to/cert3.pem",
+-			PrivateKey:  "/path/to/key3.pem",
+-		},
+-		&structs.FileSystemCertificateConfigEntry{
+-			Kind:        structs.FileSystemCertificate,
+-			Name:        "cert4",
+-			Certificate: "/path/to/cert4.pem",
+-			PrivateKey:  "/path/to/key4.pem",
+-		},
+-	}
+-
+-	s := ResourceGenerator{}
+-	filterOpts := listenerFilterOpts{
+-		protocol:   "http",
+-		routeName:  "test-route",
+-		cluster:    "test-cluster",
+-		statPrefix: "test",
+-	}
+-
+-	chains, err := s.makeInlineOverrideFilterChains(
+-		snap,
+-		snap.APIGateway.TLSConfig,
+-		"http",
+-		filterOpts,
+-		certs,
+-	)
+-
+-	require.NoError(t, err)
+-	require.Len(t, chains, 1, "Should consolidate all file-system certificates into one filter chain")
+-
+-	// Verify no duplicate matchers even with many certificates
+-	chain := chains[0]
+-	if chain.FilterChainMatch != nil {
+-		require.Empty(t, chain.FilterChainMatch.ServerNames,
+-			"Filter chain should not have SNI restrictions with multiple file-system certificates")
+-	}
+-}
+-
+-func TestMakeInlineOverrideFilterChains_TLSParameters(t *testing.T) {
+-	// Test that TLS parameters are preserved
+-	snap := &proxycfg.ConfigSnapshot{}
+-	snap.APIGateway.TLSConfig = structs.GatewayTLSConfig{
+-		TLSMinVersion: "TLSv1_2",
+-		TLSMaxVersion: "TLSv1_3",
+-		CipherSuites: []types.TLSCipherSuite{
+-			types.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+-			types.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+-		},
+-	}
+-
+-	certs := []structs.ConfigEntry{
+-		&structs.FileSystemCertificateConfigEntry{
+-			Kind:        structs.FileSystemCertificate,
+-			Name:        "cert1",
+-			Certificate: "/path/to/cert1.pem",
+-			PrivateKey:  "/path/to/key1.pem",
+-		},
+-	}
+-
+-	s := ResourceGenerator{}
+-	filterOpts := listenerFilterOpts{
+-		protocol:   "http",
+-		routeName:  "test-route",
+-		cluster:    "test-cluster",
+-		statPrefix: "test",
+-	}
+-
+-	chains, err := s.makeInlineOverrideFilterChains(
+-		snap,
+-		snap.APIGateway.TLSConfig,
+-		"http",
+-		filterOpts,
+-		certs,
+-	)
+-
+-	require.NoError(t, err)
+-	require.Len(t, chains, 1)
+-
+-	// Verify TLS context exists
+-	chain := chains[0]
+-	require.NotNil(t, chain.TransportSocket, "Transport socket should be configured with TLS parameters")
+-}
+-
+-// Made with Bob

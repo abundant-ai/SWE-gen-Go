@@ -1,0 +1,1132 @@
+diff --git a/api/client.go b/api/client.go
+deleted file mode 100644
+index bf26724..0000000
+--- a/api/client.go
++++ /dev/null
+@@ -1,131 +0,0 @@
+-// Copyright 2015 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-// +build go1.7
+-
+-// Package api provides clients for the HTTP APIs.
+-package api
+-
+-import (
+-	"context"
+-	"io/ioutil"
+-	"net"
+-	"net/http"
+-	"net/url"
+-	"path"
+-	"strings"
+-	"time"
+-)
+-
+-// DefaultRoundTripper is used if no RoundTripper is set in Config.
+-var DefaultRoundTripper http.RoundTripper = &http.Transport{
+-	Proxy: http.ProxyFromEnvironment,
+-	Dial: (&net.Dialer{
+-		Timeout:   30 * time.Second,
+-		KeepAlive: 30 * time.Second,
+-	}).Dial,
+-	TLSHandshakeTimeout: 10 * time.Second,
+-}
+-
+-// Config defines configuration parameters for a new client.
+-type Config struct {
+-	// The address of the Prometheus to connect to.
+-	Address string
+-
+-	// RoundTripper is used by the Client to drive HTTP requests. If not
+-	// provided, DefaultRoundTripper will be used.
+-	RoundTripper http.RoundTripper
+-}
+-
+-func (cfg *Config) roundTripper() http.RoundTripper {
+-	if cfg.RoundTripper == nil {
+-		return DefaultRoundTripper
+-	}
+-	return cfg.RoundTripper
+-}
+-
+-// Client is the interface for an API client.
+-type Client interface {
+-	URL(ep string, args map[string]string) *url.URL
+-	Do(context.Context, *http.Request) (*http.Response, []byte, error)
+-}
+-
+-// NewClient returns a new Client.
+-//
+-// It is safe to use the returned Client from multiple goroutines.
+-func NewClient(cfg Config) (Client, error) {
+-	u, err := url.Parse(cfg.Address)
+-	if err != nil {
+-		return nil, err
+-	}
+-	u.Path = strings.TrimRight(u.Path, "/")
+-
+-	return &httpClient{
+-		endpoint: u,
+-		client:   http.Client{Transport: cfg.roundTripper()},
+-	}, nil
+-}
+-
+-type httpClient struct {
+-	endpoint *url.URL
+-	client   http.Client
+-}
+-
+-func (c *httpClient) URL(ep string, args map[string]string) *url.URL {
+-	p := path.Join(c.endpoint.Path, ep)
+-
+-	for arg, val := range args {
+-		arg = ":" + arg
+-		p = strings.Replace(p, arg, val, -1)
+-	}
+-
+-	u := *c.endpoint
+-	u.Path = p
+-
+-	return &u
+-}
+-
+-func (c *httpClient) Do(ctx context.Context, req *http.Request) (*http.Response, []byte, error) {
+-	if ctx != nil {
+-		req = req.WithContext(ctx)
+-	}
+-	resp, err := c.client.Do(req)
+-	defer func() {
+-		if resp != nil {
+-			resp.Body.Close()
+-		}
+-	}()
+-
+-	if err != nil {
+-		return nil, nil, err
+-	}
+-
+-	var body []byte
+-	done := make(chan struct{})
+-	go func() {
+-		body, err = ioutil.ReadAll(resp.Body)
+-		close(done)
+-	}()
+-
+-	select {
+-	case <-ctx.Done():
+-		err = resp.Body.Close()
+-		<-done
+-		if err == nil {
+-			err = ctx.Err()
+-		}
+-	case <-done:
+-	}
+-
+-	return resp, body, err
+-}
+diff --git a/api/client_test.go b/api/client_test.go
+deleted file mode 100644
+index 53226d7..0000000
+--- a/api/client_test.go
++++ /dev/null
+@@ -1,115 +0,0 @@
+-// Copyright 2015 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-// +build go1.7
+-
+-package api
+-
+-import (
+-	"net/http"
+-	"net/url"
+-	"testing"
+-)
+-
+-func TestConfig(t *testing.T) {
+-	c := Config{}
+-	if c.roundTripper() != DefaultRoundTripper {
+-		t.Fatalf("expected default roundtripper for nil RoundTripper field")
+-	}
+-}
+-
+-func TestClientURL(t *testing.T) {
+-	tests := []struct {
+-		address  string
+-		endpoint string
+-		args     map[string]string
+-		expected string
+-	}{
+-		{
+-			address:  "http://localhost:9090",
+-			endpoint: "/test",
+-			expected: "http://localhost:9090/test",
+-		},
+-		{
+-			address:  "http://localhost",
+-			endpoint: "/test",
+-			expected: "http://localhost/test",
+-		},
+-		{
+-			address:  "http://localhost:9090",
+-			endpoint: "test",
+-			expected: "http://localhost:9090/test",
+-		},
+-		{
+-			address:  "http://localhost:9090/prefix",
+-			endpoint: "/test",
+-			expected: "http://localhost:9090/prefix/test",
+-		},
+-		{
+-			address:  "https://localhost:9090/",
+-			endpoint: "/test/",
+-			expected: "https://localhost:9090/test",
+-		},
+-		{
+-			address:  "http://localhost:9090",
+-			endpoint: "/test/:param",
+-			args: map[string]string{
+-				"param": "content",
+-			},
+-			expected: "http://localhost:9090/test/content",
+-		},
+-		{
+-			address:  "http://localhost:9090",
+-			endpoint: "/test/:param/more/:param",
+-			args: map[string]string{
+-				"param": "content",
+-			},
+-			expected: "http://localhost:9090/test/content/more/content",
+-		},
+-		{
+-			address:  "http://localhost:9090",
+-			endpoint: "/test/:param/more/:foo",
+-			args: map[string]string{
+-				"param": "content",
+-				"foo":   "bar",
+-			},
+-			expected: "http://localhost:9090/test/content/more/bar",
+-		},
+-		{
+-			address:  "http://localhost:9090",
+-			endpoint: "/test/:param",
+-			args: map[string]string{
+-				"nonexistant": "content",
+-			},
+-			expected: "http://localhost:9090/test/:param",
+-		},
+-	}
+-
+-	for _, test := range tests {
+-		ep, err := url.Parse(test.address)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-
+-		hclient := &httpClient{
+-			endpoint: ep,
+-			client:   http.Client{Transport: DefaultRoundTripper},
+-		}
+-
+-		u := hclient.URL(test.endpoint, test.args)
+-		if u.String() != test.expected {
+-			t.Errorf("unexpected result: got %s, want %s", u, test.expected)
+-			continue
+-		}
+-	}
+-}
+diff --git a/api/prometheus/v1/api.go b/api/prometheus/api.go
+similarity index 54%
+rename from api/prometheus/v1/api.go
+rename to api/prometheus/api.go
+index 734a12e..cc5cbc3 100644
+--- a/api/prometheus/v1/api.go
++++ b/api/prometheus/api.go
+@@ -1,4 +1,4 @@
+-// Copyright 2017 The Prometheus Authors
++// Copyright 2015 The Prometheus Authors
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+ // You may obtain a copy of the License at
+@@ -11,33 +11,35 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-// +build go1.7
+-
+-// Package v1 provides bindings to the Prometheus HTTP API v1:
++// Package prometheus provides bindings to the Prometheus HTTP API:
+ // http://prometheus.io/docs/querying/api/
+-package v1
++package prometheus
+ 
+ import (
+-	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"io/ioutil"
++	"net"
+ 	"net/http"
++	"net/url"
++	"path"
+ 	"strconv"
++	"strings"
+ 	"time"
+ 
+-	"github.com/prometheus/client_golang/api"
+ 	"github.com/prometheus/common/model"
++	"golang.org/x/net/context"
++	"golang.org/x/net/context/ctxhttp"
+ )
+ 
+ const (
+ 	statusAPIError = 422
++	apiPrefix      = "/api/v1"
+ 
+-	apiPrefix = "/api/v1"
+-
+-	epQuery       = apiPrefix + "/query"
+-	epQueryRange  = apiPrefix + "/query_range"
+-	epLabelValues = apiPrefix + "/label/:name/values"
+-	epSeries      = apiPrefix + "/series"
++	epQuery       = "/query"
++	epQueryRange  = "/query_range"
++	epLabelValues = "/label/:name/values"
++	epSeries      = "/series"
+ )
+ 
+ // ErrorType models the different API error types.
+@@ -62,6 +64,168 @@ func (e *Error) Error() string {
+ 	return fmt.Sprintf("%s: %s", e.Type, e.Msg)
+ }
+ 
++// CancelableTransport is like net.Transport but provides
++// per-request cancelation functionality.
++type CancelableTransport interface {
++	http.RoundTripper
++	CancelRequest(req *http.Request)
++}
++
++// DefaultTransport is used if no Transport is set in Config.
++var DefaultTransport CancelableTransport = &http.Transport{
++	Proxy: http.ProxyFromEnvironment,
++	Dial: (&net.Dialer{
++		Timeout:   30 * time.Second,
++		KeepAlive: 30 * time.Second,
++	}).Dial,
++	TLSHandshakeTimeout: 10 * time.Second,
++}
++
++// Config defines configuration parameters for a new client.
++type Config struct {
++	// The address of the Prometheus to connect to.
++	Address string
++
++	// Transport is used by the Client to drive HTTP requests. If not
++	// provided, DefaultTransport will be used.
++	Transport CancelableTransport
++}
++
++func (cfg *Config) transport() CancelableTransport {
++	if cfg.Transport == nil {
++		return DefaultTransport
++	}
++	return cfg.Transport
++}
++
++// Client is the interface for an API client.
++type Client interface {
++	url(ep string, args map[string]string) *url.URL
++	do(context.Context, *http.Request) (*http.Response, []byte, error)
++}
++
++// New returns a new Client.
++//
++// It is safe to use the returned Client from multiple goroutines.
++func New(cfg Config) (Client, error) {
++	u, err := url.Parse(cfg.Address)
++	if err != nil {
++		return nil, err
++	}
++	u.Path = strings.TrimRight(u.Path, "/") + apiPrefix
++
++	return &httpClient{
++		endpoint:  u,
++		transport: cfg.transport(),
++	}, nil
++}
++
++type httpClient struct {
++	endpoint  *url.URL
++	transport CancelableTransport
++}
++
++func (c *httpClient) url(ep string, args map[string]string) *url.URL {
++	p := path.Join(c.endpoint.Path, ep)
++
++	for arg, val := range args {
++		arg = ":" + arg
++		p = strings.Replace(p, arg, val, -1)
++	}
++
++	u := *c.endpoint
++	u.Path = p
++
++	return &u
++}
++
++func (c *httpClient) do(ctx context.Context, req *http.Request) (*http.Response, []byte, error) {
++	resp, err := ctxhttp.Do(ctx, &http.Client{Transport: c.transport}, req)
++
++	defer func() {
++		if resp != nil {
++			resp.Body.Close()
++		}
++	}()
++
++	if err != nil {
++		return nil, nil, err
++	}
++
++	var body []byte
++	done := make(chan struct{})
++	go func() {
++		body, err = ioutil.ReadAll(resp.Body)
++		close(done)
++	}()
++
++	select {
++	case <-ctx.Done():
++		err = resp.Body.Close()
++		<-done
++		if err == nil {
++			err = ctx.Err()
++		}
++	case <-done:
++	}
++
++	return resp, body, err
++}
++
++// apiClient wraps a regular client and processes successful API responses.
++// Successful also includes responses that errored at the API level.
++type apiClient struct {
++	Client
++}
++
++type apiResponse struct {
++	Status    string          `json:"status"`
++	Data      json.RawMessage `json:"data"`
++	ErrorType ErrorType       `json:"errorType"`
++	Error     string          `json:"error"`
++}
++
++func (c apiClient) do(ctx context.Context, req *http.Request) (*http.Response, []byte, error) {
++	resp, body, err := c.Client.do(ctx, req)
++	if err != nil {
++		return resp, body, err
++	}
++
++	code := resp.StatusCode
++
++	if code/100 != 2 && code != statusAPIError {
++		return resp, body, &Error{
++			Type: ErrBadResponse,
++			Msg:  fmt.Sprintf("bad response code %d", resp.StatusCode),
++		}
++	}
++
++	var result apiResponse
++
++	if err = json.Unmarshal(body, &result); err != nil {
++		return resp, body, &Error{
++			Type: ErrBadResponse,
++			Msg:  err.Error(),
++		}
++	}
++
++	if (code == statusAPIError) != (result.Status == "error") {
++		err = &Error{
++			Type: ErrBadResponse,
++			Msg:  "inconsistent body for response code",
++		}
++	}
++
++	if code == statusAPIError && result.Status == "error" {
++		err = &Error{
++			Type: result.ErrorType,
++			Msg:  result.Error,
++		}
++	}
++
++	return resp, []byte(result.Data), err
++}
++
+ // Range represents a sliced time range.
+ type Range struct {
+ 	// The boundaries of the time range.
+@@ -70,16 +234,6 @@ type Range struct {
+ 	Step time.Duration
+ }
+ 
+-// API provides bindings for Prometheus's v1 API.
+-type API interface {
+-	// Query performs a query for the given time.
+-	Query(ctx context.Context, query string, ts time.Time) (model.Value, error)
+-	// QueryRange performs a query for the given range.
+-	QueryRange(ctx context.Context, query string, r Range) (model.Value, error)
+-	// LabelValues performs a query for the values of the given label.
+-	LabelValues(ctx context.Context, label string) (model.LabelValues, error)
+-}
+-
+ // queryResult contains result data for a query.
+ type queryResult struct {
+ 	Type   model.ValueType `json:"resultType"`
+@@ -122,19 +276,27 @@ func (qr *queryResult) UnmarshalJSON(b []byte) error {
+ 	return err
+ }
+ 
+-// NewAPI returns a new API for the client.
++// QueryAPI provides bindings the Prometheus's query API.
++type QueryAPI interface {
++	// Query performs a query for the given time.
++	Query(ctx context.Context, query string, ts time.Time) (model.Value, error)
++	// Query performs a query for the given range.
++	QueryRange(ctx context.Context, query string, r Range) (model.Value, error)
++}
++
++// NewQueryAPI returns a new QueryAPI for the client.
+ //
+-// It is safe to use the returned API from multiple goroutines.
+-func NewAPI(c api.Client) API {
+-	return &httpAPI{client: apiClient{c}}
++// It is safe to use the returned QueryAPI from multiple goroutines.
++func NewQueryAPI(c Client) QueryAPI {
++	return &httpQueryAPI{client: apiClient{c}}
+ }
+ 
+-type httpAPI struct {
+-	client api.Client
++type httpQueryAPI struct {
++	client Client
+ }
+ 
+-func (h *httpAPI) Query(ctx context.Context, query string, ts time.Time) (model.Value, error) {
+-	u := h.client.URL(epQuery, nil)
++func (h *httpQueryAPI) Query(ctx context.Context, query string, ts time.Time) (model.Value, error) {
++	u := h.client.url(epQuery, nil)
+ 	q := u.Query()
+ 
+ 	q.Set("query", query)
+@@ -142,12 +304,9 @@ func (h *httpAPI) Query(ctx context.Context, query string, ts time.Time) (model.
+ 
+ 	u.RawQuery = q.Encode()
+ 
+-	req, err := http.NewRequest("GET", u.String(), nil)
+-	if err != nil {
+-		return nil, err
+-	}
++	req, _ := http.NewRequest("GET", u.String(), nil)
+ 
+-	_, body, err := h.client.Do(ctx, req)
++	_, body, err := h.client.do(ctx, req)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -158,8 +317,8 @@ func (h *httpAPI) Query(ctx context.Context, query string, ts time.Time) (model.
+ 	return model.Value(qres.v), err
+ }
+ 
+-func (h *httpAPI) QueryRange(ctx context.Context, query string, r Range) (model.Value, error) {
+-	u := h.client.URL(epQueryRange, nil)
++func (h *httpQueryAPI) QueryRange(ctx context.Context, query string, r Range) (model.Value, error) {
++	u := h.client.url(epQueryRange, nil)
+ 	q := u.Query()
+ 
+ 	var (
+@@ -175,12 +334,9 @@ func (h *httpAPI) QueryRange(ctx context.Context, query string, r Range) (model.
+ 
+ 	u.RawQuery = q.Encode()
+ 
+-	req, err := http.NewRequest("GET", u.String(), nil)
+-	if err != nil {
+-		return nil, err
+-	}
++	req, _ := http.NewRequest("GET", u.String(), nil)
+ 
+-	_, body, err := h.client.Do(ctx, req)
++	_, body, err := h.client.do(ctx, req)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -190,72 +346,3 @@ func (h *httpAPI) QueryRange(ctx context.Context, query string, r Range) (model.
+ 
+ 	return model.Value(qres.v), err
+ }
+-
+-func (h *httpAPI) LabelValues(ctx context.Context, label string) (model.LabelValues, error) {
+-	u := h.client.URL(epLabelValues, map[string]string{"name": label})
+-	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+-	if err != nil {
+-		return nil, err
+-	}
+-	_, body, err := h.client.Do(ctx, req)
+-	if err != nil {
+-		return nil, err
+-	}
+-	var labelValues model.LabelValues
+-	err = json.Unmarshal(body, &labelValues)
+-	return labelValues, err
+-}
+-
+-// apiClient wraps a regular client and processes successful API responses.
+-// Successful also includes responses that errored at the API level.
+-type apiClient struct {
+-	api.Client
+-}
+-
+-type apiResponse struct {
+-	Status    string          `json:"status"`
+-	Data      json.RawMessage `json:"data"`
+-	ErrorType ErrorType       `json:"errorType"`
+-	Error     string          `json:"error"`
+-}
+-
+-func (c apiClient) Do(ctx context.Context, req *http.Request) (*http.Response, []byte, error) {
+-	resp, body, err := c.Client.Do(ctx, req)
+-	if err != nil {
+-		return resp, body, err
+-	}
+-
+-	code := resp.StatusCode
+-
+-	if code/100 != 2 && code != statusAPIError {
+-		return resp, body, &Error{
+-			Type: ErrBadResponse,
+-			Msg:  fmt.Sprintf("bad response code %d", resp.StatusCode),
+-		}
+-	}
+-
+-	var result apiResponse
+-
+-	if err = json.Unmarshal(body, &result); err != nil {
+-		return resp, body, &Error{
+-			Type: ErrBadResponse,
+-			Msg:  err.Error(),
+-		}
+-	}
+-
+-	if (code == statusAPIError) != (result.Status == "error") {
+-		err = &Error{
+-			Type: ErrBadResponse,
+-			Msg:  "inconsistent body for response code",
+-		}
+-	}
+-
+-	if code == statusAPIError && result.Status == "error" {
+-		err = &Error{
+-			Type: result.ErrorType,
+-			Msg:  result.Error,
+-		}
+-	}
+-
+-	return resp, []byte(result.Data), err
+-}
+diff --git a/api/prometheus/v1/api_test.go b/api/prometheus/api_test.go
+similarity index 71%
+rename from api/prometheus/v1/api_test.go
+rename to api/prometheus/api_test.go
+index 2c8b1b2..ca084a0 100644
+--- a/api/prometheus/v1/api_test.go
++++ b/api/prometheus/api_test.go
+@@ -1,4 +1,4 @@
+-// Copyright 2017 The Prometheus Authors
++// Copyright 2015 The Prometheus Authors
+ // Licensed under the Apache License, Version 2.0 (the "License");
+ // you may not use this file except in compliance with the License.
+ // You may obtain a copy of the License at
+@@ -11,203 +11,118 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-// +build go1.7
+-
+-package v1
++package prometheus
+ 
+ import (
+-	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
+ 	"reflect"
+-	"strings"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/prometheus/common/model"
++	"golang.org/x/net/context"
+ )
+ 
+-type apiTest struct {
+-	do    func() (interface{}, error)
+-	inErr error
+-	inRes interface{}
+-
+-	reqPath   string
+-	reqParam  url.Values
+-	reqMethod string
+-	res       interface{}
+-	err       error
+-}
+-
+-type apiTestClient struct {
+-	*testing.T
+-	curTest apiTest
+-}
+-
+-func (c *apiTestClient) URL(ep string, args map[string]string) *url.URL {
+-	path := ep
+-	for k, v := range args {
+-		path = strings.Replace(path, ":"+k, v, -1)
++func TestConfig(t *testing.T) {
++	c := Config{}
++	if c.transport() != DefaultTransport {
++		t.Fatalf("expected default transport for nil Transport field")
+ 	}
+-	u := &url.URL{
+-		Host: "test:9090",
+-		Path: path,
+-	}
+-	return u
+ }
+ 
+-func (c *apiTestClient) Do(ctx context.Context, req *http.Request) (*http.Response, []byte, error) {
+-
+-	test := c.curTest
+-
+-	if req.URL.Path != test.reqPath {
+-		c.Errorf("unexpected request path: want %s, got %s", test.reqPath, req.URL.Path)
+-	}
+-	if req.Method != test.reqMethod {
+-		c.Errorf("unexpected request method: want %s, got %s", test.reqMethod, req.Method)
+-	}
+-
+-	b, err := json.Marshal(test.inRes)
+-	if err != nil {
+-		c.Fatal(err)
+-	}
+-
+-	resp := &http.Response{}
+-	if test.inErr != nil {
+-		resp.StatusCode = statusAPIError
+-	} else {
+-		resp.StatusCode = http.StatusOK
+-	}
+-
+-	return resp, b, test.inErr
+-}
+-
+-func TestAPIs(t *testing.T) {
+-
+-	testTime := time.Now()
+-
+-	client := &apiTestClient{T: t}
+-
+-	queryAPI := &httpAPI{
+-		client: client,
+-	}
+-
+-	doQuery := func(q string, ts time.Time) func() (interface{}, error) {
+-		return func() (interface{}, error) {
+-			return queryAPI.Query(context.Background(), q, ts)
+-		}
+-	}
+-
+-	doQueryRange := func(q string, rng Range) func() (interface{}, error) {
+-		return func() (interface{}, error) {
+-			return queryAPI.QueryRange(context.Background(), q, rng)
+-		}
+-	}
+-
+-	doLabelValues := func(label string) func() (interface{}, error) {
+-		return func() (interface{}, error) {
+-			return queryAPI.LabelValues(context.Background(), label)
+-		}
+-	}
+-
+-	queryTests := []apiTest{
++func TestClientURL(t *testing.T) {
++	tests := []struct {
++		address  string
++		endpoint string
++		args     map[string]string
++		expected string
++	}{
+ 		{
+-			do: doQuery("2", testTime),
+-			inRes: &queryResult{
+-				Type: model.ValScalar,
+-				Result: &model.Scalar{
+-					Value:     2,
+-					Timestamp: model.TimeFromUnix(testTime.Unix()),
+-				},
+-			},
+-
+-			reqMethod: "GET",
+-			reqPath:   "/api/v1/query",
+-			reqParam: url.Values{
+-				"query": []string{"2"},
+-				"time":  []string{testTime.Format(time.RFC3339Nano)},
+-			},
+-			res: &model.Scalar{
+-				Value:     2,
+-				Timestamp: model.TimeFromUnix(testTime.Unix()),
+-			},
++			address:  "http://localhost:9090",
++			endpoint: "/test",
++			expected: "http://localhost:9090/test",
+ 		},
+ 		{
+-			do:    doQuery("2", testTime),
+-			inErr: fmt.Errorf("some error"),
+-
+-			reqMethod: "GET",
+-			reqPath:   "/api/v1/query",
+-			reqParam: url.Values{
+-				"query": []string{"2"},
+-				"time":  []string{testTime.Format(time.RFC3339Nano)},
++			address:  "http://localhost",
++			endpoint: "/test",
++			expected: "http://localhost/test",
++		},
++		{
++			address:  "http://localhost:9090",
++			endpoint: "test",
++			expected: "http://localhost:9090/test",
++		},
++		{
++			address:  "http://localhost:9090/prefix",
++			endpoint: "/test",
++			expected: "http://localhost:9090/prefix/test",
++		},
++		{
++			address:  "https://localhost:9090/",
++			endpoint: "/test/",
++			expected: "https://localhost:9090/test",
++		},
++		{
++			address:  "http://localhost:9090",
++			endpoint: "/test/:param",
++			args: map[string]string{
++				"param": "content",
+ 			},
+-			err: fmt.Errorf("some error"),
++			expected: "http://localhost:9090/test/content",
+ 		},
+-
+ 		{
+-			do: doQueryRange("2", Range{
+-				Start: testTime.Add(-time.Minute),
+-				End:   testTime,
+-				Step:  time.Minute,
+-			}),
+-			inErr: fmt.Errorf("some error"),
+-
+-			reqMethod: "GET",
+-			reqPath:   "/api/v1/query_range",
+-			reqParam: url.Values{
+-				"query": []string{"2"},
+-				"start": []string{testTime.Add(-time.Minute).Format(time.RFC3339Nano)},
+-				"end":   []string{testTime.Format(time.RFC3339Nano)},
+-				"step":  []string{time.Minute.String()},
++			address:  "http://localhost:9090",
++			endpoint: "/test/:param/more/:param",
++			args: map[string]string{
++				"param": "content",
+ 			},
+-			err: fmt.Errorf("some error"),
++			expected: "http://localhost:9090/test/content/more/content",
+ 		},
+-
+ 		{
+-			do:        doLabelValues("mylabel"),
+-			inRes:     []string{"val1", "val2"},
+-			reqMethod: "GET",
+-			reqPath:   "/api/v1/label/mylabel/values",
+-			res:       model.LabelValues{"val1", "val2"},
++			address:  "http://localhost:9090",
++			endpoint: "/test/:param/more/:foo",
++			args: map[string]string{
++				"param": "content",
++				"foo":   "bar",
++			},
++			expected: "http://localhost:9090/test/content/more/bar",
+ 		},
+-
+ 		{
+-			do:        doLabelValues("mylabel"),
+-			inErr:     fmt.Errorf("some error"),
+-			reqMethod: "GET",
+-			reqPath:   "/api/v1/label/mylabel/values",
+-			err:       fmt.Errorf("some error"),
++			address:  "http://localhost:9090",
++			endpoint: "/test/:param",
++			args: map[string]string{
++				"nonexistant": "content",
++			},
++			expected: "http://localhost:9090/test/:param",
+ 		},
+ 	}
+ 
+-	var tests []apiTest
+-	tests = append(tests, queryTests...)
+-
+ 	for _, test := range tests {
+-		client.curTest = test
+-
+-		res, err := test.do()
++		ep, err := url.Parse(test.address)
++		if err != nil {
++			t.Fatal(err)
++		}
+ 
+-		if test.err != nil {
+-			if err == nil {
+-				t.Errorf("expected error %q but got none", test.err)
+-				continue
+-			}
+-			if err.Error() != test.err.Error() {
+-				t.Errorf("unexpected error: want %s, got %s", test.err, err)
+-			}
+-			continue
++		hclient := &httpClient{
++			endpoint:  ep,
++			transport: DefaultTransport,
+ 		}
+-		if err != nil {
+-			t.Errorf("unexpected error: %s", err)
++
++		u := hclient.url(test.endpoint, test.args)
++		if u.String() != test.expected {
++			t.Errorf("unexpected result: got %s, want %s", u, test.expected)
+ 			continue
+ 		}
+ 
+-		if !reflect.DeepEqual(res, test.res) {
+-			t.Errorf("unexpected result: want %v, got %v", test.res, res)
++		// The apiClient must return exactly the same result as the httpClient.
++		aclient := &apiClient{hclient}
++
++		u = aclient.url(test.endpoint, test.args)
++		if u.String() != test.expected {
++			t.Errorf("unexpected result: got %s, want %s", u, test.expected)
+ 		}
+ 	}
+ }
+@@ -226,11 +141,11 @@ type apiClientTest struct {
+ 	err      *Error
+ }
+ 
+-func (c *testClient) URL(ep string, args map[string]string) *url.URL {
++func (c *testClient) url(ep string, args map[string]string) *url.URL {
+ 	return nil
+ }
+ 
+-func (c *testClient) Do(ctx context.Context, req *http.Request) (*http.Response, []byte, error) {
++func (c *testClient) do(ctx context.Context, req *http.Request) (*http.Response, []byte, error) {
+ 	if ctx == nil {
+ 		c.Fatalf("context was not passed down")
+ 	}
+@@ -356,7 +271,7 @@ func TestAPIClientDo(t *testing.T) {
+ 
+ 		tc.ch <- test
+ 
+-		_, body, err := client.Do(context.Background(), tc.req)
++		_, body, err := client.do(context.Background(), tc.req)
+ 
+ 		if test.err != nil {
+ 			if err == nil {
+@@ -379,3 +294,160 @@ func TestAPIClientDo(t *testing.T) {
+ 		}
+ 	}
+ }
++
++type apiTestClient struct {
++	*testing.T
++	curTest apiTest
++}
++
++type apiTest struct {
++	do    func() (interface{}, error)
++	inErr error
++	inRes interface{}
++
++	reqPath   string
++	reqParam  url.Values
++	reqMethod string
++	res       interface{}
++	err       error
++}
++
++func (c *apiTestClient) url(ep string, args map[string]string) *url.URL {
++	u := &url.URL{
++		Host: "test:9090",
++		Path: apiPrefix + ep,
++	}
++	return u
++}
++
++func (c *apiTestClient) do(ctx context.Context, req *http.Request) (*http.Response, []byte, error) {
++
++	test := c.curTest
++
++	if req.URL.Path != test.reqPath {
++		c.Errorf("unexpected request path: want %s, got %s", test.reqPath, req.URL.Path)
++	}
++	if req.Method != test.reqMethod {
++		c.Errorf("unexpected request method: want %s, got %s", test.reqMethod, req.Method)
++	}
++
++	b, err := json.Marshal(test.inRes)
++	if err != nil {
++		c.Fatal(err)
++	}
++
++	resp := &http.Response{}
++	if test.inErr != nil {
++		resp.StatusCode = statusAPIError
++	} else {
++		resp.StatusCode = http.StatusOK
++	}
++
++	return resp, b, test.inErr
++}
++
++func TestAPIs(t *testing.T) {
++
++	testTime := time.Now()
++
++	client := &apiTestClient{T: t}
++
++	queryAPI := &httpQueryAPI{
++		client: client,
++	}
++
++	doQuery := func(q string, ts time.Time) func() (interface{}, error) {
++		return func() (interface{}, error) {
++			return queryAPI.Query(context.Background(), q, ts)
++		}
++	}
++
++	doQueryRange := func(q string, rng Range) func() (interface{}, error) {
++		return func() (interface{}, error) {
++			return queryAPI.QueryRange(context.Background(), q, rng)
++		}
++	}
++
++	queryTests := []apiTest{
++		{
++			do: doQuery("2", testTime),
++			inRes: &queryResult{
++				Type: model.ValScalar,
++				Result: &model.Scalar{
++					Value:     2,
++					Timestamp: model.TimeFromUnix(testTime.Unix()),
++				},
++			},
++
++			reqMethod: "GET",
++			reqPath:   "/api/v1/query",
++			reqParam: url.Values{
++				"query": []string{"2"},
++				"time":  []string{testTime.Format(time.RFC3339Nano)},
++			},
++			res: &model.Scalar{
++				Value:     2,
++				Timestamp: model.TimeFromUnix(testTime.Unix()),
++			},
++		},
++		{
++			do:    doQuery("2", testTime),
++			inErr: fmt.Errorf("some error"),
++
++			reqMethod: "GET",
++			reqPath:   "/api/v1/query",
++			reqParam: url.Values{
++				"query": []string{"2"},
++				"time":  []string{testTime.Format(time.RFC3339Nano)},
++			},
++			err: fmt.Errorf("some error"),
++		},
++
++		{
++			do: doQueryRange("2", Range{
++				Start: testTime.Add(-time.Minute),
++				End:   testTime,
++				Step:  time.Minute,
++			}),
++			inErr: fmt.Errorf("some error"),
++
++			reqMethod: "GET",
++			reqPath:   "/api/v1/query_range",
++			reqParam: url.Values{
++				"query": []string{"2"},
++				"start": []string{testTime.Add(-time.Minute).Format(time.RFC3339Nano)},
++				"end":   []string{testTime.Format(time.RFC3339Nano)},
++				"step":  []string{time.Minute.String()},
++			},
++			err: fmt.Errorf("some error"),
++		},
++	}
++
++	var tests []apiTest
++	tests = append(tests, queryTests...)
++
++	for _, test := range tests {
++		client.curTest = test
++
++		res, err := test.do()
++
++		if test.err != nil {
++			if err == nil {
++				t.Errorf("expected error %q but got none", test.err)
++				continue
++			}
++			if err.Error() != test.err.Error() {
++				t.Errorf("unexpected error: want %s, got %s", test.err, err)
++			}
++			continue
++		}
++		if err != nil {
++			t.Errorf("unexpected error: %s", err)
++			continue
++		}
++
++		if !reflect.DeepEqual(res, test.res) {
++			t.Errorf("unexpected result: want %v, got %v", test.res, res)
++		}
++	}
++}

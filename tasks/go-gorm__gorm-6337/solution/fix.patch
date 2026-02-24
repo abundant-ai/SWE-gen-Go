@@ -1,0 +1,192 @@
+diff --git a/LICENSE b/LICENSE
+new file mode 100644
+index 0000000..037e165
+--- /dev/null
++++ b/LICENSE
+@@ -0,0 +1,21 @@
++The MIT License (MIT)
++
++Copyright (c) 2013-NOW  Jinzhu <wosmvp@gmail.com>
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in
++all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++THE SOFTWARE.
+diff --git a/errors.go b/errors.go
+index 57e3fc5..cd76f1f 100644
+--- a/errors.go
++++ b/errors.go
+@@ -47,4 +47,6 @@ var (
+ 	ErrPreloadNotAllowed = errors.New("preload is not allowed when count is used")
+ 	// ErrDuplicatedKey occurs when there is a unique key constraint violation
+ 	ErrDuplicatedKey = errors.New("duplicated key not allowed")
++	// ErrForeignKeyViolated occurs when there is a foreign key constraint violation
++	ErrForeignKeyViolated = errors.New("violates foreign key constraint")
+ )
+diff --git a/finisher_api.go b/finisher_api.go
+index ad14e29..f80aa6c 100644
+--- a/finisher_api.go
++++ b/finisher_api.go
+@@ -6,8 +6,6 @@ import (
+ 	"fmt"
+ 	"reflect"
+ 	"strings"
+-	"sync"
+-	"sync/atomic"
+ 
+ 	"gorm.io/gorm/clause"
+ 	"gorm.io/gorm/logger"
+@@ -107,7 +105,7 @@ func (db *DB) Save(value interface{}) (tx *DB) {
+ 		updateTx := tx.callbacks.Update().Execute(tx.Session(&Session{Initialized: true}))
+ 
+ 		if updateTx.Error == nil && updateTx.RowsAffected == 0 && !updateTx.DryRun && !selectedUpdate {
+-			return tx.Clauses(clause.OnConflict{UpdateAll: true}).Create(value)
++			return tx.Session(&Session{SkipHooks: true}).Clauses(clause.OnConflict{UpdateAll: true}).Create(value)
+ 		}
+ 
+ 		return updateTx
+@@ -612,15 +610,6 @@ func (db *DB) Connection(fc func(tx *DB) error) (err error) {
+ 	return fc(tx)
+ }
+ 
+-var (
+-	savepointIdx      int64
+-	savepointNamePool = &sync.Pool{
+-		New: func() interface{} {
+-			return fmt.Sprintf("gorm_%d", atomic.AddInt64(&savepointIdx, 1))
+-		},
+-	}
+-)
+-
+ // Transaction start a transaction as a block, return error will rollback, otherwise to commit. Transaction executes an
+ // arbitrary number of commands in fc within a transaction. On success the changes are committed; if an error occurs
+ // they are rolled back.
+@@ -630,17 +619,14 @@ func (db *DB) Transaction(fc func(tx *DB) error, opts ...*sql.TxOptions) (err er
+ 	if committer, ok := db.Statement.ConnPool.(TxCommitter); ok && committer != nil {
+ 		// nested transaction
+ 		if !db.DisableNestedTransaction {
+-			poolName := savepointNamePool.Get()
+-			defer savepointNamePool.Put(poolName)
+-			err = db.SavePoint(poolName.(string)).Error
++			err = db.SavePoint(fmt.Sprintf("sp%p", fc)).Error
+ 			if err != nil {
+ 				return
+ 			}
+-
+ 			defer func() {
+ 				// Make sure to rollback when panic, Block error or Commit error
+ 				if panicked || err != nil {
+-					db.RollbackTo(poolName.(string))
++					db.RollbackTo(fmt.Sprintf("sp%p", fc))
+ 				}
+ 			}()
+ 		}
+@@ -721,7 +707,21 @@ func (db *DB) Rollback() *DB {
+ 
+ func (db *DB) SavePoint(name string) *DB {
+ 	if savePointer, ok := db.Dialector.(SavePointerDialectorInterface); ok {
++		// close prepared statement, because SavePoint not support prepared statement.
++		// e.g. mysql8.0 doc: https://dev.mysql.com/doc/refman/8.0/en/sql-prepared-statements.html
++		var (
++			preparedStmtTx   *PreparedStmtTX
++			isPreparedStmtTx bool
++		)
++		// close prepared statement, because SavePoint not support prepared statement.
++		if preparedStmtTx, isPreparedStmtTx = db.Statement.ConnPool.(*PreparedStmtTX); isPreparedStmtTx {
++			db.Statement.ConnPool = preparedStmtTx.Tx
++		}
+ 		db.AddError(savePointer.SavePoint(db, name))
++		// restore prepared statement
++		if isPreparedStmtTx {
++			db.Statement.ConnPool = preparedStmtTx
++		}
+ 	} else {
+ 		db.AddError(ErrUnsupportedDriver)
+ 	}
+@@ -730,7 +730,21 @@ func (db *DB) SavePoint(name string) *DB {
+ 
+ func (db *DB) RollbackTo(name string) *DB {
+ 	if savePointer, ok := db.Dialector.(SavePointerDialectorInterface); ok {
++		// close prepared statement, because RollbackTo not support prepared statement.
++		// e.g. mysql8.0 doc: https://dev.mysql.com/doc/refman/8.0/en/sql-prepared-statements.html
++		var (
++			preparedStmtTx   *PreparedStmtTX
++			isPreparedStmtTx bool
++		)
++		// close prepared statement, because SavePoint not support prepared statement.
++		if preparedStmtTx, isPreparedStmtTx = db.Statement.ConnPool.(*PreparedStmtTX); isPreparedStmtTx {
++			db.Statement.ConnPool = preparedStmtTx.Tx
++		}
+ 		db.AddError(savePointer.RollbackTo(db, name))
++		// restore prepared statement
++		if isPreparedStmtTx {
++			db.Statement.ConnPool = preparedStmtTx
++		}
+ 	} else {
+ 		db.AddError(ErrUnsupportedDriver)
+ 	}
+diff --git a/gorm.go b/gorm.go
+index 07a913f..84d4b43 100644
+--- a/gorm.go
++++ b/gorm.go
+@@ -146,7 +146,7 @@ func Open(dialector Dialector, opts ...Option) (db *DB, err error) {
+ 	}
+ 
+ 	if config.NamingStrategy == nil {
+-		config.NamingStrategy = schema.NamingStrategy{}
++		config.NamingStrategy = schema.NamingStrategy{IdentifierMaxLength: 64} // Default Identifier length is 64
+ 	}
+ 
+ 	if config.Logger == nil {
+diff --git a/schema/naming.go b/schema/naming.go
+index a258bee..a2a0150 100644
+--- a/schema/naming.go
++++ b/schema/naming.go
+@@ -28,10 +28,11 @@ type Replacer interface {
+ 
+ // NamingStrategy tables, columns naming strategy
+ type NamingStrategy struct {
+-	TablePrefix   string
+-	SingularTable bool
+-	NameReplacer  Replacer
+-	NoLowerCase   bool
++	TablePrefix         string
++	SingularTable       bool
++	NameReplacer        Replacer
++	NoLowerCase         bool
++	IdentifierMaxLength int
+ }
+ 
+ // TableName convert string to table name
+@@ -89,12 +90,16 @@ func (ns NamingStrategy) formatName(prefix, table, name string) string {
+ 		prefix, table, name,
+ 	}, "_"), ".", "_")
+ 
+-	if utf8.RuneCountInString(formattedName) > 64 {
++	if ns.IdentifierMaxLength == 0 {
++		ns.IdentifierMaxLength = 64
++	}
++
++	if utf8.RuneCountInString(formattedName) > ns.IdentifierMaxLength {
+ 		h := sha1.New()
+ 		h.Write([]byte(formattedName))
+ 		bs := h.Sum(nil)
+ 
+-		formattedName = formattedName[0:56] + hex.EncodeToString(bs)[:8]
++		formattedName = formattedName[0:ns.IdentifierMaxLength-8] + hex.EncodeToString(bs)[:8]
+ 	}
+ 	return formattedName
+ }

@@ -1,0 +1,348 @@
+diff --git a/.travis.yml b/.travis.yml
+index 228a3d2..0e98fda 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -3,7 +3,7 @@ language: go
+ go:
+   - 1.4
+   - 1.5
+-  - 1.6
++  - tip
+ 
+ install:
+   - go get -u golang.org/x/tools/cmd/goimports
+diff --git a/LICENSE b/LICENSE
+index b1e7c84..88d5ed9 100644
+--- a/LICENSE
++++ b/LICENSE
+@@ -1,4 +1,4 @@
+-Copyright (c) 2015-2016 Peter Kieltyka (https://twitter.com/peterk)
++Copyright (c) 2015 Peter Kieltyka (https://twitter.com/peterk)
+ 
+ MIT License
+ 
+diff --git a/README.md b/README.md
+index 6bb1e87..fd39dfb 100644
+--- a/README.md
++++ b/README.md
+@@ -305,16 +305,18 @@ to reusing URLParams from a pool.
+   * Trailing slash?
+   * Case insensitive paths?
+   * GET for HEAD requests (auto fallback)?
+-* Register error handler (500's), ServerError() handler?
++* Register not found handler
++* Register error handler (500's)
+ * HTTP2 example
+   * both http 1.1 and http2 automatically.. just turn it on :)
++* Websocket example
+ * Regexp support in router "/:id([0-9]+)" or "#id^[0-9]+$" or ..
+ 
+ We'll be more than happy to see [your contributions](./CONTRIBUTING.md)!
+ 
+ ## License
+ 
+-Copyright (c) 2015-2016 [Peter Kieltyka](https://github.com/pkieltyka)
++Copyright (c) 2015 [Peter Kieltyka](https://github.com/pkieltyka)
+ 
+ Licensed under [MIT License](./LICENSE)
+ 
+diff --git a/chi.go b/chi.go
+index f0adad7..6364c11 100644
+--- a/chi.go
++++ b/chi.go
+@@ -20,8 +20,6 @@ type Router interface {
+ 	Mount(pattern string, handlers ...interface{})
+ 
+ 	Handle(pattern string, handlers ...interface{})
+-	NotFound(h HandlerFunc)
+-
+ 	Connect(pattern string, handlers ...interface{})
+ 	Head(pattern string, handlers ...interface{})
+ 	Get(pattern string, handlers ...interface{})
+diff --git a/mux.go b/mux.go
+index 733ff51..c49354a 100644
+--- a/mux.go
++++ b/mux.go
+@@ -3,6 +3,7 @@ package chi
+ import (
+ 	"fmt"
+ 	"net/http"
++	"strings"
+ 
+ 	"golang.org/x/net/context"
+ )
+@@ -15,7 +16,7 @@ type Mux struct {
+ 	middlewares []interface{}
+ 
+ 	// The radix trie router with URL parameter matching
+-	router *treeRouter
++	router treeRouter
+ 
+ 	// The mux handler, chained middleware stack and tree router
+ 	handler Handler
+@@ -23,6 +24,9 @@ type Mux struct {
+ 	// Controls the behaviour of middleware chain generation when a mux
+ 	// is registered as an inline group inside another mux.
+ 	inline bool
++
++	// can add rules here for how the mux should work..
++	// ie. slashes, case insensitive, notfound handler etc.. like httprouter
+ }
+ 
+ type methodTyp int
+@@ -112,11 +116,6 @@ func (mx *Mux) Options(pattern string, handlers ...interface{}) {
+ 	mx.handle(mOPTIONS, pattern, handlers...)
+ }
+ 
+-// NotFound sets a custom handler for the case when no routes match
+-func (mx *Mux) NotFound(h HandlerFunc) {
+-	mx.router.notFoundHandler = &h
+-}
+-
+ func (mx *Mux) handle(method methodTyp, pattern string, handlers ...interface{}) {
+ 	if len(pattern) == 0 || pattern[0] != '/' {
+ 		panic(fmt.Sprintf("pattern must begin with '/' in '%s'", pattern))
+@@ -144,7 +143,7 @@ func (mx *Mux) handle(method methodTyp, pattern string, handlers ...interface{})
+ 	for _, mt := range methodMap {
+ 		m := method & mt
+ 		if m > 0 {
+-			mx.router.routes[m].Insert(pattern, endpoint)
++			mx.router[m].Insert(pattern, endpoint)
+ 		}
+ 	}
+ }
+@@ -177,28 +176,19 @@ func (mx *Mux) Mount(path string, handlers ...interface{}) {
+ 	// Build chain with any inline middlewares and endpoint handler for the subrouter
+ 	h := chain([]interface{}{}, handlers...)
+ 
+-	// Assign sub-Router's with the parent not found handler if not specified.
+-	for _, hh := range handlers {
+-		if sr, ok := hh.(*Mux); ok {
+-			if sr.router.notFoundHandler == nil && mx.router.notFoundHandler != nil {
+-				sr.NotFound(*mx.router.notFoundHandler)
+-			}
+-		}
+-	}
+-
+-	// Wrap the sub-router in a handlerFunc to scope the request path for routing.
+-	subHandler := HandlerFunc(func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	// Route the subroutes through a wildcard url param
++	subRouter := HandlerFunc(func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+ 		path := URLParams(ctx)["*"]
+ 		ctx = context.WithValue(ctx, SubRouterCtxKey, "/"+path)
+ 		h.ServeHTTPC(ctx, w, r)
+ 	})
+ 
+ 	if path == "" || path[len(path)-1] != '/' {
+-		mx.Handle(path, subHandler)
+-		mx.Handle(path+"/", mx.router.notFoundHandler)
++		mx.Handle(path, subRouter)
++		mx.Handle(path+"/", http.NotFound) // TODO: which not-found handler..?
+ 		path += "/"
+ 	}
+-	mx.Handle(path+"*", subHandler)
++	mx.Handle(path+"*", subRouter)
+ }
+ 
+ func (mx *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -209,23 +199,14 @@ func (mx *Mux) ServeHTTPC(ctx context.Context, w http.ResponseWriter, r *http.Re
+ 	mx.handler.ServeHTTPC(ctx, w, r)
+ }
+ 
+-type treeRouter struct {
+-	// Routing tree by method type
+-	routes map[methodTyp]*tree
+-
+-	// Custom route not found handler
+-	notFoundHandler *HandlerFunc
+-}
++type treeRouter map[methodTyp]*tree
+ 
+-func newTreeRouter() *treeRouter {
+-	tr := &treeRouter{
+-		routes:          make(map[methodTyp]*tree, len(methodMap)),
+-		notFoundHandler: nil,
+-	}
++func newTreeRouter() treeRouter {
++	tr := make(map[methodTyp]*tree, len(methodMap))
+ 	for _, v := range methodMap {
+-		tr.routes[v] = &tree{root: &node{}}
++		tr[v] = &tree{root: &node{}}
+ 	}
+-	return tr
++	return treeRouter(tr)
+ }
+ 
+ func (tr treeRouter) ServeHTTPC(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+@@ -247,21 +228,34 @@ func (tr treeRouter) ServeHTTPC(ctx context.Context, w http.ResponseWriter, r *h
+ 	// Check if method is supported by chi
+ 	method, ok := methodMap[r.Method]
+ 	if !ok {
+-		methodNotAllowedHandler(ctx, w, r)
++		writeMethodNotAllowed(w)
+ 		return
+ 	}
+ 
+ 	// Find the handler in the router
+-	cxh := tr.routes[method].Find(routePath, params)
++	cxh := tr[method].Find(routePath, params)
+ 	if cxh == nil {
+-		if tr.notFoundHandler == nil {
+-			http.NotFound(w, r)
+-		} else {
+-			tr.notFoundHandler.ServeHTTPC(ctx, w, r)
+-		}
++		w.WriteHeader(404)
++		w.Write([]byte(http.StatusText(404)))
+ 		return
+ 	}
+ 
+ 	// Serve it
+ 	cxh.ServeHTTPC(ctx, w, r)
+ }
++
++// Respond with just the allowed methods, as required by RFC2616 for
++// 405 Method not allowed.
++func writeMethodNotAllowed(w http.ResponseWriter) {
++	methods := make([]string, len(methodMap))
++	i := 0
++	for m := range methodMap {
++		methods[i] = m // still faster than append to array with capacity
++		i++
++	}
++
++	w.Header().Add("Allow", strings.Join(methods, ","))
++	w.WriteHeader(405)
++
++	w.Write([]byte(http.StatusText(405)))
++}
+diff --git a/mux_test.go b/mux_test.go
+index 05da20d..40f56f7 100644
+--- a/mux_test.go
++++ b/mux_test.go
+@@ -212,10 +212,6 @@ func TestMuxPlain(t *testing.T) {
+ 	r.Get("/hi", func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+ 		w.Write([]byte("bye"))
+ 	})
+-	r.NotFound(func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+-		w.WriteHeader(404)
+-		w.Write([]byte("nothing here"))
+-	})
+ 
+ 	ts := httptest.NewServer(r)
+ 	defer ts.Close()
+@@ -223,64 +219,11 @@ func TestMuxPlain(t *testing.T) {
+ 	if resp := testRequest(t, ts, "GET", "/hi", nil); resp != "bye" {
+ 		t.Fatalf(resp)
+ 	}
+-	if resp := testRequest(t, ts, "GET", "/nothing-here", nil); resp != "nothing here" {
++	if resp := testRequest(t, ts, "GET", "/nothing-here", nil); resp != "Not Found" {
+ 		t.Fatalf(resp)
+ 	}
+ }
+ 
+-func TestMuxNestedNotFound(t *testing.T) {
+-	r := NewRouter()
+-	r.Get("/hi", func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+-		w.Write([]byte("bye"))
+-	})
+-	r.NotFound(func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+-		w.WriteHeader(404)
+-		w.Write([]byte("root 404"))
+-	})
+-
+-	sr1 := NewRouter()
+-	sr1.Get("/sub", func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+-		w.Write([]byte("sub"))
+-	})
+-	sr1.NotFound(func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+-		w.WriteHeader(404)
+-		w.Write([]byte("sub 404"))
+-	})
+-
+-	sr2 := NewRouter()
+-	sr2.Get("/sub", func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+-		w.Write([]byte("sub2"))
+-	})
+-
+-	r.Mount("/admin1", sr1)
+-	r.Mount("/admin2", sr2)
+-
+-	ts := httptest.NewServer(r)
+-	defer ts.Close()
+-
+-	if resp := testRequest(t, ts, "GET", "/hi", nil); resp != "bye" {
+-		t.Fatalf(resp)
+-	}
+-	if resp := testRequest(t, ts, "GET", "/nothing-here", nil); resp != "root 404" {
+-		t.Fatalf(resp)
+-	}
+-	if resp := testRequest(t, ts, "GET", "/admin1/sub", nil); resp != "sub" {
+-		t.Fatalf(resp)
+-	}
+-	if resp := testRequest(t, ts, "GET", "/admin1/nope", nil); resp != "sub 404" {
+-		t.Fatalf(resp)
+-	}
+-	if resp := testRequest(t, ts, "GET", "/admin2/sub", nil); resp != "sub2" {
+-		t.Fatalf(resp)
+-	}
+-
+-	// Not found pages should bubble up to the root.
+-	if resp := testRequest(t, ts, "GET", "/admin2/nope", nil); resp != "root 404" {
+-		t.Fatalf(resp)
+-	}
+-
+-}
+-
+ func TestMuxMiddlewareStack(t *testing.T) {
+ 	var stdmwInit, stdmwHandler uint64
+ 	stdmw := func(next http.Handler) http.Handler {
+@@ -599,7 +542,7 @@ func TestMuxBig(t *testing.T) {
+ 		t.Fatalf("got '%s'", resp)
+ 	}
+ 	resp = testRequest(t, ts, "GET", "/folders", nil)
+-	if resp != "404 page not found\n" {
++	if resp != "Not Found" {
+ 		t.Fatalf("got '%s'", resp)
+ 	}
+ 	resp = testRequest(t, ts, "GET", "/folders/", nil)
+@@ -611,7 +554,7 @@ func TestMuxBig(t *testing.T) {
+ 		t.Fatalf("got '%s'", resp)
+ 	}
+ 	resp = testRequest(t, ts, "GET", "/folders/nothing", nil)
+-	if resp != "404 page not found\n" {
++	if resp != "Not Found" {
+ 		t.Fatalf("got '%s'", resp)
+ 	}
+ }
+diff --git a/util.go b/util.go
+index 5e6eb3f..068f7d7 100644
+--- a/util.go
++++ b/util.go
+@@ -3,7 +3,6 @@ package chi
+ import (
+ 	"fmt"
+ 	"net/http"
+-	"strings"
+ 
+ 	"golang.org/x/net/context"
+ )
+@@ -86,18 +85,3 @@ func assertMiddleware(middleware interface{}) interface{} {
+ 	}
+ 	return middleware
+ }
+-
+-// Respond with just the allowed methods, as required by RFC2616 for
+-// 405 Method not allowed.
+-func methodNotAllowedHandler(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+-	methods := make([]string, len(methodMap))
+-	i := 0
+-	for m := range methodMap {
+-		methods[i] = m // still faster than append to array with capacity
+-		i++
+-	}
+-
+-	w.Header().Add("Allow", strings.Join(methods, ","))
+-	w.WriteHeader(405)
+-	w.Write([]byte(http.StatusText(405)))
+-}

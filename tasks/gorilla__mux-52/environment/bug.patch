@@ -1,0 +1,210 @@
+diff --git a/mux.go b/mux.go
+index caa8ad5..711630d 100644
+--- a/mux.go
++++ b/mux.go
+@@ -146,13 +146,6 @@ func (r *Router) getRegexpGroup() *routeRegexpGroup {
+ 	return nil
+ }
+ 
+-func (r *Router) buildVars(m map[string]string) map[string]string {
+-	if r.parent != nil {
+-		m = r.parent.buildVars(m)
+-	}
+-	return m
+-}
+-
+ // ----------------------------------------------------------------------------
+ // Route factories
+ // ----------------------------------------------------------------------------
+@@ -225,12 +218,6 @@ func (r *Router) Schemes(schemes ...string) *Route {
+ 	return r.NewRoute().Schemes(schemes...)
+ }
+ 
+-// BuildVars registers a new route with a custom function for modifying
+-// route variables before building a URL.
+-func (r *Router) BuildVarsFunc(f BuildVarsFunc) *Route {
+-	return r.NewRoute().BuildVarsFunc(f)
+-}
+-
+ // ----------------------------------------------------------------------------
+ // Context
+ // ----------------------------------------------------------------------------
+diff --git a/mux_test.go b/mux_test.go
+index b163639..292776d 100644
+--- a/mux_test.go
++++ b/mux_test.go
+@@ -511,39 +511,6 @@ func TestMatcherFunc(t *testing.T) {
+ 	}
+ }
+ 
+-func TestBuildVarsFunc(t *testing.T) {
+-	tests := []routeTest{
+-		{
+-			title: "BuildVarsFunc set on route",
+-			route: new(Route).Path(`/111/{v1:\d}{v2:.*}`).BuildVarsFunc(func(vars map[string]string) map[string]string {
+-				vars["v1"] = "3"
+-				vars["v2"] = "a"
+-				return vars
+-			}),
+-			request:     newRequest("GET", "http://localhost/111/2"),
+-			path:        "/111/3a",
+-			shouldMatch: true,
+-		},
+-		{
+-			title: "BuildVarsFunc set on route and parent route",
+-			route: new(Route).PathPrefix(`/{v1:\d}`).BuildVarsFunc(func(vars map[string]string) map[string]string {
+-				vars["v1"] = "2"
+-				return vars
+-			}).Subrouter().Path(`/{v2:\w}`).BuildVarsFunc(func(vars map[string]string) map[string]string {
+-				vars["v2"] = "b"
+-				return vars
+-			}),
+-			request:     newRequest("GET", "http://localhost/1/a"),
+-			path:        "/2/b",
+-			shouldMatch: true,
+-		},
+-	}
+-
+-	for _, test := range tests {
+-		testRoute(t, test)
+-	}
+-}
+-
+ func TestSubRouter(t *testing.T) {
+ 	subrouter1 := new(Route).Host("{v1:[a-z]+}.google.com").Subrouter()
+ 	subrouter2 := new(Route).PathPrefix("/foo/{v1}").Subrouter()
+diff --git a/regexp.go b/regexp.go
+index e56f1bb..4c3482b 100644
+--- a/regexp.go
++++ b/regexp.go
+@@ -133,7 +133,11 @@ func (r *routeRegexp) Match(req *http.Request, match *RouteMatch) bool {
+ }
+ 
+ // url builds a URL part using the given values.
+-func (r *routeRegexp) url(values map[string]string) (string, error) {
++func (r *routeRegexp) url(pairs ...string) (string, error) {
++	values, err := mapFromPairs(pairs...)
++	if err != nil {
++		return "", err
++	}
+ 	urlValues := make([]interface{}, len(r.varsN))
+ 	for k, v := range r.varsN {
+ 		value, ok := values[v]
+diff --git a/route.go b/route.go
+index b2900de..7766254 100644
+--- a/route.go
++++ b/route.go
+@@ -31,8 +31,6 @@ type Route struct {
+ 	name string
+ 	// Error resulted from building a route.
+ 	err error
+-
+-	buildVarsFunc BuildVarsFunc
+ }
+ 
+ // Match matches the route against the request.
+@@ -338,19 +336,6 @@ func (r *Route) Schemes(schemes ...string) *Route {
+ 	return r.addMatcher(schemeMatcher(schemes))
+ }
+ 
+-// BuildVarsFunc --------------------------------------------------------------
+-
+-// BuildVarsFunc is the function signature used by custom build variable
+-// functions (which can modify route variables before a route's URL is built).
+-type BuildVarsFunc func(map[string]string) map[string]string
+-
+-// BuildVarsFunc adds a custom function to be used to modify build variables
+-// before a route's URL is built.
+-func (r *Route) BuildVarsFunc(f BuildVarsFunc) *Route {
+-	r.buildVarsFunc = f
+-	return r
+-}
+-
+ // Subrouter ------------------------------------------------------------------
+ 
+ // Subrouter creates a subrouter for the route.
+@@ -413,20 +398,17 @@ func (r *Route) URL(pairs ...string) (*url.URL, error) {
+ 	if r.regexp == nil {
+ 		return nil, errors.New("mux: route doesn't have a host or path")
+ 	}
+-	values, err := r.prepareVars(pairs...)
+-	if err != nil {
+-		return nil, err
+-	}
+ 	var scheme, host, path string
++	var err error
+ 	if r.regexp.host != nil {
+ 		// Set a default scheme.
+ 		scheme = "http"
+-		if host, err = r.regexp.host.url(values); err != nil {
++		if host, err = r.regexp.host.url(pairs...); err != nil {
+ 			return nil, err
+ 		}
+ 	}
+ 	if r.regexp.path != nil {
+-		if path, err = r.regexp.path.url(values); err != nil {
++		if path, err = r.regexp.path.url(pairs...); err != nil {
+ 			return nil, err
+ 		}
+ 	}
+@@ -447,11 +429,7 @@ func (r *Route) URLHost(pairs ...string) (*url.URL, error) {
+ 	if r.regexp == nil || r.regexp.host == nil {
+ 		return nil, errors.New("mux: route doesn't have a host")
+ 	}
+-	values, err := r.prepareVars(pairs...)
+-	if err != nil {
+-		return nil, err
+-	}
+-	host, err := r.regexp.host.url(values)
++	host, err := r.regexp.host.url(pairs...)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -471,11 +449,7 @@ func (r *Route) URLPath(pairs ...string) (*url.URL, error) {
+ 	if r.regexp == nil || r.regexp.path == nil {
+ 		return nil, errors.New("mux: route doesn't have a path")
+ 	}
+-	values, err := r.prepareVars(pairs...)
+-	if err != nil {
+-		return nil, err
+-	}
+-	path, err := r.regexp.path.url(values)
++	path, err := r.regexp.path.url(pairs...)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -484,26 +458,6 @@ func (r *Route) URLPath(pairs ...string) (*url.URL, error) {
+ 	}, nil
+ }
+ 
+-// prepareVars converts the route variable pairs into a map. If the route has a
+-// BuildVarsFunc, it is invoked.
+-func (r *Route) prepareVars(pairs ...string) (map[string]string, error) {
+-	m, err := mapFromPairs(pairs...)
+-	if err != nil {
+-		return nil, err
+-	}
+-	return r.buildVars(m), nil
+-}
+-
+-func (r *Route) buildVars(m map[string]string) map[string]string {
+-	if r.parent != nil {
+-		m = r.parent.buildVars(m)
+-	}
+-	if r.buildVarsFunc != nil {
+-		m = r.buildVarsFunc(m)
+-	}
+-	return m
+-}
+-
+ // ----------------------------------------------------------------------------
+ // parentRoute
+ // ----------------------------------------------------------------------------
+@@ -512,7 +466,6 @@ func (r *Route) buildVars(m map[string]string) map[string]string {
+ type parentRoute interface {
+ 	getNamedRoutes() map[string]*Route
+ 	getRegexpGroup() *routeRegexpGroup
+-	buildVars(map[string]string) map[string]string
+ }
+ 
+ // getNamedRoutes returns the map where named routes are registered.

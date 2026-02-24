@@ -1,0 +1,232 @@
+diff --git a/mux.go b/mux.go
+index c0c37ec..bcab454 100644
+--- a/mux.go
++++ b/mux.go
+@@ -9,6 +9,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
++	"net/url"
+ 	"path"
+ 	"regexp"
+ )
+@@ -84,6 +85,9 @@ type routeConf struct {
+ 	// will not redirect
+ 	skipClean bool
+ 
++	// If true, the http.Request context will not contain the Route.
++	omitRouteFromContext bool
++
+ 	// Manager for the variables from host and path.
+ 	regexp routeRegexpGroup
+ 
+@@ -180,15 +184,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+ 		}
+ 		// Clean path to canonical form and redirect.
+ 		if p := cleanPath(path); p != path {
+-
+-			// Added 3 lines (Philip Schlump) - It was dropping the query string and #whatever from query.
+-			// This matches with fix in go 1.2 r.c. 4 for same problem.  Go Issue:
+-			// http://code.google.com/p/go/issues/detail?id=5252
+-			url := *req.URL
+-			url.Path = p
+-			p = url.String()
+-
+-			w.Header().Set("Location", p)
++			w.Header().Set("Location", replaceURLPath(req.URL, p))
+ 			w.WriteHeader(http.StatusMovedPermanently)
+ 			return
+ 		}
+@@ -197,8 +193,15 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+ 	var handler http.Handler
+ 	if r.Match(req, &match) {
+ 		handler = match.Handler
+-		req = requestWithVars(req, match.Vars)
+-		req = requestWithRoute(req, match.Route)
++		if handler != nil {
++			// Populate context for custom handlers
++			if r.omitRouteFromContext {
++				// Only populate the match vars (if any) into the context.
++				req = requestWithVars(req, match.Vars)
++			} else {
++				req = requestWithRouteAndVars(req, match.Route, match.Vars)
++			}
++		}
+ 	}
+ 
+ 	if handler == nil && match.MatchErr == ErrMethodMismatch {
+@@ -260,6 +263,16 @@ func (r *Router) SkipClean(value bool) *Router {
+ 	return r
+ }
+ 
++// OmitRouteFromContext defines the behavior of omitting the Route from the
++//
++//	http.Request context.
++//
++// CurrentRoute will yield nil with this option.
++func (r *Router) OmitRouteFromContext(value bool) *Router {
++	r.omitRouteFromContext = value
++	return r
++}
++
+ // UseEncodedPath tells the router to match the encoded original path
+ // to the routes.
+ // For eg. "/path/foo%2Fbar/to" will match the path "/path/{var}/to".
+@@ -445,13 +458,25 @@ func CurrentRoute(r *http.Request) *Route {
+ 	return nil
+ }
+ 
++// requestWithRouteAndVars adds the matched vars to the request ctx.
++// It shortcuts the operation when the vars are empty.
+ func requestWithVars(r *http.Request, vars map[string]string) *http.Request {
++	if len(vars) == 0 {
++		return r
++	}
+ 	ctx := context.WithValue(r.Context(), varsKey, vars)
+ 	return r.WithContext(ctx)
+ }
+ 
+-func requestWithRoute(r *http.Request, route *Route) *http.Request {
++// requestWithRouteAndVars adds the matched route and vars to the request ctx.
++// It saves extra allocations in cloning the request once and skipping the
++//
++//	population of empty vars, which in turn mux.Vars can handle gracefully.
++func requestWithRouteAndVars(r *http.Request, route *Route, vars map[string]string) *http.Request {
+ 	ctx := context.WithValue(r.Context(), routeKey, route)
++	if len(vars) > 0 {
++		ctx = context.WithValue(ctx, varsKey, vars)
++	}
+ 	return r.WithContext(ctx)
+ }
+ 
+@@ -478,6 +503,14 @@ func cleanPath(p string) string {
+ 	return np
+ }
+ 
++// replaceURLPath prints an url.URL with a different path.
++func replaceURLPath(u *url.URL, p string) string {
++	// Operate on a copy of the request url.
++	u2 := *u
++	u2.Path = p
++	return u2.String()
++}
++
+ // uniqueVars returns an error if two slices contain duplicated strings.
+ func uniqueVars(s1, s2 []string) error {
+ 	for _, v1 := range s1 {
+diff --git a/regexp.go b/regexp.go
+index 5d05cfa..b577073 100644
+--- a/regexp.go
++++ b/regexp.go
+@@ -324,16 +324,18 @@ type routeRegexpGroup struct {
+ func (v routeRegexpGroup) setMatch(req *http.Request, m *RouteMatch, r *Route) {
+ 	// Store host variables.
+ 	if v.host != nil {
+-		host := getHost(req)
+-		if v.host.wildcardHostPort {
+-			// Don't be strict on the port match
+-			if i := strings.Index(host, ":"); i != -1 {
+-				host = host[:i]
++		if len(v.host.varsN) > 0 {
++			host := getHost(req)
++			if v.host.wildcardHostPort {
++				// Don't be strict on the port match
++				if i := strings.Index(host, ":"); i != -1 {
++					host = host[:i]
++				}
++			}
++			matches := v.host.regexp.FindStringSubmatchIndex(host)
++			if len(matches) > 0 {
++				m.Vars = extractVars(host, matches, v.host.varsN, m.Vars)
+ 			}
+-		}
+-		matches := v.host.regexp.FindStringSubmatchIndex(host)
+-		if len(matches) > 0 {
+-			extractVars(host, matches, v.host.varsN, m.Vars)
+ 		}
+ 	}
+ 	path := req.URL.Path
+@@ -342,31 +344,36 @@ func (v routeRegexpGroup) setMatch(req *http.Request, m *RouteMatch, r *Route) {
+ 	}
+ 	// Store path variables.
+ 	if v.path != nil {
+-		matches := v.path.regexp.FindStringSubmatchIndex(path)
+-		if len(matches) > 0 {
+-			extractVars(path, matches, v.path.varsN, m.Vars)
+-			// Check if we should redirect.
+-			if v.path.options.strictSlash {
+-				p1 := strings.HasSuffix(path, "/")
+-				p2 := strings.HasSuffix(v.path.template, "/")
+-				if p1 != p2 {
+-					u, _ := url.Parse(req.URL.String())
+-					if p1 {
+-						u.Path = u.Path[:len(u.Path)-1]
+-					} else {
+-						u.Path += "/"
+-					}
+-					m.Handler = http.RedirectHandler(u.String(), http.StatusMovedPermanently)
++		if len(v.path.varsN) > 0 {
++			matches := v.path.regexp.FindStringSubmatchIndex(path)
++			if len(matches) > 0 {
++				m.Vars = extractVars(path, matches, v.path.varsN, m.Vars)
++			}
++		}
++		// Check if we should redirect.
++		if v.path.options.strictSlash {
++			p1 := strings.HasSuffix(path, "/")
++			p2 := strings.HasSuffix(v.path.template, "/")
++			if p1 != p2 {
++				p := req.URL.Path
++				if p1 {
++					p = p[:len(p)-1]
++				} else {
++					p += "/"
+ 				}
++				u := replaceURLPath(req.URL, p)
++				m.Handler = http.RedirectHandler(u, http.StatusMovedPermanently)
+ 			}
+ 		}
+ 	}
+ 	// Store query string variables.
+ 	for _, q := range v.queries {
+-		queryURL := q.getURLQuery(req)
+-		matches := q.regexp.FindStringSubmatchIndex(queryURL)
+-		if len(matches) > 0 {
+-			extractVars(queryURL, matches, q.varsN, m.Vars)
++		if len(q.varsN) > 0 {
++			queryURL := q.getURLQuery(req)
++			matches := q.regexp.FindStringSubmatchIndex(queryURL)
++			if len(matches) > 0 {
++				m.Vars = extractVars(queryURL, matches, q.varsN, m.Vars)
++			}
+ 		}
+ 	}
+ }
+@@ -381,8 +388,12 @@ func getHost(r *http.Request) string {
+ 	return r.Host
+ }
+ 
+-func extractVars(input string, matches []int, names []string, output map[string]string) {
++func extractVars(input string, matches []int, names []string, output map[string]string) map[string]string {
+ 	for i, name := range names {
++		if output == nil {
++			output = make(map[string]string, len(names))
++		}
+ 		output[name] = input[matches[2*i+2]:matches[2*i+3]]
+ 	}
++	return output
+ }
+diff --git a/route.go b/route.go
+index e8f11df..8a9e754 100644
+--- a/route.go
++++ b/route.go
+@@ -98,9 +98,6 @@ func (r *Route) Match(req *http.Request, match *RouteMatch) bool {
+ 	if match.Handler == nil {
+ 		match.Handler = r.handler
+ 	}
+-	if match.Vars == nil {
+-		match.Vars = make(map[string]string)
+-	}
+ 
+ 	// Set variables.
+ 	r.regexp.setMatch(req, match, r)

@@ -1,0 +1,1209 @@
+diff --git a/agent/agent.go b/agent/agent.go
+index ebbecfff33..1ded0ce76c 100644
+--- a/agent/agent.go
++++ b/agent/agent.go
+@@ -890,14 +890,8 @@ func (a *Agent) Start(ctx context.Context) error {
+ 		go a.retryJoinWAN()
+ 	}
+ 
+-	if a.config.Telemetry.CertificateEnabled && a.tlsConfigurator.Cert() != nil {
+-		m := tlsCertExpirationMonitor(
+-			a.tlsConfigurator,
+-			a.config.NodeName,
+-			a.config.Telemetry.CertificateCriticalThresholdDays,
+-			a.config.Telemetry.CertificateWarningThresholdDays,
+-			a.logger,
+-		)
++	if a.tlsConfigurator.Cert() != nil {
++		m := tlsCertExpirationMonitor(a.tlsConfigurator, a.config.NodeName, a.logger)
+ 		go m.Monitor(&lib.StopChannelContext{StopCh: a.shutdownCh})
+ 	}
+ 
+diff --git a/agent/agent_certmetrics_endpoint_test.go b/agent/agent_certmetrics_endpoint_test.go
+index 6888dce443..e35d22c9e2 100644
+--- a/agent/agent_certmetrics_endpoint_test.go
++++ b/agent/agent_certmetrics_endpoint_test.go
+@@ -379,65 +379,3 @@ func TestAgentMetricsCertificates_ACLEnforcement(t *testing.T) {
+ 
+ 	t.Logf("ACL enforcement working correctly")
+ }
+-
+-func TestAgentMetricsCertificates_NodeName(t *testing.T) {
+-	// Skip this test when run in parallel with other tests as it's subject to
+-	// prometheus metric collection timing issues. The node name functionality
+-	// is thoroughly tested in TestAgentMetricsCertificates_MultipleNodesDistinguished
+-	// and in integration tests.
+-	t.Skip("Skipping due to prometheus metric collection timing - see TestAgentMetricsCertificates_MultipleNodesDistinguished")
+-}
+-
+-func TestAgentMetricsCertificates_MultipleNodesDistinguished(t *testing.T) {
+-	t.Parallel()
+-
+-	a := NewTestAgent(t, `
+-		telemetry {
+-			prometheus_retention_time = "60s"
+-			disable_hostname = true
+-			certificate {
+-				enabled = true
+-			}
+-		}
+-	`)
+-	defer a.Shutdown()
+-
+-	// Emit metrics for multiple agent nodes
+-	nodes := []string{"node-1", "node-2", "node-3"}
+-	for _, node := range nodes {
+-		metrics.SetGaugeWithLabels(
+-			[]string{"agent", "tls", "cert", "expiry"},
+-			float32((15 * 24 * time.Hour).Seconds()),
+-			[]metrics.Label{{Name: "node", Value: node}},
+-		)
+-	}
+-
+-	time.Sleep(100 * time.Millisecond)
+-
+-	req, err := http.NewRequest("GET", "/v1/agent/metrics/certificates", nil)
+-	require.NoError(t, err)
+-
+-	resp := httptest.NewRecorder()
+-	_, err = a.srv.AgentMetricsCertificates(resp, req)
+-	require.NoError(t, err)
+-
+-	var result certificatesResponse
+-	err = json.Unmarshal(resp.Body.Bytes(), &result)
+-	require.NoError(t, err)
+-
+-	// Verify each node is represented separately
+-	nodesSeen := make(map[string]bool)
+-	for _, cert := range result.Certificates {
+-		if cert.Type == "agent" && cert.NodeName != "" {
+-			nodesSeen[cert.NodeName] = true
+-			t.Logf("Found agent cert for node: %s", cert.NodeName)
+-		}
+-	}
+-
+-	// We should have distinct entries for each node
+-	for _, node := range nodes {
+-		if nodesSeen[node] {
+-			t.Logf("Successfully distinguished node: %s", node)
+-		}
+-	}
+-}
+diff --git a/agent/config/certificate_telemetry_test.go b/agent/config/certificate_telemetry_test.go
+deleted file mode 100644
+index fe013faa25..0000000000
+--- a/agent/config/certificate_telemetry_test.go
++++ /dev/null
+@@ -1,271 +0,0 @@
+-// Copyright (c) HashiCorp, Inc.
+-// SPDX-License-Identifier: BUSL-1.1
+-
+-package config
+-
+-import (
+-	"fmt"
+-	"testing"
+-	"time"
+-
+-	"github.com/stretchr/testify/require"
+-)
+-
+-func TestCertificateTelemetry_Defaults(t *testing.T) {
+-	// Test that default values are applied when no certificate telemetry config is provided
+-	hcl := `
+-		data_dir = "/tmp/consul"
+-		bind_addr = "127.0.0.1"
+-	`
+-
+-	result, err := Load(LoadOpts{HCL: []string{hcl}})
+-	require.NoError(t, err)
+-	require.NotNil(t, result.RuntimeConfig)
+-
+-	rt := result.RuntimeConfig
+-
+-	// Verify defaults
+-	require.True(t, rt.Telemetry.CertificateEnabled, "Certificate telemetry should be enabled by default")
+-	require.Equal(t, 5*time.Minute, rt.Telemetry.CertificateCacheDuration, "Default cache duration should be 5 minutes")
+-	require.Equal(t, 7, rt.Telemetry.CertificateCriticalThresholdDays, "Default critical threshold should be 7 days")
+-	require.Equal(t, 30, rt.Telemetry.CertificateWarningThresholdDays, "Default warning threshold should be 30 days")
+-	require.Equal(t, 90, rt.Telemetry.CertificateInfoThresholdDays, "Default info threshold should be 90 days")
+-	require.False(t, rt.Telemetry.CertificateExcludeAutoRenewable, "Exclude auto-renewable should be false by default")
+-}
+-
+-func TestCertificateTelemetry_CustomValues(t *testing.T) {
+-	// Test that custom values override defaults
+-	hcl := `
+-		data_dir = "/tmp/consul"
+-		bind_addr = "127.0.0.1"
+-		
+-		telemetry {
+-			certificate {
+-				enabled = false
+-				cache_duration = "10m"
+-				critical_threshold_days = 14
+-				warning_threshold_days = 60
+-				info_threshold_days = 180
+-				exclude_auto_renewable = true
+-			}
+-		}
+-	`
+-
+-	result, err := Load(LoadOpts{HCL: []string{hcl}})
+-	require.NoError(t, err)
+-	require.NotNil(t, result.RuntimeConfig)
+-
+-	rt := result.RuntimeConfig
+-
+-	// Verify custom values
+-	require.False(t, rt.Telemetry.CertificateEnabled, "Certificate telemetry should be disabled")
+-	require.Equal(t, 10*time.Minute, rt.Telemetry.CertificateCacheDuration, "Cache duration should be 10 minutes")
+-	require.Equal(t, 14, rt.Telemetry.CertificateCriticalThresholdDays, "Critical threshold should be 14 days")
+-	require.Equal(t, 60, rt.Telemetry.CertificateWarningThresholdDays, "Warning threshold should be 60 days")
+-	require.Equal(t, 180, rt.Telemetry.CertificateInfoThresholdDays, "Info threshold should be 180 days")
+-	require.True(t, rt.Telemetry.CertificateExcludeAutoRenewable, "Exclude auto-renewable should be true")
+-}
+-
+-func TestCertificateTelemetry_PartialConfig(t *testing.T) {
+-	// Test that partial config merges with defaults
+-	hcl := `
+-		data_dir = "/tmp/consul"
+-		bind_addr = "127.0.0.1"
+-		
+-		telemetry {
+-			certificate {
+-				critical_threshold_days = 3
+-				warning_threshold_days = 7
+-			}
+-		}
+-	`
+-
+-	result, err := Load(LoadOpts{HCL: []string{hcl}})
+-	require.NoError(t, err)
+-	require.NotNil(t, result.RuntimeConfig)
+-
+-	rt := result.RuntimeConfig
+-
+-	// Verify partial override with defaults
+-	require.True(t, rt.Telemetry.CertificateEnabled, "Should use default (true)")
+-	require.Equal(t, 5*time.Minute, rt.Telemetry.CertificateCacheDuration, "Should use default (5m)")
+-	require.Equal(t, 3, rt.Telemetry.CertificateCriticalThresholdDays, "Should use custom value (3)")
+-	require.Equal(t, 7, rt.Telemetry.CertificateWarningThresholdDays, "Should use custom value (7)")
+-	require.Equal(t, 90, rt.Telemetry.CertificateInfoThresholdDays, "Should use default (90)")
+-	require.False(t, rt.Telemetry.CertificateExcludeAutoRenewable, "Should use default (false)")
+-}
+-
+-func TestCertificateTelemetry_DurationParsing(t *testing.T) {
+-	tests := []struct {
+-		name     string
+-		duration string
+-		expected time.Duration
+-	}{
+-		{"seconds", "30s", 30 * time.Second},
+-		{"minutes", "15m", 15 * time.Minute},
+-		{"hours", "2h", 2 * time.Hour},
+-		{"combined", "1h30m", 90 * time.Minute},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			hcl := `
+-				data_dir = "/tmp/consul"
+-				bind_addr = "127.0.0.1"
+-				
+-				telemetry {
+-					certificate {
+-						cache_duration = "` + tt.duration + `"
+-					}
+-				}
+-			`
+-
+-			result, err := Load(LoadOpts{HCL: []string{hcl}})
+-			require.NoError(t, err)
+-			require.Equal(t, tt.expected, result.RuntimeConfig.Telemetry.CertificateCacheDuration)
+-		})
+-	}
+-}
+-
+-func TestCertificateTelemetry_InvalidDuration(t *testing.T) {
+-	hcl := `
+-		data_dir = "/tmp/consul"
+-		bind_addr = "127.0.0.1"
+-		
+-		telemetry {
+-			certificate {
+-				cache_duration = "invalid"
+-			}
+-		}
+-	`
+-
+-	_, err := Load(LoadOpts{HCL: []string{hcl}})
+-	require.Error(t, err)
+-	require.Contains(t, err.Error(), "telemetry.certificate.cache_duration")
+-}
+-
+-func TestCertificateTelemetry_ThresholdValidation(t *testing.T) {
+-	// Test that thresholds can be set to various values including edge cases
+-	tests := []struct {
+-		name     string
+-		critical int
+-		warning  int
+-		info     int
+-	}{
+-		{"normal", 7, 30, 90},
+-		{"conservative", 14, 60, 180},
+-		{"aggressive", 1, 3, 7},
+-		{"zero_critical", 0, 10, 20},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			hcl := fmt.Sprintf(`
+-				data_dir = "/tmp/consul"
+-				bind_addr = "127.0.0.1"
+-				
+-				telemetry {
+-					certificate {
+-						critical_threshold_days = %d
+-						warning_threshold_days = %d
+-						info_threshold_days = %d
+-					}
+-				}
+-			`, tt.critical, tt.warning, tt.info)
+-
+-			result, err := Load(LoadOpts{HCL: []string{hcl}})
+-			require.NoError(t, err)
+-			require.Equal(t, tt.critical, result.RuntimeConfig.Telemetry.CertificateCriticalThresholdDays)
+-			require.Equal(t, tt.warning, result.RuntimeConfig.Telemetry.CertificateWarningThresholdDays)
+-			require.Equal(t, tt.info, result.RuntimeConfig.Telemetry.CertificateInfoThresholdDays)
+-		})
+-	}
+-}
+-
+-func TestCertificateTelemetry_JSONConfig(t *testing.T) {
+-	// Test JSON configuration format
+-	json := `{
+-		"data_dir": "/tmp/consul",
+-		"bind_addr": "127.0.0.1",
+-		"telemetry": {
+-			"certificate": {
+-				"enabled": false,
+-				"cache_duration": "15m",
+-				"critical_threshold_days": 5,
+-				"warning_threshold_days": 20,
+-				"info_threshold_days": 60,
+-				"exclude_auto_renewable": true
+-			}
+-		}
+-	}`
+-
+-	result, err := Load(LoadOpts{HCL: []string{json}})
+-	require.NoError(t, err)
+-	require.NotNil(t, result.RuntimeConfig)
+-
+-	rt := result.RuntimeConfig
+-	require.False(t, rt.Telemetry.CertificateEnabled)
+-	require.Equal(t, 15*time.Minute, rt.Telemetry.CertificateCacheDuration)
+-	require.Equal(t, 5, rt.Telemetry.CertificateCriticalThresholdDays)
+-	require.Equal(t, 20, rt.Telemetry.CertificateWarningThresholdDays)
+-	require.Equal(t, 60, rt.Telemetry.CertificateInfoThresholdDays)
+-	require.True(t, rt.Telemetry.CertificateExcludeAutoRenewable)
+-}
+-
+-func TestCertificateTelemetry_MultipleConfigSources(t *testing.T) {
+-	// Test that later configs override earlier ones
+-	hcl1 := `
+-		data_dir = "/tmp/consul"
+-		bind_addr = "127.0.0.1"
+-		
+-		telemetry {
+-			certificate {
+-				critical_threshold_days = 7
+-				warning_threshold_days = 30
+-			}
+-		}
+-	`
+-
+-	hcl2 := `
+-		telemetry {
+-			certificate {
+-				critical_threshold_days = 14
+-			}
+-		}
+-	`
+-
+-	result, err := Load(LoadOpts{HCL: []string{hcl1, hcl2}})
+-	require.NoError(t, err)
+-	require.NotNil(t, result.RuntimeConfig)
+-
+-	rt := result.RuntimeConfig
+-	require.Equal(t, 14, rt.Telemetry.CertificateCriticalThresholdDays, "Should use value from second config")
+-	require.Equal(t, 30, rt.Telemetry.CertificateWarningThresholdDays, "Should keep value from first config")
+-}
+-
+-func TestCertificateTelemetry_ConsulServerConfig(t *testing.T) {
+-	// Test that telemetry config is properly passed to consul server config
+-	hcl := `
+-		data_dir = "/tmp/consul"
+-		bind_addr = "127.0.0.1"
+-		server = true
+-		bootstrap = true
+-		
+-		telemetry {
+-			certificate {
+-				enabled = false
+-				critical_threshold_days = 10
+-				warning_threshold_days = 40
+-			}
+-		}
+-	`
+-
+-	result, err := Load(LoadOpts{HCL: []string{hcl}})
+-	require.NoError(t, err)
+-	require.NotNil(t, result.RuntimeConfig)
+-
+-	rt := result.RuntimeConfig
+-	require.False(t, rt.Telemetry.CertificateEnabled)
+-	require.Equal(t, 10, rt.Telemetry.CertificateCriticalThresholdDays)
+-	require.Equal(t, 40, rt.Telemetry.CertificateWarningThresholdDays)
+-}
+diff --git a/agent/config/runtime_test.go b/agent/config/runtime_test.go
+index c1996d326a..d6139af0f1 100644
+--- a/agent/config/runtime_test.go
++++ b/agent/config/runtime_test.go
+@@ -7087,13 +7087,8 @@ func TestLoad_FullConfig(t *testing.T) {
+ 				Expiration: 15 * time.Second,
+ 				Name:       "ftO6DySn", // notice this is the same as the metrics prefix
+ 			},
+-			EnableHostMetrics:                true,
+-			DisablePerTenancyUsageMetrics:    true,
+-			CertificateEnabled:               true,
+-			CertificateCacheDuration:         5 * time.Minute,
+-			CertificateCriticalThresholdDays: 7,
+-			CertificateWarningThresholdDays:  30,
+-			CertificateInfoThresholdDays:     90,
++			EnableHostMetrics:             true,
++			DisablePerTenancyUsageMetrics: true,
+ 		},
+ 		TLS: tlsutil.Config{
+ 			InternalRPC: tlsutil.ProtocolConfig{
+diff --git a/agent/config/testdata/TestRuntimeConfig_Sanitize.golden b/agent/config/testdata/TestRuntimeConfig_Sanitize.golden
+index afa275654b..ef58c0af83 100644
+--- a/agent/config/testdata/TestRuntimeConfig_Sanitize.golden
++++ b/agent/config/testdata/TestRuntimeConfig_Sanitize.golden
+@@ -452,12 +452,6 @@
+     "Telemetry": {
+         "AllowedPrefixes": [],
+         "BlockedPrefixes": [],
+-        "CertificateCacheDuration": "0s",
+-        "CertificateCriticalThresholdDays": 0,
+-        "CertificateEnabled": false,
+-        "CertificateExcludeAutoRenewable": false,
+-        "CertificateInfoThresholdDays": 0,
+-        "CertificateWarningThresholdDays": 0,
+         "CirconusAPIApp": "",
+         "CirconusAPIToken": "hidden",
+         "CirconusAPIURL": "",
+diff --git a/agent/config/testdata/full-config.hcl b/agent/config/testdata/full-config.hcl
+index a526936d2e..53c072191f 100644
+--- a/agent/config/testdata/full-config.hcl
++++ b/agent/config/testdata/full-config.hcl
+@@ -741,13 +741,6 @@ telemetry {
+     statsd_address = "drce87cy"
+     statsite_address = "HpFwKB8R"
+     disable_per_tenancy_usage_metrics = true
+-    certificate {
+-        enabled = true
+-        cache_duration = "5m"
+-        critical_threshold_days = 7
+-        warning_threshold_days = 30
+-        info_threshold_days = 90
+-    }
+ }
+ tls {
+     defaults {
+diff --git a/agent/config/testdata/full-config.json b/agent/config/testdata/full-config.json
+index cd9d5fcbde..90f6fb1647 100644
+--- a/agent/config/testdata/full-config.json
++++ b/agent/config/testdata/full-config.json
+@@ -867,14 +867,7 @@
+     "prometheus_retention_time": "15s",
+     "statsd_address": "drce87cy",
+     "statsite_address": "HpFwKB8R",
+-    "disable_per_tenancy_usage_metrics": true,
+-    "certificate": {
+-      "enabled": true,
+-      "cache_duration": "5m",
+-      "critical_threshold_days": 7,
+-      "warning_threshold_days": 30,
+-      "info_threshold_days": 90
+-    }
++    "disable_per_tenancy_usage_metrics": true
+   },
+   "tls": {
+     "defaults": {
+diff --git a/agent/consul/leader_metrics.go b/agent/consul/leader_metrics.go
+index 3754636e1c..6a58ab04db 100644
+--- a/agent/consul/leader_metrics.go
++++ b/agent/consul/leader_metrics.go
+@@ -113,18 +113,13 @@ type CertExpirationMonitor struct {
+ 	// query failed.
+ 	Query  func() (time.Duration, time.Duration, error)
+ 	Server *Server
+-
+-	// Optional threshold overrides (used when Server is nil, e.g., for agent TLS)
+-	CriticalThresholdDays int
+-	WarningThresholdDays  int
+ }
+ 
+ const certExpirationMonitorInterval = time.Hour
+ 
+ func (m CertExpirationMonitor) Monitor(ctx context.Context) error {
+-
+-	// Check if certificate telemetry is enabled (only for server-based monitors)
+-	if m.Server != nil && !m.Server.config.CertificateTelemetryEnabled {
++	// Check if certificate telemetry is enabled
++	if !m.Server.config.CertificateTelemetryEnabled {
+ 		return nil
+ 	}
+ 
+@@ -141,16 +136,8 @@ func (m CertExpirationMonitor) Monitor(ctx context.Context) error {
+ 		}
+ 
+ 		daysRemaining := int(untilAfter.Hours() / 24)
+-
+-		// Get thresholds from Server config or use provided values
+-		var criticalDays, warningDays int
+-		if m.Server != nil {
+-			criticalDays = m.Server.config.CertificateTelemetryCriticalThresholdDays
+-			warningDays = m.Server.config.CertificateTelemetryWarningThresholdDays
+-		} else {
+-			criticalDays = m.CriticalThresholdDays
+-			warningDays = m.WarningThresholdDays
+-		}
++		criticalDays := m.Server.config.CertificateTelemetryCriticalThresholdDays
++		warningDays := m.Server.config.CertificateTelemetryWarningThresholdDays
+ 
+ 		// Determine cert type and suggested action for logging
+ 		key := strings.Join(m.Key, ":")
+@@ -194,9 +181,9 @@ func (m CertExpirationMonitor) Monitor(ctx context.Context) error {
+ 		}
+ 
+ 		// Log based on threshold severity with detailed context
+-		if daysRemaining <= criticalDays {
++		if daysRemaining < criticalDays {
+ 			logger.Error("certificate expiring soon", logFields...)
+-		} else if daysRemaining <= warningDays {
++		} else if daysRemaining < warningDays {
+ 			logger.Warn("certificate expiring soon", logFields...)
+ 		}
+ 
+diff --git a/agent/consul/leader_metrics_test.go b/agent/consul/leader_metrics_test.go
+index 27321d65a9..e3636e1bcf 100644
+--- a/agent/consul/leader_metrics_test.go
++++ b/agent/consul/leader_metrics_test.go
+@@ -5,257 +5,36 @@ package consul
+ 
+ import (
+ 	"testing"
++	"time"
+ )
+ 
+-// TestExpiresSoon was removed as we now use configurable thresholds
+-// (CertificateTelemetryCriticalThresholdDays and CertificateTelemetryWarningThresholdDays)
+-// instead of the hardcoded 28-day/40% logic.
+-// See agent/config/certificate_telemetry_test.go for threshold configuration tests.
+-
+-func TestCertificateTelemetry_ThresholdLogging(t *testing.T) {
+-	// Test that certificate expiry logging uses configurable thresholds
+-	tests := []struct {
+-		name             string
+-		daysRemaining    int
+-		criticalDays     int
+-		warningDays      int
+-		expectedSeverity string // "critical", "warning", "ok"
+-	}{
+-		{
+-			name:             "critical_default",
+-			daysRemaining:    5,
+-			criticalDays:     7,
+-			warningDays:      30,
+-			expectedSeverity: "critical",
+-		},
+-		{
+-			name:             "warning_default",
+-			daysRemaining:    20,
+-			criticalDays:     7,
+-			warningDays:      30,
+-			expectedSeverity: "warning",
+-		},
+-		{
+-			name:             "ok_default",
+-			daysRemaining:    60,
+-			criticalDays:     7,
+-			warningDays:      30,
+-			expectedSeverity: "ok",
+-		},
+-		{
+-			name:             "critical_custom",
+-			daysRemaining:    10,
+-			criticalDays:     14,
+-			warningDays:      60,
+-			expectedSeverity: "critical",
+-		},
+-		{
+-			name:             "warning_custom",
+-			daysRemaining:    50,
+-			criticalDays:     14,
+-			warningDays:      60,
+-			expectedSeverity: "warning",
+-		},
+-		{
+-			name:             "boundary_critical",
+-			daysRemaining:    7,
+-			criticalDays:     7,
+-			warningDays:      30,
+-			expectedSeverity: "critical",
+-		},
+-		{
+-			name:             "boundary_warning",
+-			daysRemaining:    30,
+-			criticalDays:     7,
+-			warningDays:      30,
+-			expectedSeverity: "warning",
+-		},
+-		{
+-			name:             "aggressive_critical",
+-			daysRemaining:    2,
+-			criticalDays:     3,
+-			warningDays:      7,
+-			expectedSeverity: "critical",
+-		},
+-		{
+-			name:             "aggressive_warning",
+-			daysRemaining:    5,
+-			criticalDays:     3,
+-			warningDays:      7,
+-			expectedSeverity: "warning",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			// Determine expected severity based on thresholds
+-			var severity string
+-			if tt.daysRemaining <= tt.criticalDays {
+-				severity = "critical"
+-			} else if tt.daysRemaining <= tt.warningDays {
+-				severity = "warning"
+-			} else {
+-				severity = "ok"
+-			}
+-
+-			if severity != tt.expectedSeverity {
+-				t.Errorf("expected severity %s, got %s for %d days remaining with critical=%d, warning=%d",
+-					tt.expectedSeverity, severity, tt.daysRemaining, tt.criticalDays, tt.warningDays)
+-			}
+-		})
+-	}
+-}
+-
+-func TestCertificateTelemetry_SuggestedActions(t *testing.T) {
+-	// Test that suggested actions are appropriate for each certificate type
+-	tests := []struct {
+-		certType               string
+-		expectedActionContains string
+-	}{
+-		{
+-			certType:               "Root",
+-			expectedActionContains: "rotate the root CA",
+-		},
+-		{
+-			certType:               "Intermediate",
+-			expectedActionContains: "intermediate CA certificate",
+-		},
+-		{
+-			certType:               "Agent",
+-			expectedActionContains: "TLS certificate",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.certType, func(t *testing.T) {
+-			// Verify suggested action logic for each cert type
+-			var suggestedAction string
+-
+-			switch tt.certType {
+-			case "Root":
+-				suggestedAction = "Consider rotating the root CA before expiration to avoid service disruption"
+-			case "Intermediate":
+-				suggestedAction = "Rotate the intermediate CA certificate before expiration"
+-			case "Agent":
+-				suggestedAction = "Renew or rotate the agent TLS certificate before expiration"
+-			default:
+-				suggestedAction = "Certificate expiring soon"
+-			}
+-
+-			// Verify action contains expected text
+-			if suggestedAction == "" {
+-				t.Errorf("expected suggested_action to be set for %s certificate", tt.certType)
+-			}
+-		})
+-	}
+-}
++const (
++	day  = time.Hour * 24
++	year = day * 365
++)
+ 
+-func TestCertificateTelemetry_ConfigDefaults(t *testing.T) {
+-	// Test default configuration values
+-	tests := []struct {
+-		name     string
+-		config   Config
+-		expected struct {
+-			enabled      bool
+-			criticalDays int
+-			warningDays  int
+-		}
++func TestExpiresSoon(t *testing.T) {
++	// ExpiresSoon() should return true if 'untilAfter' is <= 28 days
++	// OR if 40% of lifetime if it is less than 28 days
++	testCases := []struct {
++		name                 string
++		lifetime, untilAfter time.Duration
++		expiresSoon          bool
+ 	}{
+-		{
+-			name: "defaults",
+-			config: Config{
+-				CertificateTelemetryEnabled:               false, // default when not set
+-				CertificateTelemetryCriticalThresholdDays: 0,     // default when not set
+-				CertificateTelemetryWarningThresholdDays:  0,     // default when not set
+-			},
+-			expected: struct {
+-				enabled      bool
+-				criticalDays int
+-				warningDays  int
+-			}{
+-				enabled:      false,
+-				criticalDays: 0,
+-				warningDays:  0,
+-			},
+-		},
+-		{
+-			name: "custom_values",
+-			config: Config{
+-				CertificateTelemetryEnabled:               true,
+-				CertificateTelemetryCriticalThresholdDays: 14,
+-				CertificateTelemetryWarningThresholdDays:  60,
+-			},
+-			expected: struct {
+-				enabled      bool
+-				criticalDays int
+-				warningDays  int
+-			}{
+-				enabled:      true,
+-				criticalDays: 14,
+-				warningDays:  60,
+-			},
+-		},
+-		{
+-			name: "aggressive_thresholds",
+-			config: Config{
+-				CertificateTelemetryEnabled:               true,
+-				CertificateTelemetryCriticalThresholdDays: 3,
+-				CertificateTelemetryWarningThresholdDays:  7,
+-			},
+-			expected: struct {
+-				enabled      bool
+-				criticalDays int
+-				warningDays  int
+-			}{
+-				enabled:      true,
+-				criticalDays: 3,
+-				warningDays:  7,
+-			},
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			if tt.config.CertificateTelemetryEnabled != tt.expected.enabled {
+-				t.Errorf("expected enabled=%v, got %v", tt.expected.enabled, tt.config.CertificateTelemetryEnabled)
+-			}
+-			if tt.config.CertificateTelemetryCriticalThresholdDays != tt.expected.criticalDays {
+-				t.Errorf("expected criticalDays=%d, got %d", tt.expected.criticalDays, tt.config.CertificateTelemetryCriticalThresholdDays)
+-			}
+-			if tt.config.CertificateTelemetryWarningThresholdDays != tt.expected.warningDays {
+-				t.Errorf("expected warningDays=%d, got %d", tt.expected.warningDays, tt.config.CertificateTelemetryWarningThresholdDays)
++		{name: "base-pass", lifetime: year, untilAfter: year, expiresSoon: false},
++		{name: "base-expire", lifetime: year, untilAfter: (day * 27), expiresSoon: true},
++		{name: "expires", lifetime: (day * 70), untilAfter: (day * 20), expiresSoon: true},
++		{name: "passes", lifetime: (day * 70), untilAfter: (day * 50), expiresSoon: false},
++		{name: "just-expires", lifetime: (day * 70), untilAfter: (day * 27), expiresSoon: true},
++		{name: "just-passes", lifetime: (day * 70), untilAfter: (day * 43), expiresSoon: false},
++		{name: "40%-expire", lifetime: (day * 30), untilAfter: (day * 10), expiresSoon: true},
++		{name: "40%-pass", lifetime: (day * 30), untilAfter: (day * 12), expiresSoon: false},
++	}
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			if expiresSoon(tc.lifetime, tc.untilAfter) != tc.expiresSoon {
++				t.Errorf("test case failed, should return `%t`", tc.expiresSoon)
+ 			}
+ 		})
+ 	}
+ }
+-
+-func TestCertificateTelemetry_LogFields(t *testing.T) {
+-	// Test that log entries contain required fields
+-	requiredFields := []string{
+-		"cert_type",
+-		"days_remaining",
+-		"time_to_expiry",
+-		"expiration",
+-		"suggested_action",
+-	}
+-
+-	// Verify each field would be present in log output
+-	for _, field := range requiredFields {
+-		if field == "" {
+-			t.Errorf("required field is empty")
+-		}
+-	}
+-}
+-
+-func TestCertificateTelemetry_Disabled(t *testing.T) {
+-	// Test behavior when certificate telemetry is disabled
+-	config := Config{
+-		CertificateTelemetryEnabled: false,
+-	}
+-
+-	// When disabled, no metrics should be emitted
+-	// This would be tested in integration tests with actual metric collection
+-	if config.CertificateTelemetryEnabled {
+-		t.Error("telemetry should be disabled")
+-	}
+-}
+diff --git a/agent/leafcert/generate.go b/agent/leafcert/generate.go
+index e4431bb8e6..8db2059a33 100644
+--- a/agent/leafcert/generate.go
++++ b/agent/leafcert/generate.go
+@@ -348,9 +348,9 @@ func (m *Manager) generateNewLeaf(
+ 					"suggested_action", "Certificate renewal is being rate limited. This is normal during root CA rotation. The certificate will retry automatically.",
+ 				}
+ 
+-				if daysRemaining <= criticalDays {
++				if daysRemaining < criticalDays {
+ 					m.logger.Error("leaf certificate renewal rate limited - certificate expiring soon", logFields...)
+-				} else if daysRemaining <= warningDays {
++				} else if daysRemaining < warningDays {
+ 					m.logger.Warn("leaf certificate renewal rate limited", logFields...)
+ 				} else {
+ 					m.logger.Debug("leaf certificate renewal rate limited", logFields...)
+@@ -438,9 +438,9 @@ func (m *Manager) generateNewLeaf(
+ 				"suggested_action", "Check CA availability, network connectivity, and ACL permissions. Certificate may expire if renewal continues to fail.",
+ 			}
+ 
+-			if daysRemaining <= criticalDays {
++			if daysRemaining < criticalDays {
+ 				m.logger.Error("leaf certificate renewal failed - certificate expiring soon", logFields...)
+-			} else if daysRemaining <= warningDays {
++			} else if daysRemaining < warningDays {
+ 				m.logger.Error("leaf certificate renewal failed", logFields...)
+ 			} else {
+ 				m.logger.Warn("leaf certificate renewal failed", logFields...)
+diff --git a/agent/leafcert/renewal_logging_test.go b/agent/leafcert/renewal_logging_test.go
+deleted file mode 100644
+index 7a98656df7..0000000000
+--- a/agent/leafcert/renewal_logging_test.go
++++ /dev/null
+@@ -1,192 +0,0 @@
+-// Copyright (c) HashiCorp, Inc.
+-// SPDX-License-Identifier: BUSL-1.1
+-
+-package leafcert
+-
+-import (
+-	"context"
+-	"errors"
+-	"testing"
+-	"time"
+-
+-	"github.com/stretchr/testify/mock"
+-	"github.com/stretchr/testify/require"
+-
+-	"github.com/hashicorp/go-hclog"
+-
+-	"github.com/hashicorp/consul/agent/cacheshim"
+-	"github.com/hashicorp/consul/agent/structs"
+-)
+-
+-// Mock implementations for testing
+-type mockRootsReader struct {
+-	mock.Mock
+-}
+-
+-func (m *mockRootsReader) Get() (*structs.IndexedCARoots, error) {
+-	args := m.Called()
+-	if args.Get(0) == nil {
+-		return nil, args.Error(1)
+-	}
+-	return args.Get(0).(*structs.IndexedCARoots), args.Error(1)
+-}
+-
+-func (m *mockRootsReader) Notify(ctx context.Context, correlationID string, ch chan<- cacheshim.UpdateEvent) error {
+-	args := m.Called(ctx, correlationID, ch)
+-	return args.Error(0)
+-}
+-
+-type mockCertSigner struct {
+-	mock.Mock
+-}
+-
+-func (m *mockCertSigner) SignCert(ctx context.Context, args *structs.CASignRequest) (*structs.IssuedCert, error) {
+-	mArgs := m.Called(ctx, args)
+-	if mArgs.Get(0) == nil {
+-		return nil, mArgs.Error(1)
+-	}
+-	return mArgs.Get(0).(*structs.IssuedCert), mArgs.Error(1)
+-}
+-
+-func TestLeafCertRenewalFailure_RateLimitLogging(t *testing.T) {
+-	// Test that rate limit failures are logged with appropriate severity
+-	logger := hclog.NewNullLogger()
+-
+-	rootsReader := &mockRootsReader{}
+-	certSigner := &mockCertSigner{}
+-
+-	// Setup roots
+-	roots := &structs.IndexedCARoots{
+-		TrustDomain: "test.consul",
+-		Roots: []*structs.CARoot{
+-			{
+-				ID:     "root-1",
+-				Active: true,
+-			},
+-		},
+-	}
+-
+-	rootsReader.On("Get").Return(roots, nil)
+-	certSigner.On("SignCert", mock.Anything, mock.Anything).Return(nil, errors.New(structs.ErrRateLimited.Error()))
+-
+-	mgr := NewManager(Deps{
+-		Logger:      logger,
+-		RootsReader: rootsReader,
+-		CertSigner:  certSigner,
+-		Config: Config{
+-			CertificateTelemetryCriticalThresholdDays: 7,
+-			CertificateTelemetryWarningThresholdDays:  30,
+-		},
+-	})
+-	defer mgr.Stop()
+-
+-	// This test verifies the manager can be created with thresholds
+-	require.NotNil(t, mgr)
+-	require.Equal(t, 7, mgr.config.CertificateTelemetryCriticalThresholdDays)
+-	require.Equal(t, 30, mgr.config.CertificateTelemetryWarningThresholdDays)
+-}
+-
+-func TestLeafCertRenewalFailure_SigningErrorLogging(t *testing.T) {
+-	// Test that signing errors are logged with appropriate severity
+-	logger := hclog.NewNullLogger()
+-
+-	rootsReader := &mockRootsReader{}
+-	certSigner := &mockCertSigner{}
+-
+-	roots := &structs.IndexedCARoots{
+-		TrustDomain: "test.consul",
+-		Roots: []*structs.CARoot{
+-			{
+-				ID:     "root-1",
+-				Active: true,
+-			},
+-		},
+-	}
+-
+-	rootsReader.On("Get").Return(roots, nil)
+-	certSigner.On("SignCert", mock.Anything, mock.Anything).Return(nil, errors.New("CA unavailable"))
+-
+-	mgr := NewManager(Deps{
+-		Logger:      logger,
+-		RootsReader: rootsReader,
+-		CertSigner:  certSigner,
+-		Config: Config{
+-			CertificateTelemetryCriticalThresholdDays: 7,
+-			CertificateTelemetryWarningThresholdDays:  30,
+-		},
+-	})
+-	defer mgr.Stop()
+-
+-	require.NotNil(t, mgr)
+-}
+-
+-func TestLeafCertManager_ThresholdConfiguration(t *testing.T) {
+-	tests := []struct {
+-		name         string
+-		criticalDays int
+-		warningDays  int
+-	}{
+-		{"default", 7, 30},
+-		{"conservative", 14, 60},
+-		{"aggressive", 3, 7},
+-		{"custom", 10, 45},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			logger := hclog.NewNullLogger()
+-
+-			rootsReader := &mockRootsReader{}
+-			certSigner := &mockCertSigner{}
+-
+-			roots := &structs.IndexedCARoots{
+-				TrustDomain: "test.consul",
+-				Roots: []*structs.CARoot{
+-					{
+-						ID:     "root-1",
+-						Active: true,
+-					},
+-				},
+-			}
+-
+-			rootsReader.On("Get").Return(roots, nil)
+-
+-			mgr := NewManager(Deps{
+-				Logger:      logger,
+-				RootsReader: rootsReader,
+-				CertSigner:  certSigner,
+-				Config: Config{
+-					CertificateTelemetryCriticalThresholdDays: tt.criticalDays,
+-					CertificateTelemetryWarningThresholdDays:  tt.warningDays,
+-				},
+-			})
+-			defer mgr.Stop()
+-
+-			require.Equal(t, tt.criticalDays, mgr.config.CertificateTelemetryCriticalThresholdDays)
+-			require.Equal(t, tt.warningDays, mgr.config.CertificateTelemetryWarningThresholdDays)
+-		})
+-	}
+-}
+-
+-func TestLeafCert_ExpiryCalculation(t *testing.T) {
+-	// Test that days remaining calculation is correct
+-	tests := []struct {
+-		name           string
+-		hoursRemaining int
+-		expectedDays   int
+-	}{
+-		{"1 day", 24, 1},
+-		{"7 days", 168, 7},
+-		{"30 days", 720, 30},
+-		{"90 days", 2160, 90},
+-		{"partial day", 36, 1}, // 1.5 days rounds to 1
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			duration := time.Duration(tt.hoursRemaining) * time.Hour
+-			days := int(duration.Hours() / 24)
+-			require.Equal(t, tt.expectedDays, days)
+-		})
+-	}
+-}
+diff --git a/agent/metrics.go b/agent/metrics.go
+index 01b24ff09b..4ef06387dc 100644
+--- a/agent/metrics.go
++++ b/agent/metrics.go
+@@ -28,13 +28,11 @@ var metricsKeyAgentTLSCertExpiry = []string{"agent", "tls", "cert", "expiry"}
+ 
+ // tlsCertExpirationMonitor returns a CertExpirationMonitor which will
+ // monitor the expiration of the certificate used for agent TLS.
+-func tlsCertExpirationMonitor(c *tlsutil.Configurator, nodeName string, criticalDays int, warningDays int, logger hclog.Logger) consul.CertExpirationMonitor {
++func tlsCertExpirationMonitor(c *tlsutil.Configurator, nodeName string, logger hclog.Logger) consul.CertExpirationMonitor {
+ 	return consul.CertExpirationMonitor{
+-		Key:                   metricsKeyAgentTLSCertExpiry,
+-		Labels:                []metrics.Label{{Name: "node", Value: nodeName}},
+-		Logger:                logger,
+-		CriticalThresholdDays: criticalDays,
+-		WarningThresholdDays:  warningDays,
++		Key:    metricsKeyAgentTLSCertExpiry,
++		Labels: []metrics.Label{{Name: "node", Value: nodeName}},
++		Logger: logger,
+ 		Query: func() (time.Duration, time.Duration, error) {
+ 			raw := c.Cert()
+ 			if raw == nil {
+diff --git a/agent/metrics_test.go b/agent/metrics_test.go
+index 9e83db6e0c..6d04499c53 100644
+--- a/agent/metrics_test.go
++++ b/agent/metrics_test.go
+@@ -14,7 +14,6 @@ import (
+ 	"strings"
+ 	"sync/atomic"
+ 	"testing"
+-	"time"
+ 
+ 	"github.com/stretchr/testify/require"
+ 
+@@ -398,9 +397,6 @@ func TestHTTPHandlers_AgentMetrics_TLSCertExpiry_Prometheus(t *testing.T) {
+ 			prometheus_retention_time = "5s",
+ 			disable_hostname = true
+ 			metrics_prefix = "%s"
+-			certificate = {
+-				enabled = true
+-			}
+ 		}
+ 		ca_file = "%s"
+ 		cert_file = "%s"
+@@ -410,17 +406,10 @@ func TestHTTPHandlers_AgentMetrics_TLSCertExpiry_Prometheus(t *testing.T) {
+ 	a := StartTestAgent(t, TestAgent{HCL: hcl})
+ 	defer a.Shutdown()
+ 
+-	// Wait a bit for the certificate monitor to emit metrics
+-	time.Sleep(100 * time.Millisecond)
+-
+ 	respRec := httptest.NewRecorder()
+ 	recordPromMetrics(t, a, respRec)
+ 
+-	body := respRec.Body.String()
+-	// The metric includes a node label, so we check for the metric name with the node label
+-	require.Contains(t, body, metricsPrefix+"_agent_tls_cert_expiry{node=")
+-	// Check that the value is approximately 20 days = 1.728e6 seconds
+-	require.Contains(t, body, "1.7")
++	require.Contains(t, respRec.Body.String(), metricsPrefix+"_agent_tls_cert_expiry 1.7")
+ }
+ 
+ func TestHTTPHandlers_AgentMetrics_CACertExpiry_Prometheus(t *testing.T) {
+diff --git a/agent/metrics_test_cert.go b/agent/metrics_test_cert.go
+deleted file mode 100644
+index ff1a0ddd88..0000000000
+--- a/agent/metrics_test_cert.go
++++ /dev/null
+@@ -1,128 +0,0 @@
+-// Copyright (c) HashiCorp, Inc.
+-// SPDX-License-Identifier: BUSL-1.1
+-
+-package agent
+-
+-import (
+-	"fmt"
+-	"testing"
+-	"time"
+-
+-	"github.com/armon/go-metrics"
+-	"github.com/stretchr/testify/require"
+-)
+-
+-func TestAgentTLSMetrics_WithNodeName(t *testing.T) {
+-	t.Parallel()
+-
+-	// Create agent with TLS enabled
+-	a := NewTestAgent(t, `
+-		node_name = "test-node-1"
+-		verify_incoming = true
+-		verify_outgoing = true
+-		ca_file = "../test/ca/root.cer"
+-		cert_file = "../test/key/ourdomain.cer"
+-		key_file = "../test/key/ourdomain.key"
+-		
+-		telemetry {
+-			certificate {
+-				enabled = true
+-			}
+-		}
+-	`)
+-	defer a.Shutdown()
+-
+-	// Wait a bit for metrics to be emitted
+-	time.Sleep(100 * time.Millisecond)
+-
+-	// Verify that the metric was emitted with node label
+-	// This is a basic smoke test - in real scenarios we'd inspect prometheus metrics
+-	require.Equal(t, "test-node-1", a.config.NodeName)
+-}
+-
+-func TestAgentTLSMetrics_MultipleNodes(t *testing.T) {
+-	t.Parallel()
+-
+-	nodes := []string{"node-a", "node-b", "node-c"}
+-
+-	for _, nodeName := range nodes {
+-		t.Run(nodeName, func(t *testing.T) {
+-			a := NewTestAgent(t, `
+-				node_name = "`+nodeName+`"
+-				verify_incoming = true
+-				verify_outgoing = true
+-				ca_file = "../test/ca/root.cer"
+-				cert_file = "../test/key/ourdomain.cer"
+-				key_file = "../test/key/ourdomain.key"
+-				
+-				telemetry {
+-					certificate {
+-						enabled = true
+-					}
+-				}
+-			`)
+-			defer a.Shutdown()
+-
+-			require.Equal(t, nodeName, a.config.NodeName)
+-		})
+-	}
+-}
+-
+-func TestCertificateMetrics_NodeNameInResponse(t *testing.T) {
+-	t.Parallel()
+-
+-	a := NewTestAgent(t, `
+-		node_name = "server-1"
+-		
+-		telemetry {
+-			certificate {
+-				enabled = true
+-			}
+-		}
+-	`)
+-	defer a.Shutdown()
+-
+-	// Emit a test metric with node label
+-	metrics.SetGaugeWithLabels(
+-		[]string{"agent", "tls", "cert", "expiry"},
+-		float32((30 * 24 * time.Hour).Seconds()),
+-		[]metrics.Label{{Name: "node", Value: "server-1"}},
+-	)
+-
+-	time.Sleep(100 * time.Millisecond)
+-
+-	// This verifies the metric can be emitted - actual API test is in agent_certmetrics_endpoint_test.go
+-	require.Equal(t, "server-1", a.config.NodeName)
+-}
+-
+-func TestCertificateMetrics_ThresholdLogging(t *testing.T) {
+-	t.Parallel()
+-
+-	tests := []struct {
+-		name                  string
+-		criticalThresholdDays int
+-		warningThresholdDays  int
+-	}{
+-		{"default", 7, 30},
+-		{"conservative", 14, 60},
+-		{"aggressive", 3, 7},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			a := NewTestAgent(t, fmt.Sprintf(`
+-				telemetry {
+-					certificate {
+-						enabled = true
+-						critical_threshold_days = %d
+-						warning_threshold_days = %d
+-					}
+-				}
+-			`, tt.criticalThresholdDays, tt.warningThresholdDays))
+-			defer a.Shutdown()
+-
+-			require.Equal(t, tt.criticalThresholdDays, a.config.Telemetry.CertificateCriticalThresholdDays)
+-			require.Equal(t, tt.warningThresholdDays, a.config.Telemetry.CertificateWarningThresholdDays)
+-		})
+-	}
+-}

@@ -1,0 +1,351 @@
+diff --git a/.golangci.next.reference.yml b/.golangci.next.reference.yml
+index 323164f0..210b1f1d 100644
+--- a/.golangci.next.reference.yml
++++ b/.golangci.next.reference.yml
+@@ -59,15 +59,25 @@ run:
+ 
+ # output configuration options
+ output:
+-  # Format: colored-line-number|line-number|json|colored-tab|tab|checkstyle|code-climate|junit-xml|github-actions|teamcity
+-  #
+-  # Multiple can be specified by separating them by comma, output can be provided
+-  # for each of them by separating format name and path by colon symbol.
++  # The formats used to render issues.
++  # Format: `colored-line-number`, `line-number`, `json`, `colored-tab`, `tab`, `checkstyle`, `code-climate`, `junit-xml`, `github-actions`, `teamcity`
+   # Output path can be either `stdout`, `stderr` or path to the file to write to.
+-  # Example: "checkstyle:report.xml,json:stdout,colored-line-number"
+   #
+-  # Default: colored-line-number
+-  format: json
++  # For the CLI flag (`--out-format`), multiple formats can be specified by separating them by comma.
++  # The output can be specified for each of them by separating format name and path by colon symbol.
++  # Example: "--out-format=checkstyle:report.xml,json:stdout,colored-line-number"
++  # The CLI flag (`--out-format`) override the configuration file.
++  #
++  # Default:
++  #   formats:
++  #     - format: colored-line-number
++  #       path: stdout
++  formats:
++    - format: json
++      path: stderr
++    - format: checkstyle
++      path: report.xml
++    - format: colored-line-number
+ 
+   # Print lines of code with issue.
+   # Default: true
+diff --git a/jsonschema/golangci.next.jsonschema.json b/jsonschema/golangci.next.jsonschema.json
+index 0b1b582e..8c2fda9c 100644
+--- a/jsonschema/golangci.next.jsonschema.json
++++ b/jsonschema/golangci.next.jsonschema.json
+@@ -448,15 +448,42 @@
+       "description": "Output configuration options.",
+       "type": "object",
+       "properties": {
+-        "format": {
+-          "description": "Output format to use.",
+-          "pattern": "^(,?(colored-line-number|line-number|json|colored-tab|tab|checkstyle|code-climate|junit-xml|github-actions|teamcity)(:[^,]+)?)+$",
+-          "default": "colored-line-number",
+-          "examples": [
+-            "colored-line-number",
+-            "checkstyle:report.json,colored-line-number",
+-            "line-number:golangci-lint.out,colored-line-number:stdout"
+-          ]
++        "formats": {
++          "description": "Output formats to use.",
++          "type": "array",
++          "items": {
++            "type": "object",
++            "additionalProperties": false,
++            "properties": {
++              "path": {
++                "default": "stdout",
++                "anyOf": [
++                  {
++                    "enum": [ "stdout", "stderr" ]
++                  },
++                  {
++                    "type": "string"
++                  }
++                ]
++              },
++              "format": {
++                "default": "colored-line-number",
++                "enum": [
++                  "colored-line-number",
++                  "line-number",
++                  "json",
++                  "colored-tab",
++                  "tab",
++                  "checkstyle",
++                  "code-climate",
++                  "junit-xml",
++                  "github-actions",
++                  "teamcity"
++                ]
++              }
++            },
++            "required": ["format"]
++          }
+         },
+         "print-issued-lines": {
+           "description": "Print lines of code with issue.",
+diff --git a/pkg/commands/flagsets.go b/pkg/commands/flagsets.go
+index 9eed3694..be541d12 100644
+--- a/pkg/commands/flagsets.go
++++ b/pkg/commands/flagsets.go
+@@ -63,8 +63,8 @@ func setupRunFlagSet(v *viper.Viper, fs *pflag.FlagSet) {
+ }
+ 
+ func setupOutputFlagSet(v *viper.Viper, fs *pflag.FlagSet) {
+-	internal.AddFlagAndBind(v, fs, fs.String, "out-format", "output.format", config.OutFormatColoredLineNumber,
+-		color.GreenString(fmt.Sprintf("Format of output: %s", strings.Join(config.OutFormats, "|"))))
++	internal.AddFlagAndBind(v, fs, fs.String, "out-format", "output.formats", config.OutFormatColoredLineNumber,
++		color.GreenString(fmt.Sprintf("Formats of output: %s", strings.Join(config.AllOutputFormats, "|"))))
+ 	internal.AddFlagAndBind(v, fs, fs.Bool, "print-issued-lines", "output.print-issued-lines", true,
+ 		color.GreenString("Print lines of code with issue"))
+ 	internal.AddFlagAndBind(v, fs, fs.Bool, "print-linter-name", "output.print-linter-name", true,
+diff --git a/pkg/config/loader.go b/pkg/config/loader.go
+index 0cc567c2..ea752e60 100644
+--- a/pkg/config/loader.go
++++ b/pkg/config/loader.go
+@@ -61,7 +61,10 @@ func (l *Loader) Load() error {
+ 
+ 	l.handleGoVersion()
+ 
+-	l.handleDeprecation()
++	err = l.handleDeprecation()
++	if err != nil {
++		return err
++	}
+ 
+ 	err = l.handleEnableOnlyOption()
+ 	if err != nil {
+@@ -164,7 +167,7 @@ func (l *Loader) parseConfig() error {
+ 		var configFileNotFoundError viper.ConfigFileNotFoundError
+ 		if errors.As(err, &configFileNotFoundError) {
+ 			// Load configuration from flags only.
+-			err = l.viper.Unmarshal(l.cfg)
++			err = l.viper.Unmarshal(l.cfg, customDecoderHook())
+ 			if err != nil {
+ 				return fmt.Errorf("can't unmarshal config by viper (flags): %w", err)
+ 			}
+@@ -181,7 +184,7 @@ func (l *Loader) parseConfig() error {
+ 	}
+ 
+ 	// Load configuration from all sources (flags, file).
+-	if err := l.viper.Unmarshal(l.cfg, fileDecoderHook()); err != nil {
++	if err := l.viper.Unmarshal(l.cfg, customDecoderHook()); err != nil {
+ 		return fmt.Errorf("can't unmarshal config by viper (flags, file): %w", err)
+ 	}
+ 
+@@ -279,28 +282,47 @@ func (l *Loader) handleGoVersion() {
+ 	}
+ }
+ 
+-func (l *Loader) handleDeprecation() {
++func (l *Loader) handleDeprecation() error {
++	// Deprecated since v1.57.0
+ 	if len(l.cfg.Run.SkipFiles) > 0 {
+ 		l.warn("The configuration option `run.skip-files` is deprecated, please use `issues.exclude-files`.")
+ 		l.cfg.Issues.ExcludeFiles = l.cfg.Run.SkipFiles
+ 	}
+ 
++	// Deprecated since v1.57.0
+ 	if len(l.cfg.Run.SkipDirs) > 0 {
+ 		l.warn("The configuration option `run.skip-dirs` is deprecated, please use `issues.exclude-dirs`.")
+ 		l.cfg.Issues.ExcludeDirs = l.cfg.Run.SkipDirs
+ 	}
+ 
+ 	// The 2 options are true by default.
++	// Deprecated since v1.57.0
+ 	if !l.cfg.Run.UseDefaultSkipDirs {
+ 		l.warn("The configuration option `run.skip-dirs-use-default` is deprecated, please use `issues.exclude-dirs-use-default`.")
+ 	}
+ 	l.cfg.Issues.UseDefaultExcludeDirs = l.cfg.Run.UseDefaultSkipDirs && l.cfg.Issues.UseDefaultExcludeDirs
+ 
+ 	// The 2 options are false by default.
++	// Deprecated since v1.57.0
+ 	if l.cfg.Run.ShowStats {
+ 		l.warn("The configuration option `run.show-stats` is deprecated, please use `output.show-stats`")
+ 	}
+ 	l.cfg.Output.ShowStats = l.cfg.Run.ShowStats || l.cfg.Output.ShowStats
++
++	// Deprecated since v1.57.0
++	if l.cfg.Output.Format != "" {
++		l.warn("The configuration option `output.format` is deprecated, please use `output.formats`")
++
++		var f OutputFormats
++		err := f.UnmarshalText([]byte(l.cfg.Output.Format))
++		if err != nil {
++			return fmt.Errorf("unmarshal output format: %w", err)
++		}
++
++		l.cfg.Output.Formats = f
++	}
++
++	return nil
+ }
+ 
+ func (l *Loader) handleEnableOnlyOption() error {
+@@ -327,13 +349,13 @@ func (l *Loader) warn(format string) {
+ 	l.log.Warnf(format)
+ }
+ 
+-func fileDecoderHook() viper.DecoderConfigOption {
++func customDecoderHook() viper.DecoderConfigOption {
+ 	return viper.DecodeHook(mapstructure.ComposeDecodeHookFunc(
+ 		// Default hooks (https://github.com/spf13/viper/blob/518241257478c557633ab36e474dfcaeb9a3c623/viper.go#L135-L138).
+ 		mapstructure.StringToTimeDurationHookFunc(),
+ 		mapstructure.StringToSliceHookFunc(","),
+ 
+-		// Needed for forbidigo.
++		// Needed for forbidigo, and output.formats.
+ 		mapstructure.TextUnmarshallerHookFunc(),
+ 	))
+ }
+diff --git a/pkg/config/output.go b/pkg/config/output.go
+index a0734ab7..672b1c7d 100644
+--- a/pkg/config/output.go
++++ b/pkg/config/output.go
+@@ -21,7 +21,7 @@ const (
+ 	OutFormatTeamCity          = "teamcity"
+ )
+ 
+-var OutFormats = []string{
++var AllOutputFormats = []string{
+ 	OutFormatColoredLineNumber,
+ 	OutFormatLineNumber,
+ 	OutFormatJSON,
+@@ -35,14 +35,17 @@ var OutFormats = []string{
+ }
+ 
+ type Output struct {
+-	Format          string   `mapstructure:"format"`
+-	PrintIssuedLine bool     `mapstructure:"print-issued-lines"`
+-	PrintLinterName bool     `mapstructure:"print-linter-name"`
+-	UniqByLine      bool     `mapstructure:"uniq-by-line"`
+-	SortResults     bool     `mapstructure:"sort-results"`
+-	SortOrder       []string `mapstructure:"sort-order"`
+-	PathPrefix      string   `mapstructure:"path-prefix"`
+-	ShowStats       bool     `mapstructure:"show-stats"`
++	Formats         OutputFormats `mapstructure:"formats"`
++	PrintIssuedLine bool          `mapstructure:"print-issued-lines"`
++	PrintLinterName bool          `mapstructure:"print-linter-name"`
++	UniqByLine      bool          `mapstructure:"uniq-by-line"`
++	SortResults     bool          `mapstructure:"sort-results"`
++	SortOrder       []string      `mapstructure:"sort-order"`
++	PathPrefix      string        `mapstructure:"path-prefix"`
++	ShowStats       bool          `mapstructure:"show-stats"`
++
++	// Deprecated: use Formats instead.
++	Format string `mapstructure:"format"`
+ }
+ 
+ func (o *Output) Validate() error {
+@@ -64,5 +67,46 @@ func (o *Output) Validate() error {
+ 		}
+ 	}
+ 
++	for _, format := range o.Formats {
++		err := format.Validate()
++		if err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++type OutputFormat struct {
++	Format string `mapstructure:"format"`
++	Path   string `mapstructure:"path"`
++}
++
++func (o *OutputFormat) Validate() error {
++	if o.Format == "" {
++		return errors.New("the format is required")
++	}
++
++	if !slices.Contains(AllOutputFormats, o.Format) {
++		return fmt.Errorf("unsupported output format %q", o.Format)
++	}
++
++	return nil
++}
++
++type OutputFormats []OutputFormat
++
++func (p *OutputFormats) UnmarshalText(text []byte) error {
++	formats := strings.Split(string(text), ",")
++
++	for _, item := range formats {
++		format, path, _ := strings.Cut(item, ":")
++
++		*p = append(*p, OutputFormat{
++			Path:   path,
++			Format: format,
++		})
++	}
++
+ 	return nil
+ }
+diff --git a/pkg/printers/printer.go b/pkg/printers/printer.go
+index f4112985..08c34234 100644
+--- a/pkg/printers/printer.go
++++ b/pkg/printers/printer.go
+@@ -6,7 +6,6 @@ import (
+ 	"io"
+ 	"os"
+ 	"path/filepath"
+-	"strings"
+ 
+ 	"github.com/golangci/golangci-lint/pkg/config"
+ 	"github.com/golangci/golangci-lint/pkg/logutils"
+@@ -54,11 +53,8 @@ func NewPrinter(log logutils.Log, cfg *config.Output, reportData *report.Data) (
+ 
+ // Print prints issues based on the formats defined
+ func (c *Printer) Print(issues []result.Issue) error {
+-	formats := strings.Split(c.cfg.Format, ",")
+-
+-	for _, item := range formats {
+-		format, path, _ := strings.Cut(item, ":")
+-		err := c.printReports(issues, path, format)
++	for _, format := range c.cfg.Formats {
++		err := c.printReports(issues, format)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -67,10 +63,10 @@ func (c *Printer) Print(issues []result.Issue) error {
+ 	return nil
+ }
+ 
+-func (c *Printer) printReports(issues []result.Issue, path, format string) error {
+-	w, shouldClose, err := c.createWriter(path)
++func (c *Printer) printReports(issues []result.Issue, format config.OutputFormat) error {
++	w, shouldClose, err := c.createWriter(format.Path)
+ 	if err != nil {
+-		return fmt.Errorf("can't create output for %s: %w", path, err)
++		return fmt.Errorf("can't create output for %s: %w", format.Path, err)
+ 	}
+ 
+ 	defer func() {
+@@ -79,7 +75,7 @@ func (c *Printer) printReports(issues []result.Issue, path, format string) error
+ 		}
+ 	}()
+ 
+-	p, err := c.createPrinter(format, w)
++	p, err := c.createPrinter(format.Format, w)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -140,7 +136,7 @@ func (c *Printer) createPrinter(format string, w io.Writer) (issuePrinter, error
+ 	case config.OutFormatTeamCity:
+ 		p = NewTeamCity(w)
+ 	default:
+-		return nil, fmt.Errorf("unknown output format %s", format)
++		return nil, fmt.Errorf("unknown output format %q", format)
+ 	}
+ 
+ 	return p, nil

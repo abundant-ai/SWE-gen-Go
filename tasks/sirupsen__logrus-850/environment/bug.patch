@@ -1,0 +1,996 @@
+diff --git a/README.md b/README.md
+index 093bb13..f088432 100644
+--- a/README.md
++++ b/README.md
+@@ -56,39 +56,8 @@ time="2015-03-26T01:27:38-04:00" level=warning msg="The group's number increased
+ time="2015-03-26T01:27:38-04:00" level=debug msg="Temperature changes" temperature=-4
+ time="2015-03-26T01:27:38-04:00" level=panic msg="It's over 9000!" animal=orca size=9009
+ time="2015-03-26T01:27:38-04:00" level=fatal msg="The ice breaks!" err=&{0x2082280c0 map[animal:orca size:9009] 2015-03-26 01:27:38.441574009 -0400 EDT panic It's over 9000!} number=100 omg=true
++exit status 1
+ ```
+-To ensure this behaviour even if a TTY is attached, set your formatter as follows:
+-
+-```go
+-	log.SetFormatter(&log.TextFormatter{
+-		DisableColors: true,
+-		FullTimestamp: true,
+-	})
+-```
+-
+-#### Logging Method Name
+-
+-If you wish to add the calling method as a field, instruct the logger via:
+-```go
+-log.SetReportCaller(true)
+-```
+-This adds the caller as 'method' like so:
+-
+-```json
+-{"animal":"penguin","level":"fatal","method":"github.com/sirupsen/arcticcreatures.migrate","msg":"a penguin swims by",
+-"time":"2014-03-10 19:57:38.562543129 -0400 EDT"}
+-```
+-
+-```text
+-time="2015-03-26T01:27:38-04:00" level=fatal method=github.com/sirupsen/arcticcreatures.migrate msg="a penguin swims by" animal=penguin
+-```
+-Note that this does add measurable overhead - the cost will depend on the version of Go, but is
+-between 20 and 40% in recent tests with 1.6 and 1.7.  You can validate this in your
+-environment via benchmarks: 
+-```
+-go test -bench=.*CallerTracing
+-```
+-
+ 
+ #### Case-sensitivity
+ 
+diff --git a/alt_exit_test.go b/alt_exit_test.go
+index 0a2ff56..a08b1a8 100644
+--- a/alt_exit_test.go
++++ b/alt_exit_test.go
+@@ -6,8 +6,6 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+-	"runtime"
+-	"strings"
+ 	"testing"
+ 	"time"
+ )
+@@ -21,9 +19,6 @@ func TestRegister(t *testing.T) {
+ }
+ 
+ func TestHandler(t *testing.T) {
+-	testprog := testprogleader
+-	testprog = append(testprog, getPackage()...)
+-	testprog = append(testprog, testprogtrailer...)
+ 	tempDir, err := ioutil.TempDir("", "test_handler")
+ 	if err != nil {
+ 		log.Fatalf("can't create temp dir. %q", err)
+@@ -52,24 +47,13 @@ func TestHandler(t *testing.T) {
+ 	}
+ }
+ 
+-// getPackage returns the name of the current package, which makes running this
+-// test in a fork simpler
+-func getPackage() []byte {
+-	pc, _, _, _ := runtime.Caller(0)
+-	fullFuncName := runtime.FuncForPC(pc).Name()
+-	idx := strings.LastIndex(fullFuncName, ".")
+-	return []byte(fullFuncName[:idx]) // trim off function details
+-}
+-
+-var testprogleader = []byte(`
++var testprog = []byte(`
+ // Test program for atexit, gets output file and data as arguments and writes
+ // data to output file in atexit handler.
+ package main
+ 
+ import (
+-	"`)
+-var testprogtrailer = []byte(
+-	`"
++	"github.com/sirupsen/logrus"
+ 	"flag"
+ 	"fmt"
+ 	"io/ioutil"
+diff --git a/entry.go b/entry.go
+index cc85d3a..a76be76 100644
+--- a/entry.go
++++ b/entry.go
+@@ -5,29 +5,11 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"reflect"
+-	"runtime"
+-	"strings"
+ 	"sync"
+ 	"time"
+ )
+ 
+-var (
+-	bufferPool *sync.Pool
+-
+-	// qualified package name, cached at first use
+-	logrusPackage string
+-
+-	// Positions in the call stack when tracing to report the calling method
+-	minimumCallerDepth int
+-
+-	// Used for caller information initialisation
+-	callerInitOnce sync.Once
+-)
+-
+-const (
+-	maximumCallerDepth int = 25
+-	knownLogrusFrames  int = 4
+-)
++var bufferPool *sync.Pool
+ 
+ func init() {
+ 	bufferPool = &sync.Pool{
+@@ -35,9 +17,6 @@ func init() {
+ 			return new(bytes.Buffer)
+ 		},
+ 	}
+-
+-	// start at the bottom of the stack before the package-name cache is primed
+-	minimumCallerDepth = 1
+ }
+ 
+ // Defines the key when adding errors using WithError.
+@@ -60,9 +39,6 @@ type Entry struct {
+ 	// This field will be set on entry firing and the value will be equal to the one in Logger struct field.
+ 	Level Level
+ 
+-	// Calling method, with package name
+-	Caller *runtime.Frame
+-
+ 	// Message passed to Trace, Debug, Info, Warn, Error, Fatal or Panic
+ 	Message string
+ 
+@@ -76,8 +52,8 @@ type Entry struct {
+ func NewEntry(logger *Logger) *Entry {
+ 	return &Entry{
+ 		Logger: logger,
+-		// Default is three fields, plus one optional.  Give a little extra room.
+-		Data: make(Fields, 6),
++		// Default is five fields, give a little extra room
++		Data: make(Fields, 5),
+ 	}
+ }
+ 
+@@ -127,57 +103,6 @@ func (entry *Entry) WithTime(t time.Time) *Entry {
+ 	return &Entry{Logger: entry.Logger, Data: entry.Data, Time: t}
+ }
+ 
+-// getPackageName reduces a fully qualified function name to the package name
+-// There really ought to be to be a better way...
+-func getPackageName(f string) string {
+-	for {
+-		lastPeriod := strings.LastIndex(f, ".")
+-		lastSlash := strings.LastIndex(f, "/")
+-		if lastPeriod > lastSlash {
+-			f = f[:lastPeriod]
+-		} else {
+-			break
+-		}
+-	}
+-
+-	return f
+-}
+-
+-// getCaller retrieves the name of the first non-logrus calling function
+-func getCaller() *runtime.Frame {
+-	// Restrict the lookback frames to avoid runaway lookups
+-	pcs := make([]uintptr, maximumCallerDepth)
+-	depth := runtime.Callers(minimumCallerDepth, pcs)
+-	frames := runtime.CallersFrames(pcs[:depth])
+-
+-	// cache this package's fully-qualified name
+-	callerInitOnce.Do(func() {
+-		logrusPackage = getPackageName(runtime.FuncForPC(pcs[0]).Name())
+-
+-		// now that we have the cache, we can skip a minimum count of known-logrus functions
+-		// XXX this is dubious, the number of frames may vary store an entry in a logger interface
+-		minimumCallerDepth = knownLogrusFrames
+-	})
+-
+-	for f, again := frames.Next(); again; f, again = frames.Next() {
+-		pkg := getPackageName(f.Function)
+-
+-		// If the caller isn't part of this package, we're done
+-		if pkg != logrusPackage {
+-			return &f
+-		}
+-	}
+-
+-	// if we got here, we failed to find the caller's context
+-	return nil
+-}
+-
+-func (entry Entry) HasCaller() (has bool) {
+-	return entry.Logger != nil &&
+-		entry.Logger.ReportCaller &&
+-		entry.Caller != nil
+-}
+-
+ // This function is not declared with a pointer value because otherwise
+ // race conditions will occur when using multiple goroutines
+ func (entry Entry) log(level Level, msg string) {
+@@ -194,9 +119,6 @@ func (entry Entry) log(level Level, msg string) {
+ 
+ 	entry.Level = level
+ 	entry.Message = msg
+-	if entry.Logger.ReportCaller {
+-		entry.Caller = getCaller()
+-	}
+ 
+ 	entry.fireHooks()
+ 
+diff --git a/exported.go b/exported.go
+index 7342613..b9f1c9d 100644
+--- a/exported.go
++++ b/exported.go
+@@ -24,12 +24,6 @@ func SetFormatter(formatter Formatter) {
+ 	std.SetFormatter(formatter)
+ }
+ 
+-// SetReportCaller sets whether the standard logger will include the calling
+-// method as a field.
+-func SetReportCaller(include bool) {
+-	std.SetReportCaller(include)
+-}
+-
+ // SetLevel sets the standard logger level.
+ func SetLevel(level Level) {
+ 	std.SetLevel(level)
+diff --git a/formatter.go b/formatter.go
+index 4088837..be2f3fc 100644
+--- a/formatter.go
++++ b/formatter.go
+@@ -9,8 +9,6 @@ const (
+ 	FieldKeyLevel          = "level"
+ 	FieldKeyTime           = "time"
+ 	FieldKeyLogrusError    = "logrus_error"
+-	FieldKeyFunc           = "func"
+-	FieldKeyFile           = "file"
+ )
+ 
+ // The Formatter interface is used to implement a custom Formatter. It takes an
+@@ -27,7 +25,7 @@ type Formatter interface {
+ 	Format(*Entry) ([]byte, error)
+ }
+ 
+-// This is to not silently overwrite `time`, `msg`, `func` and `level` fields when
++// This is to not silently overwrite `time`, `msg` and `level` fields when
+ // dumping it. If this code wasn't there doing:
+ //
+ //  logrus.WithField("level", 1).Info("hello")
+@@ -39,7 +37,7 @@ type Formatter interface {
+ //
+ // It's not exported because it's still using Data in an opinionated way. It's to
+ // avoid code duplication between the two default formatters.
+-func prefixFieldClashes(data Fields, fieldMap FieldMap, reportCaller bool) {
++func prefixFieldClashes(data Fields, fieldMap FieldMap) {
+ 	timeKey := fieldMap.resolve(FieldKeyTime)
+ 	if t, ok := data[timeKey]; ok {
+ 		data["fields."+timeKey] = t
+@@ -63,16 +61,4 @@ func prefixFieldClashes(data Fields, fieldMap FieldMap, reportCaller bool) {
+ 		data["fields."+logrusErrKey] = l
+ 		delete(data, logrusErrKey)
+ 	}
+-
+-	// If reportCaller is not set, 'func' will not conflict.
+-	if reportCaller {
+-		funcKey := fieldMap.resolve(FieldKeyFunc)
+-		if l, ok := data[funcKey]; ok {
+-			data["fields."+funcKey] = l
+-		}
+-		fileKey := fieldMap.resolve(FieldKeyFile)
+-		if l, ok := data[fileKey]; ok {
+-			data["fields."+fileKey] = l
+-		}
+-	}
+ }
+diff --git a/hook_test.go b/hook_test.go
+index b967593..7196e99 100644
+--- a/hook_test.go
++++ b/hook_test.go
+@@ -1,4 +1,4 @@
+-package logrus_test
++package logrus
+ 
+ import (
+ 	"bytes"
+@@ -8,9 +8,6 @@ import (
+ 
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+-
+-	. "github.com/sirupsen/logrus"
+-	. "github.com/sirupsen/logrus/internal/testutils"
+ )
+ 
+ type TestHook struct {
+diff --git a/internal/testutils/testutils.go b/internal/testutils/testutils.go
+deleted file mode 100644
+index 20bc3c3..0000000
+--- a/internal/testutils/testutils.go
++++ /dev/null
+@@ -1,58 +0,0 @@
+-package testutils
+-
+-import (
+-	"bytes"
+-	"encoding/json"
+-	"strconv"
+-	"strings"
+-	"testing"
+-
+-	. "github.com/sirupsen/logrus"
+-
+-	"github.com/stretchr/testify/require"
+-)
+-
+-func LogAndAssertJSON(t *testing.T, log func(*Logger), assertions func(fields Fields)) {
+-	var buffer bytes.Buffer
+-	var fields Fields
+-
+-	logger := New()
+-	logger.Out = &buffer
+-	logger.Formatter = new(JSONFormatter)
+-
+-	log(logger)
+-
+-	err := json.Unmarshal(buffer.Bytes(), &fields)
+-	require.Nil(t, err)
+-
+-	assertions(fields)
+-}
+-
+-func LogAndAssertText(t *testing.T, log func(*Logger), assertions func(fields map[string]string)) {
+-	var buffer bytes.Buffer
+-
+-	logger := New()
+-	logger.Out = &buffer
+-	logger.Formatter = &TextFormatter{
+-		DisableColors: true,
+-	}
+-
+-	log(logger)
+-
+-	fields := make(map[string]string)
+-	for _, kv := range strings.Split(buffer.String(), " ") {
+-		if !strings.Contains(kv, "=") {
+-			continue
+-		}
+-		kvArr := strings.Split(kv, "=")
+-		key := strings.TrimSpace(kvArr[0])
+-		val := kvArr[1]
+-		if kvArr[1][0] == '"' {
+-			var err error
+-			val, err = strconv.Unquote(val)
+-			require.NoError(t, err)
+-		}
+-		fields[key] = val
+-	}
+-	assertions(fields)
+-}
+diff --git a/json_formatter.go b/json_formatter.go
+index 2605753..ef8d074 100644
+--- a/json_formatter.go
++++ b/json_formatter.go
+@@ -34,10 +34,9 @@ type JSONFormatter struct {
+ 	// As an example:
+ 	// formatter := &JSONFormatter{
+ 	//   	FieldMap: FieldMap{
+-	// 		 FieldKeyTime:  "@timestamp",
++	// 		 FieldKeyTime: "@timestamp",
+ 	// 		 FieldKeyLevel: "@level",
+-	// 		 FieldKeyMsg:   "@message",
+-	// 		 FieldKeyFunc:  "@caller",
++	// 		 FieldKeyMsg: "@message",
+ 	//    },
+ 	// }
+ 	FieldMap FieldMap
+@@ -48,7 +47,7 @@ type JSONFormatter struct {
+ 
+ // Format renders a single log entry
+ func (f *JSONFormatter) Format(entry *Entry) ([]byte, error) {
+-	data := make(Fields, len(entry.Data)+4)
++	data := make(Fields, len(entry.Data)+3)
+ 	for k, v := range entry.Data {
+ 		switch v := v.(type) {
+ 		case error:
+@@ -66,7 +65,7 @@ func (f *JSONFormatter) Format(entry *Entry) ([]byte, error) {
+ 		data = newData
+ 	}
+ 
+-	prefixFieldClashes(data, f.FieldMap, entry.HasCaller())
++	prefixFieldClashes(data, f.FieldMap)
+ 
+ 	timestampFormat := f.TimestampFormat
+ 	if timestampFormat == "" {
+@@ -81,10 +80,6 @@ func (f *JSONFormatter) Format(entry *Entry) ([]byte, error) {
+ 	}
+ 	data[f.FieldMap.resolve(FieldKeyMsg)] = entry.Message
+ 	data[f.FieldMap.resolve(FieldKeyLevel)] = entry.Level.String()
+-	if entry.HasCaller() {
+-		data[f.FieldMap.resolve(FieldKeyFunc)] = entry.Caller.Function
+-		data[f.FieldMap.resolve(FieldKeyFile)] = fmt.Sprintf("%s:%d", entry.Caller.File, entry.Caller.Line)
+-	}
+ 
+ 	var b *bytes.Buffer
+ 	if entry.Buffer != nil {
+diff --git a/json_formatter_test.go b/json_formatter_test.go
+index 695c36e..0dde300 100644
+--- a/json_formatter_test.go
++++ b/json_formatter_test.go
+@@ -4,7 +4,6 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+-	"runtime"
+ 	"strings"
+ 	"testing"
+ )
+@@ -168,8 +167,8 @@ func TestFieldsInNestedDictionary(t *testing.T) {
+ 	}
+ 
+ 	logEntry := WithFields(Fields{
+-		"level": "level",
+-		"test":  "test",
++		"level":      "level",
++		"test":		  "test",
+ 	})
+ 	logEntry.Level = InfoLevel
+ 
+@@ -268,55 +267,6 @@ func TestJSONTimeKey(t *testing.T) {
+ 	}
+ }
+ 
+-func TestFieldDoesNotClashWithCaller(t *testing.T) {
+-	SetReportCaller(false)
+-	formatter := &JSONFormatter{}
+-
+-	b, err := formatter.Format(WithField("func", "howdy pardner"))
+-	if err != nil {
+-		t.Fatal("Unable to format entry: ", err)
+-	}
+-
+-	entry := make(map[string]interface{})
+-	err = json.Unmarshal(b, &entry)
+-	if err != nil {
+-		t.Fatal("Unable to unmarshal formatted entry: ", err)
+-	}
+-
+-	if entry["func"] != "howdy pardner" {
+-		t.Fatal("func field replaced when ReportCaller=false")
+-	}
+-}
+-
+-func TestFieldClashWithCaller(t *testing.T) {
+-	SetReportCaller(true)
+-	formatter := &JSONFormatter{}
+-	e := WithField("func", "howdy pardner")
+-	e.Caller = &runtime.Frame{Function: "somefunc"}
+-	b, err := formatter.Format(e)
+-	if err != nil {
+-		t.Fatal("Unable to format entry: ", err)
+-	}
+-
+-	entry := make(map[string]interface{})
+-	err = json.Unmarshal(b, &entry)
+-	if err != nil {
+-		t.Fatal("Unable to unmarshal formatted entry: ", err)
+-	}
+-
+-	if entry["fields.func"] != "howdy pardner" {
+-		t.Fatalf("fields.func not set to original func field when ReportCaller=true (got '%s')",
+-			entry["fields.func"])
+-	}
+-
+-	if entry["func"] != "somefunc" {
+-		t.Fatalf("func not set as expected when ReportCaller=true (got '%s')",
+-			entry["func"])
+-	}
+-
+-	SetReportCaller(false) // return to default value
+-}
+-
+ func TestJSONDisableTimestamp(t *testing.T) {
+ 	formatter := &JSONFormatter{
+ 		DisableTimestamp: true,
+diff --git a/logger.go b/logger.go
+index 5ceca0e..52f1761 100644
+--- a/logger.go
++++ b/logger.go
+@@ -24,10 +24,6 @@ type Logger struct {
+ 	// own that implements the `Formatter` interface, see the `README` or included
+ 	// formatters for examples.
+ 	Formatter Formatter
+-
+-	// Flag for whether to log caller info (off by default)
+-	ReportCaller bool
+-
+ 	// The logging level the logger should log at. This is typically (and defaults
+ 	// to) `logrus.Info`, which allows Info(), Warn(), Error() and Fatal() to be
+ 	// logged.
+@@ -77,12 +73,11 @@ func (mw *MutexWrap) Disable() {
+ // It's recommended to make this a global instance called `log`.
+ func New() *Logger {
+ 	return &Logger{
+-		Out:          os.Stderr,
+-		Formatter:    new(TextFormatter),
+-		Hooks:        make(LevelHooks),
+-		Level:        InfoLevel,
+-		ExitFunc:     os.Exit,
+-		ReportCaller: false,
++		Out:       os.Stderr,
++		Formatter: new(TextFormatter),
++		Hooks:     make(LevelHooks),
++		Level:     InfoLevel,
++		ExitFunc:  os.Exit,
+ 	}
+ }
+ 
+@@ -399,12 +394,6 @@ func (logger *Logger) SetOutput(output io.Writer) {
+ 	logger.Out = output
+ }
+ 
+-func (logger *Logger) SetReportCaller(reportCaller bool) {
+-	logger.mu.Lock()
+-	defer logger.mu.Unlock()
+-	logger.ReportCaller = reportCaller
+-}
+-
+ // ReplaceHooks replaces the logger hooks and returns the old ones
+ func (logger *Logger) ReplaceHooks(hooks LevelHooks) LevelHooks {
+ 	logger.mu.Lock()
+diff --git a/logrus_test.go b/logrus_test.go
+index 7c99825..ccdf5cc 100644
+--- a/logrus_test.go
++++ b/logrus_test.go
+@@ -1,93 +1,69 @@
+-package logrus_test
++package logrus
+ 
+ import (
+ 	"bytes"
+ 	"encoding/json"
+ 	"io/ioutil"
+-	"os"
+-	"path/filepath"
++	"strconv"
++	"strings"
+ 	"sync"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/stretchr/testify/assert"
+-	"github.com/stretchr/testify/require"
+-
+-	. "github.com/sirupsen/logrus"
+-	. "github.com/sirupsen/logrus/internal/testutils"
+ )
+ 
+-// TestReportCaller verifies that when ReportCaller is set, the 'func' field
+-// is added, and when it is unset it is not set or modified
+-// Verify that functions within the Logrus package aren't considered when
+-// discovering the caller.
+-func TestReportCallerWhenConfigured(t *testing.T) {
+-	LogAndAssertJSON(t, func(log *Logger) {
+-		log.ReportCaller = false
+-		log.Print("testNoCaller")
+-	}, func(fields Fields) {
+-		assert.Equal(t, "testNoCaller", fields["msg"])
+-		assert.Equal(t, "info", fields["level"])
+-		assert.Equal(t, nil, fields["func"])
+-	})
+-
+-	LogAndAssertJSON(t, func(log *Logger) {
+-		log.ReportCaller = true
+-		log.Print("testWithCaller")
+-	}, func(fields Fields) {
+-		assert.Equal(t, "testWithCaller", fields["msg"])
+-		assert.Equal(t, "info", fields["level"])
+-		assert.Equal(t,
+-			"github.com/sirupsen/logrus_test.TestReportCallerWhenConfigured.func3", fields["func"])
+-	})
+-}
+-
+-func logSomething(t *testing.T, message string) Fields {
++func LogAndAssertJSON(t *testing.T, log func(*Logger), assertions func(fields Fields)) {
+ 	var buffer bytes.Buffer
+ 	var fields Fields
+ 
+ 	logger := New()
+ 	logger.Out = &buffer
+ 	logger.Formatter = new(JSONFormatter)
+-	logger.ReportCaller = true
+-
+-	entry := logger.WithFields(Fields{
+-		"foo": "bar",
+-	})
+ 
+-	entry.Info(message)
++	log(logger)
+ 
+ 	err := json.Unmarshal(buffer.Bytes(), &fields)
+ 	assert.Nil(t, err)
+ 
+-	return fields
++	assertions(fields)
+ }
+ 
+-// TestReportCallerHelperDirect - verify reference when logging from a regular function
+-func TestReportCallerHelperDirect(t *testing.T) {
+-	fields := logSomething(t, "direct")
++func LogAndAssertText(t *testing.T, log func(*Logger), assertions func(fields map[string]string)) {
++	var buffer bytes.Buffer
+ 
+-	assert.Equal(t, "direct", fields["msg"])
+-	assert.Equal(t, "info", fields["level"])
+-	assert.Regexp(t, "github.com/.*/logrus_test.logSomething", fields["func"])
+-}
++	logger := New()
++	logger.Out = &buffer
++	logger.Formatter = &TextFormatter{
++		DisableColors: true,
++	}
+ 
+-// TestReportCallerHelperDirect - verify reference when logging from a function called via pointer
+-func TestReportCallerHelperViaPointer(t *testing.T) {
+-	fptr := logSomething
+-	fields := fptr(t, "via pointer")
++	log(logger)
+ 
+-	assert.Equal(t, "via pointer", fields["msg"])
+-	assert.Equal(t, "info", fields["level"])
+-	assert.Regexp(t, "github.com/.*/logrus_test.logSomething", fields["func"])
++	fields := make(map[string]string)
++	for _, kv := range strings.Split(buffer.String(), " ") {
++		if !strings.Contains(kv, "=") {
++			continue
++		}
++		kvArr := strings.Split(kv, "=")
++		key := strings.TrimSpace(kvArr[0])
++		val := kvArr[1]
++		if kvArr[1][0] == '"' {
++			var err error
++			val, err = strconv.Unquote(val)
++			assert.NoError(t, err)
++		}
++		fields[key] = val
++	}
++	assertions(fields)
+ }
+ 
+ func TestPrint(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.Print("test")
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "test", fields["msg"])
+-		assert.Equal(t, "info", fields["level"])
++		assert.Equal(t, fields["msg"], "test")
++		assert.Equal(t, fields["level"], "info")
+ 	})
+ }
+ 
+@@ -95,8 +71,8 @@ func TestInfo(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.Info("test")
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "test", fields["msg"])
+-		assert.Equal(t, "info", fields["level"])
++		assert.Equal(t, fields["msg"], "test")
++		assert.Equal(t, fields["level"], "info")
+ 	})
+ }
+ 
+@@ -104,8 +80,8 @@ func TestWarn(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.Warn("test")
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "test", fields["msg"])
+-		assert.Equal(t, "warning", fields["level"])
++		assert.Equal(t, fields["msg"], "test")
++		assert.Equal(t, fields["level"], "warning")
+ 	})
+ }
+ 
+@@ -113,7 +89,7 @@ func TestInfolnShouldAddSpacesBetweenStrings(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.Infoln("test", "test")
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "test test", fields["msg"])
++		assert.Equal(t, fields["msg"], "test test")
+ 	})
+ }
+ 
+@@ -121,7 +97,7 @@ func TestInfolnShouldAddSpacesBetweenStringAndNonstring(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.Infoln("test", 10)
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "test 10", fields["msg"])
++		assert.Equal(t, fields["msg"], "test 10")
+ 	})
+ }
+ 
+@@ -129,7 +105,7 @@ func TestInfolnShouldAddSpacesBetweenTwoNonStrings(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.Infoln(10, 10)
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "10 10", fields["msg"])
++		assert.Equal(t, fields["msg"], "10 10")
+ 	})
+ }
+ 
+@@ -137,7 +113,7 @@ func TestInfoShouldAddSpacesBetweenTwoNonStrings(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.Infoln(10, 10)
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "10 10", fields["msg"])
++		assert.Equal(t, fields["msg"], "10 10")
+ 	})
+ }
+ 
+@@ -145,7 +121,7 @@ func TestInfoShouldNotAddSpacesBetweenStringAndNonstring(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.Info("test", 10)
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "test10", fields["msg"])
++		assert.Equal(t, fields["msg"], "test10")
+ 	})
+ }
+ 
+@@ -153,7 +129,7 @@ func TestInfoShouldNotAddSpacesBetweenStrings(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.Info("test", "test")
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "testtest", fields["msg"])
++		assert.Equal(t, fields["msg"], "testtest")
+ 	})
+ }
+ 
+@@ -191,7 +167,7 @@ func TestUserSuppliedFieldDoesNotOverwriteDefaults(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.WithField("msg", "hello").Info("test")
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "test", fields["msg"])
++		assert.Equal(t, fields["msg"], "test")
+ 	})
+ }
+ 
+@@ -199,8 +175,8 @@ func TestUserSuppliedMsgFieldHasPrefix(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.WithField("msg", "hello").Info("test")
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "test", fields["msg"])
+-		assert.Equal(t, "hello", fields["fields.msg"])
++		assert.Equal(t, fields["msg"], "test")
++		assert.Equal(t, fields["fields.msg"], "hello")
+ 	})
+ }
+ 
+@@ -208,7 +184,7 @@ func TestUserSuppliedTimeFieldHasPrefix(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.WithField("time", "hello").Info("test")
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "hello", fields["fields.time"])
++		assert.Equal(t, fields["fields.time"], "hello")
+ 	})
+ }
+ 
+@@ -216,8 +192,8 @@ func TestUserSuppliedLevelFieldHasPrefix(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.WithField("level", 1).Info("test")
+ 	}, func(fields Fields) {
+-		assert.Equal(t, "info", fields["level"])
+-		assert.Equal(t, 1.0, fields["fields.level"]) // JSON has floats only
++		assert.Equal(t, fields["level"], "info")
++		assert.Equal(t, fields["fields.level"], 1.0) // JSON has floats only
+ 	})
+ }
+ 
+@@ -241,7 +217,7 @@ func TestWithTimeShouldOverrideTime(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.WithTime(now).Info("foobar")
+ 	}, func(fields Fields) {
+-		assert.Equal(t, fields["time"], now.Format(time.RFC3339))
++		assert.Equal(t, fields["time"], now.Format(defaultTimestampFormat))
+ 	})
+ }
+ 
+@@ -251,7 +227,7 @@ func TestWithTimeShouldNotOverrideFields(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.WithField("herp", "derp").WithTime(now).Info("blah")
+ 	}, func(fields Fields) {
+-		assert.Equal(t, fields["time"], now.Format(time.RFC3339))
++		assert.Equal(t, fields["time"], now.Format(defaultTimestampFormat))
+ 		assert.Equal(t, fields["herp"], "derp")
+ 	})
+ }
+@@ -262,7 +238,7 @@ func TestWithFieldShouldNotOverrideTime(t *testing.T) {
+ 	LogAndAssertJSON(t, func(log *Logger) {
+ 		log.WithTime(now).WithField("herp", "derp").Info("blah")
+ 	}, func(fields Fields) {
+-		assert.Equal(t, fields["time"], now.Format(time.RFC3339))
++		assert.Equal(t, fields["time"], now.Format(defaultTimestampFormat))
+ 		assert.Equal(t, fields["herp"], "derp")
+ 	})
+ }
+@@ -320,113 +296,10 @@ func TestDoubleLoggingDoesntPrefixPreviousFields(t *testing.T) {
+ 	err = json.Unmarshal(buffer.Bytes(), &fields)
+ 	assert.NoError(t, err, "should have decoded second message")
+ 	assert.Equal(t, len(fields), 4, "should only have msg/time/level/context fields")
+-	assert.Equal(t, "omg it is!", fields["msg"])
+-	assert.Equal(t, "eating raw fish", fields["context"])
+-	assert.Nil(t, fields["fields.msg"], "should not have prefixed previous `msg` entry")
+-
+-}
+-
+-func TestNestedLoggingReportsCorrectCaller(t *testing.T) {
+-	var buffer bytes.Buffer
+-	var fields Fields
+-
+-	logger := New()
+-	logger.Out = &buffer
+-	logger.Formatter = new(JSONFormatter)
+-	logger.ReportCaller = true
+-
+-	llog := logger.WithField("context", "eating raw fish")
+-
+-	llog.Info("looks delicious")
+-
+-	err := json.Unmarshal(buffer.Bytes(), &fields)
+-	require.NoError(t, err, "should have decoded first message")
+-	assert.Equal(t, 6, len(fields), "should have msg/time/level/func/context fields")
+-	assert.Equal(t, "looks delicious", fields["msg"])
+-	assert.Equal(t, "eating raw fish", fields["context"])
+-	assert.Equal(t,
+-		"github.com/sirupsen/logrus_test.TestNestedLoggingReportsCorrectCaller", fields["func"])
+-	cwd, err := os.Getwd()
+-	require.NoError(t, err)
+-	assert.Equal(t, filepath.ToSlash(cwd+"/logrus_test.go:340"), filepath.ToSlash(fields["file"].(string)))
+-
+-	buffer.Reset()
+-
+-	logger.WithFields(Fields{
+-		"Clyde": "Stubblefield",
+-	}).WithFields(Fields{
+-		"Jab'o": "Starks",
+-	}).WithFields(Fields{
+-		"uri": "https://www.youtube.com/watch?v=V5DTznu-9v0",
+-	}).WithFields(Fields{
+-		"func": "y drummer",
+-	}).WithFields(Fields{
+-		"James": "Brown",
+-	}).Print("The hardest workin' man in show business")
+-
+-	err = json.Unmarshal(buffer.Bytes(), &fields)
+-	assert.NoError(t, err, "should have decoded second message")
+-	assert.Equal(t, 11, len(fields), "should have all builtin fields plus foo,bar,baz,...")
+-	assert.Equal(t, "Stubblefield", fields["Clyde"])
+-	assert.Equal(t, "Starks", fields["Jab'o"])
+-	assert.Equal(t, "https://www.youtube.com/watch?v=V5DTznu-9v0", fields["uri"])
+-	assert.Equal(t, "y drummer", fields["fields.func"])
+-	assert.Equal(t, "Brown", fields["James"])
+-	assert.Equal(t, "The hardest workin' man in show business", fields["msg"])
++	assert.Equal(t, fields["msg"], "omg it is!")
++	assert.Equal(t, fields["context"], "eating raw fish")
+ 	assert.Nil(t, fields["fields.msg"], "should not have prefixed previous `msg` entry")
+-	assert.Equal(t,
+-		"github.com/sirupsen/logrus_test.TestNestedLoggingReportsCorrectCaller", fields["func"])
+-	require.NoError(t, err)
+-	assert.Equal(t, filepath.ToSlash(cwd+"/logrus_test.go:365"), filepath.ToSlash(fields["file"].(string)))
+-
+-	logger.ReportCaller = false // return to default value
+-}
+-
+-func logLoop(iterations int, reportCaller bool) {
+-	var buffer bytes.Buffer
+ 
+-	logger := New()
+-	logger.Out = &buffer
+-	logger.Formatter = new(JSONFormatter)
+-	logger.ReportCaller = reportCaller
+-
+-	for i := 0; i < iterations; i++ {
+-		logger.Infof("round %d of %d", i, iterations)
+-	}
+-}
+-
+-// Assertions for upper bounds to reporting overhead
+-func TestCallerReportingOverhead(t *testing.T) {
+-	iterations := 5000
+-	before := time.Now()
+-	logLoop(iterations, false)
+-	during := time.Now()
+-	logLoop(iterations, true)
+-	after := time.Now()
+-
+-	elapsedNotReporting := during.Sub(before).Nanoseconds()
+-	elapsedReporting := after.Sub(during).Nanoseconds()
+-
+-	maxDelta := 1 * time.Second
+-	assert.WithinDuration(t, during, before, maxDelta,
+-		"%d log calls without caller name lookup takes less than %d second(s) (was %d nanoseconds)",
+-		iterations, maxDelta.Seconds(), elapsedNotReporting)
+-	assert.WithinDuration(t, after, during, maxDelta,
+-		"%d log calls without caller name lookup takes less than %d second(s) (was %d nanoseconds)",
+-		iterations, maxDelta.Seconds(), elapsedReporting)
+-}
+-
+-// benchmarks for both with and without caller-function reporting
+-func BenchmarkWithoutCallerTracing(b *testing.B) {
+-	for i := 0; i < b.N; i++ {
+-		logLoop(1000, false)
+-	}
+-}
+-
+-func BenchmarkWithCallerTracing(b *testing.B) {
+-	for i := 0; i < b.N; i++ {
+-		logLoop(1000, true)
+-	}
+ }
+ 
+ func TestConvertLevelToString(t *testing.T) {
+diff --git a/text_formatter.go b/text_formatter.go
+index c5f9ca3..74dffcf 100644
+--- a/text_formatter.go
++++ b/text_formatter.go
+@@ -107,7 +107,7 @@ func (f *TextFormatter) isColored() bool {
+ 
+ // Format renders a single log entry
+ func (f *TextFormatter) Format(entry *Entry) ([]byte, error) {
+-	prefixFieldClashes(entry.Data, f.FieldMap, entry.HasCaller())
++	prefixFieldClashes(entry.Data, f.FieldMap)
+ 
+ 	keys := make([]string, 0, len(entry.Data))
+ 	for k := range entry.Data {
+@@ -125,10 +125,6 @@ func (f *TextFormatter) Format(entry *Entry) ([]byte, error) {
+ 	if entry.err != "" {
+ 		fixedKeys = append(fixedKeys, f.FieldMap.resolve(FieldKeyLogrusError))
+ 	}
+-	if entry.HasCaller() {
+-		fixedKeys = append(fixedKeys,
+-			f.FieldMap.resolve(FieldKeyFunc), f.FieldMap.resolve(FieldKeyFile))
+-	}
+ 
+ 	if !f.DisableSorting {
+ 		if f.SortingFunc == nil {
+@@ -173,10 +169,6 @@ func (f *TextFormatter) Format(entry *Entry) ([]byte, error) {
+ 				value = entry.Message
+ 			case f.FieldMap.resolve(FieldKeyLogrusError):
+ 				value = entry.err
+-			case f.FieldMap.resolve(FieldKeyFunc):
+-				value = entry.Caller.Function
+-			case f.FieldMap.resolve(FieldKeyFile):
+-				value = fmt.Sprintf("%s:%d", entry.Caller.File, entry.Caller.Line)
+ 			default:
+ 				value = entry.Data[key]
+ 			}
+@@ -210,19 +202,12 @@ func (f *TextFormatter) printColored(b *bytes.Buffer, entry *Entry, keys []strin
+ 	// the behavior of logrus text_formatter the same as the stdlib log package
+ 	entry.Message = strings.TrimSuffix(entry.Message, "\n")
+ 
+-	caller := ""
+-
+-	if entry.HasCaller() {
+-		caller = fmt.Sprintf("%s:%d %s()",
+-			entry.Caller.File, entry.Caller.Line, entry.Caller.Function)
+-	}
+-
+ 	if f.DisableTimestamp {
+-		fmt.Fprintf(b, "\x1b[%dm%s\x1b[0m%s %-44s ", levelColor, levelText, caller, entry.Message)
++		fmt.Fprintf(b, "\x1b[%dm%s\x1b[0m %-44s ", levelColor, levelText, entry.Message)
+ 	} else if !f.FullTimestamp {
+-		fmt.Fprintf(b, "\x1b[%dm%s\x1b[0m[%04d]%s %-44s ", levelColor, levelText, int(entry.Time.Sub(baseTimestamp)/time.Second), caller, entry.Message)
++		fmt.Fprintf(b, "\x1b[%dm%s\x1b[0m[%04d] %-44s ", levelColor, levelText, int(entry.Time.Sub(baseTimestamp)/time.Second), entry.Message)
+ 	} else {
+-		fmt.Fprintf(b, "\x1b[%dm%s\x1b[0m[%s]%s %-44s ", levelColor, levelText, entry.Time.Format(timestampFormat), caller, entry.Message)
++		fmt.Fprintf(b, "\x1b[%dm%s\x1b[0m[%s] %-44s ", levelColor, levelText, entry.Time.Format(timestampFormat), entry.Message)
+ 	}
+ 	for _, k := range keys {
+ 		v := entry.Data[k]

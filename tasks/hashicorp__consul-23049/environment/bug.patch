@@ -1,0 +1,322 @@
+diff --git a/.changelog/23049.txt b/.changelog/23049.txt
+deleted file mode 100644
+index 1d200e3c36..0000000000
+--- a/.changelog/23049.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-```release-note:bug
+-xds: fix RBAC failure in upstream service when there are more than one downstream exported service with same name but different peer
+-```
+\ No newline at end of file
+diff --git a/agent/consul/state/peering.go b/agent/consul/state/peering.go
+index 08e19a62d7..05dfa59a37 100644
+--- a/agent/consul/state/peering.go
++++ b/agent/consul/state/peering.go
+@@ -1424,9 +1424,9 @@ func peersForServiceTxn(
+ 	}
+ 
+ 	var (
+-		wildcardNamespaceIdxs []int // Indexes where namespace is wildcarded (*)
+-		wildcardServiceIdxs   []int // Indexes where service is wildcarded (*) in the matching namespace
+-		exactMatchIdxs        []int // Indexes where both service name and namespace match exactly
++		wildcardNamespaceIdx = -1
++		wildcardServiceIdx   = -1
++		exactMatchIdx        = -1
+ 	)
+ 
+ 	// Ensure the metadata is defaulted since we make assertions against potentially empty values below.
+@@ -1443,48 +1443,39 @@ func peersForServiceTxn(
+ 	for i, service := range exportedServices.Services {
+ 		switch {
+ 		case service.Namespace == structs.WildcardSpecifier:
+-			wildcardNamespaceIdxs = append(wildcardNamespaceIdxs, i)
++			wildcardNamespaceIdx = i
+ 
+ 		case service.Name == structs.WildcardSpecifier && acl.EqualNamespaces(service.Namespace, entMeta.NamespaceOrDefault()):
+-			wildcardServiceIdxs = append(wildcardServiceIdxs, i)
++			wildcardServiceIdx = i
+ 
+ 		case service.Name == serviceName && acl.EqualNamespaces(service.Namespace, entMeta.NamespaceOrDefault()):
+-			exactMatchIdxs = append(exactMatchIdxs, i) // Capture all exact matches
++			exactMatchIdx = i
+ 		}
+ 	}
+ 
+ 	var results []string
+-	peerSet := make(map[string]struct{}) // Track unique peers
+ 
+ 	// Prefer the exact match over the wildcard match. This matches how we handle intention precedence.
+-	var targetIdxs []int
++	var targetIdx int
+ 	switch {
+-	case len(exactMatchIdxs) > 0:
+-		targetIdxs = exactMatchIdxs
++	case exactMatchIdx >= 0:
++		targetIdx = exactMatchIdx
+ 
+-	case len(wildcardServiceIdxs) > 0:
+-		targetIdxs = wildcardServiceIdxs
++	case wildcardServiceIdx >= 0:
++		targetIdx = wildcardServiceIdx
+ 
+-	case len(wildcardNamespaceIdxs) > 0:
+-		targetIdxs = wildcardNamespaceIdxs
++	case wildcardNamespaceIdx >= 0:
++		targetIdx = wildcardNamespaceIdx
+ 
+ 	default:
+ 		return idx, results, nil
+ 	}
+ 
+-	// Process all target indexes and collect unique peers
+-	for _, targetIdx := range targetIdxs {
+-		for _, c := range exportedServices.Services[targetIdx].Consumers {
+-			if c.Peer != "" {
+-				// Check if peer is unique
+-				if _, exists := peerSet[c.Peer]; !exists {
+-					peerSet[c.Peer] = struct{}{}
+-					results = append(results, c.Peer)
+-				}
+-			}
++	for _, c := range exportedServices.Services[targetIdx].Consumers {
++		if c.Peer != "" {
++			results = append(results, c.Peer)
+ 		}
+ 	}
+-
+ 	return idx, results, nil
+ }
+ 
+diff --git a/agent/consul/state/peering_test.go b/agent/consul/state/peering_test.go
+index 883876ea7c..764286bb77 100644
+--- a/agent/consul/state/peering_test.go
++++ b/agent/consul/state/peering_test.go
+@@ -2569,228 +2569,6 @@ func TestStateStore_PeeringsForService(t *testing.T) {
+ 	}
+ }
+ 
+-func TestStateStore_PeeringsForService_MultipleExportsAndDeduplication(t *testing.T) {
+-	// This test specifically validates the behavior when:
+-	// 1. A service has multiple exported service entries at the same precedence level
+-	// 2. Multiple entries export to overlapping sets of peers (deduplication needed)
+-	// 3. Multiple entries export to different peers (aggregation needed)
+-
+-	s := testStateStore(t)
+-	var lastIdx uint64
+-
+-	// Create peerings
+-	peerings := []*pbpeering.Peering{
+-		{
+-			ID:    testUUID(),
+-			Name:  "peer1",
+-			State: pbpeering.PeeringState_ACTIVE,
+-		},
+-		{
+-			ID:    testUUID(),
+-			Name:  "peer2",
+-			State: pbpeering.PeeringState_ACTIVE,
+-		},
+-		{
+-			ID:    testUUID(),
+-			Name:  "peer3",
+-			State: pbpeering.PeeringState_ACTIVE,
+-		},
+-		{
+-			ID:    testUUID(),
+-			Name:  "peer4",
+-			State: pbpeering.PeeringState_ACTIVE,
+-		},
+-	}
+-
+-	for _, p := range peerings {
+-		lastIdx++
+-		require.NoError(t, s.PeeringWrite(lastIdx, &pbpeering.PeeringWriteRequest{Peering: p}))
+-	}
+-
+-	// Create a node for services
+-	svcNode := &structs.Node{Node: "test-node", Address: "127.0.0.1"}
+-	lastIdx++
+-	require.NoError(t, s.EnsureNode(lastIdx, svcNode))
+-
+-	// Create test services
+-	services := []string{"api", "web", "db"}
+-	for _, svcName := range services {
+-		lastIdx++
+-		require.NoError(t, s.EnsureService(lastIdx, svcNode.Node, &structs.NodeService{
+-			ID:      svcName,
+-			Service: svcName,
+-			Port:    8080,
+-		}))
+-	}
+-
+-	testCases := []struct {
+-		name        string
+-		entry       *structs.ExportedServicesConfigEntry
+-		queryName   string
+-		expectPeers []string
+-	}{
+-		{
+-			name: "multiple exact match entries with overlapping peers - deduplication",
+-			entry: &structs.ExportedServicesConfigEntry{
+-				Name: "default",
+-				Services: []structs.ExportedService{
+-					{
+-						Name: "api",
+-						Consumers: []structs.ServiceConsumer{
+-							{Peer: "peer1"},
+-							{Peer: "peer2"},
+-						},
+-					},
+-					{
+-						Name: "api", // Duplicate exact match
+-						Consumers: []structs.ServiceConsumer{
+-							{Peer: "peer2"}, // Duplicate peer
+-							{Peer: "peer3"},
+-						},
+-					},
+-				},
+-			},
+-			queryName:   "api",
+-			expectPeers: []string{"peer1", "peer2", "peer3"}, // peer2 should be deduplicated
+-		},
+-		{
+-			name: "multiple exact match entries with distinct peers - aggregation",
+-			entry: &structs.ExportedServicesConfigEntry{
+-				Name: "default",
+-				Services: []structs.ExportedService{
+-					{
+-						Name: "web",
+-						Consumers: []structs.ServiceConsumer{
+-							{Peer: "peer1"},
+-						},
+-					},
+-					{
+-						Name: "web",
+-						Consumers: []structs.ServiceConsumer{
+-							{Peer: "peer2"},
+-						},
+-					},
+-					{
+-						Name: "web",
+-						Consumers: []structs.ServiceConsumer{
+-							{Peer: "peer3"},
+-						},
+-					},
+-				},
+-			},
+-			queryName:   "web",
+-			expectPeers: []string{"peer1", "peer2", "peer3"},
+-		},
+-		{
+-			name: "multiple wildcard service entries - deduplication across wildcards",
+-			entry: &structs.ExportedServicesConfigEntry{
+-				Name: "default",
+-				Services: []structs.ExportedService{
+-					{
+-						Name: "*", // First wildcard
+-						Consumers: []structs.ServiceConsumer{
+-							{Peer: "peer1"},
+-							{Peer: "peer2"},
+-						},
+-					},
+-					{
+-						Name: "*", // Second wildcard
+-						Consumers: []structs.ServiceConsumer{
+-							{Peer: "peer2"}, // Duplicate
+-							{Peer: "peer3"},
+-						},
+-					},
+-				},
+-			},
+-			queryName:   "db",
+-			expectPeers: []string{"peer1", "peer2", "peer3"},
+-		},
+-		{
+-			name: "exact match takes precedence over wildcards even with multiple entries",
+-			entry: &structs.ExportedServicesConfigEntry{
+-				Name: "default",
+-				Services: []structs.ExportedService{
+-					{
+-						Name: "*", // Wildcard
+-						Consumers: []structs.ServiceConsumer{
+-							{Peer: "peer1"},
+-							{Peer: "peer2"},
+-						},
+-					},
+-					{
+-						Name: "api", // Exact match entry 1
+-						Consumers: []structs.ServiceConsumer{
+-							{Peer: "peer3"},
+-						},
+-					},
+-					{
+-						Name: "api", // Exact match entry 2
+-						Consumers: []structs.ServiceConsumer{
+-							{Peer: "peer4"},
+-						},
+-					},
+-				},
+-			},
+-			queryName:   "api",
+-			expectPeers: []string{"peer3", "peer4"}, // Should NOT include peer1, peer2 from wildcard
+-		},
+-		{
+-			name: "multiple exact matches with duplicate and non-duplicate peers",
+-			entry: &structs.ExportedServicesConfigEntry{
+-				Name: "default",
+-				Services: []structs.ExportedService{
+-					{
+-						Name: "api",
+-						Consumers: []structs.ServiceConsumer{
+-							{Peer: "peer1"},
+-							{Peer: "peer2"},
+-							{Peer: "peer3"},
+-						},
+-					},
+-					{
+-						Name: "api",
+-						Consumers: []structs.ServiceConsumer{
+-							{Peer: "peer1"}, // Duplicate
+-							{Peer: "peer3"}, // Duplicate
+-							{Peer: "peer4"}, // New
+-						},
+-					},
+-				},
+-			},
+-			queryName:   "api",
+-			expectPeers: []string{"peer1", "peer2", "peer3", "peer4"},
+-		},
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.name, func(t *testing.T) {
+-			// Write the config entry
+-			lastIdx++
+-			require.NoError(t, tc.entry.Normalize())
+-			require.NoError(t, s.EnsureConfigEntry(lastIdx, tc.entry))
+-
+-			// Query for peers
+-			idx, peers, err := s.PeeringsForService(nil, tc.queryName, *acl.DefaultEnterpriseMeta())
+-			require.NoError(t, err)
+-			require.Equal(t, lastIdx, idx)
+-
+-			// Extract peer names from results
+-			var gotPeerNames []string
+-			for _, p := range peers {
+-				gotPeerNames = append(gotPeerNames, p.Name)
+-			}
+-
+-			// Verify the result
+-			require.Len(t, gotPeerNames, len(tc.expectPeers), "unexpected number of peers returned")
+-			require.ElementsMatch(t, tc.expectPeers, gotPeerNames, "peer names don't match expected")
+-
+-			// Cleanup: delete the config entry for next test
+-			lastIdx++
+-			require.NoError(t, s.DeleteConfigEntry(lastIdx, structs.ExportedServices, tc.entry.Name, &tc.entry.EnterpriseMeta))
+-		})
+-	}
+-}
+-
+ func TestStore_TrustBundleListByService(t *testing.T) {
+ 	store := testStateStore(t)
+ 	entMeta := *acl.DefaultEnterpriseMeta()

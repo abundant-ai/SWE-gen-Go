@@ -1,0 +1,498 @@
+diff --git a/context.go b/context.go
+index 65819c6..01c7cb4 100644
+--- a/context.go
++++ b/context.go
+@@ -17,7 +17,7 @@ import (
+ 
+ 	"github.com/gin-gonic/gin/binding"
+ 	"github.com/gin-gonic/gin/render"
+-	"gopkg.in/gin-contrib/sse.v0"
++	"github.com/manucorporat/sse"
+ )
+ 
+ // Content-Type MIME of the most common data formats
+@@ -404,19 +404,6 @@ func (c *Context) requestHeader(key string) string {
+ /******** RESPONSE RENDERING ********/
+ /************************************/
+ 
+-// bodyAllowedForStatus is a copy of http.bodyAllowedForStatus non-exported function
+-func bodyAllowedForStatus(status int) bool {
+-	switch {
+-	case status >= 100 && status <= 199:
+-		return false
+-	case status == 204:
+-		return false
+-	case status == 304:
+-		return false
+-	}
+-	return true
+-}
+-
+ func (c *Context) Status(code int) {
+ 	c.writermem.WriteHeader(code)
+ }
+@@ -466,13 +453,6 @@ func (c *Context) Cookie(name string) (string, error) {
+ 
+ func (c *Context) Render(code int, r render.Render) {
+ 	c.Status(code)
+-
+-	if !bodyAllowedForStatus(code) {
+-		r.WriteContentType(c.Writer)
+-		c.Writer.WriteHeaderNow()
+-		return
+-	}
+-
+ 	if err := r.Render(c.Writer); err != nil {
+ 		panic(err)
+ 	}
+@@ -497,7 +477,10 @@ func (c *Context) IndentedJSON(code int, obj interface{}) {
+ // JSON serializes the given struct as JSON into the response body.
+ // It also sets the Content-Type as "application/json".
+ func (c *Context) JSON(code int, obj interface{}) {
+-	c.Render(code, render.JSON{Data: obj})
++	c.Status(code)
++	if err := render.WriteJSON(c.Writer, obj); err != nil {
++		panic(err)
++	}
+ }
+ 
+ // XML serializes the given struct as XML into the response body.
+@@ -513,7 +496,8 @@ func (c *Context) YAML(code int, obj interface{}) {
+ 
+ // String writes the given string into the response body.
+ func (c *Context) String(code int, format string, values ...interface{}) {
+-	c.Render(code, render.String{Format: format, Data: values})
++	c.Status(code)
++	render.WriteString(c.Writer, format, values)
+ }
+ 
+ // Redirect returns a HTTP redirect to the specific location.
+diff --git a/context_test.go b/context_test.go
+index 8071a37..fe22c49 100644
+--- a/context_test.go
++++ b/context_test.go
+@@ -7,7 +7,6 @@ package gin
+ import (
+ 	"bytes"
+ 	"errors"
+-	"fmt"
+ 	"html/template"
+ 	"mime/multipart"
+ 	"net/http"
+@@ -16,9 +15,9 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/manucorporat/sse"
+ 	"github.com/stretchr/testify/assert"
+ 	"golang.org/x/net/context"
+-	"gopkg.in/gin-contrib/sse.v0"
+ )
+ 
+ var _ context.Context = &Context{}
+@@ -382,35 +381,6 @@ func TestContextGetCookie(t *testing.T) {
+ 	assert.Equal(t, cookie, "gin")
+ }
+ 
+-func TestContextBodyAllowedForStatus(t *testing.T) {
+-	assert.Equal(t, false, bodyAllowedForStatus(102))
+-	assert.Equal(t, false, bodyAllowedForStatus(204))
+-	assert.Equal(t, false, bodyAllowedForStatus(304))
+-	assert.Equal(t, true, bodyAllowedForStatus(500))
+-}
+-
+-type TestPanicRender struct {
+-}
+-
+-func (*TestPanicRender) Render(http.ResponseWriter) error {
+-	return errors.New("TestPanicRender")
+-}
+-
+-func (*TestPanicRender) WriteContentType(http.ResponseWriter) {}
+-
+-func TestContextRenderPanicIfErr(t *testing.T) {
+-	defer func() {
+-		r := recover()
+-		assert.Equal(t, "TestPanicRender", fmt.Sprint(r))
+-	}()
+-	w := httptest.NewRecorder()
+-	c, _ := CreateTestContext(w)
+-
+-	c.Render(http.StatusOK, &TestPanicRender{})
+-
+-	assert.Fail(t, "Panic not detected")
+-}
+-
+ // Tests that the response is serialized as JSON
+ // and Content-Type is set to application/json
+ func TestContextRenderJSON(t *testing.T) {
+@@ -424,18 +394,6 @@ func TestContextRenderJSON(t *testing.T) {
+ 	assert.Equal(t, "application/json; charset=utf-8", w.HeaderMap.Get("Content-Type"))
+ }
+ 
+-// Tests that no JSON is rendered if code is 204
+-func TestContextRenderNoContentJSON(t *testing.T) {
+-	w := httptest.NewRecorder()
+-	c, _ := CreateTestContext(w)
+-
+-	c.JSON(204, H{"foo": "bar"})
+-
+-	assert.Equal(t, 204, w.Code)
+-	assert.Equal(t, "", w.Body.String())
+-	assert.Equal(t, "application/json; charset=utf-8", w.HeaderMap.Get("Content-Type"))
+-}
+-
+ // Tests that the response is serialized as JSON
+ // we change the content-type before
+ func TestContextRenderAPIJSON(t *testing.T) {
+@@ -450,19 +408,6 @@ func TestContextRenderAPIJSON(t *testing.T) {
+ 	assert.Equal(t, "application/vnd.api+json", w.HeaderMap.Get("Content-Type"))
+ }
+ 
+-// Tests that no Custom JSON is rendered if code is 204
+-func TestContextRenderNoContentAPIJSON(t *testing.T) {
+-	w := httptest.NewRecorder()
+-	c, _ := CreateTestContext(w)
+-
+-	c.Header("Content-Type", "application/vnd.api+json")
+-	c.JSON(204, H{"foo": "bar"})
+-
+-	assert.Equal(t, 204, w.Code)
+-	assert.Equal(t, "", w.Body.String())
+-	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "application/vnd.api+json")
+-}
+-
+ // Tests that the response is serialized as JSON
+ // and Content-Type is set to application/json
+ func TestContextRenderIndentedJSON(t *testing.T) {
+@@ -476,18 +421,6 @@ func TestContextRenderIndentedJSON(t *testing.T) {
+ 	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "application/json; charset=utf-8")
+ }
+ 
+-// Tests that no Custom JSON is rendered if code is 204
+-func TestContextRenderNoContentIndentedJSON(t *testing.T) {
+-	w := httptest.NewRecorder()
+-	c, _ := CreateTestContext(w)
+-
+-	c.IndentedJSON(204, H{"foo": "bar", "bar": "foo", "nested": H{"foo": "bar"}})
+-
+-	assert.Equal(t, 204, w.Code)
+-	assert.Equal(t, "", w.Body.String())
+-	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "application/json; charset=utf-8")
+-}
+-
+ // Tests that the response executes the templates
+ // and responds with Content-Type set to text/html
+ func TestContextRenderHTML(t *testing.T) {
+@@ -503,20 +436,6 @@ func TestContextRenderHTML(t *testing.T) {
+ 	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "text/html; charset=utf-8")
+ }
+ 
+-// Tests that no HTML is rendered if code is 204
+-func TestContextRenderNoContentHTML(t *testing.T) {
+-	w := httptest.NewRecorder()
+-	c, router := CreateTestContext(w)
+-	templ := template.Must(template.New("t").Parse(`Hello {{.name}}`))
+-	router.SetHTMLTemplate(templ)
+-
+-	c.HTML(204, "t", H{"name": "alexandernyquist"})
+-
+-	assert.Equal(t, 204, w.Code)
+-	assert.Equal(t, "", w.Body.String())
+-	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "text/html; charset=utf-8")
+-}
+-
+ // TestContextXML tests that the response is serialized as XML
+ // and Content-Type is set to application/xml
+ func TestContextRenderXML(t *testing.T) {
+@@ -530,18 +449,6 @@ func TestContextRenderXML(t *testing.T) {
+ 	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "application/xml; charset=utf-8")
+ }
+ 
+-// Tests that no XML is rendered if code is 204
+-func TestContextRenderNoContentXML(t *testing.T) {
+-	w := httptest.NewRecorder()
+-	c, _ := CreateTestContext(w)
+-
+-	c.XML(204, H{"foo": "bar"})
+-
+-	assert.Equal(t, 204, w.Code)
+-	assert.Equal(t, "", w.Body.String())
+-	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "application/xml; charset=utf-8")
+-}
+-
+ // TestContextString tests that the response is returned
+ // with Content-Type set to text/plain
+ func TestContextRenderString(t *testing.T) {
+@@ -555,18 +462,6 @@ func TestContextRenderString(t *testing.T) {
+ 	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "text/plain; charset=utf-8")
+ }
+ 
+-// Tests that no String is rendered if code is 204
+-func TestContextRenderNoContentString(t *testing.T) {
+-	w := httptest.NewRecorder()
+-	c, _ := CreateTestContext(w)
+-
+-	c.String(204, "test %s %d", "string", 2)
+-
+-	assert.Equal(t, 204, w.Code)
+-	assert.Equal(t, "", w.Body.String())
+-	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "text/plain; charset=utf-8")
+-}
+-
+ // TestContextString tests that the response is returned
+ // with Content-Type set to text/html
+ func TestContextRenderHTMLString(t *testing.T) {
+@@ -581,19 +476,6 @@ func TestContextRenderHTMLString(t *testing.T) {
+ 	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "text/html; charset=utf-8")
+ }
+ 
+-// Tests that no HTML String is rendered if code is 204
+-func TestContextRenderNoContentHTMLString(t *testing.T) {
+-	w := httptest.NewRecorder()
+-	c, _ := CreateTestContext(w)
+-
+-	c.Header("Content-Type", "text/html; charset=utf-8")
+-	c.String(204, "<html>%s %d</html>", "string", 3)
+-
+-	assert.Equal(t, 204, w.Code)
+-	assert.Equal(t, "", w.Body.String())
+-	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "text/html; charset=utf-8")
+-}
+-
+ // TestContextData tests that the response can be written from `bytesting`
+ // with specified MIME type
+ func TestContextRenderData(t *testing.T) {
+@@ -607,18 +489,6 @@ func TestContextRenderData(t *testing.T) {
+ 	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "text/csv")
+ }
+ 
+-// Tests that no Custom Data is rendered if code is 204
+-func TestContextRenderNoContentData(t *testing.T) {
+-	w := httptest.NewRecorder()
+-	c, _ := CreateTestContext(w)
+-
+-	c.Data(204, "text/csv", []byte(`foo,bar`))
+-
+-	assert.Equal(t, 204, w.Code)
+-	assert.Equal(t, "", w.Body.String())
+-	assert.Equal(t, w.HeaderMap.Get("Content-Type"), "text/csv")
+-}
+-
+ func TestContextRenderSSE(t *testing.T) {
+ 	w := httptest.NewRecorder()
+ 	c, _ := CreateTestContext(w)
+diff --git a/middleware_test.go b/middleware_test.go
+index c77f827..273d003 100644
+--- a/middleware_test.go
++++ b/middleware_test.go
+@@ -10,8 +10,8 @@ import (
+ 
+ 	"testing"
+ 
++	"github.com/manucorporat/sse"
+ 	"github.com/stretchr/testify/assert"
+-	"gopkg.in/gin-contrib/sse.v0"
+ )
+ 
+ func TestMiddlewareGeneralCase(t *testing.T) {
+diff --git a/render/data.go b/render/data.go
+index c296042..efa75d5 100644
+--- a/render/data.go
++++ b/render/data.go
+@@ -11,13 +11,10 @@ type Data struct {
+ 	Data        []byte
+ }
+ 
+-// Render (Data) writes data with custom ContentType
+-func (r Data) Render(w http.ResponseWriter) (err error) {
+-	r.WriteContentType(w)
+-	_, err = w.Write(r.Data)
+-	return
+-}
+-
+-func (r Data) WriteContentType(w http.ResponseWriter) {
+-	writeContentType(w, []string{r.ContentType})
++func (r Data) Render(w http.ResponseWriter) error {
++	if len(r.ContentType) > 0 {
++		w.Header()["Content-Type"] = []string{r.ContentType}
++	}
++	w.Write(r.Data)
++	return nil
+ }
+diff --git a/render/html.go b/render/html.go
+index a3cbda6..8bfb23a 100644
+--- a/render/html.go
++++ b/render/html.go
+@@ -58,14 +58,9 @@ func (r HTMLDebug) loadTemplate() *template.Template {
+ }
+ 
+ func (r HTML) Render(w http.ResponseWriter) error {
+-	r.WriteContentType(w)
+-
++	writeContentType(w, htmlContentType)
+ 	if len(r.Name) == 0 {
+ 		return r.Template.Execute(w, r.Data)
+ 	}
+ 	return r.Template.ExecuteTemplate(w, r.Name, r.Data)
+ }
+-
+-func (r HTML) WriteContentType(w http.ResponseWriter) {
+-	writeContentType(w, htmlContentType)
+-}
+diff --git a/render/json.go b/render/json.go
+index 3ee8b13..b652c4c 100644
+--- a/render/json.go
++++ b/render/json.go
+@@ -21,20 +21,13 @@ type (
+ 
+ var jsonContentType = []string{"application/json; charset=utf-8"}
+ 
+-func (r JSON) Render(w http.ResponseWriter) (err error) {
+-	if err = WriteJSON(w, r.Data); err != nil {
+-		panic(err)
+-	}
+-	return
+-}
+-
+-func (r JSON) WriteContentType(w http.ResponseWriter) {
+-	writeContentType(w, jsonContentType)
++func (r JSON) Render(w http.ResponseWriter) error {
++	return WriteJSON(w, r.Data)
+ }
+ 
+-func WriteJSON(w http.ResponseWriter, obj interface{}) error {
++func (r IndentedJSON) Render(w http.ResponseWriter) error {
+ 	writeContentType(w, jsonContentType)
+-	jsonBytes, err := json.Marshal(obj)
++	jsonBytes, err := json.MarshalIndent(r.Data, "", "    ")
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -42,16 +35,12 @@ func WriteJSON(w http.ResponseWriter, obj interface{}) error {
+ 	return nil
+ }
+ 
+-func (r IndentedJSON) Render(w http.ResponseWriter) error {
+-	r.WriteContentType(w)
+-	jsonBytes, err := json.MarshalIndent(r.Data, "", "    ")
++func WriteJSON(w http.ResponseWriter, obj interface{}) error {
++	writeContentType(w, jsonContentType)
++	jsonBytes, err := json.Marshal(obj)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	w.Write(jsonBytes)
+ 	return nil
+ }
+-
+-func (r IndentedJSON) WriteContentType(w http.ResponseWriter) {
+-	writeContentType(w, jsonContentType)
+-}
+diff --git a/render/redirect.go b/render/redirect.go
+index f874a35..bd48d7d 100644
+--- a/render/redirect.go
++++ b/render/redirect.go
+@@ -22,5 +22,3 @@ func (r Redirect) Render(w http.ResponseWriter) error {
+ 	http.Redirect(w, r.Request, r.Location, r.Code)
+ 	return nil
+ }
+-
+-func (r Redirect) WriteContentType(http.ResponseWriter) {}
+diff --git a/render/render.go b/render/render.go
+index 7e99737..3808666 100644
+--- a/render/render.go
++++ b/render/render.go
+@@ -8,7 +8,6 @@ import "net/http"
+ 
+ type Render interface {
+ 	Render(http.ResponseWriter) error
+-	WriteContentType(w http.ResponseWriter)
+ }
+ 
+ var (
+diff --git a/render/text.go b/render/text.go
+index 74cd26b..5a9e280 100644
+--- a/render/text.go
++++ b/render/text.go
+@@ -22,12 +22,9 @@ func (r String) Render(w http.ResponseWriter) error {
+ 	return nil
+ }
+ 
+-func (r String) WriteContentType(w http.ResponseWriter) {
+-	writeContentType(w, plainContentType)
+-}
+-
+ func WriteString(w http.ResponseWriter, format string, data []interface{}) {
+ 	writeContentType(w, plainContentType)
++
+ 	if len(data) > 0 {
+ 		fmt.Fprintf(w, format, data...)
+ 	} else {
+diff --git a/render/xml.go b/render/xml.go
+index cff1ac3..be22e6f 100644
+--- a/render/xml.go
++++ b/render/xml.go
+@@ -16,10 +16,6 @@ type XML struct {
+ var xmlContentType = []string{"application/xml; charset=utf-8"}
+ 
+ func (r XML) Render(w http.ResponseWriter) error {
+-	r.WriteContentType(w)
+-	return xml.NewEncoder(w).Encode(r.Data)
+-}
+-
+-func (r XML) WriteContentType(w http.ResponseWriter) {
+ 	writeContentType(w, xmlContentType)
++	return xml.NewEncoder(w).Encode(r.Data)
+ }
+diff --git a/render/yaml.go b/render/yaml.go
+index 25d0ebd..46937d8 100644
+--- a/render/yaml.go
++++ b/render/yaml.go
+@@ -17,7 +17,7 @@ type YAML struct {
+ var yamlContentType = []string{"application/x-yaml; charset=utf-8"}
+ 
+ func (r YAML) Render(w http.ResponseWriter) error {
+-	r.WriteContentType(w)
++	writeContentType(w, yamlContentType)
+ 
+ 	bytes, err := yaml.Marshal(r.Data)
+ 	if err != nil {
+@@ -27,7 +27,3 @@ func (r YAML) Render(w http.ResponseWriter) error {
+ 	w.Write(bytes)
+ 	return nil
+ }
+-
+-func (r YAML) WriteContentType(w http.ResponseWriter) {
+-	writeContentType(w, yamlContentType)
+-}
+diff --git a/vendor/vendor.json b/vendor/vendor.json
+index e754a3f..3c6b0ed 100644
+--- a/vendor/vendor.json
++++ b/vendor/vendor.json
+@@ -21,6 +21,12 @@
+ 			"revision": "8ee79997227bf9b34611aee7946ae64735e6fd93",
+ 			"revisionTime": "2016-11-17T03:31:26Z"
+ 		},
++		{
++			"checksumSHA1": "b0T0Hzd+zYk+OCDTFMps+jwa/nY=",
++			"path": "github.com/manucorporat/sse",
++			"revision": "ee05b128a739a0fb76c7ebd3ae4810c1de808d6d",
++			"revisionTime": "2016-01-26T18:01:36Z"
++		},
+ 		{
+ 			"checksumSHA1": "9if9IBLsxkarJ804NPWAzgskIAk=",
+ 			"path": "github.com/manucorporat/stats",
+@@ -60,12 +66,6 @@
+ 			"revision": "478fcf54317e52ab69f40bb4c7a1520288d7f7ea",
+ 			"revisionTime": "2016-12-05T15:46:50Z"
+ 		},
+-		{
+-			"checksumSHA1": "pyAPYrymvmZl0M/Mr4yfjOQjA8I=",
+-			"path": "gopkg.in/gin-contrib/sse.v0",
+-			"revision": "22d885f9ecc78bf4ee5d72b937e4bbcdc58e8cae",
+-			"revisionTime": "2017-01-09T09:34:21Z"
+-		},
+ 		{
+ 			"checksumSHA1": "39V1idWER42Lmcmg2Uy40wMzOlo=",
+ 			"comment": "v8.18.1",

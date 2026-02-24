@@ -1,0 +1,149 @@
+diff --git a/mux.go b/mux.go
+index 3263a00..d66ec38 100644
+--- a/mux.go
++++ b/mux.go
+@@ -53,6 +53,8 @@ type Router struct {
+ 	// This has no effect when go1.7+ is used, since the context is stored
+ 	// on the request itself.
+ 	KeepContext bool
++	// see Router.UseEncodedPath(). This defines a flag for all routes.
++	useEncodedPath bool
+ }
+ 
+ // Match matches registered routes against the request.
+@@ -77,7 +79,10 @@ func (r *Router) Match(req *http.Request, match *RouteMatch) bool {
+ // mux.Vars(request).
+ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+ 	if !r.skipClean {
+-		path := getPath(req)
++		path := req.URL.Path
++		if r.useEncodedPath {
++			path = getPath(req)
++		}
+ 		// Clean path to canonical form and redirect.
+ 		if p := cleanPath(path); p != path {
+ 
+@@ -152,6 +157,21 @@ func (r *Router) SkipClean(value bool) *Router {
+ 	return r
+ }
+ 
++// UseEncodedPath tells the router to match the encoded original path
++// to the routes.
++// For eg. "/path/foo%2Fbar/to" will match the path "/path/{var}/to".
++// This behavior has the drawback of needing to match routes against
++// r.RequestURI instead of r.URL.Path. Any modifications (such as http.StripPrefix)
++// to r.URL.Path will not affect routing when this flag is on and thus may
++// induce unintended behavior.
++//
++// If not called, the router will match the unencoded path to the routes.
++// For eg. "/path/foo%2Fbar/to" will match the path "/path/foo/bar/to"
++func (r *Router) UseEncodedPath() *Router {
++	r.useEncodedPath = true
++	return r
++}
++
+ // ----------------------------------------------------------------------------
+ // parentRoute
+ // ----------------------------------------------------------------------------
+@@ -189,7 +209,7 @@ func (r *Router) buildVars(m map[string]string) map[string]string {
+ 
+ // NewRoute registers an empty route.
+ func (r *Router) NewRoute() *Route {
+-	route := &Route{parent: r, strictSlash: r.strictSlash, skipClean: r.skipClean}
++	route := &Route{parent: r, strictSlash: r.strictSlash, skipClean: r.skipClean, useEncodedPath: r.useEncodedPath}
+ 	r.routes = append(r.routes, route)
+ 	return route
+ }
+diff --git a/regexp.go b/regexp.go
+index f645332..fd8fe39 100644
+--- a/regexp.go
++++ b/regexp.go
+@@ -24,7 +24,7 @@ import (
+ // Previously we accepted only Python-like identifiers for variable
+ // names ([a-zA-Z_][a-zA-Z0-9_]*), but currently the only restriction is that
+ // name and pattern can't be empty, and names can't contain a colon.
+-func newRouteRegexp(tpl string, matchHost, matchPrefix, matchQuery, strictSlash bool) (*routeRegexp, error) {
++func newRouteRegexp(tpl string, matchHost, matchPrefix, matchQuery, strictSlash, useEncodedPath bool) (*routeRegexp, error) {
+ 	// Check if it is well-formed.
+ 	idxs, errBraces := braceIndices(tpl)
+ 	if errBraces != nil {
+@@ -111,14 +111,15 @@ func newRouteRegexp(tpl string, matchHost, matchPrefix, matchQuery, strictSlash
+ 	}
+ 	// Done!
+ 	return &routeRegexp{
+-		template:    template,
+-		matchHost:   matchHost,
+-		matchQuery:  matchQuery,
+-		strictSlash: strictSlash,
+-		regexp:      reg,
+-		reverse:     reverse.String(),
+-		varsN:       varsN,
+-		varsR:       varsR,
++		template:       template,
++		matchHost:      matchHost,
++		matchQuery:     matchQuery,
++		strictSlash:    strictSlash,
++		useEncodedPath: useEncodedPath,
++		regexp:         reg,
++		reverse:        reverse.String(),
++		varsN:          varsN,
++		varsR:          varsR,
+ 	}, nil
+ }
+ 
+@@ -133,6 +134,9 @@ type routeRegexp struct {
+ 	matchQuery bool
+ 	// The strictSlash value defined on the route, but disabled if PathPrefix was used.
+ 	strictSlash bool
++	// Determines whether to use encoded path from getPath function or unencoded
++	// req.URL.Path for path matching
++	useEncodedPath bool
+ 	// Expanded regexp.
+ 	regexp *regexp.Regexp
+ 	// Reverse template.
+@@ -149,7 +153,10 @@ func (r *routeRegexp) Match(req *http.Request, match *RouteMatch) bool {
+ 		if r.matchQuery {
+ 			return r.matchQueryString(req)
+ 		}
+-		path := getPath(req)
++		path := req.URL.Path
++		if r.useEncodedPath {
++			path = getPath(req)
++		}
+ 		return r.regexp.MatchString(path)
+ 	}
+ 
+@@ -253,7 +260,10 @@ func (v *routeRegexpGroup) setMatch(req *http.Request, m *RouteMatch, r *Route)
+ 			extractVars(host, matches, v.host.varsN, m.Vars)
+ 		}
+ 	}
+-	path := getPath(req)
++	path := req.URL.Path
++	if r.useEncodedPath {
++		path = getPath(req)
++	}
+ 	// Store path variables.
+ 	if v.path != nil {
+ 		matches := v.path.regexp.FindStringSubmatchIndex(path)
+diff --git a/route.go b/route.go
+index 6c53f9f..293b6d4 100644
+--- a/route.go
++++ b/route.go
+@@ -29,6 +29,8 @@ type Route struct {
+ 	// If true, when the path pattern is "/path//to", accessing "/path//to"
+ 	// will not redirect
+ 	skipClean bool
++	// If true, "/path/foo%2Fbar/to" will match the path "/path/{var}/to"
++	useEncodedPath bool
+ 	// If true, this route never matches: it is only used to build URLs.
+ 	buildOnly bool
+ 	// The name used to build URLs.
+@@ -158,7 +160,7 @@ func (r *Route) addRegexpMatcher(tpl string, matchHost, matchPrefix, matchQuery
+ 			tpl = strings.TrimRight(r.regexp.path.template, "/") + tpl
+ 		}
+ 	}
+-	rr, err := newRouteRegexp(tpl, matchHost, matchPrefix, matchQuery, r.strictSlash)
++	rr, err := newRouteRegexp(tpl, matchHost, matchPrefix, matchQuery, r.strictSlash, r.useEncodedPath)
+ 	if err != nil {
+ 		return err
+ 	}

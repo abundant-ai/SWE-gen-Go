@@ -1,0 +1,433 @@
+diff --git a/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go b/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go
+index e6204725..494314f2 100644
+--- a/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go
++++ b/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go
+@@ -54,9 +54,18 @@ func init() {
+ 	balancer.Register(pickfirstBuilder{})
+ }
+ 
+-// enableHealthListenerKeyType is a unique key type used in resolver
+-// attributes to indicate whether the health listener usage is enabled.
+-type enableHealthListenerKeyType struct{}
++type (
++	// enableHealthListenerKeyType is a unique key type used in resolver
++	// attributes to indicate whether the health listener usage is enabled.
++	enableHealthListenerKeyType struct{}
++	// managedByPickfirstKeyType is an attribute key type to inform Outlier
++	// Detection that the generic health listener is being used.
++	// TODO: https://github.com/grpc/grpc-go/issues/7915 - Remove this when
++	// implementing the dualstack design. This is a hack. Once Dualstack is
++	// completed, outlier detection will stop sending ejection updates through
++	// the connectivity listener.
++	managedByPickfirstKeyType struct{}
++)
+ 
+ var (
+ 	logger = grpclog.Component("pick-first-leaf-lb")
+@@ -140,6 +149,17 @@ func EnableHealthListener(state resolver.State) resolver.State {
+ 	return state
+ }
+ 
++// IsManagedByPickfirst returns whether an address belongs to a SubConn
++// managed by the pickfirst LB policy.
++// TODO: https://github.com/grpc/grpc-go/issues/7915 - This is a hack to disable
++// outlier_detection via the with connectivity listener when using pick_first.
++// Once Dualstack changes are complete, all SubConns will be created by
++// pick_first and outlier detection will only use the health listener for
++// ejection. This hack can then be removed.
++func IsManagedByPickfirst(addr resolver.Address) bool {
++	return addr.BalancerAttributes.Value(managedByPickfirstKeyType{}) != nil
++}
++
+ type pfConfig struct {
+ 	serviceconfig.LoadBalancingConfig `json:"-"`
+ 
+@@ -166,6 +186,7 @@ type scData struct {
+ }
+ 
+ func (b *pickfirstBalancer) newSCData(addr resolver.Address) (*scData, error) {
++	addr.BalancerAttributes = addr.BalancerAttributes.WithValue(managedByPickfirstKeyType{}, true)
+ 	sd := &scData{
+ 		rawConnectivityState: connectivity.Idle,
+ 		effectiveState:       connectivity.Idle,
+diff --git a/xds/internal/balancer/outlierdetection/balancer.go b/xds/internal/balancer/outlierdetection/balancer.go
+index 1b0149e3..bc5cea40 100644
+--- a/xds/internal/balancer/outlierdetection/balancer.go
++++ b/xds/internal/balancer/outlierdetection/balancer.go
+@@ -32,6 +32,7 @@ import (
+ 	"time"
+ 
+ 	"google.golang.org/grpc/balancer"
++	"google.golang.org/grpc/balancer/pickfirst/pickfirstleaf"
+ 	"google.golang.org/grpc/connectivity"
+ 	"google.golang.org/grpc/internal/balancer/gracefulswitch"
+ 	"google.golang.org/grpc/internal/buffer"
+@@ -466,10 +467,12 @@ func (b *outlierDetectionBalancer) UpdateState(s balancer.State) {
+ func (b *outlierDetectionBalancer) NewSubConn(addrs []resolver.Address, opts balancer.NewSubConnOptions) (balancer.SubConn, error) {
+ 	oldListener := opts.StateListener
+ 	scw := &subConnWrapper{
+-		addresses:         addrs,
+-		scUpdateCh:        b.scUpdateCh,
+-		listener:          oldListener,
+-		latestHealthState: balancer.SubConnState{ConnectivityState: connectivity.Connecting},
++		addresses:                  addrs,
++		scUpdateCh:                 b.scUpdateCh,
++		listener:                   oldListener,
++		latestRawConnectivityState: balancer.SubConnState{ConnectivityState: connectivity.Idle},
++		latestHealthState:          balancer.SubConnState{ConnectivityState: connectivity.Connecting},
++		healthListenerEnabled:      len(addrs) == 1 && pickfirstleaf.IsManagedByPickfirst(addrs[0]),
+ 	}
+ 	opts.StateListener = func(state balancer.SubConnState) { b.updateSubConnState(scw, state) }
+ 	b.mu.Lock()
+diff --git a/xds/internal/balancer/outlierdetection/balancer_test.go b/xds/internal/balancer/outlierdetection/balancer_test.go
+index 491afa4f..061c1880 100644
+--- a/xds/internal/balancer/outlierdetection/balancer_test.go
++++ b/xds/internal/balancer/outlierdetection/balancer_test.go
+@@ -698,27 +698,20 @@ func (s) TestUpdateAddresses(t *testing.T) {
+ 	scsCh := testutils.NewChannel()
+ 	var scw1, scw2 balancer.SubConn
+ 	var err error
+-	connectivityCh := make(chan struct{})
+ 	stub.Register(t.Name(), stub.BalancerFuncs{
+ 		UpdateClientConnState: func(bd *stub.BalancerData, _ balancer.ClientConnState) error {
+ 			scw1, err = bd.ClientConn.NewSubConn([]resolver.Address{{Addr: "address1"}}, balancer.NewSubConnOptions{
+-				StateListener: func(balancer.SubConnState) {},
++				StateListener: func(state balancer.SubConnState) { scsCh.Send(subConnWithState{sc: scw1, state: state}) },
+ 			})
+ 			if err != nil {
+ 				t.Errorf("error in od.NewSubConn call: %v", err)
+ 			}
+-			scw1.Connect()
+ 			scw2, err = bd.ClientConn.NewSubConn([]resolver.Address{{Addr: "address2"}}, balancer.NewSubConnOptions{
+-				StateListener: func(state balancer.SubConnState) {
+-					if state.ConnectivityState == connectivity.Ready {
+-						close(connectivityCh)
+-					}
+-				},
++				StateListener: func(state balancer.SubConnState) { scsCh.Send(subConnWithState{sc: scw2, state: state}) },
+ 			})
+ 			if err != nil {
+ 				t.Errorf("error in od.NewSubConn call: %v", err)
+ 			}
+-			scw2.Connect()
+ 			bd.ClientConn.UpdateState(balancer.State{
+ 				ConnectivityState: connectivity.Ready,
+ 				Picker: &rrPicker{
+@@ -760,33 +753,6 @@ func (s) TestUpdateAddresses(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 
+-	// Transition SubConns to READY so that they can register a health listener.
+-	for range 2 {
+-		select {
+-		case <-ctx.Done():
+-			t.Fatalf("Timed out waiting for creation of new SubConn.")
+-		case sc := <-tcc.NewSubConnCh:
+-			sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
+-			sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Ready})
+-		}
+-	}
+-
+-	// Register health listeners after all the connectivity updates are
+-	// processed to avoid data races while accessing the health listener within
+-	// the TestClientConn.
+-	select {
+-	case <-ctx.Done():
+-		t.Fatal("Context timed out waiting for all SubConns to become READY.")
+-	case <-connectivityCh:
+-	}
+-
+-	scw1.RegisterHealthListener(func(healthState balancer.SubConnState) {
+-		scsCh.Send(subConnWithState{sc: scw1, state: healthState})
+-	})
+-	scw2.RegisterHealthListener(func(healthState balancer.SubConnState) {
+-		scsCh.Send(subConnWithState{sc: scw2, state: healthState})
+-	})
+-
+ 	// Setup the system to where one address is ejected and one address
+ 	// isn't.
+ 	select {
+@@ -863,7 +829,7 @@ func (s) TestUpdateAddresses(t *testing.T) {
+ 	}
+ 	if err = scwsEqual(gotSCWS.(subConnWithState), subConnWithState{
+ 		sc:    scw1,
+-		state: balancer.SubConnState{ConnectivityState: connectivity.Connecting},
++		state: balancer.SubConnState{ConnectivityState: connectivity.Idle},
+ 	}); err != nil {
+ 		t.Fatalf("Error in Sub Conn update: %v", err)
+ 	}
+@@ -1039,34 +1005,26 @@ func (s) TestEjectUnejectSuccessRate(t *testing.T) {
+ 	scsCh := testutils.NewChannel()
+ 	var scw1, scw2, scw3 balancer.SubConn
+ 	var err error
+-	connectivityCh := make(chan struct{})
+ 	stub.Register(t.Name(), stub.BalancerFuncs{
+ 		UpdateClientConnState: func(bd *stub.BalancerData, _ balancer.ClientConnState) error {
+ 			scw1, err = bd.ClientConn.NewSubConn([]resolver.Address{{Addr: "address1"}}, balancer.NewSubConnOptions{
+-				StateListener: func(balancer.SubConnState) {},
++				StateListener: func(state balancer.SubConnState) { scsCh.Send(subConnWithState{sc: scw1, state: state}) },
+ 			})
+ 			if err != nil {
+ 				t.Errorf("error in od.NewSubConn call: %v", err)
+ 			}
+-			scw1.Connect()
+ 			scw2, err = bd.ClientConn.NewSubConn([]resolver.Address{{Addr: "address2"}}, balancer.NewSubConnOptions{
+-				StateListener: func(balancer.SubConnState) {},
++				StateListener: func(state balancer.SubConnState) { scsCh.Send(subConnWithState{sc: scw2, state: state}) },
+ 			})
+ 			if err != nil {
+ 				t.Errorf("error in od.NewSubConn call: %v", err)
+ 			}
+-			scw2.Connect()
+ 			scw3, err = bd.ClientConn.NewSubConn([]resolver.Address{{Addr: "address3"}}, balancer.NewSubConnOptions{
+-				StateListener: func(state balancer.SubConnState) {
+-					if state.ConnectivityState == connectivity.Ready {
+-						close(connectivityCh)
+-					}
+-				},
++				StateListener: func(state balancer.SubConnState) { scsCh.Send(subConnWithState{sc: scw3, state: state}) },
+ 			})
+ 			if err != nil {
+ 				t.Errorf("error in od.NewSubConn call: %v", err)
+ 			}
+-			scw3.Connect()
+ 			bd.ClientConn.UpdateState(balancer.State{
+ 				ConnectivityState: connectivity.Ready,
+ 				Picker: &rrPicker{
+@@ -1111,37 +1069,6 @@ func (s) TestEjectUnejectSuccessRate(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 
+-	// Transition the SubConns to READY so that they can register health
+-	// listeners.
+-	for range 3 {
+-		select {
+-		case <-ctx.Done():
+-			t.Fatalf("Timed out waiting for creation of new SubConn.")
+-		case sc := <-tcc.NewSubConnCh:
+-			sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
+-			sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Ready})
+-		}
+-	}
+-
+-	// Register health listeners after all the connectivity updates are
+-	// processed to avoid data races while accessing the health listener within
+-	// the TestClientConn.
+-	select {
+-	case <-ctx.Done():
+-		t.Fatal("Context timed out waiting for all SubConns to become READY.")
+-	case <-connectivityCh:
+-	}
+-
+-	scw1.RegisterHealthListener(func(healthState balancer.SubConnState) {
+-		scsCh.Send(subConnWithState{sc: scw1, state: healthState})
+-	})
+-	scw2.RegisterHealthListener(func(healthState balancer.SubConnState) {
+-		scsCh.Send(subConnWithState{sc: scw2, state: healthState})
+-	})
+-	scw3.RegisterHealthListener(func(healthState balancer.SubConnState) {
+-		scsCh.Send(subConnWithState{sc: scw3, state: healthState})
+-	})
+-
+ 	select {
+ 	case <-ctx.Done():
+ 		t.Fatalf("timeout while waiting for a UpdateState call on the ClientConn")
+@@ -1171,12 +1098,9 @@ func (s) TestEjectUnejectSuccessRate(t *testing.T) {
+ 
+ 		// Since no addresses are ejected, a SubConn update should forward down
+ 		// to the child.
+-		od.scUpdateCh.Put(&scHealthUpdate{
+-			scw: scw1.(*subConnWrapper),
+-			state: balancer.SubConnState{
+-				ConnectivityState: connectivity.Connecting,
+-			}},
+-		)
++		od.updateSubConnState(scw1.(*subConnWrapper), balancer.SubConnState{
++			ConnectivityState: connectivity.Connecting,
++		})
+ 
+ 		gotSCWS, err := scsCh.Receive(ctx)
+ 		if err != nil {
+@@ -1239,9 +1163,8 @@ func (s) TestEjectUnejectSuccessRate(t *testing.T) {
+ 		// that address should not be forwarded downward. These SubConn updates
+ 		// will be cached to update the child sometime in the future when the
+ 		// address gets unejected.
+-		od.scUpdateCh.Put(&scHealthUpdate{
+-			scw:   scw3.(*subConnWrapper),
+-			state: balancer.SubConnState{ConnectivityState: connectivity.Connecting},
++		od.updateSubConnState(scw3.(*subConnWrapper), balancer.SubConnState{
++			ConnectivityState: connectivity.Connecting,
+ 		})
+ 		sCtx, cancel = context.WithTimeout(context.Background(), defaultTestShortTimeout)
+ 		defer cancel()
+@@ -1292,37 +1215,29 @@ func (s) TestEjectFailureRate(t *testing.T) {
+ 	scsCh := testutils.NewChannel()
+ 	var scw1, scw2, scw3 balancer.SubConn
+ 	var err error
+-	connectivityCh := make(chan struct{})
+ 	stub.Register(t.Name(), stub.BalancerFuncs{
+ 		UpdateClientConnState: func(bd *stub.BalancerData, _ balancer.ClientConnState) error {
+ 			if scw1 != nil { // UpdateClientConnState was already called, no need to recreate SubConns.
+ 				return nil
+ 			}
+ 			scw1, err = bd.ClientConn.NewSubConn([]resolver.Address{{Addr: "address1"}}, balancer.NewSubConnOptions{
+-				StateListener: func(balancer.SubConnState) {},
++				StateListener: func(state balancer.SubConnState) { scsCh.Send(subConnWithState{sc: scw1, state: state}) },
+ 			})
+ 			if err != nil {
+ 				t.Errorf("error in od.NewSubConn call: %v", err)
+ 			}
+-			scw1.Connect()
+ 			scw2, err = bd.ClientConn.NewSubConn([]resolver.Address{{Addr: "address2"}}, balancer.NewSubConnOptions{
+-				StateListener: func(balancer.SubConnState) {},
++				StateListener: func(state balancer.SubConnState) { scsCh.Send(subConnWithState{sc: scw2, state: state}) },
+ 			})
+ 			if err != nil {
+ 				t.Errorf("error in od.NewSubConn call: %v", err)
+ 			}
+-			scw2.Connect()
+ 			scw3, err = bd.ClientConn.NewSubConn([]resolver.Address{{Addr: "address3"}}, balancer.NewSubConnOptions{
+-				StateListener: func(scs balancer.SubConnState) {
+-					if scs.ConnectivityState == connectivity.Ready {
+-						close(connectivityCh)
+-					}
+-				},
++				StateListener: func(state balancer.SubConnState) { scsCh.Send(subConnWithState{sc: scw3, state: state}) },
+ 			})
+ 			if err != nil {
+ 				t.Errorf("error in od.NewSubConn call: %v", err)
+ 			}
+-			scw3.Connect()
+ 			return nil
+ 		},
+ 	})
+@@ -1368,36 +1283,6 @@ func (s) TestEjectFailureRate(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 
+-	// Transition the SubConns to READY so that they can register health
+-	// listeners.
+-	for range 3 {
+-		select {
+-		case <-ctx.Done():
+-			t.Fatal("Timed out waiting for creation of new SubConn.")
+-		case sc := <-tcc.NewSubConnCh:
+-			sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Connecting})
+-			sc.UpdateState(balancer.SubConnState{ConnectivityState: connectivity.Ready})
+-		}
+-	}
+-	// Register health listeners after all the connectivity updates are
+-	// processed to avoid data races while accessing the health listener within
+-	// the TestClientConn.
+-	select {
+-	case <-ctx.Done():
+-		t.Fatal("Context timed out waiting for all SubConns to become READY.")
+-	case <-connectivityCh:
+-	}
+-
+-	scw1.RegisterHealthListener(func(healthState balancer.SubConnState) {
+-		scsCh.Send(subConnWithState{sc: scw1, state: healthState})
+-	})
+-	scw2.RegisterHealthListener(func(healthState balancer.SubConnState) {
+-		scsCh.Send(subConnWithState{sc: scw2, state: healthState})
+-	})
+-	scw3.RegisterHealthListener(func(healthState balancer.SubConnState) {
+-		scsCh.Send(subConnWithState{sc: scw3, state: healthState})
+-	})
+-
+ 	select {
+ 	case <-ctx.Done():
+ 		t.Fatalf("timeout while waiting for a UpdateState call on the ClientConn")
+@@ -1493,7 +1378,7 @@ func (s) TestEjectFailureRate(t *testing.T) {
+ 		}
+ 		if err = scwsEqual(gotSCWS.(subConnWithState), subConnWithState{
+ 			sc:    scw3,
+-			state: balancer.SubConnState{ConnectivityState: connectivity.Connecting},
++			state: balancer.SubConnState{ConnectivityState: connectivity.Idle},
+ 		}); err != nil {
+ 			t.Fatalf("Error in Sub Conn update: %v", err)
+ 		}
+diff --git a/xds/internal/balancer/outlierdetection/subconn_wrapper.go b/xds/internal/balancer/outlierdetection/subconn_wrapper.go
+index b893ea68..2c390d23 100644
+--- a/xds/internal/balancer/outlierdetection/subconn_wrapper.go
++++ b/xds/internal/balancer/outlierdetection/subconn_wrapper.go
+@@ -40,6 +40,16 @@ type subConnWrapper struct {
+ 	// that.
+ 
+ 	listener func(balancer.SubConnState)
++	// healthListenerEnabled indicates whether the leaf LB policy is using a
++	// generic health listener. When enabled, ejection updates are sent via the
++	// health listener instead of the connectivity listener. Once Dualstack
++	// changes are complete, all SubConns will be created by pickfirst which
++	// uses the health listener.
++	// TODO: https://github.com/grpc/grpc-go/issues/7915 - Once Dualstack
++	// changes are complete, all SubConns will be created by pick_first and
++	// outlier detection will only use the health listener for ejection and
++	// this field can be removed.
++	healthListenerEnabled bool
+ 
+ 	scUpdateCh *buffer.Unbounded
+ 
+@@ -57,6 +67,9 @@ type subConnWrapper struct {
+ 	// latestHealthState is tracked to update the child policy during
+ 	// unejection.
+ 	latestHealthState balancer.SubConnState
++	// latestRawConnectivityState is tracked to update the child policy during
++	// unejection.
++	latestRawConnectivityState balancer.SubConnState
+ 
+ 	// Access to the following fields are protected by a mutex. These fields
+ 	// should not be accessed from outside this file, instead use methods
+@@ -101,7 +114,12 @@ func (scw *subConnWrapper) RegisterHealthListener(listener func(balancer.SubConn
+ 	// pick_first the universal leaf policy (see A61), both these mechanisms
+ 	// started using the new health listener to make health signal visible to
+ 	// the petiole policies without affecting the underlying connectivity
+-	// management of the pick_first policy.
++	// management of the pick_first policy
++	if !scw.healthListenerEnabled {
++		logger.Errorf("Health listener unexpectedly registered on SubConn %v.", scw)
++		return
++	}
++
+ 	scw.mu.Lock()
+ 	defer scw.mu.Unlock()
+ 
+@@ -139,6 +157,12 @@ func (scw *subConnWrapper) updateSubConnHealthState(scs balancer.SubConnState) {
+ // updateSubConnConnectivityState stores the latest connectivity state for
+ // unejection and updates the raw connectivity listener.
+ func (scw *subConnWrapper) updateSubConnConnectivityState(scs balancer.SubConnState) {
++	scw.latestRawConnectivityState = scs
++	// If the raw connectivity listener is used for ejection, and the SubConn is
++	// ejected, don't send the update.
++	if scw.ejected && !scw.healthListenerEnabled {
++		return
++	}
+ 	if scw.listener != nil {
+ 		scw.listener(scs)
+ 	}
+@@ -152,6 +176,12 @@ func (scw *subConnWrapper) clearHealthListener() {
+ 
+ func (scw *subConnWrapper) handleUnejection() {
+ 	scw.ejected = false
++	if !scw.healthListenerEnabled {
++		// If scw.latestRawConnectivityState has never been written to will
++		// default to connectivity IDLE, which is fine.
++		scw.updateSubConnConnectivityState(scw.latestRawConnectivityState)
++		return
++	}
+ 	// If scw.latestHealthState has never been written to will use the health
+ 	// state CONNECTING set during object creation.
+ 	scw.updateSubConnHealthState(scw.latestHealthState)
+@@ -162,6 +192,12 @@ func (scw *subConnWrapper) handleEjection() {
+ 	stateToUpdate := balancer.SubConnState{
+ 		ConnectivityState: connectivity.TransientFailure,
+ 	}
++	if !scw.healthListenerEnabled {
++		if scw.listener != nil {
++			scw.listener(stateToUpdate)
++		}
++		return
++	}
+ 	scw.mu.Lock()
+ 	defer scw.mu.Unlock()
+ 	if scw.healthListener != nil {

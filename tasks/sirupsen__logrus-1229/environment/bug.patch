@@ -1,0 +1,216 @@
+diff --git a/entry.go b/entry.go
+index e02e057..1e32a64 100644
+--- a/entry.go
++++ b/entry.go
+@@ -78,20 +78,8 @@ func NewEntry(logger *Logger) *Entry {
+ 	}
+ }
+ 
+-func (entry *Entry) Dup() *Entry {
+-	data := make(Fields, len(entry.Data))
+-	for k, v := range entry.Data {
+-		data[k] = v
+-	}
+-	return &Entry{Logger: entry.Logger, Data: data, Time: entry.Time, Context: entry.Context, err: entry.err}
+-}
+-
+ // Returns the bytes representation of this entry from the formatter.
+ func (entry *Entry) Bytes() ([]byte, error) {
+-	return entry.bytes_nolock()
+-}
+-
+-func (entry *Entry) bytes_nolock() ([]byte, error) {
+ 	return entry.Logger.Formatter.Format(entry)
+ }
+ 
+@@ -224,49 +212,51 @@ func (entry Entry) HasCaller() (has bool) {
+ 
+ // This function is not declared with a pointer value because otherwise
+ // race conditions will occur when using multiple goroutines
+-func (entry *Entry) log(level Level, msg string) {
++func (entry Entry) log(level Level, msg string) {
+ 	var buffer *bytes.Buffer
+ 
+-	newEntry := entry.Dup()
+-
+-	if newEntry.Time.IsZero() {
+-		newEntry.Time = time.Now()
++	// Default to now, but allow users to override if they want.
++	//
++	// We don't have to worry about polluting future calls to Entry#log()
++	// with this assignment because this function is declared with a
++	// non-pointer receiver.
++	if entry.Time.IsZero() {
++		entry.Time = time.Now()
+ 	}
+ 
+-	newEntry.Level = level
+-	newEntry.Message = msg
+-
+-	newEntry.Logger.mu.Lock()
+-	reportCaller := newEntry.Logger.ReportCaller
+-	newEntry.Logger.mu.Unlock()
+-
+-	if reportCaller {
+-		newEntry.Caller = getCaller()
++	entry.Level = level
++	entry.Message = msg
++	entry.Logger.mu.Lock()
++	if entry.Logger.ReportCaller {
++		entry.Caller = getCaller()
+ 	}
++	entry.Logger.mu.Unlock()
+ 
+-	newEntry.fireHooks()
++	entry.fireHooks()
+ 
+ 	buffer = getBuffer()
+ 	defer func() {
+-		newEntry.Buffer = nil
++		entry.Buffer = nil
+ 		putBuffer(buffer)
+ 	}()
+ 	buffer.Reset()
+-	newEntry.Buffer = buffer
++	entry.Buffer = buffer
+ 
+-	newEntry.write()
++	entry.write()
+ 
+-	newEntry.Buffer = nil
++	entry.Buffer = nil
+ 
+ 	// To avoid Entry#log() returning a value that only would make sense for
+ 	// panic() to use in Entry#Panic(), we avoid the allocation by checking
+ 	// directly here.
+ 	if level <= PanicLevel {
+-		panic(newEntry)
++		panic(&entry)
+ 	}
+ }
+ 
+ func (entry *Entry) fireHooks() {
++	entry.Logger.mu.Lock()
++	defer entry.Logger.mu.Unlock()
+ 	err := entry.Logger.Hooks.Fire(entry.Level, entry)
+ 	if err != nil {
+ 		fmt.Fprintf(os.Stderr, "Failed to fire hook: %v\n", err)
+@@ -274,18 +264,16 @@ func (entry *Entry) fireHooks() {
+ }
+ 
+ func (entry *Entry) write() {
++	entry.Logger.mu.Lock()
++	defer entry.Logger.mu.Unlock()
+ 	serialized, err := entry.Logger.Formatter.Format(entry)
+ 	if err != nil {
+ 		fmt.Fprintf(os.Stderr, "Failed to obtain reader, %v\n", err)
+ 		return
+ 	}
+-	func() {
+-		entry.Logger.mu.Lock()
+-		defer entry.Logger.mu.Unlock()
+-		if _, err := entry.Logger.Out.Write(serialized); err != nil {
+-			fmt.Fprintf(os.Stderr, "Failed to write to log, %v\n", err)
+-		}
+-	}()
++	if _, err = entry.Logger.Out.Write(serialized); err != nil {
++		fmt.Fprintf(os.Stderr, "Failed to write to log, %v\n", err)
++	}
+ }
+ 
+ func (entry *Entry) Log(level Level, args ...interface{}) {
+diff --git a/entry_test.go b/entry_test.go
+index 035e411..df687ad 100644
+--- a/entry_test.go
++++ b/entry_test.go
+@@ -232,7 +232,7 @@ func TestEntryWithIncorrectField(t *testing.T) {
+ 
+ 	fn := func() {}
+ 
+-	e := Entry{Logger: New()}
++	e := Entry{}
+ 	eWithFunc := e.WithFields(Fields{"func": fn})
+ 	eWithFuncPtr := e.WithFields(Fields{"funcPtr": &fn})
+ 
+diff --git a/logger.go b/logger.go
+index 3377044..dbf627c 100644
+--- a/logger.go
++++ b/logger.go
+@@ -12,7 +12,7 @@ import (
+ // LogFunction For big messages, it can be more efficient to pass a function
+ // and only call it if the log level is actually enables rather than
+ // generating the log message and then checking if the level is enabled
+-type LogFunction func() []interface{}
++type LogFunction func()[]interface{}
+ 
+ type Logger struct {
+ 	// The logs are `io.Copy`'d to this in a mutex. It's common to set this to a
+diff --git a/logger_test.go b/logger_test.go
+index 8afb2fe..f12a04e 100644
+--- a/logger_test.go
++++ b/logger_test.go
+@@ -25,7 +25,7 @@ func TestFieldValueError(t *testing.T) {
+ 		t.Error("unexpected error", err)
+ 	}
+ 	_, ok := data[FieldKeyLogrusError]
+-	require.True(t, ok, `cannot found expected "logrus_error" field: %v`, data)
++	require.True(t, ok)
+ }
+ 
+ func TestNoFieldValueError(t *testing.T) {
+diff --git a/logrus_test.go b/logrus_test.go
+index 4edee28..9c3c920 100644
+--- a/logrus_test.go
++++ b/logrus_test.go
+@@ -588,48 +588,15 @@ func TestLoggingRaceWithHooksOnEntry(t *testing.T) {
+ 	logger.AddHook(hook)
+ 	entry := logger.WithField("context", "clue")
+ 
+-	var (
+-		wg    sync.WaitGroup
+-		mtx   sync.Mutex
+-		start bool
+-	)
+-
+-	cond := sync.NewCond(&mtx)
+-
++	var wg sync.WaitGroup
+ 	wg.Add(100)
+ 
+-	for i := 0; i < 50; i++ {
+-		go func() {
+-			cond.L.Lock()
+-			for !start {
+-				cond.Wait()
+-			}
+-			cond.L.Unlock()
+-			for j := 0; j < 100; j++ {
+-				entry.Info("info")
+-			}
+-			wg.Done()
+-		}()
+-	}
+-
+-	for i := 0; i < 50; i++ {
++	for i := 0; i < 100; i++ {
+ 		go func() {
+-			cond.L.Lock()
+-			for !start {
+-				cond.Wait()
+-			}
+-			cond.L.Unlock()
+-			for j := 0; j < 100; j++ {
+-				entry.WithField("another field", "with some data").Info("info")
+-			}
++			entry.Info("info")
+ 			wg.Done()
+ 		}()
+ 	}
+-
+-	cond.L.Lock()
+-	start = true
+-	cond.L.Unlock()
+-	cond.Broadcast()
+ 	wg.Wait()
+ }
+ 

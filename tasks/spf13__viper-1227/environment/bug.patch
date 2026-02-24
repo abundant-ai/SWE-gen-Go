@@ -1,0 +1,616 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 389898a..5267fe2 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -11,9 +11,6 @@ jobs:
+     name: Build
+     runs-on: ${{ matrix.os }}
+     strategy:
+-      # Fail fast is disabled because there are Go version specific features and tests
+-      # that should be able to fail independently.
+-      fail-fast: false
+       matrix:
+         os: [ubuntu-latest, macos-latest]
+         go: ['1.14', '1.15', '1.16', '1.17']
+diff --git a/fs.go b/fs.go
+deleted file mode 100644
+index 70631f8..0000000
+--- a/fs.go
++++ /dev/null
+@@ -1,65 +0,0 @@
+-//go:build go1.16
+-// +build go1.16
+-
+-package viper
+-
+-import (
+-	"errors"
+-	"io/fs"
+-	"path/filepath"
+-)
+-
+-type finder struct {
+-	paths      []string
+-	fileNames  []string
+-	extensions []string
+-
+-	withoutExtension bool
+-}
+-
+-func (f finder) Find(fsys fs.FS) (string, error) {
+-	for _, path := range f.paths {
+-		for _, fileName := range f.fileNames {
+-			for _, extension := range f.extensions {
+-				filePath := filepath.Join(path, fileName+"."+extension)
+-
+-				ok, err := fileExists(fsys, filePath)
+-				if err != nil {
+-					return "", err
+-				}
+-
+-				if ok {
+-					return filePath, nil
+-				}
+-			}
+-
+-			if f.withoutExtension {
+-				filePath := filepath.Join(path, fileName)
+-
+-				ok, err := fileExists(fsys, filePath)
+-				if err != nil {
+-					return "", err
+-				}
+-
+-				if ok {
+-					return filePath, nil
+-				}
+-			}
+-		}
+-	}
+-
+-	return "", nil
+-}
+-
+-func fileExists(fsys fs.FS, filePath string) (bool, error) {
+-	fileInfo, err := fs.Stat(fsys, filePath)
+-	if err == nil {
+-		return !fileInfo.IsDir(), nil
+-	}
+-
+-	if errors.Is(err, fs.ErrNotExist) {
+-		return false, nil
+-	}
+-
+-	return false, err
+-}
+diff --git a/fs_test.go b/fs_test.go
+deleted file mode 100644
+index d811f45..0000000
+--- a/fs_test.go
++++ /dev/null
+@@ -1,100 +0,0 @@
+-//go:build go1.16
+-// +build go1.16
+-
+-package viper
+-
+-import (
+-	"io/fs"
+-	"testing"
+-	"testing/fstest"
+-
+-	"github.com/stretchr/testify/assert"
+-	"github.com/stretchr/testify/require"
+-)
+-
+-func TestFinder(t *testing.T) {
+-	t.Parallel()
+-
+-	fsys := fstest.MapFS{
+-		"home/user/.config":            &fstest.MapFile{},
+-		"home/user/config.json":        &fstest.MapFile{},
+-		"home/user/config.yaml":        &fstest.MapFile{},
+-		"home/user/data.json":          &fstest.MapFile{},
+-		"etc/config/.config":           &fstest.MapFile{},
+-		"etc/config/a_random_file.txt": &fstest.MapFile{},
+-		"etc/config/config.json":       &fstest.MapFile{},
+-		"etc/config/config.yaml":       &fstest.MapFile{},
+-		"etc/config/config.xml":        &fstest.MapFile{},
+-	}
+-
+-	testCases := []struct {
+-		name   string
+-		fsys   func() fs.FS
+-		finder finder
+-		result string
+-	}{
+-		{
+-			name: "find file",
+-			fsys: func() fs.FS { return fsys },
+-			finder: finder{
+-				paths:      []string{"etc/config"},
+-				fileNames:  []string{"config"},
+-				extensions: []string{"json"},
+-			},
+-			result: "etc/config/config.json",
+-		},
+-		{
+-			name: "file not found",
+-			fsys: func() fs.FS { return fsys },
+-			finder: finder{
+-				paths:      []string{"var/config"},
+-				fileNames:  []string{"config"},
+-				extensions: []string{"json"},
+-			},
+-			result: "",
+-		},
+-		{
+-			name:   "empty search params",
+-			fsys:   func() fs.FS { return fsys },
+-			finder: finder{},
+-			result: "",
+-		},
+-		{
+-			name: "precedence",
+-			fsys: func() fs.FS { return fsys },
+-			finder: finder{
+-				paths:      []string{"var/config", "home/user", "etc/config"},
+-				fileNames:  []string{"aconfig", "config"},
+-				extensions: []string{"zml", "xml", "json"},
+-			},
+-			result: "home/user/config.json",
+-		},
+-		{
+-			name: "without extension",
+-			fsys: func() fs.FS { return fsys },
+-			finder: finder{
+-				paths:      []string{"var/config", "home/user", "etc/config"},
+-				fileNames:  []string{".config"},
+-				extensions: []string{"zml", "xml", "json"},
+-
+-				withoutExtension: true,
+-			},
+-			result: "home/user/.config",
+-		},
+-	}
+-
+-	for _, testCase := range testCases {
+-		testCase := testCase
+-
+-		t.Run(testCase.name, func(t *testing.T) {
+-			t.Parallel()
+-
+-			fsys := testCase.fsys()
+-
+-			result, err := testCase.finder.Find(fsys)
+-			require.NoError(t, err)
+-
+-			assert.Equal(t, testCase.result, result)
+-		})
+-	}
+-}
+diff --git a/util.go b/util.go
+index 742f997..09d051a 100644
+--- a/util.go
++++ b/util.go
+@@ -18,6 +18,7 @@ import (
+ 	"strings"
+ 	"unicode"
+ 
++	"github.com/spf13/afero"
+ 	"github.com/spf13/cast"
+ 	jww "github.com/spf13/jwalterweatherman"
+ )
+@@ -110,6 +111,18 @@ func absPathify(inPath string) string {
+ 	return ""
+ }
+ 
++// Check if file Exists
++func exists(fs afero.Fs, path string) (bool, error) {
++	stat, err := fs.Stat(path)
++	if err == nil {
++		return !stat.IsDir(), nil
++	}
++	if os.IsNotExist(err) {
++		return false, nil
++	}
++	return false, err
++}
++
+ func stringInSlice(a string, list []string) bool {
+ 	for _, b := range list {
+ 		if b == a {
+diff --git a/viper.go b/viper.go
+index 6c456a9..9e2e353 100644
+--- a/viper.go
++++ b/viper.go
+@@ -2108,6 +2108,39 @@ func (v *Viper) getConfigFile() (string, error) {
+ 	return v.configFile, nil
+ }
+ 
++func (v *Viper) searchInPath(in string) (filename string) {
++	jww.DEBUG.Println("Searching for config in ", in)
++	for _, ext := range SupportedExts {
++		jww.DEBUG.Println("Checking for", filepath.Join(in, v.configName+"."+ext))
++		if b, _ := exists(v.fs, filepath.Join(in, v.configName+"."+ext)); b {
++			jww.DEBUG.Println("Found: ", filepath.Join(in, v.configName+"."+ext))
++			return filepath.Join(in, v.configName+"."+ext)
++		}
++	}
++
++	if v.configType != "" {
++		if b, _ := exists(v.fs, filepath.Join(in, v.configName)); b {
++			return filepath.Join(in, v.configName)
++		}
++	}
++
++	return ""
++}
++
++// Search all configPaths for any config file.
++// Returns the first path that exists (and is a config file).
++func (v *Viper) findConfigFile() (string, error) {
++	jww.INFO.Println("Searching for config in ", v.configPaths)
++
++	for _, cp := range v.configPaths {
++		file := v.searchInPath(cp)
++		if file != "" {
++			return file, nil
++		}
++	}
++	return "", ConfigFileNotFoundError{v.configName, fmt.Sprintf("%s", v.configPaths)}
++}
++
+ // Debug prints all configuration registries for debugging
+ // purposes.
+ func Debug() { v.Debug() }
+diff --git a/viper_go1_15.go b/viper_go1_15.go
+deleted file mode 100644
+index 487e0c8..0000000
+--- a/viper_go1_15.go
++++ /dev/null
+@@ -1,58 +0,0 @@
+-//go:build !go1.16
+-// +build !go1.16
+-
+-package viper
+-
+-import (
+-	"fmt"
+-	"os"
+-	"path/filepath"
+-
+-	"github.com/spf13/afero"
+-	jww "github.com/spf13/jwalterweatherman"
+-)
+-
+-// Search all configPaths for any config file.
+-// Returns the first path that exists (and is a config file).
+-func (v *Viper) findConfigFile() (string, error) {
+-	jww.INFO.Println("Searching for config in ", v.configPaths)
+-
+-	for _, cp := range v.configPaths {
+-		file := v.searchInPath(cp)
+-		if file != "" {
+-			return file, nil
+-		}
+-	}
+-	return "", ConfigFileNotFoundError{v.configName, fmt.Sprintf("%s", v.configPaths)}
+-}
+-
+-func (v *Viper) searchInPath(in string) (filename string) {
+-	jww.DEBUG.Println("Searching for config in ", in)
+-	for _, ext := range SupportedExts {
+-		jww.DEBUG.Println("Checking for", filepath.Join(in, v.configName+"."+ext))
+-		if b, _ := exists(v.fs, filepath.Join(in, v.configName+"."+ext)); b {
+-			jww.DEBUG.Println("Found: ", filepath.Join(in, v.configName+"."+ext))
+-			return filepath.Join(in, v.configName+"."+ext)
+-		}
+-	}
+-
+-	if v.configType != "" {
+-		if b, _ := exists(v.fs, filepath.Join(in, v.configName)); b {
+-			return filepath.Join(in, v.configName)
+-		}
+-	}
+-
+-	return ""
+-}
+-
+-// Check if file Exists
+-func exists(fs afero.Fs, path string) (bool, error) {
+-	stat, err := fs.Stat(path)
+-	if err == nil {
+-		return !stat.IsDir(), nil
+-	}
+-	if os.IsNotExist(err) {
+-		return false, nil
+-	}
+-	return false, err
+-}
+diff --git a/viper_go1_16.go b/viper_go1_16.go
+deleted file mode 100644
+index eb313fa..0000000
+--- a/viper_go1_16.go
++++ /dev/null
+@@ -1,32 +0,0 @@
+-//go:build go1.16
+-// +build go1.16
+-
+-package viper
+-
+-import (
+-	"fmt"
+-
+-	"github.com/spf13/afero"
+-)
+-
+-// Search all configPaths for any config file.
+-// Returns the first path that exists (and is a config file).
+-func (v *Viper) findConfigFile() (string, error) {
+-	finder := finder{
+-		paths:            v.configPaths,
+-		fileNames:        []string{v.configName},
+-		extensions:       SupportedExts,
+-		withoutExtension: v.configType != "",
+-	}
+-
+-	file, err := finder.Find(afero.NewIOFS(v.fs))
+-	if err != nil {
+-		return "", err
+-	}
+-
+-	if file == "" {
+-		return "", ConfigFileNotFoundError{v.configName, fmt.Sprintf("%s", v.configPaths)}
+-	}
+-
+-	return file, nil
+-}
+diff --git a/viper_test.go b/viper_test.go
+index 2ad25ba..c371c07 100644
+--- a/viper_test.go
++++ b/viper_test.go
+@@ -301,192 +301,65 @@ func (s *stringValue) String() string {
+ 	return string(*s)
+ }
+ 
+-func TestGetConfigFile(t *testing.T) {
+-	t.Run("config file set", func(t *testing.T) {
+-		fs := afero.NewMemMapFs()
+-
+-		err := fs.Mkdir("/etc/viper", 0777)
+-		require.NoError(t, err)
+-
+-		_, err = fs.Create("/etc/viper/config.yaml")
+-		require.NoError(t, err)
+-
+-		v := New()
+-
+-		v.SetFs(fs)
+-		v.AddConfigPath("/etc/viper")
+-		v.SetConfigFile("/etc/viper/config.json")
+-
+-		filename, err := v.getConfigFile()
+-		assert.Equal(t, "/etc/viper/config.json", filename)
+-		assert.NoError(t, err)
+-	})
+-
+-	t.Run("find file", func(t *testing.T) {
+-		fs := afero.NewMemMapFs()
+-
+-		err := fs.Mkdir("/etc/viper", 0777)
+-		require.NoError(t, err)
+-
+-		_, err = fs.Create("/etc/viper/config.yaml")
+-		require.NoError(t, err)
+-
+-		v := New()
+-
+-		v.SetFs(fs)
+-		v.AddConfigPath("/etc/viper")
+-
+-		filename, err := v.getConfigFile()
+-		assert.Equal(t, "/etc/viper/config.yaml", filename)
+-		assert.NoError(t, err)
+-	})
+-
+-	t.Run("find files only", func(t *testing.T) {
+-		fs := afero.NewMemMapFs()
+-
+-		err := fs.Mkdir("/etc/config", 0777)
+-		require.NoError(t, err)
+-
+-		_, err = fs.Create("/etc/config/config.yaml")
+-		require.NoError(t, err)
+-
+-		v := New()
+-
+-		v.SetFs(fs)
+-		v.AddConfigPath("/etc")
+-		v.AddConfigPath("/etc/config")
+-
+-		filename, err := v.getConfigFile()
+-		assert.Equal(t, "/etc/config/config.yaml", filename)
+-		assert.NoError(t, err)
+-	})
+-
+-	t.Run("precedence", func(t *testing.T) {
+-		fs := afero.NewMemMapFs()
+-
+-		err := fs.Mkdir("/home/viper", 0777)
+-		require.NoError(t, err)
+-
+-		_, err = fs.Create("/home/viper/config.zml")
+-		require.NoError(t, err)
+-
+-		err = fs.Mkdir("/etc/viper", 0777)
+-		require.NoError(t, err)
+-
+-		_, err = fs.Create("/etc/viper/config.bml")
+-		require.NoError(t, err)
+-
+-		err = fs.Mkdir("/var/viper", 0777)
+-		require.NoError(t, err)
+-
+-		_, err = fs.Create("/var/viper/config.yaml")
+-		require.NoError(t, err)
+-
+-		v := New()
+-
+-		v.SetFs(fs)
+-		v.AddConfigPath("/home/viper")
+-		v.AddConfigPath("/etc/viper")
+-		v.AddConfigPath("/var/viper")
+-
+-		filename, err := v.getConfigFile()
+-		assert.Equal(t, "/var/viper/config.yaml", filename)
+-		assert.NoError(t, err)
+-	})
+-
+-	t.Run("without extension", func(t *testing.T) {
+-		fs := afero.NewMemMapFs()
+-
+-		err := fs.Mkdir("/etc/viper", 0777)
+-		require.NoError(t, err)
+-
+-		_, err = fs.Create("/etc/viper/.dotfilenoext")
+-		require.NoError(t, err)
+-
+-		v := New()
+-
+-		v.SetFs(fs)
+-		v.AddConfigPath("/etc/viper")
+-		v.SetConfigName(".dotfilenoext")
+-		v.SetConfigType("yaml")
+-
+-		filename, err := v.getConfigFile()
+-		assert.Equal(t, "/etc/viper/.dotfilenoext", filename)
+-		assert.NoError(t, err)
+-	})
+-
+-	t.Run("without extension and config type", func(t *testing.T) {
+-		fs := afero.NewMemMapFs()
+-
+-		err := fs.Mkdir("/etc/viper", 0777)
+-		require.NoError(t, err)
+-
+-		_, err = fs.Create("/etc/viper/.dotfilenoext")
+-		require.NoError(t, err)
+-
+-		v := New()
+-
+-		v.SetFs(fs)
+-		v.AddConfigPath("/etc/viper")
+-		v.SetConfigName(".dotfilenoext")
+-
+-		_, err = v.getConfigFile()
+-		// unless config type is set, files without extension
+-		// are not considered
+-		assert.Error(t, err)
+-	})
++func TestBasics(t *testing.T) {
++	SetConfigFile("/tmp/config.yaml")
++	filename, err := v.getConfigFile()
++	assert.Equal(t, "/tmp/config.yaml", filename)
++	assert.NoError(t, err)
+ }
+ 
+-func TestReadInConfig(t *testing.T) {
+-	t.Run("config file set", func(t *testing.T) {
+-		fs := afero.NewMemMapFs()
+-
+-		err := fs.Mkdir("/etc/viper", 0777)
+-		require.NoError(t, err)
+-
+-		file, err := fs.Create("/etc/viper/config.yaml")
+-		require.NoError(t, err)
+-
+-		_, err = file.Write([]byte(`key: value`))
+-		require.NoError(t, err)
+-
+-		file.Close()
+-
+-		v := New()
+-
+-		v.SetFs(fs)
+-		v.SetConfigFile("/etc/viper/config.yaml")
+-
+-		err = v.ReadInConfig()
+-		require.NoError(t, err)
+-
+-		assert.Equal(t, "value", v.Get("key"))
+-	})
+-
+-	t.Run("find file", func(t *testing.T) {
+-		fs := afero.NewMemMapFs()
+-
+-		err := fs.Mkdir("/etc/viper", 0777)
+-		require.NoError(t, err)
+-
+-		file, err := fs.Create("/etc/viper/config.yaml")
+-		require.NoError(t, err)
++func TestSearchInPath_WithoutConfigTypeSet(t *testing.T) {
++	filename := ".dotfilenoext"
++	path := "/tmp"
++	file := filepath.Join(path, filename)
++	SetConfigName(filename)
++	AddConfigPath(path)
++	_, createErr := v.fs.Create(file)
++	defer func() {
++		_ = v.fs.Remove(file)
++	}()
++	assert.NoError(t, createErr)
++	_, err := v.getConfigFile()
++	// unless config type is set, files without extension
++	// are not considered
++	assert.Error(t, err)
++}
++
++func TestSearchInPath(t *testing.T) {
++	filename := ".dotfilenoext"
++	path := "/tmp"
++	file := filepath.Join(path, filename)
++	SetConfigName(filename)
++	SetConfigType("yaml")
++	AddConfigPath(path)
++	_, createErr := v.fs.Create(file)
++	defer func() {
++		_ = v.fs.Remove(file)
++	}()
++	assert.NoError(t, createErr)
++	filename, err := v.getConfigFile()
++	assert.Equal(t, file, filename)
++	assert.NoError(t, err)
++}
+ 
+-		_, err = file.Write([]byte(`key: value`))
+-		require.NoError(t, err)
++func TestSearchInPath_FilesOnly(t *testing.T) {
++	fs := afero.NewMemMapFs()
+ 
+-		file.Close()
++	err := fs.Mkdir("/tmp/config", 0777)
++	require.NoError(t, err)
+ 
+-		v := New()
++	_, err = fs.Create("/tmp/config/config.yaml")
++	require.NoError(t, err)
+ 
+-		v.SetFs(fs)
+-		v.AddConfigPath("/etc/viper")
++	v := New()
+ 
+-		err = v.ReadInConfig()
+-		require.NoError(t, err)
++	v.SetFs(fs)
++	v.AddConfigPath("/tmp")
++	v.AddConfigPath("/tmp/config")
+ 
+-		assert.Equal(t, "value", v.Get("key"))
+-	})
++	filename, err := v.getConfigFile()
++	assert.Equal(t, "/tmp/config/config.yaml", filename)
++	assert.NoError(t, err)
+ }
+ 
+ func TestDefault(t *testing.T) {

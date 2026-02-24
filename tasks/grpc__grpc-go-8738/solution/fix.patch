@@ -1,0 +1,290 @@
+diff --git a/clientconn.go b/clientconn.go
+index c0c2c9a7..aec48cc0 100644
+--- a/clientconn.go
++++ b/clientconn.go
+@@ -35,6 +35,8 @@ import (
+ 	"google.golang.org/grpc/balancer/pickfirst"
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/connectivity"
++	"google.golang.org/grpc/credentials"
++	expstats "google.golang.org/grpc/experimental/stats"
+ 	"google.golang.org/grpc/internal"
+ 	"google.golang.org/grpc/internal/channelz"
+ 	"google.golang.org/grpc/internal/grpcsync"
+@@ -98,6 +100,41 @@ var (
+ 	errTransportCredentialsMissing = errors.New("grpc: the credentials require transport level security (use grpc.WithTransportCredentials() to set)")
+ )
+ 
++var (
++	disconnectionsMetric = expstats.RegisterInt64Count(expstats.MetricDescriptor{
++		Name:           "grpc.subchannel.disconnections",
++		Description:    "EXPERIMENTAL. Number of times the selected subchannel becomes disconnected.",
++		Unit:           "{disconnection}",
++		Labels:         []string{"grpc.target"},
++		OptionalLabels: []string{"grpc.lb.backend_service", "grpc.lb.locality", "grpc.disconnect_error"},
++		Default:        false,
++	})
++	connectionAttemptsSucceededMetric = expstats.RegisterInt64Count(expstats.MetricDescriptor{
++		Name:           "grpc.subchannel.connection_attempts_succeeded",
++		Description:    "EXPERIMENTAL. Number of successful connection attempts.",
++		Unit:           "{attempt}",
++		Labels:         []string{"grpc.target"},
++		OptionalLabels: []string{"grpc.lb.backend_service", "grpc.lb.locality"},
++		Default:        false,
++	})
++	connectionAttemptsFailedMetric = expstats.RegisterInt64Count(expstats.MetricDescriptor{
++		Name:           "grpc.subchannel.connection_attempts_failed",
++		Description:    "EXPERIMENTAL. Number of failed connection attempts.",
++		Unit:           "{attempt}",
++		Labels:         []string{"grpc.target"},
++		OptionalLabels: []string{"grpc.lb.backend_service", "grpc.lb.locality"},
++		Default:        false,
++	})
++	openConnectionsMetric = expstats.RegisterInt64UpDownCount(expstats.MetricDescriptor{
++		Name:           "grpc.subchannel.open_connections",
++		Description:    "EXPERIMENTAL. Number of open connections.",
++		Unit:           "{attempt}",
++		Labels:         []string{"grpc.target"},
++		OptionalLabels: []string{"grpc.lb.backend_service", "grpc.security_level", "grpc.lb.locality"},
++		Default:        false,
++	})
++)
++
+ const (
+ 	defaultClientMaxReceiveMessageSize = 1024 * 1024 * 4
+ 	defaultClientMaxSendMessageSize    = math.MaxInt32
+@@ -861,6 +898,7 @@ func (cc *ClientConn) newAddrConnLocked(addrs []resolver.Address, opts balancer.
+ 		channelz:     channelz.RegisterSubChannel(cc.channelz, ""),
+ 		resetBackoff: make(chan struct{}),
+ 	}
++	ac.updateTelemetryLabelsLocked()
+ 	ac.ctx, ac.cancel = context.WithCancel(cc.ctx)
+ 	// Start with our address set to the first address; this may be updated if
+ 	// we connect to different addresses.
+@@ -977,7 +1015,7 @@ func (ac *addrConn) updateAddrs(addrs []resolver.Address) {
+ 	}
+ 
+ 	ac.addrs = addrs
+-
++	ac.updateTelemetryLabelsLocked()
+ 	if ac.state == connectivity.Shutdown ||
+ 		ac.state == connectivity.TransientFailure ||
+ 		ac.state == connectivity.Idle {
+@@ -1216,6 +1254,9 @@ type addrConn struct {
+ 	resetBackoff chan struct{}
+ 
+ 	channelz *channelz.SubChannel
++
++	localityLabel       string
++	backendServiceLabel string
+ }
+ 
+ // Note: this requires a lock on ac.mu.
+@@ -1223,6 +1264,18 @@ func (ac *addrConn) updateConnectivityState(s connectivity.State, lastErr error)
+ 	if ac.state == s {
+ 		return
+ 	}
++
++	// If we are transitioning out of Ready, it means there is a disconnection.
++	// A SubConn can also transition from CONNECTING directly to IDLE when
++	// a transport is successfully created, but the connection fails
++	// before the SubConn can send the notification for READY. We treat
++	// this as a successful connection and transition to IDLE.
++	// TODO: https://github.com/grpc/grpc-go/issues/7862 - Remove the second
++	// part of the if condition below once the issue is fixed.
++	if ac.state == connectivity.Ready || (ac.state == connectivity.Connecting && s == connectivity.Idle) {
++		disconnectionsMetric.Record(ac.cc.metricsRecorderList, 1, ac.cc.target, ac.backendServiceLabel, ac.localityLabel, "unknown")
++		openConnectionsMetric.Record(ac.cc.metricsRecorderList, -1, ac.cc.target, ac.backendServiceLabel, ac.securityLevelLocked(), ac.localityLabel)
++	}
+ 	ac.state = s
+ 	ac.channelz.ChannelMetrics.State.Store(&s)
+ 	if lastErr == nil {
+@@ -1280,6 +1333,15 @@ func (ac *addrConn) resetTransportAndUnlock() {
+ 	ac.mu.Unlock()
+ 
+ 	if err := ac.tryAllAddrs(acCtx, addrs, connectDeadline); err != nil {
++		if !errors.Is(err, context.Canceled) {
++			connectionAttemptsFailedMetric.Record(ac.cc.metricsRecorderList, 1, ac.cc.target, ac.backendServiceLabel, ac.localityLabel)
++		} else {
++			if logger.V(2) {
++				// This records cancelled connection attempts which can be later
++				// replaced by a metric.
++				logger.Infof("Context cancellation detected; not recording this as a failed connection attempt.")
++			}
++		}
+ 		// TODO: #7534 - Move re-resolution requests into the pick_first LB policy
+ 		// to ensure one resolution request per pass instead of per subconn failure.
+ 		ac.cc.resolveNow(resolver.ResolveNowOptions{})
+@@ -1319,10 +1381,50 @@ func (ac *addrConn) resetTransportAndUnlock() {
+ 	}
+ 	// Success; reset backoff.
+ 	ac.mu.Lock()
++	connectionAttemptsSucceededMetric.Record(ac.cc.metricsRecorderList, 1, ac.cc.target, ac.backendServiceLabel, ac.localityLabel)
++	openConnectionsMetric.Record(ac.cc.metricsRecorderList, 1, ac.cc.target, ac.backendServiceLabel, ac.securityLevelLocked(), ac.localityLabel)
+ 	ac.backoffIdx = 0
+ 	ac.mu.Unlock()
+ }
+ 
++// updateTelemetryLabelsLocked calculates and caches the telemetry labels based on the
++// first address in addrConn.
++func (ac *addrConn) updateTelemetryLabelsLocked() {
++	labelsFunc, ok := internal.AddressToTelemetryLabels.(func(resolver.Address) map[string]string)
++	if !ok || len(ac.addrs) == 0 {
++		// Reset defaults
++		ac.localityLabel = ""
++		ac.backendServiceLabel = ""
++		return
++	}
++	labels := labelsFunc(ac.addrs[0])
++	ac.localityLabel = labels["grpc.lb.locality"]
++	ac.backendServiceLabel = labels["grpc.lb.backend_service"]
++}
++
++type securityLevelKey struct{}
++
++func (ac *addrConn) securityLevelLocked() string {
++	var secLevel string
++	// During disconnection, ac.transport is nil. Fall back to the security level
++	// stored in the current address during connection.
++	if ac.transport == nil {
++		secLevel, _ = ac.curAddr.Attributes.Value(securityLevelKey{}).(string)
++		return secLevel
++	}
++	authInfo := ac.transport.Peer().AuthInfo
++	if ci, ok := authInfo.(interface {
++		GetCommonAuthInfo() credentials.CommonAuthInfo
++	}); ok {
++		secLevel = ci.GetCommonAuthInfo().SecurityLevel.String()
++		// Store the security level in the current address' attributes so
++		// that it remains available for disconnection metrics after the
++		// transport is closed.
++		ac.curAddr.Attributes = ac.curAddr.Attributes.WithValue(securityLevelKey{}, secLevel)
++	}
++	return secLevel
++}
++
+ // tryAllAddrs tries to create a connection to the addresses, and stop when at
+ // the first successful one. It returns an error if no address was successfully
+ // connected, or updates ac appropriately with the new transport.
+diff --git a/internal/internal.go b/internal/internal.go
+index 2699223a..27bef83d 100644
+--- a/internal/internal.go
++++ b/internal/internal.go
+@@ -244,6 +244,10 @@ var (
+ 	// When set, the function will be called before the stream enters
+ 	// the blocking state.
+ 	NewStreamWaitingForResolver = func() {}
++
++	// AddressToTelemetryLabels is an xDS-provided function to extract telemetry
++	// labels from a resolver.Address. Callers must assert its type before calling.
++	AddressToTelemetryLabels any // func(addr resolver.Address) map[string]string
+ )
+ 
+ // HealthChecker defines the signature of the client-side LB channel health
+diff --git a/internal/transport/http2_client.go b/internal/transport/http2_client.go
+index 65b4ab24..f8c2f5f5 100644
+--- a/internal/transport/http2_client.go
++++ b/internal/transport/http2_client.go
+@@ -370,7 +370,7 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
+ 		})
+ 	t.logger = prefixLoggerForClientTransport(t)
+ 	// Add peer information to the http2client context.
+-	t.ctx = peer.NewContext(t.ctx, t.getPeer())
++	t.ctx = peer.NewContext(t.ctx, t.Peer())
+ 
+ 	if md, ok := addr.Metadata.(*metadata.MD); ok {
+ 		t.md = *md
+@@ -510,7 +510,7 @@ func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr) *ClientSt
+ 	return s
+ }
+ 
+-func (t *http2Client) getPeer() *peer.Peer {
++func (t *http2Client) Peer() *peer.Peer {
+ 	return &peer.Peer{
+ 		Addr:      t.remoteAddr,
+ 		AuthInfo:  t.authInfo, // Can be nil
+@@ -742,7 +742,7 @@ func (e NewStreamError) Error() string {
+ // NewStream creates a stream and registers it into the transport as "active"
+ // streams.  All non-nil errors returned will be *NewStreamError.
+ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*ClientStream, error) {
+-	ctx = peer.NewContext(ctx, t.getPeer())
++	ctx = peer.NewContext(ctx, t.Peer())
+ 
+ 	// ServerName field of the resolver returned address takes precedence over
+ 	// Host field of CallHdr to determine the :authority header. This is because,
+@@ -1807,8 +1807,6 @@ func (t *http2Client) socketMetrics() *channelz.EphemeralSocketMetrics {
+ 	}
+ }
+ 
+-func (t *http2Client) RemoteAddr() net.Addr { return t.remoteAddr }
+-
+ func (t *http2Client) incrMsgSent() {
+ 	if channelz.IsOn() {
+ 		t.channelz.SocketMetrics.MessagesSent.Add(1)
+diff --git a/internal/transport/transport.go b/internal/transport/transport.go
+index 5ff83a7d..844a4c16 100644
+--- a/internal/transport/transport.go
++++ b/internal/transport/transport.go
+@@ -608,8 +608,9 @@ type ClientTransport interface {
+ 	// with a human readable string with debug info.
+ 	GetGoAwayReason() (GoAwayReason, string)
+ 
+-	// RemoteAddr returns the remote network address.
+-	RemoteAddr() net.Addr
++	// Peer returns information about the peer associated with the Transport.
++	// The returned information includes authentication and network address details.
++	Peer() *peer.Peer
+ }
+ 
+ // ServerTransport is the common interface for all gRPC server-side transport
+diff --git a/internal/xds/xds.go b/internal/xds/xds.go
+index 4d5a85ef..e4fcbea0 100644
+--- a/internal/xds/xds.go
++++ b/internal/xds/xds.go
+@@ -24,6 +24,7 @@ import (
+ 	"fmt"
+ 
+ 	"google.golang.org/grpc/attributes"
++	"google.golang.org/grpc/internal"
+ 	"google.golang.org/grpc/internal/xds/clients"
+ 	"google.golang.org/grpc/resolver"
+ )
+@@ -46,6 +47,17 @@ func GetXDSHandshakeClusterName(attr *attributes.Attributes) (string, bool) {
+ 	return name, ok
+ }
+ 
++// addressToTelemetryLabels prepares a telemetry label map from resolver
++// address atrributes.
++func addressToTelemetryLabels(addr resolver.Address) map[string]string {
++	cluster, _ := GetXDSHandshakeClusterName(addr.Attributes)
++	locality := LocalityString(GetLocalityID(addr))
++	return map[string]string{
++		"grpc.lb.locality":        locality,
++		"grpc.lb.backend_service": cluster,
++	}
++}
++
+ // LocalityString generates a string representation of clients.Locality in the
+ // format specified in gRFC A76.
+ func LocalityString(l clients.Locality) string {
+@@ -99,3 +111,7 @@ var UnknownCSMLabels = map[string]string{
+ 	"csm.service_name":           "unknown",
+ 	"csm.service_namespace_name": "unknown",
+ }
++
++func init() {
++	internal.AddressToTelemetryLabels = addressToTelemetryLabels
++}
+diff --git a/stream.go b/stream.go
+index ca87ff97..5dc57ec4 100644
+--- a/stream.go
++++ b/stream.go
+@@ -484,7 +484,7 @@ func (a *csAttempt) getTransport() error {
+ 		return err
+ 	}
+ 	if a.trInfo != nil {
+-		a.trInfo.firstLine.SetRemoteAddr(a.transport.RemoteAddr())
++		a.trInfo.firstLine.SetRemoteAddr(a.transport.Peer().Addr)
+ 	}
+ 	if pick.blocked && a.statsHandler != nil {
+ 		a.statsHandler.HandleRPC(a.ctx, &stats.DelayedPickComplete{})

@@ -1,0 +1,7 @@
+The Sentry hook for Logrus currently can only be constructed from a DSN string (e.g., via `NewSentryHook(dsn, levels)` and `NewWithTagsSentryHook(dsn, tags, levels)`), which forces users to create a separate Raven client for the hook even when they already have an initialized `*raven.Client` they want to reuse (for example to call `raven.CapturePanic` elsewhere). Add support for constructing the hook from an existing Raven client.
+
+Introduce a new constructor function named `NewWithClientSentryHook(client *raven.Client, levels []logrus.Level) (*SentryHook, error)` that creates a Sentry hook using the provided initialized client rather than creating a new one from a DSN.
+
+When a logger emits an `Error` message through a hook created by `NewWithClientSentryHook`, Sentry should receive a packet whose `Message` matches the log message. The hook should behave consistently with the existing DSN-based constructor regarding basic event capture.
+
+Additionally, existing behavior around special fields must remain correct when using the hook: when logging with fields `server_name`, `logger`, and `http_request` (an `*http.Request`), the resulting Sentry packet should set `ServerName` from `server_name` and `Logger` from `logger` (and continue to include the HTTP request context as it already does). Ensure the new client-based constructor does not bypass or break this field mapping logic.

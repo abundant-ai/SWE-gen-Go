@@ -1,0 +1,828 @@
+diff --git a/api/prometheus/v1/api.go b/api/prometheus/v1/api.go
+index 9f95566..f74139c 100644
+--- a/api/prometheus/v1/api.go
++++ b/api/prometheus/v1/api.go
+@@ -35,15 +35,11 @@ import (
+ )
+ 
+ func init() {
+-	json.RegisterTypeEncoderFunc("model.SamplePair", marshalSamplePairJSON, marshalJSONIsEmpty)
+-	json.RegisterTypeDecoderFunc("model.SamplePair", unmarshalSamplePairJSON)
+-	json.RegisterTypeEncoderFunc("model.SampleHistogramPair", marshalSampleHistogramPairJSON, marshalJSONIsEmpty)
+-	json.RegisterTypeDecoderFunc("model.SampleHistogramPair", unmarshalSampleHistogramPairJSON)
+-	json.RegisterTypeEncoderFunc("model.SampleStream", marshalSampleStreamJSON, marshalJSONIsEmpty) // Only needed for benchmark.
+-	json.RegisterTypeDecoderFunc("model.SampleStream", unmarshalSampleStreamJSON)                   // Only needed for benchmark.
++	json.RegisterTypeEncoderFunc("model.SamplePair", marshalPointJSON, marshalPointJSONIsEmpty)
++	json.RegisterTypeDecoderFunc("model.SamplePair", unMarshalPointJSON)
+ }
+ 
+-func unmarshalSamplePairJSON(ptr unsafe.Pointer, iter *json.Iterator) {
++func unMarshalPointJSON(ptr unsafe.Pointer, iter *json.Iterator) {
+ 	p := (*model.SamplePair)(ptr)
+ 	if !iter.ReadArray() {
+ 		iter.ReportError("unmarshal model.SamplePair", "SamplePair must be [timestamp, value]")
+@@ -72,165 +68,12 @@ func unmarshalSamplePairJSON(ptr unsafe.Pointer, iter *json.Iterator) {
+ 	}
+ }
+ 
+-func marshalSamplePairJSON(ptr unsafe.Pointer, stream *json.Stream) {
++func marshalPointJSON(ptr unsafe.Pointer, stream *json.Stream) {
+ 	p := *((*model.SamplePair)(ptr))
+ 	stream.WriteArrayStart()
+-	marshalTimestamp(p.Timestamp, stream)
+-	stream.WriteMore()
+-	marshalFloat(float64(p.Value), stream)
+-	stream.WriteArrayEnd()
+-}
+-
+-func unmarshalSampleHistogramPairJSON(ptr unsafe.Pointer, iter *json.Iterator) {
+-	p := (*model.SampleHistogramPair)(ptr)
+-	if !iter.ReadArray() {
+-		iter.ReportError("unmarshal model.SampleHistogramPair", "SampleHistogramPair must be [timestamp, {histogram}]")
+-		return
+-	}
+-	t := iter.ReadNumber()
+-	if err := p.Timestamp.UnmarshalJSON([]byte(t)); err != nil {
+-		iter.ReportError("unmarshal model.SampleHistogramPair", err.Error())
+-		return
+-	}
+-	if !iter.ReadArray() {
+-		iter.ReportError("unmarshal model.SampleHistogramPair", "SamplePair missing histogram")
+-		return
+-	}
+-	h := &model.SampleHistogram{}
+-	p.Histogram = h
+-	for key := iter.ReadObject(); key != ""; key = iter.ReadObject() {
+-		switch key {
+-		case "count":
+-			f, err := strconv.ParseFloat(iter.ReadString(), 64)
+-			if err != nil {
+-				iter.ReportError("unmarshal model.SampleHistogramPair", "count of histogram is not a float")
+-				return
+-			}
+-			h.Count = model.FloatString(f)
+-		case "sum":
+-			f, err := strconv.ParseFloat(iter.ReadString(), 64)
+-			if err != nil {
+-				iter.ReportError("unmarshal model.SampleHistogramPair", "sum of histogram is not a float")
+-				return
+-			}
+-			h.Sum = model.FloatString(f)
+-		case "buckets":
+-			for iter.ReadArray() {
+-				b, err := unmarshalHistogramBucket(iter)
+-				if err != nil {
+-					iter.ReportError("unmarshal model.HistogramBucket", err.Error())
+-					return
+-				}
+-				h.Buckets = append(h.Buckets, b)
+-			}
+-		default:
+-			iter.ReportError("unmarshal model.SampleHistogramPair", fmt.Sprint("unexpected key in histogram:", key))
+-			return
+-		}
+-	}
+-	if iter.ReadArray() {
+-		iter.ReportError("unmarshal model.SampleHistogramPair", "SampleHistogramPair has too many values, must be [timestamp, {histogram}]")
+-		return
+-	}
+-}
+-
+-func marshalSampleHistogramPairJSON(ptr unsafe.Pointer, stream *json.Stream) {
+-	p := *((*model.SampleHistogramPair)(ptr))
+-	stream.WriteArrayStart()
+-	marshalTimestamp(p.Timestamp, stream)
+-	stream.WriteMore()
+-	marshalHistogram(*p.Histogram, stream)
+-	stream.WriteArrayEnd()
+-}
+-
+-func unmarshalSampleStreamJSON(ptr unsafe.Pointer, iter *json.Iterator) {
+-	ss := (*model.SampleStream)(ptr)
+-	for key := iter.ReadObject(); key != ""; key = iter.ReadObject() {
+-		switch key {
+-		case "metric":
+-			metricString := iter.ReadAny().ToString()
+-			if err := json.UnmarshalFromString(metricString, &ss.Metric); err != nil {
+-				iter.ReportError("unmarshal model.SampleStream", err.Error())
+-				return
+-			}
+-		case "values":
+-			for iter.ReadArray() {
+-				v := model.SamplePair{}
+-				unmarshalSamplePairJSON(unsafe.Pointer(&v), iter)
+-				ss.Values = append(ss.Values, v)
+-			}
+-		case "histograms":
+-			for iter.ReadArray() {
+-				h := model.SampleHistogramPair{}
+-				unmarshalSampleHistogramPairJSON(unsafe.Pointer(&h), iter)
+-				ss.Histograms = append(ss.Histograms, h)
+-			}
+-		default:
+-			iter.ReportError("unmarshal model.SampleStream", fmt.Sprint("unexpected key:", key))
+-			return
+-		}
+-	}
+-}
+-
+-func marshalSampleStreamJSON(ptr unsafe.Pointer, stream *json.Stream) {
+-	ss := *((*model.SampleStream)(ptr))
+-	stream.WriteObjectStart()
+-	stream.WriteObjectField(`metric`)
+-	m, err := json.ConfigCompatibleWithStandardLibrary.Marshal(ss.Metric)
+-	if err != nil {
+-		stream.Error = err
+-		return
+-	}
+-	stream.SetBuffer(append(stream.Buffer(), m...))
+-	if len(ss.Values) > 0 {
+-		stream.WriteMore()
+-		stream.WriteObjectField(`values`)
+-		stream.WriteArrayStart()
+-		for i, v := range ss.Values {
+-			if i > 0 {
+-				stream.WriteMore()
+-			}
+-			marshalSamplePairJSON(unsafe.Pointer(&v), stream)
+-		}
+-		stream.WriteArrayEnd()
+-	}
+-	if len(ss.Histograms) > 0 {
+-		stream.WriteMore()
+-		stream.WriteObjectField(`histograms`)
+-		stream.WriteArrayStart()
+-		for i, h := range ss.Histograms {
+-			if i > 0 {
+-				stream.WriteMore()
+-			}
+-			marshalSampleHistogramPairJSON(unsafe.Pointer(&h), stream)
+-		}
+-		stream.WriteArrayEnd()
+-	}
+-	stream.WriteObjectEnd()
+-}
+-
+-func marshalFloat(v float64, stream *json.Stream) {
+-	stream.WriteRaw(`"`)
+-	// Taken from https://github.com/json-iterator/go/blob/master/stream_float.go#L71 as a workaround
+-	// to https://github.com/json-iterator/go/issues/365 (json-iterator, to follow json standard, doesn't allow inf/nan).
+-	buf := stream.Buffer()
+-	abs := math.Abs(v)
+-	fmt := byte('f')
+-	// Note: Must use float32 comparisons for underlying float32 value to get precise cutoffs right.
+-	if abs != 0 {
+-		if abs < 1e-6 || abs >= 1e21 {
+-			fmt = 'e'
+-		}
+-	}
+-	buf = strconv.AppendFloat(buf, v, fmt, -1, 64)
+-	stream.SetBuffer(buf)
+-	stream.WriteRaw(`"`)
+-}
+-
+-func marshalTimestamp(timestamp model.Time, stream *json.Stream) {
+-	t := int64(timestamp)
+ 	// Write out the timestamp as a float divided by 1000.
+ 	// This is ~3x faster than converting to a float.
++	t := int64(p.Timestamp)
+ 	if t < 0 {
+ 		stream.WriteRaw(`-`)
+ 		t = -t
+@@ -247,113 +90,28 @@ func marshalTimestamp(timestamp model.Time, stream *json.Stream) {
+ 		}
+ 		stream.WriteInt64(fraction)
+ 	}
+-}
+-
+-func unmarshalHistogramBucket(iter *json.Iterator) (*model.HistogramBucket, error) {
+-	b := model.HistogramBucket{}
+-	if !iter.ReadArray() {
+-		return nil, errors.New("HistogramBucket must be [boundaries, lower, upper, count]")
+-	}
+-	boundaries, err := iter.ReadNumber().Int64()
+-	if err != nil {
+-		return nil, err
+-	}
+-	b.Boundaries = int32(boundaries)
+-	if !iter.ReadArray() {
+-		return nil, errors.New("HistogramBucket must be [boundaries, lower, upper, count]")
+-	}
+-	f, err := strconv.ParseFloat(iter.ReadString(), 64)
+-	if err != nil {
+-		return nil, err
+-	}
+-	b.Lower = model.FloatString(f)
+-	if !iter.ReadArray() {
+-		return nil, errors.New("HistogramBucket must be [boundaries, lower, upper, count]")
+-	}
+-	f, err = strconv.ParseFloat(iter.ReadString(), 64)
+-	if err != nil {
+-		return nil, err
+-	}
+-	b.Upper = model.FloatString(f)
+-	if !iter.ReadArray() {
+-		return nil, errors.New("HistogramBucket must be [boundaries, lower, upper, count]")
+-	}
+-	f, err = strconv.ParseFloat(iter.ReadString(), 64)
+-	if err != nil {
+-		return nil, err
+-	}
+-	b.Count = model.FloatString(f)
+-	if iter.ReadArray() {
+-		return nil, errors.New("HistogramBucket has too many values, must be [boundaries, lower, upper, count]")
+-	}
+-	return &b, nil
+-}
+-
+-// marshalHistogramBucket writes something like: [ 3, "-0.25", "0.25", "3"]
+-// See marshalHistogram to understand what the numbers mean
+-func marshalHistogramBucket(b model.HistogramBucket, stream *json.Stream) {
+-	stream.WriteArrayStart()
+-	stream.WriteInt32(b.Boundaries)
+-	stream.WriteMore()
+-	marshalFloat(float64(b.Lower), stream)
+-	stream.WriteMore()
+-	marshalFloat(float64(b.Upper), stream)
+-	stream.WriteMore()
+-	marshalFloat(float64(b.Count), stream)
+-	stream.WriteArrayEnd()
+-}
+-
+-// marshalHistogram writes something like:
+-//
+-//	{
+-//	    "count": "42",
+-//	    "sum": "34593.34",
+-//	    "buckets": [
+-//	      [ 3, "-0.25", "0.25", "3"],
+-//	      [ 0, "0.25", "0.5", "12"],
+-//	      [ 0, "0.5", "1", "21"],
+-//	      [ 0, "2", "4", "6"]
+-//	    ]
+-//	}
+-//
+-// The 1st element in each bucket array determines if the boundaries are
+-// inclusive (AKA closed) or exclusive (AKA open):
+-//
+-//	0: lower exclusive, upper inclusive
+-//	1: lower inclusive, upper exclusive
+-//	2: both exclusive
+-//	3: both inclusive
+-//
+-// The 2nd and 3rd elements are the lower and upper boundary. The 4th element is
+-// the bucket count.
+-func marshalHistogram(h model.SampleHistogram, stream *json.Stream) {
+-	stream.WriteObjectStart()
+-	stream.WriteObjectField(`count`)
+-	marshalFloat(float64(h.Count), stream)
+ 	stream.WriteMore()
+-	stream.WriteObjectField(`sum`)
+-	marshalFloat(float64(h.Sum), stream)
++	stream.WriteRaw(`"`)
+ 
+-	bucketFound := false
+-	for _, bucket := range h.Buckets {
+-		if bucket.Count == 0 {
+-			continue // No need to expose empty buckets in JSON.
+-		}
+-		stream.WriteMore()
+-		if !bucketFound {
+-			stream.WriteObjectField(`buckets`)
+-			stream.WriteArrayStart()
++	// Taken from https://github.com/json-iterator/go/blob/master/stream_float.go#L71 as a workaround
++	// to https://github.com/json-iterator/go/issues/365 (jsoniter, to follow json standard, doesn't allow inf/nan)
++	buf := stream.Buffer()
++	abs := math.Abs(float64(p.Value))
++	fmt := byte('f')
++	// Note: Must use float32 comparisons for underlying float32 value to get precise cutoffs right.
++	if abs != 0 {
++		if abs < 1e-6 || abs >= 1e21 {
++			fmt = 'e'
+ 		}
+-		bucketFound = true
+-		marshalHistogramBucket(*bucket, stream)
+ 	}
+-	if bucketFound {
+-		stream.WriteArrayEnd()
+-	}
+-	stream.WriteObjectEnd()
++	buf = strconv.AppendFloat(buf, float64(p.Value), fmt, -1, 64)
++	stream.SetBuffer(buf)
++
++	stream.WriteRaw(`"`)
++	stream.WriteArrayEnd()
+ }
+ 
+-func marshalJSONIsEmpty(ptr unsafe.Pointer) bool {
++func marshalPointJSONIsEmpty(ptr unsafe.Pointer) bool {
+ 	return false
+ }
+ 
+diff --git a/api/prometheus/v1/api_bench_test.go b/api/prometheus/v1/api_bench_test.go
+index f1f8000..764895a 100644
+--- a/api/prometheus/v1/api_bench_test.go
++++ b/api/prometheus/v1/api_bench_test.go
+@@ -23,84 +23,33 @@ import (
+ 	"github.com/prometheus/common/model"
+ )
+ 
+-func generateData(timeseries, datapoints int) (floatMatrix, histogramMatrix model.Matrix) {
++func generateData(timeseries, datapoints int) model.Matrix {
++	m := make(model.Matrix, 0)
++
+ 	for i := 0; i < timeseries; i++ {
+ 		lset := map[model.LabelName]model.LabelValue{
+ 			model.MetricNameLabel: model.LabelValue("timeseries_" + strconv.Itoa(i)),
+-			"foo":                 "bar",
+ 		}
+-		now := model.Time(1677587274055)
+-		floats := make([]model.SamplePair, datapoints)
+-		histograms := make([]model.SampleHistogramPair, datapoints)
++		now := model.Now()
++		values := make([]model.SamplePair, datapoints)
+ 
+ 		for x := datapoints; x > 0; x-- {
+-			f := float64(x)
+-			floats[x-1] = model.SamplePair{
++			values[x-1] = model.SamplePair{
+ 				// Set the time back assuming a 15s interval. Since this is used for
+ 				// Marshal/Unmarshal testing the actual interval doesn't matter.
+ 				Timestamp: now.Add(time.Second * -15 * time.Duration(x)),
+-				Value:     model.SampleValue(f),
+-			}
+-			histograms[x-1] = model.SampleHistogramPair{
+-				Timestamp: now.Add(time.Second * -15 * time.Duration(x)),
+-				Histogram: &model.SampleHistogram{
+-					Count: model.FloatString(13.5 * f),
+-					Sum:   model.FloatString(.1 * f),
+-					Buckets: model.HistogramBuckets{
+-						{
+-							Boundaries: 1,
+-							Lower:      -4870.992343051145,
+-							Upper:      -4466.7196729968955,
+-							Count:      model.FloatString(1 * f),
+-						},
+-						{
+-							Boundaries: 1,
+-							Lower:      -861.0779292198035,
+-							Upper:      -789.6119426088657,
+-							Count:      model.FloatString(2 * f),
+-						},
+-						{
+-							Boundaries: 1,
+-							Lower:      -558.3399591246119,
+-							Upper:      -512,
+-							Count:      model.FloatString(3 * f),
+-						},
+-						{
+-							Boundaries: 0,
+-							Lower:      2048,
+-							Upper:      2233.3598364984477,
+-							Count:      model.FloatString(1.5 * f),
+-						},
+-						{
+-							Boundaries: 0,
+-							Lower:      2896.3093757400984,
+-							Upper:      3158.4477704354626,
+-							Count:      model.FloatString(2.5 * f),
+-						},
+-						{
+-							Boundaries: 0,
+-							Lower:      4466.7196729968955,
+-							Upper:      4870.992343051145,
+-							Count:      model.FloatString(3.5 * f),
+-						},
+-					},
+-				},
++				Value:     model.SampleValue(float64(x)),
+ 			}
+ 		}
+ 
+-		fss := &model.SampleStream{
++		ss := &model.SampleStream{
+ 			Metric: model.Metric(lset),
+-			Values: floats,
+-		}
+-		hss := &model.SampleStream{
+-			Metric:     model.Metric(lset),
+-			Histograms: histograms,
++			Values: values,
+ 		}
+ 
+-		floatMatrix = append(floatMatrix, fss)
+-		histogramMatrix = append(histogramMatrix, hss)
++		m = append(m, ss)
+ 	}
+-	return
++	return m
+ }
+ 
+ func BenchmarkSamplesJsonSerialization(b *testing.B) {
+@@ -108,46 +57,27 @@ func BenchmarkSamplesJsonSerialization(b *testing.B) {
+ 		b.Run(strconv.Itoa(timeseriesCount), func(b *testing.B) {
+ 			for _, datapointCount := range []int{10, 100, 1000} {
+ 				b.Run(strconv.Itoa(datapointCount), func(b *testing.B) {
+-					floats, histograms := generateData(timeseriesCount, datapointCount)
++					data := generateData(timeseriesCount, datapointCount)
+ 
+-					floatBytes, err := json.Marshal(floats)
+-					if err != nil {
+-						b.Fatalf("Error marshaling: %v", err)
+-					}
+-					histogramBytes, err := json.Marshal(histograms)
++					dataBytes, err := json.Marshal(data)
+ 					if err != nil {
+ 						b.Fatalf("Error marshaling: %v", err)
+ 					}
+ 
+ 					b.Run("marshal", func(b *testing.B) {
+-						b.Run("encoding/json/floats", func(b *testing.B) {
+-							b.ReportAllocs()
+-							for i := 0; i < b.N; i++ {
+-								if _, err := json.Marshal(floats); err != nil {
+-									b.Fatal(err)
+-								}
+-							}
+-						})
+-						b.Run("jsoniter/floats", func(b *testing.B) {
++						b.Run("encoding/json", func(b *testing.B) {
+ 							b.ReportAllocs()
+ 							for i := 0; i < b.N; i++ {
+-								if _, err := jsoniter.Marshal(floats); err != nil {
++								if _, err := json.Marshal(data); err != nil {
+ 									b.Fatal(err)
+ 								}
+ 							}
+ 						})
+-						b.Run("encoding/json/histograms", func(b *testing.B) {
+-							b.ReportAllocs()
+-							for i := 0; i < b.N; i++ {
+-								if _, err := json.Marshal(histograms); err != nil {
+-									b.Fatal(err)
+-								}
+-							}
+-						})
+-						b.Run("jsoniter/histograms", func(b *testing.B) {
++
++						b.Run("jsoniter", func(b *testing.B) {
+ 							b.ReportAllocs()
+ 							for i := 0; i < b.N; i++ {
+-								if _, err := jsoniter.Marshal(histograms); err != nil {
++								if _, err := jsoniter.Marshal(data); err != nil {
+ 									b.Fatal(err)
+ 								}
+ 							}
+@@ -155,38 +85,21 @@ func BenchmarkSamplesJsonSerialization(b *testing.B) {
+ 					})
+ 
+ 					b.Run("unmarshal", func(b *testing.B) {
+-						b.Run("encoding/json/floats", func(b *testing.B) {
+-							b.ReportAllocs()
+-							var m model.Matrix
+-							for i := 0; i < b.N; i++ {
+-								if err := json.Unmarshal(floatBytes, &m); err != nil {
+-									b.Fatal(err)
+-								}
+-							}
+-						})
+-						b.Run("jsoniter/floats", func(b *testing.B) {
++						b.Run("encoding/json", func(b *testing.B) {
+ 							b.ReportAllocs()
+ 							var m model.Matrix
+ 							for i := 0; i < b.N; i++ {
+-								if err := jsoniter.Unmarshal(floatBytes, &m); err != nil {
++								if err := json.Unmarshal(dataBytes, &m); err != nil {
+ 									b.Fatal(err)
+ 								}
+ 							}
+ 						})
+-						b.Run("encoding/json/histograms", func(b *testing.B) {
+-							b.ReportAllocs()
+-							var m model.Matrix
+-							for i := 0; i < b.N; i++ {
+-								if err := json.Unmarshal(histogramBytes, &m); err != nil {
+-									b.Fatal(err)
+-								}
+-							}
+-						})
+-						b.Run("jsoniter/histograms", func(b *testing.B) {
++
++						b.Run("jsoniter", func(b *testing.B) {
+ 							b.ReportAllocs()
+ 							var m model.Matrix
+ 							for i := 0; i < b.N; i++ {
+-								if err := jsoniter.Unmarshal(histogramBytes, &m); err != nil {
++								if err := jsoniter.Unmarshal(dataBytes, &m); err != nil {
+ 									b.Fatal(err)
+ 								}
+ 							}
+diff --git a/api/prometheus/v1/api_test.go b/api/prometheus/v1/api_test.go
+index 7579127..c933e0c 100644
+--- a/api/prometheus/v1/api_test.go
++++ b/api/prometheus/v1/api_test.go
+@@ -1478,7 +1478,7 @@ func TestAPIClientDo(t *testing.T) {
+ 	}
+ }
+ 
+-func TestSamplesJSONSerialization(t *testing.T) {
++func TestSamplesJsonSerialization(t *testing.T) {
+ 	tests := []struct {
+ 		point    model.SamplePair
+ 		expected string
+@@ -1574,162 +1574,6 @@ func TestSamplesJSONSerialization(t *testing.T) {
+ 	}
+ }
+ 
+-func TestHistogramJSONSerialization(t *testing.T) {
+-	tests := []struct {
+-		name     string
+-		point    model.SampleHistogramPair
+-		expected string
+-	}{
+-		{
+-			name: "empty histogram",
+-			point: model.SampleHistogramPair{
+-				Timestamp: 0,
+-				Histogram: &model.SampleHistogram{},
+-			},
+-			expected: `[0,{"count":"0","sum":"0"}]`,
+-		},
+-		{
+-			name: "histogram with NaN/Inf and no buckets",
+-			point: model.SampleHistogramPair{
+-				Timestamp: 0,
+-				Histogram: &model.SampleHistogram{
+-					Count: model.FloatString(math.NaN()),
+-					Sum:   model.FloatString(math.Inf(1)),
+-				},
+-			},
+-			expected: `[0,{"count":"NaN","sum":"+Inf"}]`,
+-		},
+-		{
+-			name: "six-bucket histogram",
+-			point: model.SampleHistogramPair{
+-				Timestamp: 1,
+-				Histogram: &model.SampleHistogram{
+-					Count: 13.5,
+-					Sum:   3897.1,
+-					Buckets: model.HistogramBuckets{
+-						{
+-							Boundaries: 1,
+-							Lower:      -4870.992343051145,
+-							Upper:      -4466.7196729968955,
+-							Count:      1,
+-						},
+-						{
+-							Boundaries: 1,
+-							Lower:      -861.0779292198035,
+-							Upper:      -789.6119426088657,
+-							Count:      2,
+-						},
+-						{
+-							Boundaries: 1,
+-							Lower:      -558.3399591246119,
+-							Upper:      -512,
+-							Count:      3,
+-						},
+-						{
+-							Boundaries: 0,
+-							Lower:      2048,
+-							Upper:      2233.3598364984477,
+-							Count:      1.5,
+-						},
+-						{
+-							Boundaries: 0,
+-							Lower:      2896.3093757400984,
+-							Upper:      3158.4477704354626,
+-							Count:      2.5,
+-						},
+-						{
+-							Boundaries: 0,
+-							Lower:      4466.7196729968955,
+-							Upper:      4870.992343051145,
+-							Count:      3.5,
+-						},
+-					},
+-				},
+-			},
+-			expected: `[0.001,{"count":"13.5","sum":"3897.1","buckets":[[1,"-4870.992343051145","-4466.7196729968955","1"],[1,"-861.0779292198035","-789.6119426088657","2"],[1,"-558.3399591246119","-512","3"],[0,"2048","2233.3598364984477","1.5"],[0,"2896.3093757400984","3158.4477704354626","2.5"],[0,"4466.7196729968955","4870.992343051145","3.5"]]}]`,
+-		},
+-	}
+-
+-	for _, test := range tests {
+-		t.Run(test.name, func(t *testing.T) {
+-			b, err := json.Marshal(test.point)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			if string(b) != test.expected {
+-				t.Fatalf("Mismatch marshal expected=%s actual=%s", test.expected, string(b))
+-			}
+-
+-			// To test Unmarshal we will Unmarshal then re-Marshal. This way we
+-			// can do a string compare, otherwise NaN values don't show equivalence
+-			// properly.
+-			var sp model.SampleHistogramPair
+-			if err = json.Unmarshal(b, &sp); err != nil {
+-				t.Fatal(err)
+-			}
+-
+-			b, err = json.Marshal(sp)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			if string(b) != test.expected {
+-				t.Fatalf("Mismatch marshal expected=%s actual=%s", test.expected, string(b))
+-			}
+-		})
+-	}
+-}
+-
+-func TestSampleStreamJSONSerialization(t *testing.T) {
+-	floats, histograms := generateData(1, 5)
+-
+-	tests := []struct {
+-		name         string
+-		stream       model.SampleStream
+-		expectedJSON string
+-	}{
+-		{
+-			"floats",
+-			*floats[0],
+-			`{"metric":{"__name__":"timeseries_0","foo":"bar"},"values":[[1677587259.055,"1"],[1677587244.055,"2"],[1677587229.055,"3"],[1677587214.055,"4"],[1677587199.055,"5"]]}`,
+-		},
+-		{
+-			"histograms",
+-			*histograms[0],
+-			`{"metric":{"__name__":"timeseries_0","foo":"bar"},"histograms":[[1677587259.055,{"count":"13.5","sum":"0.1","buckets":[[1,"-4870.992343051145","-4466.7196729968955","1"],[1,"-861.0779292198035","-789.6119426088657","2"],[1,"-558.3399591246119","-512","3"],[0,"2048","2233.3598364984477","1.5"],[0,"2896.3093757400984","3158.4477704354626","2.5"],[0,"4466.7196729968955","4870.992343051145","3.5"]]}],[1677587244.055,{"count":"27","sum":"0.2","buckets":[[1,"-4870.992343051145","-4466.7196729968955","2"],[1,"-861.0779292198035","-789.6119426088657","4"],[1,"-558.3399591246119","-512","6"],[0,"2048","2233.3598364984477","3"],[0,"2896.3093757400984","3158.4477704354626","5"],[0,"4466.7196729968955","4870.992343051145","7"]]}],[1677587229.055,{"count":"40.5","sum":"0.30000000000000004","buckets":[[1,"-4870.992343051145","-4466.7196729968955","3"],[1,"-861.0779292198035","-789.6119426088657","6"],[1,"-558.3399591246119","-512","9"],[0,"2048","2233.3598364984477","4.5"],[0,"2896.3093757400984","3158.4477704354626","7.5"],[0,"4466.7196729968955","4870.992343051145","10.5"]]}],[1677587214.055,{"count":"54","sum":"0.4","buckets":[[1,"-4870.992343051145","-4466.7196729968955","4"],[1,"-861.0779292198035","-789.6119426088657","8"],[1,"-558.3399591246119","-512","12"],[0,"2048","2233.3598364984477","6"],[0,"2896.3093757400984","3158.4477704354626","10"],[0,"4466.7196729968955","4870.992343051145","14"]]}],[1677587199.055,{"count":"67.5","sum":"0.5","buckets":[[1,"-4870.992343051145","-4466.7196729968955","5"],[1,"-861.0779292198035","-789.6119426088657","10"],[1,"-558.3399591246119","-512","15"],[0,"2048","2233.3598364984477","7.5"],[0,"2896.3093757400984","3158.4477704354626","12.5"],[0,"4466.7196729968955","4870.992343051145","17.5"]]}]]}`,
+-		},
+-		{
+-			"both",
+-			model.SampleStream{
+-				Metric:     floats[0].Metric,
+-				Values:     floats[0].Values,
+-				Histograms: histograms[0].Histograms,
+-			},
+-			`{"metric":{"__name__":"timeseries_0","foo":"bar"},"values":[[1677587259.055,"1"],[1677587244.055,"2"],[1677587229.055,"3"],[1677587214.055,"4"],[1677587199.055,"5"]],"histograms":[[1677587259.055,{"count":"13.5","sum":"0.1","buckets":[[1,"-4870.992343051145","-4466.7196729968955","1"],[1,"-861.0779292198035","-789.6119426088657","2"],[1,"-558.3399591246119","-512","3"],[0,"2048","2233.3598364984477","1.5"],[0,"2896.3093757400984","3158.4477704354626","2.5"],[0,"4466.7196729968955","4870.992343051145","3.5"]]}],[1677587244.055,{"count":"27","sum":"0.2","buckets":[[1,"-4870.992343051145","-4466.7196729968955","2"],[1,"-861.0779292198035","-789.6119426088657","4"],[1,"-558.3399591246119","-512","6"],[0,"2048","2233.3598364984477","3"],[0,"2896.3093757400984","3158.4477704354626","5"],[0,"4466.7196729968955","4870.992343051145","7"]]}],[1677587229.055,{"count":"40.5","sum":"0.30000000000000004","buckets":[[1,"-4870.992343051145","-4466.7196729968955","3"],[1,"-861.0779292198035","-789.6119426088657","6"],[1,"-558.3399591246119","-512","9"],[0,"2048","2233.3598364984477","4.5"],[0,"2896.3093757400984","3158.4477704354626","7.5"],[0,"4466.7196729968955","4870.992343051145","10.5"]]}],[1677587214.055,{"count":"54","sum":"0.4","buckets":[[1,"-4870.992343051145","-4466.7196729968955","4"],[1,"-861.0779292198035","-789.6119426088657","8"],[1,"-558.3399591246119","-512","12"],[0,"2048","2233.3598364984477","6"],[0,"2896.3093757400984","3158.4477704354626","10"],[0,"4466.7196729968955","4870.992343051145","14"]]}],[1677587199.055,{"count":"67.5","sum":"0.5","buckets":[[1,"-4870.992343051145","-4466.7196729968955","5"],[1,"-861.0779292198035","-789.6119426088657","10"],[1,"-558.3399591246119","-512","15"],[0,"2048","2233.3598364984477","7.5"],[0,"2896.3093757400984","3158.4477704354626","12.5"],[0,"4466.7196729968955","4870.992343051145","17.5"]]}]]}`,
+-		},
+-	}
+-
+-	for _, test := range tests {
+-		t.Run(test.name, func(t *testing.T) {
+-			b, err := json.Marshal(test.stream)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-			if string(b) != test.expectedJSON {
+-				t.Fatalf("Mismatch marshal expected=%s actual=%s", test.expectedJSON, string(b))
+-			}
+-
+-			var stream model.SampleStream
+-			if err = json.Unmarshal(b, &stream); err != nil {
+-				t.Fatal(err)
+-			}
+-
+-			if !reflect.DeepEqual(test.stream, stream) {
+-				t.Fatalf("Mismatch after unmarshal expected=%#v actual=%#v", test.stream, stream)
+-			}
+-		})
+-	}
+-}
+-
+ type httpTestClient struct {
+ 	client http.Client
+ }
+diff --git a/go.mod b/go.mod
+index da55035..536f0e5 100644
+--- a/go.mod
++++ b/go.mod
+@@ -9,9 +9,9 @@ require (
+ 	github.com/golang/protobuf v1.5.2
+ 	github.com/json-iterator/go v1.1.12
+ 	github.com/prometheus/client_model v0.3.0
+-	github.com/prometheus/common v0.41.0
++	github.com/prometheus/common v0.39.0
+ 	github.com/prometheus/procfs v0.9.0
+-	golang.org/x/sys v0.5.0
++	golang.org/x/sys v0.4.0
+ 	google.golang.org/protobuf v1.28.1
+ )
+ 
+@@ -19,12 +19,12 @@ require (
+ 	github.com/jpillora/backoff v1.0.0 // indirect
+ 	github.com/kr/pretty v0.3.1 // indirect
+ 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
+-	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
++	github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421 // indirect
+ 	github.com/modern-go/reflect2 v1.0.2 // indirect
+ 	github.com/mwitkow/go-conntrack v0.0.0-20190716064945-2f068394615f // indirect
+-	golang.org/x/net v0.7.0 // indirect
+-	golang.org/x/oauth2 v0.5.0 // indirect
+-	golang.org/x/text v0.7.0 // indirect
++	golang.org/x/net v0.4.0 // indirect
++	golang.org/x/oauth2 v0.3.0 // indirect
++	golang.org/x/text v0.5.0 // indirect
+ 	google.golang.org/appengine v1.6.7 // indirect
+ 	gopkg.in/yaml.v2 v2.4.0 // indirect
+ 	gopkg.in/yaml.v3 v3.0.1 // indirect
+diff --git a/go.sum b/go.sum
+index 3e62c14..07c1546 100644
+--- a/go.sum
++++ b/go.sum
+@@ -34,9 +34,8 @@ cloud.google.com/go/storage v1.10.0/go.mod h1:FLPqc6j+Ki4BU591ie1oL6qBQGu2Bl/tZ9
+ dmitri.shuralyov.com/gpu/mtl v0.0.0-20190408044501-666a987793e9/go.mod h1:H6x//7gZCb22OMCxBHrMx7a5I7Hp++hsVxbQ4BYO7hU=
+ github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
+ github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
+-github.com/alecthomas/kingpin/v2 v2.3.1/go.mod h1:oYL5vtsvEHZGHxU7DMp32Dvx+qL+ptGn6lWaot2vCNE=
+-github.com/alecthomas/units v0.0.0-20151022065526-2efee857e7cf/go.mod h1:ybxpYRFXyAe+OPACYpWeL0wqObRcbAqCMya13uyzqw0=
+-github.com/alecthomas/units v0.0.0-20211218093645-b94a6e3cc137/go.mod h1:OMCwj8VM1Kc9e19TLln2VL61YJF0x1XFtfdL4JdbSyE=
++github.com/alecthomas/template v0.0.0-20190718012654-fb15b899a751/go.mod h1:LOuyumcjzFXgccqObfd/Ljyb9UuFJ6TxHnclSeseNhc=
++github.com/alecthomas/units v0.0.0-20190924025748-f65c72e2690d/go.mod h1:rBZYJk541a8SKzHPHnH3zbiI+7dagKZ0cgpgrD7Fyho=
+ github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
+ github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
+ github.com/census-instrumentation/opencensus-proto v0.2.1/go.mod h1:f6KPmirojxKA12rnyqOA5BBL4O983OfeGPqjHWSTneU=
+@@ -137,9 +136,8 @@ github.com/kr/text v0.2.0/go.mod h1:eLer722TekiGuMkidMxC/pM04lWEeraHUUmBw8l2grE=
+ github.com/matttproud/golang_protobuf_extensions v1.0.1/go.mod h1:D8He9yQNgCq6Z5Ld7szi9bcBfOoFv/3dc6xSMkL2PC0=
+ github.com/matttproud/golang_protobuf_extensions v1.0.4 h1:mmDVorXM7PCGKw94cs5zkfA9PSy5pEvNWRP0ET0TIVo=
+ github.com/matttproud/golang_protobuf_extensions v1.0.4/go.mod h1:BSXmuO+STAnVfrANrmjBb36TMTDstsz7MSK+HVaYKv4=
++github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421 h1:ZqeYNhU3OHLH3mGKHDcjJRFFRrJa6eAM5H+CtDdOsPc=
+ github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
+-github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd h1:TRLaZ9cD/w8PVh93nsPXa1VrQ6jlwL5oN8l14QlcNfg=
+-github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
+ github.com/modern-go/reflect2 v1.0.2 h1:xBagoLtFs94CBntxluKeaWgTMpvLxC4ur3nMaC9Gz0M=
+ github.com/modern-go/reflect2 v1.0.2/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
+ github.com/mwitkow/go-conntrack v0.0.0-20190716064945-2f068394615f h1:KUppIJq7/+SVif2QVs3tOP0zanoHgBEVAwHxUSIzRqU=
+@@ -153,8 +151,8 @@ github.com/prometheus/client_model v0.2.0/go.mod h1:xMI15A0UPsDsEKsMN9yxemIoYk6T
+ github.com/prometheus/client_model v0.3.0 h1:UBgGFHqYdG/TPFD1B1ogZywDqEkwp3fBMvqdiQ7Xew4=
+ github.com/prometheus/client_model v0.3.0/go.mod h1:LDGWKZIo7rky3hgvBe+caln+Dr3dPggB5dvjtD7w9+w=
+ github.com/prometheus/common v0.37.0/go.mod h1:phzohg0JFMnBEFGxTDbfu3QyL5GI8gTQJFhYO5B3mfA=
+-github.com/prometheus/common v0.41.0 h1:npo01n6vUlRViIj5fgwiK8vlNIh8bnoxqh3gypKsyAw=
+-github.com/prometheus/common v0.41.0/go.mod h1:xBwqVerjNdUDjgODMpudtOMwlOwf2SaTr1yjz4b7Zbc=
++github.com/prometheus/common v0.39.0 h1:oOyhkDq05hPZKItWVBkJ6g6AtGxi+fy7F4JvUV8uhsI=
++github.com/prometheus/common v0.39.0/go.mod h1:6XBZ7lYdLCbkAVhwRsWTZn+IN5AB9F/NXd5w0BbEX0Y=
+ github.com/prometheus/procfs v0.8.0/go.mod h1:z7EfXMXOkbkqb9IINtpCn86r/to3BnA0uaxHdg830/4=
+ github.com/prometheus/procfs v0.9.0 h1:wzCHvIvM5SxWqYvwgVL7yJY8Lz3PKn49KQtpgMYJfhI=
+ github.com/prometheus/procfs v0.9.0/go.mod h1:+pB4zwohETzFnmlpe6yd2lSc+0/46IYZRB/chUwxUZY=
+@@ -163,13 +161,11 @@ github.com/rogpeppe/go-internal v1.9.0 h1:73kH8U+JUqXU8lRuOHeVHaa/SZPifC7BkcraZV
+ github.com/rogpeppe/go-internal v1.9.0/go.mod h1:WtVeX8xhTBvf0smdhujwtBcq4Qrzq/fJaraNFVN+nFs=
+ github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
+ github.com/stretchr/objx v0.4.0/go.mod h1:YvHI0jy2hoMjB+UWwv71VJQ9isScKT/TqJzVSSt89Yw=
+-github.com/stretchr/testify v1.2.2/go.mod h1:a8OnRcib4nhh0OaRAV+Yts87kKdq0PP7pXfy6kDkUVs=
+ github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=
+ github.com/stretchr/testify v1.4.0/go.mod h1:j7eGeouHqKxXV5pUuKE4zz7dFj8WfuZ+81PSLYec5m4=
+ github.com/stretchr/testify v1.7.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
+ github.com/stretchr/testify v1.8.0 h1:pSgiaMZlXftHpm5L7V1+rVB+AZJydKsMxsQBIJw4PKk=
+ github.com/stretchr/testify v1.8.0/go.mod h1:yNjHg4UonilssWZ8iaSj1OCr/vHnekPRkoO+kdMU+MU=
+-github.com/xhit/go-str2duration v1.2.0/go.mod h1:3cPSlfZlUHVlneIVfePFWcJZsuwf+P1v2SRTV4cUmp4=
+ github.com/yuin/goldmark v1.1.25/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
+ github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
+ github.com/yuin/goldmark v1.1.32/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
+@@ -246,17 +242,17 @@ golang.org/x/net v0.0.0-20210226172049-e18ecbb05110/go.mod h1:m0MpNAwzfU5UDzcl9v
+ golang.org/x/net v0.0.0-20220127200216-cd36cc0744dd/go.mod h1:CfG3xpIq0wQ8r1q4Su4UZFWDARRcnwPjda9FqA0JpMk=
+ golang.org/x/net v0.0.0-20220225172249-27dd8689420f/go.mod h1:CfG3xpIq0wQ8r1q4Su4UZFWDARRcnwPjda9FqA0JpMk=
+ golang.org/x/net v0.0.0-20220722155237-a158d28d115b/go.mod h1:XRhObCWvk6IyKnWLug+ECip1KBveYUHfp+8e9klMJ9c=
+-golang.org/x/net v0.6.0/go.mod h1:2Tu9+aMcznHK/AK1HMvgo6xiTLG5rD5rZLDS+rp2Bjs=
+-golang.org/x/net v0.7.0 h1:rJrUqqhjsgNp7KqAIc25s9pZnjU7TUcSY7HcVZjdn1g=
+-golang.org/x/net v0.7.0/go.mod h1:2Tu9+aMcznHK/AK1HMvgo6xiTLG5rD5rZLDS+rp2Bjs=
++golang.org/x/net v0.3.0/go.mod h1:MBQ8lrhLObU/6UmLb4fmbmk5OcyYmqtbGd/9yIeKjEE=
++golang.org/x/net v0.4.0 h1:Q5QPcMlvfxFTAPV0+07Xz/MpK9NTXu2VDUuy0FeMfaU=
++golang.org/x/net v0.4.0/go.mod h1:MBQ8lrhLObU/6UmLb4fmbmk5OcyYmqtbGd/9yIeKjEE=
+ golang.org/x/oauth2 v0.0.0-20180821212333-d2e6202438be/go.mod h1:N/0e6XlmueqKjAGxoOufVs8QHGRruUQn6yWY3a++T0U=
+ golang.org/x/oauth2 v0.0.0-20190226205417-e64efc72b421/go.mod h1:gOpvHmFTYa4IltrdGE7lF6nIHvwfUNPOp7c8zoXwtLw=
+ golang.org/x/oauth2 v0.0.0-20190604053449-0f29369cfe45/go.mod h1:gOpvHmFTYa4IltrdGE7lF6nIHvwfUNPOp7c8zoXwtLw=
+ golang.org/x/oauth2 v0.0.0-20191202225959-858c2ad4c8b6/go.mod h1:gOpvHmFTYa4IltrdGE7lF6nIHvwfUNPOp7c8zoXwtLw=
+ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4IltrdGE7lF6nIHvwfUNPOp7c8zoXwtLw=
+ golang.org/x/oauth2 v0.0.0-20220223155221-ee480838109b/go.mod h1:DAh4E804XQdzx2j+YRIaUnCqCV2RuMz24cGBJ5QYIrc=
+-golang.org/x/oauth2 v0.5.0 h1:HuArIo48skDwlrvM3sEdHXElYslAMsf3KwRkkW4MC4s=
+-golang.org/x/oauth2 v0.5.0/go.mod h1:9/XBHVqLaWO3/BRHs5jbpYCnOZVjj5V0ndyaAM7KB4I=
++golang.org/x/oauth2 v0.3.0 h1:6l90koy8/LaBLmLu8jpHeHexzMwEita0zFfYlggy2F8=
++golang.org/x/oauth2 v0.3.0/go.mod h1:rQrIauxkUhJ6CuwEXwymO2/eh4xz2ZWF1nBkcxS+tGk=
+ golang.org/x/sync v0.0.0-20180314180146-1d60e4601c6f/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.0.0-20181108010431-42b317875d0f/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.0.0-20181221193216-37e7f081c4d4/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+@@ -299,19 +295,19 @@ golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e/go.mod h1:oPkhp1MJrh7nUepCBc
+ golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20220722155257-8c9f86f7a55f/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.3.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+-golang.org/x/sys v0.5.0 h1:MUK/U/4lj1t1oPg0HfuXDN/Z1wv31ZJ/YcPiGccS4DU=
+-golang.org/x/sys v0.5.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
++golang.org/x/sys v0.4.0 h1:Zr2JFtRQNX3BCZ8YtxRE9hNJYC8J6I1MVbMg6owUp18=
++golang.org/x/sys v0.4.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1/go.mod h1:bj7SfCRtBDWHUb9snDiAeCFNEtKQo2Wmx5Cou7ajbmo=
+ golang.org/x/term v0.0.0-20210927222741-03fcf44c2211/go.mod h1:jbD1KX2456YbFQfuXm/mYQcufACuNUgVhRMnK/tPxf8=
+-golang.org/x/term v0.5.0/go.mod h1:jMB1sMXY+tzblOD4FWmEbocvup2/aLOaQEp7JmGp78k=
++golang.org/x/term v0.3.0/go.mod h1:q750SLmJuPmVoN1blW3UFBPREJfb1KmY3vwxfr+nFDA=
+ golang.org/x/text v0.0.0-20170915032832-14c0d48ead0c/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
+ golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
+ golang.org/x/text v0.3.1-0.20180807135948-17ff2d5776d2/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
+ golang.org/x/text v0.3.2/go.mod h1:bEr9sfX3Q8Zfm5fL9x+3itogRgK3+ptLWKqgva+5dAk=
+ golang.org/x/text v0.3.3/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=
+ golang.org/x/text v0.3.7/go.mod h1:u+2+/6zg+i71rQMx5EYifcz6MCKuco9NR6JIITiCfzQ=
+-golang.org/x/text v0.7.0 h1:4BRB4x83lYWy72KwLD/qYDuTu7q9PjSagHvijDw7cLo=
+-golang.org/x/text v0.7.0/go.mod h1:mrYo+phRRbMaCq/xk9113O4dZlRixOauAjOtrjsXDZ8=
++golang.org/x/text v0.5.0 h1:OLmvp0KP+FVG99Ct/qFiL/Fhk4zp4QQnZ7b2U+5piUM=
++golang.org/x/text v0.5.0/go.mod h1:mrYo+phRRbMaCq/xk9113O4dZlRixOauAjOtrjsXDZ8=
+ golang.org/x/time v0.0.0-20181108054448-85acf8d2951c/go.mod h1:tRJNPiyCQ0inRvYxbN9jk5I+vvW/OXSQhTDSoE431IQ=
+ golang.org/x/time v0.0.0-20190308202827-9d24e82272b4/go.mod h1:tRJNPiyCQ0inRvYxbN9jk5I+vvW/OXSQhTDSoE431IQ=
+ golang.org/x/time v0.0.0-20191024005414-555d28b269f0/go.mod h1:tRJNPiyCQ0inRvYxbN9jk5I+vvW/OXSQhTDSoE431IQ=

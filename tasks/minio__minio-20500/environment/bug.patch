@@ -1,0 +1,145 @@
+diff --git a/cmd/erasure-healing-common.go b/cmd/erasure-healing-common.go
+index 1e39c2c26..3b10ea55e 100644
+--- a/cmd/erasure-healing-common.go
++++ b/cmd/erasure-healing-common.go
+@@ -289,7 +289,7 @@ func hasPartErr(partErrs []int) bool {
+ //   - slice of errors about the state of data files on disk - can have
+ //     a not-found error or a hash-mismatch error.
+ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetadata []FileInfo,
+-	errs []error, latestMeta FileInfo, filterByETag bool, bucket, object string,
++	errs []error, latestMeta FileInfo, bucket, object string,
+ 	scanMode madmin.HealScanMode,
+ ) (availableDisks []StorageAPI, dataErrsByDisk map[int][]int, dataErrsByPart map[int][]int) {
+ 	availableDisks = make([]StorageAPI, len(onlineDisks))
+@@ -345,14 +345,7 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
+ 		}
+ 
+ 		meta := partsMetadata[i]
+-		corrupted := false
+-		if filterByETag {
+-			corrupted = meta.Metadata["etag"] != latestMeta.Metadata["etag"]
+-		} else {
+-			corrupted = !meta.ModTime.Equal(latestMeta.ModTime) || meta.DataDir != latestMeta.DataDir
+-		}
+-
+-		if corrupted {
++		if !meta.ModTime.Equal(latestMeta.ModTime) || meta.DataDir != latestMeta.DataDir {
+ 			metaErrs[i] = errFileCorrupt
+ 			partsMetadata[i] = FileInfo{}
+ 			continue
+@@ -415,6 +408,7 @@ func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetad
+ 			verifyResp *CheckPartsResp
+ 		)
+ 
++		meta.DataDir = latestMeta.DataDir
+ 		switch scanMode {
+ 		case madmin.HealDeepScan:
+ 			// disk has a valid xl.meta but may not have all the
+diff --git a/cmd/erasure-healing-common_test.go b/cmd/erasure-healing-common_test.go
+index a3a973646..7cf755059 100644
+--- a/cmd/erasure-healing-common_test.go
++++ b/cmd/erasure-healing-common_test.go
+@@ -314,7 +314,7 @@ func TestListOnlineDisks(t *testing.T) {
+ 					test.expectedTime, modTime)
+ 			}
+ 			availableDisks, _, _ := disksWithAllParts(ctx, onlineDisks, partsMetadata,
+-				test.errs, fi, false, bucket, object, madmin.HealDeepScan)
++				test.errs, fi, bucket, object, madmin.HealDeepScan)
+ 
+ 			if test._tamperBackend != noTamper {
+ 				if tamperedIndex != -1 && availableDisks[tamperedIndex] != nil {
+@@ -496,7 +496,7 @@ func TestListOnlineDisksSmallObjects(t *testing.T) {
+ 			}
+ 
+ 			availableDisks, _, _ := disksWithAllParts(ctx, onlineDisks, partsMetadata,
+-				test.errs, fi, false, bucket, object, madmin.HealDeepScan)
++				test.errs, fi, bucket, object, madmin.HealDeepScan)
+ 
+ 			if test._tamperBackend != noTamper {
+ 				if tamperedIndex != -1 && availableDisks[tamperedIndex] != nil {
+@@ -558,7 +558,7 @@ func TestDisksWithAllParts(t *testing.T) {
+ 	erasureDisks, _, _ = listOnlineDisks(erasureDisks, partsMetadata, errs, readQuorum)
+ 
+ 	filteredDisks, _, dataErrsPerDisk := disksWithAllParts(ctx, erasureDisks, partsMetadata,
+-		errs, fi, false, bucket, object, madmin.HealDeepScan)
++		errs, fi, bucket, object, madmin.HealDeepScan)
+ 
+ 	if len(filteredDisks) != len(erasureDisks) {
+ 		t.Errorf("Unexpected number of drives: %d", len(filteredDisks))
+@@ -580,7 +580,7 @@ func TestDisksWithAllParts(t *testing.T) {
+ 
+ 	errs = make([]error, len(erasureDisks))
+ 	filteredDisks, _, _ = disksWithAllParts(ctx, erasureDisks, partsMetadata,
+-		errs, fi, false, bucket, object, madmin.HealDeepScan)
++		errs, fi, bucket, object, madmin.HealDeepScan)
+ 
+ 	if len(filteredDisks) != len(erasureDisks) {
+ 		t.Errorf("Unexpected number of drives: %d", len(filteredDisks))
+@@ -601,7 +601,7 @@ func TestDisksWithAllParts(t *testing.T) {
+ 
+ 	errs = make([]error, len(erasureDisks))
+ 	filteredDisks, _, _ = disksWithAllParts(ctx, erasureDisks, partsMetadata,
+-		errs, fi, false, bucket, object, madmin.HealDeepScan)
++		errs, fi, bucket, object, madmin.HealDeepScan)
+ 
+ 	if len(filteredDisks) != len(erasureDisks) {
+ 		t.Errorf("Unexpected number of drives: %d", len(filteredDisks))
+@@ -638,7 +638,7 @@ func TestDisksWithAllParts(t *testing.T) {
+ 
+ 	errs = make([]error, len(erasureDisks))
+ 	filteredDisks, dataErrsPerDisk, _ = disksWithAllParts(ctx, erasureDisks, partsMetadata,
+-		errs, fi, false, bucket, object, madmin.HealDeepScan)
++		errs, fi, bucket, object, madmin.HealDeepScan)
+ 
+ 	if len(filteredDisks) != len(erasureDisks) {
+ 		t.Errorf("Unexpected number of drives: %d", len(filteredDisks))
+diff --git a/cmd/erasure-healing.go b/cmd/erasure-healing.go
+index 6f4ea4fd5..6972c0e27 100644
+--- a/cmd/erasure-healing.go
++++ b/cmd/erasure-healing.go
+@@ -327,18 +327,15 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object
+ 
+ 	// List of disks having latest version of the object xl.meta
+ 	// (by modtime).
+-	onlineDisks, quorumModTime, quorumETag := listOnlineDisks(storageDisks, partsMetadata, errs, readQuorum)
++	onlineDisks, modTime, etag := listOnlineDisks(storageDisks, partsMetadata, errs, readQuorum)
+ 
+ 	// Latest FileInfo for reference. If a valid metadata is not
+ 	// present, it is as good as object not found.
+-	latestMeta, err := pickValidFileInfo(ctx, partsMetadata, quorumModTime, quorumETag, readQuorum)
++	latestMeta, err := pickValidFileInfo(ctx, partsMetadata, modTime, etag, readQuorum)
+ 	if err != nil {
+ 		return result, err
+ 	}
+ 
+-	// No modtime quorum
+-	filterDisksByETag := quorumETag != ""
+-
+ 	// List of disks having all parts as per latest metadata.
+ 	// NOTE: do not pass in latestDisks to diskWithAllParts since
+ 	// the diskWithAllParts needs to reach the drive to ensure
+@@ -349,7 +346,7 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object
+ 	// we do not skip drives that have inconsistent metadata to be
+ 	// skipped from purging when they are stale.
+ 	availableDisks, dataErrsByDisk, dataErrsByPart := disksWithAllParts(ctx, onlineDisks, partsMetadata,
+-		errs, latestMeta, filterDisksByETag, bucket, object, scanMode)
++		errs, latestMeta, bucket, object, scanMode)
+ 
+ 	var erasure Erasure
+ 	if !latestMeta.Deleted && !latestMeta.IsRemote() {
+@@ -424,14 +421,7 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object
+ 		return result, nil
+ 	}
+ 
+-	cannotHeal := !latestMeta.XLV1 && !latestMeta.Deleted && disksToHealCount > latestMeta.Erasure.ParityBlocks
+-	if cannotHeal && quorumETag != "" {
+-		// This is an object that is supposed to be removed by the dangling code
+-		// but we noticed that ETag is the same for all objects, let's give it a shot
+-		cannotHeal = false
+-	}
+-
+-	if cannotHeal {
++	if !latestMeta.XLV1 && !latestMeta.Deleted && disksToHealCount > latestMeta.Erasure.ParityBlocks {
+ 		// Allow for dangling deletes, on versions that have DataDir missing etc.
+ 		// this would end up restoring the correct readable versions.
+ 		m, err := er.deleteIfDangling(ctx, bucket, object, partsMetadata, errs, dataErrsByPart, ObjectOptions{

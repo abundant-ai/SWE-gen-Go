@@ -1,0 +1,452 @@
+diff --git a/experimental/stats/metrics.go b/experimental/stats/metrics.go
+index 1d2dc016..88742724 100644
+--- a/experimental/stats/metrics.go
++++ b/experimental/stats/metrics.go
+@@ -19,9 +19,13 @@
+ // Package stats contains experimental metrics/stats API's.
+ package stats
+ 
+-import "google.golang.org/grpc/stats"
++import (
++	"google.golang.org/grpc/internal"
++	"google.golang.org/grpc/stats"
++)
+ 
+ // MetricsRecorder records on metrics derived from metric registry.
++// Implementors must embed UnimplementedMetricsRecorder.
+ type MetricsRecorder interface {
+ 	// RecordInt64Count records the measurement alongside labels on the int
+ 	// count associated with the provided handle.
+@@ -46,6 +50,11 @@ type MetricsRecorder interface {
+ 	// the metrics are no longer needed, which will remove the reporter. The
+ 	// returned method needs to be idempotent and concurrent safe.
+ 	RegisterAsyncReporter(reporter AsyncMetricReporter, descriptors ...AsyncMetric) func()
++
++	// EnforceMetricsRecorderEmbedding is included to force implementers to embed
++	// another implementation of this interface, allowing gRPC to add methods
++	// without breaking users.
++	internal.EnforceMetricsRecorderEmbedding
+ }
+ 
+ // AsyncMetricReporter is an interface for types that record metrics asynchronously
+@@ -90,3 +99,33 @@ type Metric = string
+ func NewMetrics(metrics ...Metric) *Metrics {
+ 	return stats.NewMetricSet(metrics...)
+ }
++
++// UnimplementedMetricsRecorder must be embedded to have forward compatible implementations.
++type UnimplementedMetricsRecorder struct {
++	internal.EnforceMetricsRecorderEmbedding
++}
++
++// RecordInt64Count provides a no-op implementation.
++func (UnimplementedMetricsRecorder) RecordInt64Count(*Int64CountHandle, int64, ...string) {}
++
++// RecordFloat64Count provides a no-op implementation.
++func (UnimplementedMetricsRecorder) RecordFloat64Count(*Float64CountHandle, float64, ...string) {}
++
++// RecordInt64Histo provides a no-op implementation.
++func (UnimplementedMetricsRecorder) RecordInt64Histo(*Int64HistoHandle, int64, ...string) {}
++
++// RecordFloat64Histo provides a no-op implementation.
++func (UnimplementedMetricsRecorder) RecordFloat64Histo(*Float64HistoHandle, float64, ...string) {}
++
++// RecordInt64Gauge provides a no-op implementation.
++func (UnimplementedMetricsRecorder) RecordInt64Gauge(*Int64GaugeHandle, int64, ...string) {}
++
++// RecordInt64UpDownCount provides a no-op implementation.
++func (UnimplementedMetricsRecorder) RecordInt64UpDownCount(*Int64UpDownCountHandle, int64, ...string) {
++}
++
++// RegisterAsyncReporter provides a no-op implementation.
++func (UnimplementedMetricsRecorder) RegisterAsyncReporter(AsyncMetricReporter, ...AsyncMetric) func() {
++	// No-op: Return an empty function to ensure caller doesn't panic on nil function call
++	return func() {}
++}
+diff --git a/internal/grpctest/grpctest.go b/internal/grpctest/grpctest.go
+index 29e8c8b9..1e93fe73 100644
+--- a/internal/grpctest/grpctest.go
++++ b/internal/grpctest/grpctest.go
+@@ -60,6 +60,7 @@ func (Tester) Setup(t *testing.T) {
+ 	//  fixed.
+ 	leakcheck.SetTrackingBufferPool(logger{t: t})
+ 	leakcheck.TrackTimers()
++	leakcheck.TrackAsyncReporters()
+ }
+ 
+ // Teardown performs a leak check.
+@@ -75,6 +76,10 @@ func (Tester) Teardown(t *testing.T) {
+ 	if atomic.LoadUint32(&lcFailed) == 1 {
+ 		t.Log("Goroutine leak check disabled for future tests")
+ 	}
++	leakcheck.CheckAsyncReporters(logger{t: t})
++	if atomic.LoadUint32(&lcFailed) == 1 {
++		return
++	}
+ 	tLogr.endTest(t)
+ }
+ 
+diff --git a/internal/internal.go b/internal/internal.go
+index 27bef83d..144b2803 100644
+--- a/internal/internal.go
++++ b/internal/internal.go
+@@ -248,6 +248,14 @@ var (
+ 	// AddressToTelemetryLabels is an xDS-provided function to extract telemetry
+ 	// labels from a resolver.Address. Callers must assert its type before calling.
+ 	AddressToTelemetryLabels any // func(addr resolver.Address) map[string]string
++
++	// AsyncReporterCleanupDelegate is initialized to a pass-through function by
++	// default (production behavior), allowing tests to swap it with an
++	// implementation which tracks registration of async reporter and its
++	// corresponding cleanup.
++	AsyncReporterCleanupDelegate = func(cleanup func()) func() {
++		return cleanup
++	}
+ )
+ 
+ // HealthChecker defines the signature of the client-side LB channel health
+@@ -295,3 +303,9 @@ type EnforceClientConnEmbedding interface {
+ type Timer interface {
+ 	Stop() bool
+ }
++
++// EnforceMetricsRecorderEmbedding is used to enforce proper MetricsRecorder
++// implementation embedding.
++type EnforceMetricsRecorderEmbedding interface {
++	enforceMetricsRecorderEmbedding()
++}
+diff --git a/internal/leakcheck/leakcheck.go b/internal/leakcheck/leakcheck.go
+index 2927fb37..3c5d9057 100644
+--- a/internal/leakcheck/leakcheck.go
++++ b/internal/leakcheck/leakcheck.go
+@@ -394,3 +394,96 @@ func traceToString(stack []uintptr) string {
+ 	}
+ 	return trace.String()
+ }
++
++// Async Reporter Leak Checking
++
++var asyncReporterTracker *reporterTracker
++
++type reporterTracker struct {
++	mu          sync.Mutex
++	allocations map[*int][]uintptr
++}
++
++func newReporterTracker() *reporterTracker {
++	return &reporterTracker{
++		allocations: make(map[*int][]uintptr),
++	}
++}
++
++// register records the stack trace.
++func (rt *reporterTracker) register() *int {
++	rt.mu.Lock()
++	defer rt.mu.Unlock()
++
++	id := new(int)
++	// Skip 4 frames: register -> internal.Delegate -> stats.RegisterAsyncReporter -> Caller
++	rt.allocations[id] = currentStack(4)
++	return id
++}
++
++// unregister removes the ID.
++func (rt *reporterTracker) unregister(id *int) {
++	rt.mu.Lock()
++	defer rt.mu.Unlock()
++	delete(rt.allocations, id)
++}
++
++// leakedStackTraces returns formatted stack traces for all currently registered
++// reporters.
++func (rt *reporterTracker) leakedStackTraces() []string {
++	rt.mu.Lock()
++	defer rt.mu.Unlock()
++
++	var traces []string
++	for _, pcs := range rt.allocations {
++		msg := "\n--- Leaked Async Reporter Registration ---\n" + traceToString(pcs)
++		traces = append(traces, msg)
++	}
++	return traces
++}
++
++// TrackAsyncReporters installs the tracking delegate.
++func TrackAsyncReporters() {
++	asyncReporterTracker = newReporterTracker()
++
++	// Swap the delegate: Replace the default pass-through with tracking logic.
++	internal.AsyncReporterCleanupDelegate = func(originalCleanup func()) func() {
++		// 1. Capture Stack Trace (happens during Registration)
++		token := asyncReporterTracker.register()
++
++		// 2. Return Wrapped Cleanup
++		return func() {
++			// Defer unregister to ensure we stop tracking even if the original cleanup panics.
++			defer asyncReporterTracker.unregister(token)
++
++			if originalCleanup != nil {
++				originalCleanup()
++			}
++		}
++	}
++}
++
++// CheckAsyncReporters verifies that no leaks exist and restores the default delegate.
++func CheckAsyncReporters(logger Logger) {
++	// Restore the delegate: Reset to the default pass-through behavior.
++	internal.AsyncReporterCleanupDelegate = func(cleanup func()) func() {
++		return cleanup
++	}
++
++	if asyncReporterTracker == nil {
++		return
++	}
++
++	leaks := asyncReporterTracker.leakedStackTraces()
++	if len(leaks) > 0 {
++		// Join all stack traces into one message
++		allTraces := ""
++		for _, trace := range leaks {
++			allTraces += trace
++		}
++		logger.Errorf("Found %d leaked async reporters:%s", len(leaks), allTraces)
++	}
++
++	// Clean up global state
++	asyncReporterTracker = nil
++}
+diff --git a/internal/stats/metrics_recorder_list.go b/internal/stats/metrics_recorder_list.go
+index 4a9fc012..1b53cf5f 100644
+--- a/internal/stats/metrics_recorder_list.go
++++ b/internal/stats/metrics_recorder_list.go
+@@ -20,6 +20,7 @@ import (
+ 	"fmt"
+ 
+ 	estats "google.golang.org/grpc/experimental/stats"
++	"google.golang.org/grpc/internal"
+ 	"google.golang.org/grpc/stats"
+ )
+ 
+@@ -28,6 +29,7 @@ import (
+ // It eats any record calls where the label values provided do not match the
+ // number of label keys.
+ type MetricsRecorderList struct {
++	internal.EnforceMetricsRecorderEmbedding
+ 	// metricsRecorders are the metrics recorders this list will forward to.
+ 	metricsRecorders []estats.MetricsRecorder
+ }
+@@ -138,6 +140,14 @@ func (l *MetricsRecorderList) RegisterAsyncReporter(reporter estats.AsyncMetricR
+ 		}
+ 		unregisterFns = append(unregisterFns, mr.RegisterAsyncReporter(estats.AsyncMetricReporterFunc(wrappedCallback), metrics...))
+ 	}
++
++	// Wrap the cleanup function using the internal delegate.
++	// In production, this returns realCleanup as-is.
++	// In tests, the leak checker can swap this to track the registration lifetime.
++	return internal.AsyncReporterCleanupDelegate(defaultCleanUp(unregisterFns))
++}
++
++func defaultCleanUp(unregisterFns []func()) func() {
+ 	return func() {
+ 		for _, unregister := range unregisterFns {
+ 			unregister()
+diff --git a/internal/testutils/stats/test_metrics_recorder.go b/internal/testutils/stats/test_metrics_recorder.go
+index 40fc9b7b..5481bce9 100644
+--- a/internal/testutils/stats/test_metrics_recorder.go
++++ b/internal/testutils/stats/test_metrics_recorder.go
+@@ -35,6 +35,7 @@ import (
+ // have taken place. It also persists metrics data keyed on the metrics
+ // descriptor.
+ type TestMetricsRecorder struct {
++	estats.UnimplementedMetricsRecorder
+ 	intCountCh       *testutils.Channel
+ 	floatCountCh     *testutils.Channel
+ 	intHistoCh       *testutils.Channel
+@@ -276,12 +277,6 @@ func (r *TestMetricsRecorder) RecordInt64Gauge(handle *estats.Int64GaugeHandle,
+ 	r.data[handle.Name] = float64(incr)
+ }
+ 
+-// RegisterAsyncReporter is noop implementation, async gauge test recorders should
+-// provide their own implementation
+-func (r *TestMetricsRecorder) RegisterAsyncReporter(estats.AsyncMetricReporter, ...estats.AsyncMetric) func() {
+-	return func() {}
+-}
+-
+ // To implement a stats.Handler, which allows it to be set as a dial option:
+ 
+ // TagRPC is TestMetricsRecorder's implementation of TagRPC.
+@@ -302,28 +297,6 @@ func (r *TestMetricsRecorder) HandleConn(context.Context, stats.ConnStats) {}
+ 
+ // NoopMetricsRecorder is a noop MetricsRecorder to be used in tests to prevent
+ // nil panics.
+-type NoopMetricsRecorder struct{}
+-
+-// RecordInt64Count is a noop implementation of RecordInt64Count.
+-func (r *NoopMetricsRecorder) RecordInt64Count(*estats.Int64CountHandle, int64, ...string) {}
+-
+-// RecordFloat64Count is a noop implementation of RecordFloat64Count.
+-func (r *NoopMetricsRecorder) RecordFloat64Count(*estats.Float64CountHandle, float64, ...string) {}
+-
+-// RecordInt64Histo is a noop implementation of RecordInt64Histo.
+-func (r *NoopMetricsRecorder) RecordInt64Histo(*estats.Int64HistoHandle, int64, ...string) {}
+-
+-// RecordFloat64Histo is a noop implementation of RecordFloat64Histo.
+-func (r *NoopMetricsRecorder) RecordFloat64Histo(*estats.Float64HistoHandle, float64, ...string) {}
+-
+-// RecordInt64Gauge is a noop implementation of RecordInt64Gauge.
+-func (r *NoopMetricsRecorder) RecordInt64Gauge(*estats.Int64GaugeHandle, int64, ...string) {}
+-
+-// RecordInt64UpDownCount is a noop implementation of RecordInt64UpDownCount.
+-func (r *NoopMetricsRecorder) RecordInt64UpDownCount(*estats.Int64UpDownCountHandle, int64, ...string) {
+-}
+-
+-// RegisterAsyncReporter is a noop implementation of RegisterAsyncReporter.
+-func (r *NoopMetricsRecorder) RegisterAsyncReporter(estats.AsyncMetricReporter, ...estats.AsyncMetric) func() {
+-	return func() {}
++type NoopMetricsRecorder struct {
++	estats.UnimplementedMetricsRecorder
+ }
+diff --git a/stats/opentelemetry/opentelemetry.go b/stats/opentelemetry/opentelemetry.go
+index db720752..1031e9fa 100644
+--- a/stats/opentelemetry/opentelemetry.go
++++ b/stats/opentelemetry/opentelemetry.go
+@@ -340,6 +340,21 @@ func createInt64Gauge(setOfMetrics map[string]bool, metricName string, meter ote
+ 	return ret
+ }
+ 
++// createInt64ObservableGauge initializes an OTel Int64ObservableGauge if the metric is enabled.
++func createInt64ObservableGauge(setOfMetrics map[string]bool, metricName string, meter otelmetric.Meter, options ...otelmetric.Int64ObservableGaugeOption) otelmetric.Int64ObservableGauge {
++	if _, ok := setOfMetrics[metricName]; !ok {
++		n, _ := noop.NewMeterProvider().Meter("noop").Int64ObservableGauge("noop")
++		return n
++	}
++	ret, err := meter.Int64ObservableGauge(metricName, options...)
++	if err != nil {
++		logger.Errorf("failed to register metric %q, will not record: %v", metricName, err)
++		n, _ := noop.NewMeterProvider().Meter("noop").Int64ObservableGauge("noop")
++		return n
++	}
++	return ret
++}
++
+ func optionFromLabels(labelKeys []string, optionalLabelKeys []string, optionalLabels []string, labelVals ...string) otelmetric.MeasurementOption {
+ 	var attributes []otelattribute.KeyValue
+ 
+@@ -362,6 +377,7 @@ func optionFromLabels(labelKeys []string, optionalLabelKeys []string, optionalLa
+ // registryMetrics implements MetricsRecorder for the client and server stats
+ // handlers.
+ type registryMetrics struct {
++	internal.EnforceMetricsRecorderEmbedding
+ 	intCounts       map[*estats.MetricDescriptor]otelmetric.Int64Counter
+ 	floatCounts     map[*estats.MetricDescriptor]otelmetric.Float64Counter
+ 	intHistos       map[*estats.MetricDescriptor]otelmetric.Int64Histogram
+@@ -369,16 +385,22 @@ type registryMetrics struct {
+ 	intGauges       map[*estats.MetricDescriptor]otelmetric.Int64Gauge
+ 	intUpDownCounts map[*estats.MetricDescriptor]otelmetric.Int64UpDownCounter
+ 
++	// Asynchronous (Observable) Instruments
++	intObservableGauges map[*estats.MetricDescriptor]otelmetric.Int64ObservableGauge
++
++	meter          otelmetric.Meter
+ 	optionalLabels []string
+ }
+ 
+ func (rm *registryMetrics) registerMetrics(metrics *stats.MetricSet, meter otelmetric.Meter) {
++	rm.meter = meter
+ 	rm.intCounts = make(map[*estats.MetricDescriptor]otelmetric.Int64Counter)
+ 	rm.floatCounts = make(map[*estats.MetricDescriptor]otelmetric.Float64Counter)
+ 	rm.intHistos = make(map[*estats.MetricDescriptor]otelmetric.Int64Histogram)
+ 	rm.floatHistos = make(map[*estats.MetricDescriptor]otelmetric.Float64Histogram)
+ 	rm.intGauges = make(map[*estats.MetricDescriptor]otelmetric.Int64Gauge)
+ 	rm.intUpDownCounts = make(map[*estats.MetricDescriptor]otelmetric.Int64UpDownCounter)
++	rm.intObservableGauges = make(map[*estats.MetricDescriptor]otelmetric.Int64ObservableGauge)
+ 
+ 	for metric := range metrics.Metrics() {
+ 		desc := estats.DescriptorForMetric(metric)
+@@ -401,6 +423,8 @@ func (rm *registryMetrics) registerMetrics(metrics *stats.MetricSet, meter otelm
+ 			rm.intGauges[desc] = createInt64Gauge(metrics.Metrics(), desc.Name, meter, otelmetric.WithUnit(desc.Unit), otelmetric.WithDescription(desc.Description))
+ 		case estats.MetricTypeIntUpDownCount:
+ 			rm.intUpDownCounts[desc] = createInt64UpDownCounter(metrics.Metrics(), desc.Name, meter, otelmetric.WithUnit(desc.Unit), otelmetric.WithDescription(desc.Description))
++		case estats.MetricTypeIntAsyncGauge:
++			rm.intObservableGauges[desc] = createInt64ObservableGauge(metrics.Metrics(), desc.Name, meter, otelmetric.WithUnit(desc.Unit), otelmetric.WithDescription(desc.Description))
+ 		}
+ 	}
+ }
+@@ -461,9 +485,45 @@ func (rm *registryMetrics) RecordInt64Gauge(handle *estats.Int64GaugeHandle, inc
+ // skipped.
+ //
+ // The returned cleanup function unregisters the callback from the Meter.
+-func (rm *registryMetrics) RegisterAsyncReporter(_ estats.AsyncMetricReporter, _ ...estats.AsyncMetric) func() {
+-	// TODO(@mbissa) - add implementation
+-	return func() {}
++// RegisterAsyncReporter registers a callback with the OpenTelemetry Meter.
++func (rm *registryMetrics) RegisterAsyncReporter(reporter estats.AsyncMetricReporter, metrics ...estats.AsyncMetric) func() {
++	observables := make([]otelmetric.Observable, 0, len(metrics))
++	observableMap := make(map[*estats.MetricDescriptor]otelmetric.Observable, len(metrics))
++
++	for _, m := range metrics {
++		d := m.Descriptor()
++		if inst, ok := rm.intObservableGauges[d]; ok {
++			observables = append(observables, inst)
++			observableMap[d] = inst
++		}
++	}
++
++	if len(observables) == 0 {
++		return func() {}
++	}
++
++	cbWrapper := func(_ context.Context, o otelmetric.Observer) error {
++		adapter := &observerAdapter{
++			observableMap:  observableMap,
++			optionalLabels: rm.optionalLabels,
++			delegate:       o,
++		}
++		reporter.Report(adapter)
++		return nil
++	}
++
++	reg, err := rm.meter.RegisterCallback(cbWrapper, observables...)
++	if err != nil {
++		logger.Warningf("grpc: failed to register callback for async metrics: %v", err)
++		return func() {}
++	}
++
++	return func() {
++		err = reg.Unregister()
++		if err != nil {
++			logger.Errorf("grpc: failed to unregister callback for async metrics: %v", err)
++		}
++	}
+ }
+ 
+ // Users of this component should use these bucket boundaries as part of their
+@@ -486,3 +546,27 @@ var (
+ func DefaultMetrics() *stats.MetricSet {
+ 	return defaultPerCallMetrics.Join(estats.DefaultMetrics)
+ }
++
++type observerAdapter struct {
++	observableMap  map[*estats.MetricDescriptor]otelmetric.Observable
++	optionalLabels []string
++	delegate       otelmetric.Observer
++}
++
++// RecordInt64AsyncGauge records the measurement alongside labels on the int
++// gauge associated with the provided handle.
++func (a *observerAdapter) RecordInt64AsyncGauge(handle *estats.Int64AsyncGaugeHandle, val int64, labels ...string) {
++	desc := handle.Descriptor()
++	observable, ok := a.observableMap[desc]
++	if !ok {
++		return
++	}
++
++	ao := optionFromLabels(desc.Labels, desc.OptionalLabels, a.optionalLabels, labels...)
++
++	switch obs := observable.(type) {
++	case otelmetric.Int64ObservableGauge:
++		a.delegate.ObserveInt64(obs, val, ao)
++	default:
++	}
++}

@@ -1,0 +1,592 @@
+diff --git a/prometheus/promhttp/delegator.go b/prometheus/promhttp/delegator.go
+deleted file mode 100644
+index 5ee095b..0000000
+--- a/prometheus/promhttp/delegator.go
++++ /dev/null
+@@ -1,199 +0,0 @@
+-// Copyright 2017 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package promhttp
+-
+-import (
+-	"bufio"
+-	"io"
+-	"net"
+-	"net/http"
+-)
+-
+-const (
+-	closeNotifier = 1 << iota
+-	flusher
+-	hijacker
+-	readerFrom
+-	pusher
+-)
+-
+-type delegator interface {
+-	http.ResponseWriter
+-
+-	Status() int
+-	Written() int64
+-}
+-
+-type responseWriterDelegator struct {
+-	http.ResponseWriter
+-
+-	handler, method    string
+-	status             int
+-	written            int64
+-	wroteHeader        bool
+-	observeWriteHeader func(int)
+-}
+-
+-func (r *responseWriterDelegator) Status() int {
+-	return r.status
+-}
+-
+-func (r *responseWriterDelegator) Written() int64 {
+-	return r.written
+-}
+-
+-func (r *responseWriterDelegator) WriteHeader(code int) {
+-	r.status = code
+-	r.wroteHeader = true
+-	r.ResponseWriter.WriteHeader(code)
+-	if r.observeWriteHeader != nil {
+-		r.observeWriteHeader(code)
+-	}
+-}
+-
+-func (r *responseWriterDelegator) Write(b []byte) (int, error) {
+-	if !r.wroteHeader {
+-		r.WriteHeader(http.StatusOK)
+-	}
+-	n, err := r.ResponseWriter.Write(b)
+-	r.written += int64(n)
+-	return n, err
+-}
+-
+-type closeNotifierDelegator struct{ *responseWriterDelegator }
+-type flusherDelegator struct{ *responseWriterDelegator }
+-type hijackerDelegator struct{ *responseWriterDelegator }
+-type readerFromDelegator struct{ *responseWriterDelegator }
+-
+-func (d *closeNotifierDelegator) CloseNotify() <-chan bool {
+-	return d.ResponseWriter.(http.CloseNotifier).CloseNotify()
+-}
+-func (d *flusherDelegator) Flush() {
+-	d.ResponseWriter.(http.Flusher).Flush()
+-}
+-func (d *hijackerDelegator) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+-	return d.ResponseWriter.(http.Hijacker).Hijack()
+-}
+-func (d *readerFromDelegator) ReadFrom(re io.Reader) (int64, error) {
+-	if !d.wroteHeader {
+-		d.WriteHeader(http.StatusOK)
+-	}
+-	n, err := d.ResponseWriter.(io.ReaderFrom).ReadFrom(re)
+-	d.written += n
+-	return n, err
+-}
+-
+-var pickDelegator = make([]func(*responseWriterDelegator) delegator, 32)
+-
+-func init() {
+-	// TODO(beorn7): Code generation would help here.
+-	pickDelegator[0] = func(d *responseWriterDelegator) delegator { // 0
+-		return d
+-	}
+-	pickDelegator[closeNotifier] = func(d *responseWriterDelegator) delegator { // 1
+-		return closeNotifierDelegator{d}
+-	}
+-	pickDelegator[flusher] = func(d *responseWriterDelegator) delegator { // 2
+-		return flusherDelegator{d}
+-	}
+-	pickDelegator[flusher+closeNotifier] = func(d *responseWriterDelegator) delegator { // 3
+-		return struct {
+-			*responseWriterDelegator
+-			http.Flusher
+-			http.CloseNotifier
+-		}{d, &flusherDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[hijacker] = func(d *responseWriterDelegator) delegator { // 4
+-		return hijackerDelegator{d}
+-	}
+-	pickDelegator[hijacker+closeNotifier] = func(d *responseWriterDelegator) delegator { // 5
+-		return struct {
+-			*responseWriterDelegator
+-			http.Hijacker
+-			http.CloseNotifier
+-		}{d, &hijackerDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[hijacker+flusher] = func(d *responseWriterDelegator) delegator { // 6
+-		return struct {
+-			*responseWriterDelegator
+-			http.Hijacker
+-			http.Flusher
+-		}{d, &hijackerDelegator{d}, &flusherDelegator{d}}
+-	}
+-	pickDelegator[hijacker+flusher+closeNotifier] = func(d *responseWriterDelegator) delegator { // 7
+-		return struct {
+-			*responseWriterDelegator
+-			http.Hijacker
+-			http.Flusher
+-			http.CloseNotifier
+-		}{d, &hijackerDelegator{d}, &flusherDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[readerFrom] = func(d *responseWriterDelegator) delegator { // 8
+-		return readerFromDelegator{d}
+-	}
+-	pickDelegator[readerFrom+closeNotifier] = func(d *responseWriterDelegator) delegator { // 9
+-		return struct {
+-			*responseWriterDelegator
+-			io.ReaderFrom
+-			http.CloseNotifier
+-		}{d, &readerFromDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[readerFrom+flusher] = func(d *responseWriterDelegator) delegator { // 10
+-		return struct {
+-			*responseWriterDelegator
+-			io.ReaderFrom
+-			http.Flusher
+-		}{d, &readerFromDelegator{d}, &flusherDelegator{d}}
+-	}
+-	pickDelegator[readerFrom+flusher+closeNotifier] = func(d *responseWriterDelegator) delegator { // 11
+-		return struct {
+-			*responseWriterDelegator
+-			io.ReaderFrom
+-			http.Flusher
+-			http.CloseNotifier
+-		}{d, &readerFromDelegator{d}, &flusherDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[readerFrom+hijacker] = func(d *responseWriterDelegator) delegator { // 12
+-		return struct {
+-			*responseWriterDelegator
+-			io.ReaderFrom
+-			http.Hijacker
+-		}{d, &readerFromDelegator{d}, &hijackerDelegator{d}}
+-	}
+-	pickDelegator[readerFrom+hijacker+closeNotifier] = func(d *responseWriterDelegator) delegator { // 13
+-		return struct {
+-			*responseWriterDelegator
+-			io.ReaderFrom
+-			http.Hijacker
+-			http.CloseNotifier
+-		}{d, &readerFromDelegator{d}, &hijackerDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[readerFrom+hijacker+flusher] = func(d *responseWriterDelegator) delegator { // 14
+-		return struct {
+-			*responseWriterDelegator
+-			io.ReaderFrom
+-			http.Hijacker
+-			http.Flusher
+-		}{d, &readerFromDelegator{d}, &hijackerDelegator{d}, &flusherDelegator{d}}
+-	}
+-	pickDelegator[readerFrom+hijacker+flusher+closeNotifier] = func(d *responseWriterDelegator) delegator { // 15
+-		return struct {
+-			*responseWriterDelegator
+-			io.ReaderFrom
+-			http.Hijacker
+-			http.Flusher
+-			http.CloseNotifier
+-		}{d, &readerFromDelegator{d}, &hijackerDelegator{d}, &flusherDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-}
+diff --git a/prometheus/promhttp/delegator_pre_1_8.go b/prometheus/promhttp/delegator_1_7.go
+similarity index 75%
+rename from prometheus/promhttp/delegator_pre_1_8.go
+rename to prometheus/promhttp/delegator_1_7.go
+index 8bb9b8b..24b3150 100644
+--- a/prometheus/promhttp/delegator_pre_1_8.go
++++ b/prometheus/promhttp/delegator_1_7.go
+@@ -26,19 +26,13 @@ func newDelegator(w http.ResponseWriter, observeWriteHeaderFunc func(int)) deleg
+ 		observeWriteHeader: observeWriteHeaderFunc,
+ 	}
+ 
+-	id := 0
+-	if _, ok := w.(http.CloseNotifier); ok {
+-		id += closeNotifier
+-	}
+-	if _, ok := w.(http.Flusher); ok {
+-		id += flusher
+-	}
+-	if _, ok := w.(http.Hijacker); ok {
+-		id += hijacker
+-	}
+-	if _, ok := w.(io.ReaderFrom); ok {
+-		id += readerFrom
++	_, cn := w.(http.CloseNotifier)
++	_, fl := w.(http.Flusher)
++	_, hj := w.(http.Hijacker)
++	_, rf := w.(io.ReaderFrom)
++	if cn && fl && hj && rf {
++		return &fancyDelegator{d}
+ 	}
+ 
+-	return pickDelegator[id](d)
++	return d
+ }
+diff --git a/prometheus/promhttp/delegator_1_8.go b/prometheus/promhttp/delegator_1_8.go
+index f4d386f..b7743fb 100644
+--- a/prometheus/promhttp/delegator_1_8.go
++++ b/prometheus/promhttp/delegator_1_8.go
+@@ -20,162 +20,54 @@ import (
+ 	"net/http"
+ )
+ 
+-type pusherDelegator struct{ *responseWriterDelegator }
+-
+-func (d *pusherDelegator) Push(target string, opts *http.PushOptions) error {
+-	return d.ResponseWriter.(http.Pusher).Push(target, opts)
+-}
+-
+-func init() {
+-	pickDelegator[pusher] = func(d *responseWriterDelegator) delegator { // 16
+-		return pusherDelegator{d}
+-	}
+-	pickDelegator[pusher+closeNotifier] = func(d *responseWriterDelegator) delegator { // 17
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			http.CloseNotifier
+-		}{d, &pusherDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[pusher+flusher] = func(d *responseWriterDelegator) delegator { // 18
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			http.Flusher
+-		}{d, &pusherDelegator{d}, &flusherDelegator{d}}
+-	}
+-	pickDelegator[pusher+flusher+closeNotifier] = func(d *responseWriterDelegator) delegator { // 19
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			http.Flusher
+-			http.CloseNotifier
+-		}{d, &pusherDelegator{d}, &flusherDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[pusher+hijacker] = func(d *responseWriterDelegator) delegator { // 20
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			http.Hijacker
+-		}{d, &pusherDelegator{d}, &hijackerDelegator{d}}
+-	}
+-	pickDelegator[pusher+hijacker+closeNotifier] = func(d *responseWriterDelegator) delegator { // 21
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			http.Hijacker
+-			http.CloseNotifier
+-		}{d, &pusherDelegator{d}, &hijackerDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[pusher+hijacker+flusher] = func(d *responseWriterDelegator) delegator { // 22
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			http.Hijacker
+-			http.Flusher
+-		}{d, &pusherDelegator{d}, &hijackerDelegator{d}, &flusherDelegator{d}}
+-	}
+-	pickDelegator[pusher+hijacker+flusher+closeNotifier] = func(d *responseWriterDelegator) delegator { //23
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			http.Hijacker
+-			http.Flusher
+-			http.CloseNotifier
+-		}{d, &pusherDelegator{d}, &hijackerDelegator{d}, &flusherDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[pusher+readerFrom] = func(d *responseWriterDelegator) delegator { // 24
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			io.ReaderFrom
+-		}{d, &pusherDelegator{d}, &readerFromDelegator{d}}
+-	}
+-	pickDelegator[pusher+readerFrom+closeNotifier] = func(d *responseWriterDelegator) delegator { // 25
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			io.ReaderFrom
+-			http.CloseNotifier
+-		}{d, &pusherDelegator{d}, &readerFromDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[pusher+readerFrom+flusher] = func(d *responseWriterDelegator) delegator { // 26
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			io.ReaderFrom
+-			http.Flusher
+-		}{d, &pusherDelegator{d}, &readerFromDelegator{d}, &flusherDelegator{d}}
+-	}
+-	pickDelegator[pusher+readerFrom+flusher+closeNotifier] = func(d *responseWriterDelegator) delegator { // 27
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			io.ReaderFrom
+-			http.Flusher
+-			http.CloseNotifier
+-		}{d, &pusherDelegator{d}, &readerFromDelegator{d}, &flusherDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[pusher+readerFrom+hijacker] = func(d *responseWriterDelegator) delegator { // 28
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			io.ReaderFrom
+-			http.Hijacker
+-		}{d, &pusherDelegator{d}, &readerFromDelegator{d}, &hijackerDelegator{d}}
+-	}
+-	pickDelegator[pusher+readerFrom+hijacker+closeNotifier] = func(d *responseWriterDelegator) delegator { // 29
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			io.ReaderFrom
+-			http.Hijacker
+-			http.CloseNotifier
+-		}{d, &pusherDelegator{d}, &readerFromDelegator{d}, &hijackerDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-	pickDelegator[pusher+readerFrom+hijacker+flusher] = func(d *responseWriterDelegator) delegator { // 30
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			io.ReaderFrom
+-			http.Hijacker
+-			http.Flusher
+-		}{d, &pusherDelegator{d}, &readerFromDelegator{d}, &hijackerDelegator{d}, &flusherDelegator{d}}
+-	}
+-	pickDelegator[pusher+readerFrom+hijacker+flusher+closeNotifier] = func(d *responseWriterDelegator) delegator { // 31
+-		return struct {
+-			*responseWriterDelegator
+-			http.Pusher
+-			io.ReaderFrom
+-			http.Hijacker
+-			http.Flusher
+-			http.CloseNotifier
+-		}{d, &pusherDelegator{d}, &readerFromDelegator{d}, &hijackerDelegator{d}, &flusherDelegator{d}, &closeNotifierDelegator{d}}
+-	}
+-}
+-
++// newDelegator handles the four different methods of upgrading a
++// http.ResponseWriter to delegator.
+ func newDelegator(w http.ResponseWriter, observeWriteHeaderFunc func(int)) delegator {
+ 	d := &responseWriterDelegator{
+ 		ResponseWriter:     w,
+ 		observeWriteHeader: observeWriteHeaderFunc,
+ 	}
+ 
+-	id := 0
+-	if _, ok := w.(http.CloseNotifier); ok {
+-		id += closeNotifier
+-	}
+-	if _, ok := w.(http.Flusher); ok {
+-		id += flusher
+-	}
+-	if _, ok := w.(http.Hijacker); ok {
+-		id += hijacker
+-	}
+-	if _, ok := w.(io.ReaderFrom); ok {
+-		id += readerFrom
+-	}
+-	if _, ok := w.(http.Pusher); ok {
+-		id += pusher
++	_, cn := w.(http.CloseNotifier)
++	_, fl := w.(http.Flusher)
++	_, hj := w.(http.Hijacker)
++	_, ps := w.(http.Pusher)
++	_, rf := w.(io.ReaderFrom)
++
++	// Check for the four most common combination of interfaces a
++	// http.ResponseWriter might implement.
++	switch {
++	case cn && fl && hj && rf && ps:
++		// All interfaces.
++		return &fancyPushDelegator{
++			fancyDelegator: &fancyDelegator{d},
++			p:              &pushDelegator{d},
++		}
++	case cn && fl && hj && rf:
++		// All interfaces, except http.Pusher.
++		return &fancyDelegator{d}
++	case ps:
++		// Just http.Pusher.
++		return &pushDelegator{d}
+ 	}
+ 
+-	return pickDelegator[id](d)
++	return d
++}
++
++type fancyPushDelegator struct {
++	p *pushDelegator
++
++	*fancyDelegator
++}
++
++func (f *fancyPushDelegator) Push(target string, opts *http.PushOptions) error {
++	return f.p.Push(target, opts)
++}
++
++type pushDelegator struct {
++	*responseWriterDelegator
++}
++
++func (f *pushDelegator) Push(target string, opts *http.PushOptions) error {
++	return f.ResponseWriter.(http.Pusher).Push(target, opts)
+ }
+diff --git a/prometheus/promhttp/instrument_server.go b/prometheus/promhttp/instrument_server.go
+index a9b9649..ac419e5 100644
+--- a/prometheus/promhttp/instrument_server.go
++++ b/prometheus/promhttp/instrument_server.go
+@@ -14,6 +14,9 @@
+ package promhttp
+ 
+ import (
++	"bufio"
++	"io"
++	"net"
+ 	"net/http"
+ 	"strconv"
+ 	"strings"
+@@ -432,3 +435,71 @@ func sanitizeCode(s int) string {
+ 		return strconv.Itoa(s)
+ 	}
+ }
++
++type delegator interface {
++	Status() int
++	Written() int64
++
++	http.ResponseWriter
++}
++
++type responseWriterDelegator struct {
++	http.ResponseWriter
++
++	handler, method    string
++	status             int
++	written            int64
++	wroteHeader        bool
++	observeWriteHeader func(int)
++}
++
++func (r *responseWriterDelegator) Status() int {
++	return r.status
++}
++
++func (r *responseWriterDelegator) Written() int64 {
++	return r.written
++}
++
++func (r *responseWriterDelegator) WriteHeader(code int) {
++	r.status = code
++	r.wroteHeader = true
++	r.ResponseWriter.WriteHeader(code)
++	if r.observeWriteHeader != nil {
++		r.observeWriteHeader(code)
++	}
++}
++
++func (r *responseWriterDelegator) Write(b []byte) (int, error) {
++	if !r.wroteHeader {
++		r.WriteHeader(http.StatusOK)
++	}
++	n, err := r.ResponseWriter.Write(b)
++	r.written += int64(n)
++	return n, err
++}
++
++type fancyDelegator struct {
++	*responseWriterDelegator
++}
++
++func (r *fancyDelegator) CloseNotify() <-chan bool {
++	return r.ResponseWriter.(http.CloseNotifier).CloseNotify()
++}
++
++func (r *fancyDelegator) Hijack() (net.Conn, *bufio.ReadWriter, error) {
++	return r.ResponseWriter.(http.Hijacker).Hijack()
++}
++
++func (r *fancyDelegator) Flush() {
++	r.ResponseWriter.(http.Flusher).Flush()
++}
++
++func (r *fancyDelegator) ReadFrom(re io.Reader) (int64, error) {
++	if !r.wroteHeader {
++		r.WriteHeader(http.StatusOK)
++	}
++	n, err := r.ResponseWriter.(io.ReaderFrom).ReadFrom(re)
++	r.written += n
++	return n, err
++}
+diff --git a/prometheus/promhttp/instrument_server_test.go b/prometheus/promhttp/instrument_server_test.go
+index 50f7524..7d372c4 100644
+--- a/prometheus/promhttp/instrument_server_test.go
++++ b/prometheus/promhttp/instrument_server_test.go
+@@ -14,7 +14,6 @@
+ package promhttp
+ 
+ import (
+-	"io"
+ 	"log"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -106,45 +105,6 @@ func TestInstrumentTimeToFirstWrite(t *testing.T) {
+ 	}
+ }
+ 
+-// testResponseWriter is an http.ResponseWriter that also implements
+-// http.CloseNotifier, http.Flusher, and io.ReaderFrom.
+-type testResponseWriter struct {
+-	closeNotifyCalled, flushCalled, readFromCalled bool
+-}
+-
+-func (t *testResponseWriter) Header() http.Header       { return nil }
+-func (t *testResponseWriter) Write([]byte) (int, error) { return 0, nil }
+-func (t *testResponseWriter) WriteHeader(int)           {}
+-func (t *testResponseWriter) CloseNotify() <-chan bool {
+-	t.closeNotifyCalled = true
+-	return nil
+-}
+-func (t *testResponseWriter) Flush() { t.flushCalled = true }
+-func (t *testResponseWriter) ReadFrom(io.Reader) (int64, error) {
+-	t.readFromCalled = true
+-	return 0, nil
+-}
+-
+-func TestInterfaceUpgrade(t *testing.T) {
+-	w := &testResponseWriter{}
+-	d := newDelegator(w, nil)
+-	d.(http.CloseNotifier).CloseNotify()
+-	if !w.closeNotifyCalled {
+-		t.Error("CloseNotify not called")
+-	}
+-	d.(http.Flusher).Flush()
+-	if !w.flushCalled {
+-		t.Error("Flush not called")
+-	}
+-	d.(io.ReaderFrom).ReadFrom(nil)
+-	if !w.readFromCalled {
+-		t.Error("ReadFrom not called")
+-	}
+-	if _, ok := d.(http.Hijacker); ok {
+-		t.Error("delegator unexpectedly implements http.Hijacker")
+-	}
+-}
+-
+ func ExampleInstrumentHandlerDuration() {
+ 	inFlightGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+ 		Name: "in_flight_requests",

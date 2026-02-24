@@ -1,0 +1,166 @@
+diff --git a/README.md b/README.md
+index 08f63a1..92e422e 100644
+--- a/README.md
++++ b/README.md
+@@ -30,6 +30,7 @@ The name mux stands for "HTTP request multiplexer". Like the standard `http.Serv
+ * [Walking Routes](#walking-routes)
+ * [Graceful Shutdown](#graceful-shutdown)
+ * [Middleware](#middleware)
++* [Handling CORS Requests](#handling-cors-requests)
+ * [Testing Handlers](#testing-handlers)
+ * [Full Example](#full-example)
+ 
+@@ -492,6 +493,73 @@ r.Use(amw.Middleware)
+ 
+ Note: The handler chain will be stopped if your middleware doesn't call `next.ServeHTTP()` with the corresponding parameters. This can be used to abort a request if the middleware writer wants to. Middlewares _should_ write to `ResponseWriter` if they _are_ going to terminate the request, and they _should not_ write to `ResponseWriter` if they _are not_ going to terminate it.
+ 
++### Handling CORS Requests
++
++[CORSMethodMiddleware](https://godoc.org/github.com/gorilla/mux#CORSMethodMiddleware) intends to make it easier to strictly set the `Access-Control-Allow-Methods` response header.
++
++* You will still need to use your own CORS handler to set the other CORS headers such as `Access-Control-Allow-Origin`
++* The middleware will set the `Access-Control-Allow-Methods` header to all the method matchers (e.g. `r.Methods(http.MethodGet, http.MethodPut, http.MethodOptions)` -> `Access-Control-Allow-Methods: GET,PUT,OPTIONS`) on a route
++* If you do not specify any methods, then:
++> _Important_: there must be an `OPTIONS` method matcher for the middleware to set the headers.
++
++Here is an example of using `CORSMethodMiddleware` along with a custom `OPTIONS` handler to set all the required CORS headers:
++
++```go
++package main
++
++import (
++	"net/http"
++	"github.com/gorilla/mux"
++)
++
++func main() {
++    r := mux.NewRouter()
++
++    // IMPORTANT: you must specify an OPTIONS method matcher for the middleware to set CORS headers
++    r.HandleFunc("/foo", fooHandler).Methods(http.MethodGet, http.MethodPut, http.MethodPatch, http.MethodOptions)
++    r.Use(mux.CORSMethodMiddleware(r))
++    
++    http.ListenAndServe(":8080", r)
++}
++
++func fooHandler(w http.ResponseWriter, r *http.Request) {
++    w.Header().Set("Access-Control-Allow-Origin", "*")
++    if r.Method == http.MethodOptions {
++        return
++    }
++
++    w.Write([]byte("foo"))
++}
++```
++
++And an request to `/foo` using something like:
++
++```bash
++curl localhost:8080/foo -v
++```
++
++Would look like:
++
++```bash
++*   Trying ::1...
++* TCP_NODELAY set
++* Connected to localhost (::1) port 8080 (#0)
++> GET /foo HTTP/1.1
++> Host: localhost:8080
++> User-Agent: curl/7.59.0
++> Accept: */*
++> 
++< HTTP/1.1 200 OK
++< Access-Control-Allow-Methods: GET,PUT,PATCH,OPTIONS
++< Access-Control-Allow-Origin: *
++< Date: Fri, 28 Jun 2019 20:13:30 GMT
++< Content-Length: 3
++< Content-Type: text/plain; charset=utf-8
++< 
++* Connection #0 to host localhost left intact
++foo
++```
++
+ ### Testing Handlers
+ 
+ Testing handlers in a Go web application is straightforward, and _mux_ doesn't complicate this any further. Given two files: `endpoints.go` and `endpoints_test.go`, here's how we'd test an application using _mux_.
+diff --git a/middleware.go b/middleware.go
+index ceb812c..cf2b26d 100644
+--- a/middleware.go
++++ b/middleware.go
+@@ -32,37 +32,19 @@ func (r *Router) useInterface(mw middleware) {
+ 	r.middlewares = append(r.middlewares, mw)
+ }
+ 
+-// CORSMethodMiddleware sets the Access-Control-Allow-Methods response header
+-// on a request, by matching routes based only on paths. It also handles
+-// OPTIONS requests, by settings Access-Control-Allow-Methods, and then
+-// returning without calling the next http handler.
++// CORSMethodMiddleware automatically sets the Access-Control-Allow-Methods response header
++// on requests for routes that have an OPTIONS method matcher to all the method matchers on
++// the route. Routes that do not explicitly handle OPTIONS requests will not be processed
++// by the middleware. See examples for usage.
+ func CORSMethodMiddleware(r *Router) MiddlewareFunc {
+ 	return func(next http.Handler) http.Handler {
+ 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+-			var allMethods []string
+-
+-			err := r.Walk(func(route *Route, _ *Router, _ []*Route) error {
+-				for _, m := range route.matchers {
+-					if _, ok := m.(*routeRegexp); ok {
+-						if m.Match(req, &RouteMatch{}) {
+-							methods, err := route.GetMethods()
+-							if err != nil {
+-								return err
+-							}
+-
+-							allMethods = append(allMethods, methods...)
+-						}
+-						break
+-					}
+-				}
+-				return nil
+-			})
+-
++			allMethods, err := getAllMethodsForRoute(r, req)
+ 			if err == nil {
+-				w.Header().Set("Access-Control-Allow-Methods", strings.Join(append(allMethods, "OPTIONS"), ","))
+-
+-				if req.Method == "OPTIONS" {
+-					return
++				for _, v := range allMethods {
++					if v == http.MethodOptions {
++						w.Header().Set("Access-Control-Allow-Methods", strings.Join(allMethods, ","))
++					}
+ 				}
+ 			}
+ 
+@@ -70,3 +52,28 @@ func CORSMethodMiddleware(r *Router) MiddlewareFunc {
+ 		})
+ 	}
+ }
++
++// getAllMethodsForRoute returns all the methods from method matchers matching a given
++// request.
++func getAllMethodsForRoute(r *Router, req *http.Request) ([]string, error) {
++	var allMethods []string
++
++	err := r.Walk(func(route *Route, _ *Router, _ []*Route) error {
++		for _, m := range route.matchers {
++			if _, ok := m.(*routeRegexp); ok {
++				if m.Match(req, &RouteMatch{}) {
++					methods, err := route.GetMethods()
++					if err != nil {
++						return err
++					}
++
++					allMethods = append(allMethods, methods...)
++				}
++				break
++			}
++		}
++		return nil
++	})
++
++	return allMethods, err
++}

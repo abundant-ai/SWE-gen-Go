@@ -1,0 +1,219 @@
+diff --git a/.changelog/23249.txt b/.changelog/23249.txt
+new file mode 100644
+index 0000000000..5586b35608
+--- /dev/null
++++ b/.changelog/23249.txt
+@@ -0,0 +1,3 @@
++```release-note:security
++security: Fixed arbitrary file read vulnerability in Vault CA provider authentication methods (Kubernetes, JWT, and AppRole) by implementing OS-level path traversal protection using `os.OpenRoot()` to restrict file access to standard secret directories. This resolves the CVE-2026-2808
++```
+\ No newline at end of file
+diff --git a/agent/connect/ca/provider_vault_auth.go b/agent/connect/ca/provider_vault_auth.go
+index 70176cc3c3..a1ab753fa4 100644
+--- a/agent/connect/ca/provider_vault_auth.go
++++ b/agent/connect/ca/provider_vault_auth.go
+@@ -6,6 +6,9 @@ package ca
+ import (
+ 	"context"
+ 	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
+ 
+ 	"github.com/hashicorp/vault/api"
+ 
+@@ -92,3 +95,69 @@ func legacyCheck(params map[string]any, expectedKeys ...string) bool {
+ 	}
+ 	return false
+ }
++
++// readVaultCredentialFileSecurely reads a Vault credential file using os.OpenRoot to prevent
++// path traversal and symlink attacks. This provides OS-level enforcement of file system boundaries.
++//
++// Parameters:
++//   - filePath: the path to the credential file
++//   - allowedDirs: a list of allowed base directories where credential files can reside
++//
++// Returns the file contents or an error if the file is outside allowed directories or cannot be read.
++func readVaultCredentialFileSecurely(filePath string, allowedDirs []string) ([]byte, error) {
++	// Clean and normalize the input path to remove . and .. elements
++	cleanPath := filepath.Clean(filePath)
++
++	// Determine which allowed directory contains the path
++	var baseDir string
++	var relPath string
++
++	for _, dir := range allowedDirs {
++		// Clean the allowed directory path as well
++		cleanDir := filepath.Clean(dir)
++
++		// Use filepath.Rel to properly determine if path is within this directory
++		rel, err := filepath.Rel(cleanDir, cleanPath)
++		if err != nil {
++			// filepath.Rel failed, skip this directory
++			continue
++		}
++
++		// If the relative path starts with "..", the path is outside this directory
++		// If it equals ".", the path is the directory itself (not a file)
++		// Otherwise, it's a file/subdirectory within the allowed directory
++		if !strings.HasPrefix(rel, "..") && rel != "." {
++			baseDir = cleanDir
++			relPath = rel
++			break
++		}
++	}
++
++	// If no allowed directory matches, reject the path
++	if baseDir == "" {
++		return nil, fmt.Errorf("credential file must be within allowed directories")
++	}
++
++	// Use os.OpenRoot to create a rooted file system restricted to the base directory.
++	// This provides OS-level protection against symlink escapes and directory traversal,
++	// as any symlinks within the rooted filesystem cannot escape the root boundary.
++	root, err := os.OpenRoot(baseDir)
++	if err != nil {
++		return nil, fmt.Errorf("failed to open root directory")
++	}
++	defer root.Close()
++
++	// Read the credential file within the rooted file system
++	// ReadFile will fail appropriately for directories or special files
++	fileBytes, err := root.ReadFile(relPath)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read credential file")
++	}
++
++	// Validate file size to prevent DoS attacks
++	if len(fileBytes) > 5*1024*1024 { // 5 MB
++		return nil, fmt.Errorf("credential file exceeds maximum allowed 5MB size")
++	}
++
++	return fileBytes, nil
++}
+diff --git a/agent/connect/ca/provider_vault_auth_approle.go b/agent/connect/ca/provider_vault_auth_approle.go
+index c3d7d8f9c8..84fafbab14 100644
+--- a/agent/connect/ca/provider_vault_auth_approle.go
++++ b/agent/connect/ca/provider_vault_auth_approle.go
+@@ -6,7 +6,6 @@ package ca
+ import (
+ 	"bytes"
+ 	"fmt"
+-	"os"
+ 	"strings"
+ 
+ 	"github.com/hashicorp/consul/agent/structs"
+@@ -37,6 +36,7 @@ func NewAppRoleAuthClient(authMethod *structs.VaultAuthMethod) (*VaultAuthClient
+ 	return authClient, nil
+ }
+ 
++// ArLoginDataGen generates the login data for the AppRole auth method
+ func ArLoginDataGen(authMethod *structs.VaultAuthMethod) (map[string]any, error) {
+ 	// don't need to check for legacy params as this func isn't used in that case
+ 	params := authMethod.Params
+@@ -52,12 +52,25 @@ func ArLoginDataGen(authMethod *structs.VaultAuthMethod) (map[string]any, error)
+ 	var err error
+ 	var rawRoleID, rawSecretID []byte
+ 	data := make(map[string]any)
+-	if rawRoleID, err = os.ReadFile(roleIdFilePath); err != nil {
++
++	// Define allowed base directories for AppRole credentials
++	allowedDirs := []string{
++		"/var/run/secrets/vault",
++		"/run/secrets/vault",
++		"/var/run/secrets",
++		"/run/secrets",
++	}
++
++	// Securely read the role_id file using os.OpenRoot to prevent path traversal attacks
++	if rawRoleID, err = readVaultCredentialFileSecurely(roleIdFilePath, allowedDirs); err != nil {
+ 		return nil, err
+ 	}
+-	data["role_id"] = string(rawRoleID)
++	// Trim whitespace for consistency with secret_id handling
++	data["role_id"] = strings.TrimSpace(string(rawRoleID))
++
+ 	if hasSecret {
+-		switch rawSecretID, err = os.ReadFile(secretIdFilePath); {
++		// Securely read the secret_id file using os.OpenRoot to prevent path traversal attacks
++		switch rawSecretID, err = readVaultCredentialFileSecurely(secretIdFilePath, allowedDirs); {
+ 		case err != nil:
+ 			return nil, err
+ 		case len(bytes.TrimSpace(rawSecretID)) > 0:
+diff --git a/agent/connect/ca/provider_vault_auth_jwt.go b/agent/connect/ca/provider_vault_auth_jwt.go
+index e80751cd59..522cb8b201 100644
+--- a/agent/connect/ca/provider_vault_auth_jwt.go
++++ b/agent/connect/ca/provider_vault_auth_jwt.go
+@@ -5,7 +5,6 @@ package ca
+ 
+ import (
+ 	"fmt"
+-	"os"
+ 	"strings"
+ 
+ 	"github.com/hashicorp/consul/agent/structs"
+@@ -36,12 +35,25 @@ func NewJwtAuthClient(authMethod *structs.VaultAuthMethod) (*VaultAuthClient, er
+ 	return authClient, nil
+ }
+ 
++// JwtLoginDataGen generates the login data for the JWT auth method
+ func JwtLoginDataGen(authMethod *structs.VaultAuthMethod) (map[string]any, error) {
+ 	params := authMethod.Params
+ 	role := params["role"].(string)
+ 
+ 	tokenPath := params["path"].(string)
+-	rawToken, err := os.ReadFile(tokenPath)
++
++	// Define allowed base directories for JWT credentials
++	allowedDirs := []string{
++		"/var/run/secrets/kubernetes.io/serviceaccount",
++		"/var/run/secrets/vault",
++		"/run/secrets/vault",
++		"/var/run/secrets",
++		"/run/secrets",
++	}
++
++	// Securely read the JWT file using os.OpenRoot to prevent path traversal attacks
++	rawToken, err := readVaultCredentialFileSecurely(tokenPath, allowedDirs)
++
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/agent/connect/ca/provider_vault_auth_k8s.go b/agent/connect/ca/provider_vault_auth_k8s.go
+index acd6f68bc5..6482f868e8 100644
+--- a/agent/connect/ca/provider_vault_auth_k8s.go
++++ b/agent/connect/ca/provider_vault_auth_k8s.go
+@@ -5,7 +5,6 @@ package ca
+ 
+ import (
+ 	"fmt"
+-	"os"
+ 	"strings"
+ 
+ 	"github.com/hashicorp/consul/agent/structs"
+@@ -30,6 +29,7 @@ func NewK8sAuthClient(authMethod *structs.VaultAuthMethod) (*VaultAuthClient, er
+ 	return authClient, nil
+ }
+ 
++// K8sLoginDataGen generates the login data for the Kubernetes auth method
+ func K8sLoginDataGen(authMethod *structs.VaultAuthMethod) (map[string]any, error) {
+ 	params := authMethod.Params
+ 	role := params["role"].(string)
+@@ -39,7 +39,15 @@ func K8sLoginDataGen(authMethod *structs.VaultAuthMethod) (map[string]any, error
+ 	if !ok || strings.TrimSpace(tokenPath) == "" {
+ 		tokenPath = defaultK8SServiceAccountTokenPath
+ 	}
+-	rawToken, err := os.ReadFile(tokenPath)
++
++	// Define allowed base directories for Kubernetes service account tokens
++	allowedDirs := []string{
++		"/var/run/secrets/kubernetes.io/serviceaccount",
++		"/run/secrets/kubernetes.io/serviceaccount",
++	}
++
++	// Securely read the JWT file using os.OpenRoot to prevent path traversal attacks
++	rawToken, err := readVaultCredentialFileSecurely(tokenPath, allowedDirs)
+ 	if err != nil {
+ 		return nil, err
+ 	}

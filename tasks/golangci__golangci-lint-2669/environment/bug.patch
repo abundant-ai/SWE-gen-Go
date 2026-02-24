@@ -1,0 +1,375 @@
+diff --git a/.golangci.example.yml b/.golangci.example.yml
+index 4d164e5a..40b9add8 100644
+--- a/.golangci.example.yml
++++ b/.golangci.example.yml
+@@ -66,8 +66,8 @@ run:
+ 
+   # Define the Go version limit.
+   # Mainly related to generics support in go1.18.
+-  # Default: use Go version from the go.mod file, fallback on the env var `GOVERSION`, fallback on 1.17
+-  go: '1.18'
++  # Default: 1.17
++  go: 1.18
+ 
+ 
+ # output configuration options
+diff --git a/.golangci.yml b/.golangci.yml
+index 4427980c..a17d2b11 100644
+--- a/.golangci.yml
++++ b/.golangci.yml
+@@ -130,7 +130,6 @@ issues:
+ 
+ run:
+   timeout: 5m
+-  go: '1.17' # TODO(ldez): we force to use an old version of Go for the CI and the tests.
+   skip-dirs:
+     - test/testdata_etc
+     - internal/cache
+diff --git a/pkg/commands/executor.go b/pkg/commands/executor.go
+index 622b5372..0ad37dde 100644
+--- a/pkg/commands/executor.go
++++ b/pkg/commands/executor.go
+@@ -110,10 +110,6 @@ func NewExecutor(version, commit, date string) *Executor {
+ 		e.log.Fatalf("Can't read config: %s", err)
+ 	}
+ 
+-	if commandLineCfg.Run.Go == "" && e.cfg.Run.Go == "" {
+-		e.cfg.Run.Go = config.DetectGoVersion()
+-	}
+-
+ 	// recreate after getting config
+ 	e.DBManager = lintersdb.NewManager(e.cfg, e.log).WithCustomLinters()
+ 
+diff --git a/pkg/commands/run.go b/pkg/commands/run.go
+index f4716d18..61f86ee5 100644
+--- a/pkg/commands/run.go
++++ b/pkg/commands/run.go
+@@ -95,7 +95,7 @@ func initFlagSet(fs *pflag.FlagSet, cfg *config.Config, m *lintersdb.Manager, is
+ 		"Modules download mode. If not empty, passed as -mod=<mode> to go tools")
+ 	fs.IntVar(&rc.ExitCodeIfIssuesFound, "issues-exit-code",
+ 		exitcodes.IssuesFound, wh("Exit code when issues were found"))
+-	fs.StringVar(&rc.Go, "go", "", wh("Targeted Go version"))
++	fs.StringVar(&rc.Go, "go", "1.17", wh("Targeted Go version"))
+ 	fs.StringSliceVar(&rc.BuildTags, "build-tags", nil, wh("Build tags"))
+ 
+ 	fs.DurationVar(&rc.Timeout, "deadline", defaultTimeout, wh("Deadline for total work"))
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 9536c80c..49df4e49 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -1,13 +1,5 @@
+ package config
+ 
+-import (
+-	"os"
+-	"strings"
+-
+-	hcversion "github.com/hashicorp/go-version"
+-	"github.com/ldez/gomoddirectives"
+-)
+-
+ // Config encapsulates the config data specified in the golangci yaml config file.
+ type Config struct {
+ 	cfgDir string // The directory containing the golangci config file.
+@@ -39,32 +31,3 @@ func NewDefault() *Config {
+ type Version struct {
+ 	Format string `mapstructure:"format"`
+ }
+-
+-func IsGreaterThanOrEqualGo118(v string) bool {
+-	v1, err := hcversion.NewVersion(strings.TrimPrefix(v, "go"))
+-	if err != nil {
+-		return false
+-	}
+-
+-	limit, err := hcversion.NewVersion("1.18")
+-	if err != nil {
+-		return false
+-	}
+-
+-	return v1.GreaterThanOrEqual(limit)
+-}
+-
+-func DetectGoVersion() string {
+-	file, _ := gomoddirectives.GetModuleFile()
+-
+-	if file != nil && file.Go != nil && file.Go.Version != "" {
+-		return file.Go.Version
+-	}
+-
+-	v := os.Getenv("GOVERSION")
+-	if v != "" {
+-		return v
+-	}
+-
+-	return "1.17"
+-}
+diff --git a/pkg/config/linters_settings.go b/pkg/config/linters_settings.go
+index 3f984ce3..2ae8550e 100644
+--- a/pkg/config/linters_settings.go
++++ b/pkg/config/linters_settings.go
+@@ -374,8 +374,7 @@ type GoSecSettings struct {
+ }
+ 
+ type GovetSettings struct {
+-	Go             string `mapstructure:"-"`
+-	CheckShadowing bool   `mapstructure:"check-shadowing"`
++	CheckShadowing bool `mapstructure:"check-shadowing"`
+ 	Settings       map[string]map[string]interface{}
+ 
+ 	Enable     []string
+@@ -384,7 +383,7 @@ type GovetSettings struct {
+ 	DisableAll bool `mapstructure:"disable-all"`
+ }
+ 
+-func (cfg *GovetSettings) Validate() error {
++func (cfg GovetSettings) Validate() error {
+ 	if cfg.EnableAll && cfg.DisableAll {
+ 		return errors.New("enable-all and disable-all can't be combined")
+ 	}
+diff --git a/pkg/golinters/govet.go b/pkg/golinters/govet.go
+index c7a58af6..b3860e01 100644
+--- a/pkg/golinters/govet.go
++++ b/pkg/golinters/govet.go
+@@ -119,46 +119,7 @@ var (
+ 	}
+ )
+ 
+-func NewGovet(cfg *config.GovetSettings) *goanalysis.Linter {
+-	var settings map[string]map[string]interface{}
+-	if cfg != nil {
+-		settings = cfg.Settings
+-	}
+-	return goanalysis.NewLinter(
+-		"govet",
+-		"Vet examines Go source code and reports suspicious constructs, "+
+-			"such as Printf calls whose arguments do not align with the format string",
+-		analyzersFromConfig(cfg),
+-		settings,
+-	).WithLoadMode(goanalysis.LoadModeTypesInfo)
+-}
+-
+-func analyzersFromConfig(cfg *config.GovetSettings) []*analysis.Analyzer {
+-	if cfg == nil {
+-		return defaultAnalyzers
+-	}
+-
+-	if cfg.CheckShadowing {
+-		// Keeping for backward compatibility.
+-		cfg.Enable = append(cfg.Enable, shadow.Analyzer.Name)
+-	}
+-
+-	var enabledAnalyzers []*analysis.Analyzer
+-	for _, a := range allAnalyzers {
+-		if isAnalyzerEnabled(a.Name, cfg, defaultAnalyzers) {
+-			enabledAnalyzers = append(enabledAnalyzers, a)
+-		}
+-	}
+-
+-	return enabledAnalyzers
+-}
+-
+ func isAnalyzerEnabled(name string, cfg *config.GovetSettings, defaultAnalyzers []*analysis.Analyzer) bool {
+-	if (name == nilness.Analyzer.Name || name == unusedwrite.Analyzer.Name) &&
+-		config.IsGreaterThanOrEqualGo118(cfg.Go) {
+-		return false
+-	}
+-
+ 	if cfg.EnableAll {
+ 		for _, n := range cfg.Disable {
+ 			if n == name {
+@@ -167,24 +128,20 @@ func isAnalyzerEnabled(name string, cfg *config.GovetSettings, defaultAnalyzers
+ 		}
+ 		return true
+ 	}
+-
+ 	// Raw for loops should be OK on small slice lengths.
+ 	for _, n := range cfg.Enable {
+ 		if n == name {
+ 			return true
+ 		}
+ 	}
+-
+ 	for _, n := range cfg.Disable {
+ 		if n == name {
+ 			return false
+ 		}
+ 	}
+-
+ 	if cfg.DisableAll {
+ 		return false
+ 	}
+-
+ 	for _, a := range defaultAnalyzers {
+ 		if a.Name == name {
+ 			return true
+@@ -192,3 +149,37 @@ func isAnalyzerEnabled(name string, cfg *config.GovetSettings, defaultAnalyzers
+ 	}
+ 	return false
+ }
++
++func analyzersFromConfig(cfg *config.GovetSettings) []*analysis.Analyzer {
++	if cfg == nil {
++		return defaultAnalyzers
++	}
++
++	if cfg.CheckShadowing {
++		// Keeping for backward compatibility.
++		cfg.Enable = append(cfg.Enable, shadow.Analyzer.Name)
++	}
++
++	var enabledAnalyzers []*analysis.Analyzer
++	for _, a := range allAnalyzers {
++		if isAnalyzerEnabled(a.Name, cfg, defaultAnalyzers) {
++			enabledAnalyzers = append(enabledAnalyzers, a)
++		}
++	}
++
++	return enabledAnalyzers
++}
++
++func NewGovet(cfg *config.GovetSettings) *goanalysis.Linter {
++	var settings map[string]map[string]interface{}
++	if cfg != nil {
++		settings = cfg.Settings
++	}
++	return goanalysis.NewLinter(
++		"govet",
++		"Vet examines Go source code and reports suspicious constructs, "+
++			"such as Printf calls whose arguments do not align with the format string",
++		analyzersFromConfig(cfg),
++		settings,
++	).WithLoadMode(goanalysis.LoadModeTypesInfo)
++}
+diff --git a/pkg/lint/linter/config.go b/pkg/lint/linter/config.go
+index c8e06554..e86a5dc4 100644
+--- a/pkg/lint/linter/config.go
++++ b/pkg/lint/linter/config.go
+@@ -1,6 +1,9 @@
+ package linter
+ 
+ import (
++	"strings"
++
++	hcversion "github.com/hashicorp/go-version"
+ 	"golang.org/x/tools/go/analysis"
+ 	"golang.org/x/tools/go/packages"
+ 
+@@ -123,7 +126,7 @@ func (lc *Config) Name() string {
+ }
+ 
+ func (lc *Config) WithNoopFallback(cfg *config.Config) *Config {
+-	if cfg != nil && config.IsGreaterThanOrEqualGo118(cfg.Run.Go) {
++	if isGreaterThanOrEqualGo118(cfg) {
+ 		lc.Linter = &Noop{
+ 			name: lc.Linter.Name(),
+ 			desc: lc.Linter.Desc(),
+@@ -131,9 +134,6 @@ func (lc *Config) WithNoopFallback(cfg *config.Config) *Config {
+ 				return nil, nil
+ 			},
+ 		}
+-
+-		lc.LoadMode = 0
+-		return lc.WithLoadFiles()
+ 	}
+ 
+ 	return lc
+@@ -145,3 +145,21 @@ func NewConfig(linter Linter) *Config {
+ 	}
+ 	return lc.WithLoadFiles()
+ }
++
++func isGreaterThanOrEqualGo118(cfg *config.Config) bool {
++	if cfg == nil {
++		return false
++	}
++
++	v1, err := hcversion.NewVersion(strings.TrimPrefix(cfg.Run.Go, "go"))
++	if err != nil {
++		return false
++	}
++
++	limit, err := hcversion.NewVersion("1.18")
++	if err != nil {
++		return false
++	}
++
++	return v1.GreaterThanOrEqual(limit)
++}
+diff --git a/pkg/lint/linter/linter.go b/pkg/lint/linter/linter.go
+index 01e21969..04f0f6ae 100644
+--- a/pkg/lint/linter/linter.go
++++ b/pkg/lint/linter/linter.go
+@@ -22,6 +22,7 @@ type Noop struct {
+ 
+ func (n Noop) Run(_ context.Context, lintCtx *Context) ([]result.Issue, error) {
+ 	lintCtx.Log.Warnf("%s is disabled because of go1.18."+
++		" If you are not using go1.18, you can set `go: go1.17` in the `run` section."+
+ 		" You can track the evolution of the go1.18 support by following the https://github.com/golangci/golangci-lint/issues/2649.", n.name)
+ 	return nil, nil
+ }
+diff --git a/pkg/lint/lintersdb/manager.go b/pkg/lint/lintersdb/manager.go
+index b64ba23e..1486c560 100644
+--- a/pkg/lint/lintersdb/manager.go
++++ b/pkg/lint/lintersdb/manager.go
+@@ -164,10 +164,6 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
+ 		unusedCfg = &m.cfg.LintersSettings.Unused
+ 		varnamelenCfg = &m.cfg.LintersSettings.Varnamelen
+ 		wrapcheckCfg = &m.cfg.LintersSettings.Wrapcheck
+-
+-		if govetCfg != nil {
+-			govetCfg.Go = m.cfg.Run.Go
+-		}
+ 	}
+ 
+ 	const megacheckName = "megacheck"
+@@ -450,8 +446,7 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
+ 			WithLoadForGoAnalysis().
+ 			WithPresets(linter.PresetStyle).
+ 			WithURL("https://github.com/mvdan/interfacer").
+-			Deprecated("The repository of the linter has been archived by the owner.", "v1.38.0", "").
+-			WithNoopFallback(m.cfg),
++			Deprecated("The repository of the linter has been archived by the owner.", "v1.38.0", ""),
+ 
+ 		linter.NewConfig(golinters.NewIreturn(ireturnCfg)).
+ 			WithSince("v1.43.0").
+diff --git a/test/fix_test.go b/test/fix_test.go
+index ce61d85f..3d1144d5 100644
+--- a/test/fix_test.go
++++ b/test/fix_test.go
+@@ -43,7 +43,6 @@ func TestFix(t *testing.T) {
+ 			t.Parallel()
+ 
+ 			args := []string{
+-				"--go=1.17", //  TODO(ldez): we force to use an old version of Go for the CI and the tests.
+ 				"--disable-all", "--print-issued-lines=false", "--print-linter-name=false", "--out-format=line-number",
+ 				"--allow-parallel-runners", "--fix",
+ 				input,
+diff --git a/test/linters_test.go b/test/linters_test.go
+index 19c315ff..a80baa6a 100644
+--- a/test/linters_test.go
++++ b/test/linters_test.go
+@@ -179,7 +179,6 @@ func saveConfig(t *testing.T, cfg map[string]interface{}) (cfgPath string, finis
+ func testOneSource(t *testing.T, sourcePath string) {
+ 	args := []string{
+ 		"run",
+-		"--go=1.17", //  TODO(ldez): we force to use an old version of Go for the CI and the tests.
+ 		"--allow-parallel-runners",
+ 		"--disable-all",
+ 		"--print-issued-lines=false",
+diff --git a/test/testshared/testshared.go b/test/testshared/testshared.go
+index 9291532b..fa70c231 100644
+--- a/test/testshared/testshared.go
++++ b/test/testshared/testshared.go
+@@ -98,10 +98,7 @@ func (r *LintRunner) Run(args ...string) *RunResult {
+ func (r *LintRunner) RunCommand(command string, args ...string) *RunResult {
+ 	r.Install()
+ 
+-	runArgs := append([]string{command},
+-		"--go=1.17", //  TODO(ldez): we force to use an old version of Go for the CI and the tests.
+-		"--internal-cmd-test",
+-	)
++	runArgs := append([]string{command}, "--internal-cmd-test")
+ 	runArgs = append(runArgs, args...)
+ 
+ 	defer func(startedAt time.Time) {

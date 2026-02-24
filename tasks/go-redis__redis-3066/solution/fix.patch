@@ -1,0 +1,133 @@
+diff --git a/internal/pool/conn.go b/internal/pool/conn.go
+index 7f45bc0b..d315c793 100644
+--- a/internal/pool/conn.go
++++ b/internal/pool/conn.go
+@@ -3,8 +3,10 @@ package pool
+ import (
+ 	"bufio"
+ 	"context"
++	"crypto/tls"
+ 	"net"
+ 	"sync/atomic"
++	"syscall"
+ 	"time"
+ 
+ 	"github.com/redis/go-redis/v9/internal/proto"
+@@ -16,6 +18,9 @@ type Conn struct {
+ 	usedAt  int64 // atomic
+ 	netConn net.Conn
+ 
++	// for checking the health status of the connection, it may be nil.
++	sysConn syscall.Conn
++
+ 	rd *proto.Reader
+ 	bw *bufio.Writer
+ 	wr *proto.Writer
+@@ -34,6 +39,7 @@ func NewConn(netConn net.Conn) *Conn {
+ 	cn.bw = bufio.NewWriter(netConn)
+ 	cn.wr = proto.NewWriter(cn.bw)
+ 	cn.SetUsedAt(time.Now())
++	cn.setSysConn()
+ 	return cn
+ }
+ 
+@@ -50,6 +56,22 @@ func (cn *Conn) SetNetConn(netConn net.Conn) {
+ 	cn.netConn = netConn
+ 	cn.rd.Reset(netConn)
+ 	cn.bw.Reset(netConn)
++	cn.setSysConn()
++}
++
++func (cn *Conn) setSysConn() {
++	cn.sysConn = nil
++	conn := cn.netConn
++	if conn == nil {
++		return
++	}
++	if tlsConn, ok := conn.(*tls.Conn); ok {
++		conn = tlsConn.NetConn()
++	}
++
++	if sysConn, ok := conn.(syscall.Conn); ok {
++		cn.sysConn = sysConn
++	}
+ }
+ 
+ func (cn *Conn) Write(b []byte) (int, error) {
+diff --git a/internal/pool/conn_check.go b/internal/pool/conn_check.go
+index 07c261c2..f2883385 100644
+--- a/internal/pool/conn_check.go
++++ b/internal/pool/conn_check.go
+@@ -3,28 +3,14 @@
+ package pool
+ 
+ import (
+-	"crypto/tls"
+ 	"errors"
+ 	"io"
+-	"net"
+ 	"syscall"
+-	"time"
+ )
+ 
+ var errUnexpectedRead = errors.New("unexpected read from socket")
+ 
+-func connCheck(conn net.Conn) error {
+-	// Reset previous timeout.
+-	_ = conn.SetDeadline(time.Time{})
+-
+-	// Check if tls.Conn.
+-	if c, ok := conn.(*tls.Conn); ok {
+-		conn = c.NetConn()
+-	}
+-	sysConn, ok := conn.(syscall.Conn)
+-	if !ok {
+-		return nil
+-	}
++func connCheck(sysConn syscall.Conn) error {
+ 	rawConn, err := sysConn.SyscallConn()
+ 	if err != nil {
+ 		return err
+diff --git a/internal/pool/conn_check_dummy.go b/internal/pool/conn_check_dummy.go
+index 295da126..2d270cf5 100644
+--- a/internal/pool/conn_check_dummy.go
++++ b/internal/pool/conn_check_dummy.go
+@@ -2,8 +2,8 @@
+ 
+ package pool
+ 
+-import "net"
++import "syscall"
+ 
+-func connCheck(conn net.Conn) error {
++func connCheck(_ syscall.Conn) error {
+ 	return nil
+ }
+diff --git a/internal/pool/pool.go b/internal/pool/pool.go
+index 2125f3e1..9b84993c 100644
+--- a/internal/pool/pool.go
++++ b/internal/pool/pool.go
+@@ -499,6 +499,8 @@ func (p *ConnPool) Close() error {
+ 	return firstErr
+ }
+ 
++var zeroTime = time.Time{}
++
+ func (p *ConnPool) isHealthyConn(cn *Conn) bool {
+ 	now := time.Now()
+ 
+@@ -509,8 +511,12 @@ func (p *ConnPool) isHealthyConn(cn *Conn) bool {
+ 		return false
+ 	}
+ 
+-	if connCheck(cn.netConn) != nil {
+-		return false
++	if cn.sysConn != nil {
++		// reset previous timeout.
++		_ = cn.netConn.SetDeadline(zeroTime)
++		if connCheck(cn.sysConn) != nil {
++			return false
++		}
+ 	}
+ 
+ 	cn.SetUsedAt(now)

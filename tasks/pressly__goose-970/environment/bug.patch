@@ -1,0 +1,116 @@
+diff --git a/provider_options.go b/provider_options.go
+index 09eeec4..863ca6e 100644
+--- a/provider_options.go
++++ b/provider_options.go
+@@ -173,15 +173,6 @@ func WithLogger(l Logger) ProviderOption {
+ 	})
+ }
+ 
+-// WithIsolateDDL executes DDL operations separately from DML operations. This is useful for
+-// databases like AWS Aurora DSQL that don't support mixing DDL and DML within the same transaction.
+-func WithIsolateDDL(b bool) ProviderOption {
+-	return configFunc(func(c *config) error {
+-		c.isolateDDL = b
+-		return nil
+-	})
+-}
+-
+ type config struct {
+ 	store database.Store
+ 
+@@ -201,7 +192,6 @@ type config struct {
+ 	disableVersioning     bool
+ 	allowMissing          bool
+ 	disableGlobalRegistry bool
+-	isolateDDL            bool
+ 
+ 	logger Logger
+ }
+diff --git a/provider_run.go b/provider_run.go
+index 750195e..c083d39 100644
+--- a/provider_run.go
++++ b/provider_run.go
+@@ -172,7 +172,7 @@ func (p *Provider) runIndividually(
+ 	if err != nil {
+ 		return err
+ 	}
+-	if useTx && !p.cfg.isolateDDL {
++	if useTx {
+ 		return beginTx(ctx, conn, func(tx *sql.Tx) error {
+ 			if err := p.runMigration(ctx, tx, m, direction); err != nil {
+ 				return err
+@@ -316,34 +316,20 @@ func (p *Provider) tryEnsureVersionTable(ctx context.Context, conn *sql.Conn) er
+ 			}
+ 			// Fallthrough to create the table.
+ 		} else if err != nil {
+-			return fmt.Errorf("check if version table exists: %w", err)
++			return fmt.Errorf("failed to check if version table exists: %w", err)
+ 		}
+ 
+-		if p.cfg.isolateDDL {
+-			// If isolation is enabled, we create the version table separately to ensure subsequent
+-			// DML operations are not mixed with DDL.
+-			if err := p.store.CreateVersionTable(ctx, conn); err != nil {
+-				return retry.RetryableError(fmt.Errorf("create version table: %w", err))
+-			}
+-			if err := p.store.Insert(ctx, conn, database.InsertRequest{Version: 0}); err != nil {
+-				return retry.RetryableError(fmt.Errorf("insert zero version: %w", err))
+-			}
+-		} else {
+-			// If DDL isolation is not enabled, we can create the version table and insert the zero
+-			// version in a single transaction.
+-			if err := beginTx(ctx, conn, func(tx *sql.Tx) error {
+-				if err := p.store.CreateVersionTable(ctx, tx); err != nil {
+-					return err
+-				}
+-				return p.store.Insert(ctx, tx, database.InsertRequest{Version: 0})
+-			}); err != nil {
+-				// Mark the error as retryable so we can try again. It's possible that another instance
+-				// is creating the table at the same time and the checks above will succeed on the next
+-				// iteration.
+-				return retry.RetryableError(fmt.Errorf("create version table: %w", err))
++		if err := beginTx(ctx, conn, func(tx *sql.Tx) error {
++			if err := p.store.CreateVersionTable(ctx, tx); err != nil {
++				return err
+ 			}
++			return p.store.Insert(ctx, tx, database.InsertRequest{Version: 0})
++		}); err != nil {
++			// Mark the error as retryable so we can try again. It's possible that another instance
++			// is creating the table at the same time and the checks above will succeed on the next
++			// iteration.
++			return retry.RetryableError(fmt.Errorf("failed to create version table: %w", err))
+ 		}
+-
+ 		return nil
+ 	})
+ }
+@@ -445,6 +431,7 @@ func (p *Provider) runGo(ctx context.Context, db database.DBTxConn, m *Migration
+ // runSQL is a helper function that runs the given SQL statements in the given direction. It must
+ // only be called after the migration has been parsed.
+ func (p *Provider) runSQL(ctx context.Context, db database.DBTxConn, m *Migration, direction bool) error {
++
+ 	if !m.sql.Parsed {
+ 		return fmt.Errorf("sql migrations must be parsed")
+ 	}
+diff --git a/provider_run_test.go b/provider_run_test.go
+index 57251ca..02ee7cf 100644
+--- a/provider_run_test.go
++++ b/provider_run_test.go
+@@ -360,17 +360,6 @@ INSERT INTO owners (owner_name) VALUES ('seed-user-3');
+ 		assertStatus(t, status[1], goose.StatePending, newSource(goose.TypeSQL, "00002_partial_error.sql", 2), true)
+ 		assertStatus(t, status[2], goose.StatePending, newSource(goose.TypeSQL, "00003_insert_data.sql", 3), true)
+ 	})
+-	t.Run("isolate_ddl", func(t *testing.T) {
+-		ctx := context.Background()
+-		p, _ := newProviderWithDB(t, goose.WithIsolateDDL(true))
+-		// Apply all migrations
+-		res, err := p.Up(ctx)
+-		require.NoError(t, err)
+-		require.Len(t, res, 7)
+-		currentVersion, err := p.GetDBVersion(ctx)
+-		require.NoError(t, err)
+-		require.EqualValues(t, 7, currentVersion)
+-	})
+ }
+ 
+ func TestConcurrentProvider(t *testing.T) {

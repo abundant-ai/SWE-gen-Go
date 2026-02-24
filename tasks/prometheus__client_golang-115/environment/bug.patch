@@ -1,0 +1,327 @@
+diff --git a/prometheus/examples_test.go b/prometheus/examples_test.go
+index a28a801..d106c42 100644
+--- a/prometheus/examples_test.go
++++ b/prometheus/examples_test.go
+@@ -455,56 +455,6 @@ func ExampleSummaryVec() {
+ 	// ]
+ }
+ 
+-func ExampleConstSummary() {
+-	desc := prometheus.NewDesc(
+-		"http_request_duration_seconds",
+-		"A summary of the HTTP request durations.",
+-		[]string{"code", "method"},
+-		prometheus.Labels{"owner": "example"},
+-	)
+-
+-	// Create a constant summary from values we got from a 3rd party telemetry system.
+-	s := prometheus.MustNewConstSummary(
+-		desc,
+-		4711, 403.34,
+-		map[float64]float64{0.5: 42.3, 0.9: 323.3},
+-		"200", "get",
+-	)
+-
+-	// Just for demonstration, let's check the state of the summary by
+-	// (ab)using its Write method (which is usually only used by Prometheus
+-	// internally).
+-	metric := &dto.Metric{}
+-	s.Write(metric)
+-	fmt.Println(proto.MarshalTextString(metric))
+-
+-	// Output:
+-	// label: <
+-	//   name: "code"
+-	//   value: "200"
+-	// >
+-	// label: <
+-	//   name: "method"
+-	//   value: "get"
+-	// >
+-	// label: <
+-	//   name: "owner"
+-	//   value: "example"
+-	// >
+-	// summary: <
+-	//   sample_count: 4711
+-	//   sample_sum: 403.34
+-	//   quantile: <
+-	//     quantile: 0.5
+-	//     value: 42.3
+-	//   >
+-	//   quantile: <
+-	//     quantile: 0.9
+-	//     value: 323.3
+-	//   >
+-	// >
+-}
+-
+ func ExampleHistogram() {
+ 	temps := prometheus.NewHistogram(prometheus.HistogramOpts{
+ 		Name:    "pond_temperature_celsius",
+@@ -551,64 +501,6 @@ func ExampleHistogram() {
+ 	// >
+ }
+ 
+-func ExampleConstHistogram() {
+-	desc := prometheus.NewDesc(
+-		"http_request_duration_seconds",
+-		"A histogram of the HTTP request durations.",
+-		[]string{"code", "method"},
+-		prometheus.Labels{"owner": "example"},
+-	)
+-
+-	// Create a constant histogram from values we got from a 3rd party telemetry system.
+-	h := prometheus.MustNewConstHistogram(
+-		desc,
+-		4711, 403.34,
+-		map[float64]uint64{25: 121, 50: 2403, 100: 3221, 200: 4233},
+-		"200", "get",
+-	)
+-
+-	// Just for demonstration, let's check the state of the histogram by
+-	// (ab)using its Write method (which is usually only used by Prometheus
+-	// internally).
+-	metric := &dto.Metric{}
+-	h.Write(metric)
+-	fmt.Println(proto.MarshalTextString(metric))
+-
+-	// Output:
+-	// label: <
+-	//   name: "code"
+-	//   value: "200"
+-	// >
+-	// label: <
+-	//   name: "method"
+-	//   value: "get"
+-	// >
+-	// label: <
+-	//   name: "owner"
+-	//   value: "example"
+-	// >
+-	// histogram: <
+-	//   sample_count: 4711
+-	//   sample_sum: 403.34
+-	//   bucket: <
+-	//     cumulative_count: 121
+-	//     upper_bound: 25
+-	//   >
+-	//   bucket: <
+-	//     cumulative_count: 2403
+-	//     upper_bound: 50
+-	//   >
+-	//   bucket: <
+-	//     cumulative_count: 3221
+-	//     upper_bound: 100
+-	//   >
+-	//   bucket: <
+-	//     cumulative_count: 4233
+-	//     upper_bound: 200
+-	//   >
+-	// >
+-}
+-
+ func ExamplePushCollectors() {
+ 	hostname, _ := os.Hostname()
+ 	completionTime := prometheus.NewGauge(prometheus.GaugeOpts{
+diff --git a/prometheus/histogram.go b/prometheus/histogram.go
+index 27e9c5f..9b36a61 100644
+--- a/prometheus/histogram.go
++++ b/prometheus/histogram.go
+@@ -342,102 +342,3 @@ func (m *HistogramVec) WithLabelValues(lvs ...string) Histogram {
+ func (m *HistogramVec) With(labels Labels) Histogram {
+ 	return m.MetricVec.With(labels).(Histogram)
+ }
+-
+-type constHistogram struct {
+-	desc       *Desc
+-	count      uint64
+-	sum        float64
+-	buckets    map[float64]uint64
+-	labelPairs []*dto.LabelPair
+-}
+-
+-func (h *constHistogram) Desc() *Desc {
+-	return h.desc
+-}
+-
+-func (h *constHistogram) Write(out *dto.Metric) error {
+-	his := &dto.Histogram{}
+-	buckets := make([]*dto.Bucket, 0, len(h.buckets))
+-
+-	his.SampleCount = proto.Uint64(h.count)
+-	his.SampleSum = proto.Float64(h.sum)
+-
+-	for upperBound, count := range h.buckets {
+-		buckets = append(buckets, &dto.Bucket{
+-			CumulativeCount: proto.Uint64(count),
+-			UpperBound:      proto.Float64(upperBound),
+-		})
+-	}
+-
+-	if len(buckets) > 0 {
+-		sort.Sort(buckSort(buckets))
+-	}
+-	his.Bucket = buckets
+-
+-	out.Histogram = his
+-	out.Label = h.labelPairs
+-
+-	return nil
+-}
+-
+-// NewConstHistogram returns a metric representing a Prometheus histogram with
+-// fixed values for the count, sum, and bucket counts. As those parameters
+-// cannot be changed, the returned value does not implement the Histogram
+-// interface (but only the Metric interface). Users of this package will not
+-// have much use for it in regular operations. However, when implementing custom
+-// Collectors, it is useful as a throw-away metric that is generated on the fly
+-// to send it to Prometheus in the Collect method.
+-//
+-// buckets is a map of upper bounds to cumulative counts, excluding the +Inf
+-// bucket.
+-//
+-// NewConstHistogram returns an error if the length of labelValues is not
+-// consistent with the variable labels in Desc.
+-func NewConstHistogram(
+-	desc *Desc,
+-	count uint64,
+-	sum float64,
+-	buckets map[float64]uint64,
+-	labelValues ...string,
+-) (Metric, error) {
+-	if len(desc.variableLabels) != len(labelValues) {
+-		return nil, errInconsistentCardinality
+-	}
+-	return &constHistogram{
+-		desc:       desc,
+-		count:      count,
+-		sum:        sum,
+-		buckets:    buckets,
+-		labelPairs: makeLabelPairs(desc, labelValues),
+-	}, nil
+-}
+-
+-// MustNewConstHistogram is a version of NewConstHistogram that panics where
+-// NewConstMetric would have returned an error.
+-func MustNewConstHistogram(
+-	desc *Desc,
+-	count uint64,
+-	sum float64,
+-	buckets map[float64]uint64,
+-	labelValues ...string,
+-) Metric {
+-	m, err := NewConstHistogram(desc, count, sum, buckets, labelValues...)
+-	if err != nil {
+-		panic(err)
+-	}
+-	return m
+-}
+-
+-type buckSort []*dto.Bucket
+-
+-func (s buckSort) Len() int {
+-	return len(s)
+-}
+-
+-func (s buckSort) Swap(i, j int) {
+-	s[i], s[j] = s[j], s[i]
+-}
+-
+-func (s buckSort) Less(i, j int) bool {
+-	return s[i].GetUpperBound() < s[j].GetUpperBound()
+-}
+diff --git a/prometheus/summary.go b/prometheus/summary.go
+index 67fe43c..dd336c5 100644
+--- a/prometheus/summary.go
++++ b/prometheus/summary.go
+@@ -448,89 +448,3 @@ func (m *SummaryVec) WithLabelValues(lvs ...string) Summary {
+ func (m *SummaryVec) With(labels Labels) Summary {
+ 	return m.MetricVec.With(labels).(Summary)
+ }
+-
+-type constSummary struct {
+-	desc       *Desc
+-	count      uint64
+-	sum        float64
+-	quantiles  map[float64]float64
+-	labelPairs []*dto.LabelPair
+-}
+-
+-func (s *constSummary) Desc() *Desc {
+-	return s.desc
+-}
+-
+-func (s *constSummary) Write(out *dto.Metric) error {
+-	sum := &dto.Summary{}
+-	qs := make([]*dto.Quantile, 0, len(s.quantiles))
+-
+-	sum.SampleCount = proto.Uint64(s.count)
+-	sum.SampleSum = proto.Float64(s.sum)
+-
+-	for rank, q := range s.quantiles {
+-		qs = append(qs, &dto.Quantile{
+-			Quantile: proto.Float64(rank),
+-			Value:    proto.Float64(q),
+-		})
+-	}
+-
+-	if len(qs) > 0 {
+-		sort.Sort(quantSort(qs))
+-	}
+-	sum.Quantile = qs
+-
+-	out.Summary = sum
+-	out.Label = s.labelPairs
+-
+-	return nil
+-}
+-
+-// NewConstSummary returns a metric representing a Prometheus summary with fixed
+-// values for the count, sum, and quantiles. As those parameters cannot be
+-// changed, the returned value does not implement the Summary interface (but
+-// only the Metric interface). Users of this package will not have much use for
+-// it in regular operations. However, when implementing custom Collectors, it is
+-// useful as a throw-away metric that is generated on the fly to send it to
+-// Prometheus in the Collect method.
+-//
+-// quantiles maps ranks to quantile values. For example, a median latency of
+-// 0.23s and a 99th percentile latency of 0.56s would be expressed as:
+-//     map[float64]float64{0.5: 0.23, 0.99: 0.56}
+-//
+-// NewConstSummary returns an error if the length of labelValues is not
+-// consistent with the variable labels in Desc.
+-func NewConstSummary(
+-	desc *Desc,
+-	count uint64,
+-	sum float64,
+-	quantiles map[float64]float64,
+-	labelValues ...string,
+-) (Metric, error) {
+-	if len(desc.variableLabels) != len(labelValues) {
+-		return nil, errInconsistentCardinality
+-	}
+-	return &constSummary{
+-		desc:       desc,
+-		count:      count,
+-		sum:        sum,
+-		quantiles:  quantiles,
+-		labelPairs: makeLabelPairs(desc, labelValues),
+-	}, nil
+-}
+-
+-// MustNewConstSummary is a version of NewConstSummary that panics where
+-// NewConstMetric would have returned an error.
+-func MustNewConstSummary(
+-	desc *Desc,
+-	count uint64,
+-	sum float64,
+-	quantiles map[float64]float64,
+-	labelValues ...string,
+-) Metric {
+-	m, err := NewConstSummary(desc, count, sum, quantiles, labelValues...)
+-	if err != nil {
+-		panic(err)
+-	}
+-	return m
+-}

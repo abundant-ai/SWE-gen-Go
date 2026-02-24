@@ -1,0 +1,100 @@
+diff --git a/error.go b/error.go
+index 12b5604d..d2462a49 100644
+--- a/error.go
++++ b/error.go
+@@ -124,6 +124,9 @@ func shouldRetry(err error, retryTimeout bool) bool {
+ 	if proto.IsTryAgainError(err) {
+ 		return true
+ 	}
++	if proto.IsNoReplicasError(err) {
++		return true
++	}
+ 
+ 	// Fallback to string checking for backward compatibility with plain errors
+ 	s := err.Error()
+@@ -145,6 +148,9 @@ func shouldRetry(err error, retryTimeout bool) bool {
+ 	if strings.HasPrefix(s, "MASTERDOWN ") {
+ 		return true
+ 	}
++	if strings.HasPrefix(s, "NOREPLICAS ") {
++		return true
++	}
+ 
+ 	return false
+ }
+@@ -342,6 +348,14 @@ func IsOOMError(err error) bool {
+ 	return proto.IsOOMError(err)
+ }
+ 
++// IsNoReplicasError checks if an error is a Redis NOREPLICAS error, even if wrapped.
++// NOREPLICAS errors occur when not enough replicas acknowledge a write operation.
++// This typically happens with WAIT/WAITAOF commands or CLUSTER SETSLOT with synchronous
++// replication when the required number of replicas cannot confirm the write within the timeout.
++func IsNoReplicasError(err error) bool {
++	return proto.IsNoReplicasError(err)
++}
++
+ //------------------------------------------------------------------------------
+ 
+ type timeoutError interface {
+diff --git a/internal/proto/redis_errors.go b/internal/proto/redis_errors.go
+index f553e2f9..a28240f5 100644
+--- a/internal/proto/redis_errors.go
++++ b/internal/proto/redis_errors.go
+@@ -212,6 +212,25 @@ func NewOOMError(msg string) *OOMError {
+ 	return &OOMError{msg: msg}
+ }
+ 
++// NoReplicasError is returned when not enough replicas acknowledge a write.
++// This error occurs when using WAIT/WAITAOF commands or CLUSTER SETSLOT with
++// synchronous replication, and the required number of replicas cannot confirm
++// the write within the timeout period.
++type NoReplicasError struct {
++	msg string
++}
++
++func (e *NoReplicasError) Error() string {
++	return e.msg
++}
++
++func (e *NoReplicasError) RedisError() {}
++
++// NewNoReplicasError creates a new NoReplicasError with the given message.
++func NewNoReplicasError(msg string) *NoReplicasError {
++	return &NoReplicasError{msg: msg}
++}
++
+ // parseTypedRedisError parses a Redis error message and returns a typed error if applicable.
+ // This function maintains backward compatibility by keeping the same error messages.
+ func parseTypedRedisError(msg string) error {
+@@ -235,6 +254,8 @@ func parseTypedRedisError(msg string) error {
+ 		return NewTryAgainError(msg)
+ 	case strings.HasPrefix(msg, "MASTERDOWN "):
+ 		return NewMasterDownError(msg)
++	case strings.HasPrefix(msg, "NOREPLICAS "):
++		return NewNoReplicasError(msg)
+ 	case msg == "ERR max number of clients reached":
+ 		return NewMaxClientsError(msg)
+ 	case strings.HasPrefix(msg, "NOAUTH "), strings.HasPrefix(msg, "WRONGPASS "), strings.Contains(msg, "unauthenticated"):
+@@ -486,3 +507,21 @@ func IsOOMError(err error) bool {
+ 	// Fallback to string checking for backward compatibility
+ 	return strings.HasPrefix(err.Error(), "OOM ")
+ }
++
++// IsNoReplicasError checks if an error is a NoReplicasError, even if wrapped.
++func IsNoReplicasError(err error) bool {
++	if err == nil {
++		return false
++	}
++	var noReplicasErr *NoReplicasError
++	if errors.As(err, &noReplicasErr) {
++		return true
++	}
++	// Check if wrapped error is a RedisError with NOREPLICAS prefix
++	var redisErr RedisError
++	if errors.As(err, &redisErr) && strings.HasPrefix(redisErr.Error(), "NOREPLICAS ") {
++		return true
++	}
++	// Fallback to string checking for backward compatibility
++	return strings.HasPrefix(err.Error(), "NOREPLICAS ")
++}

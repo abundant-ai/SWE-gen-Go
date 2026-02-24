@@ -1,0 +1,287 @@
+diff --git a/pkg/lint/runner.go b/pkg/lint/runner.go
+index 150e6c7f..dc6b2e73 100644
+--- a/pkg/lint/runner.go
++++ b/pkg/lint/runner.go
+@@ -254,20 +254,15 @@ func (r *Runner) processIssues(issues []result.Issue, sw *timeutils.Stopwatch, s
+ }
+ 
+ func getExcludeProcessor(cfg *config.Issues) processors.Processor {
+-	var excludeTotalPattern string
+-
+-	if len(cfg.ExcludePatterns) != 0 {
+-		excludeTotalPattern = fmt.Sprintf("(%s)", strings.Join(cfg.ExcludePatterns, "|"))
++	opts := processors.ExcludeOptions{
++		CaseSensitive: cfg.ExcludeCaseSensitive,
+ 	}
+ 
+-	var excludeProcessor processors.Processor
+-	if cfg.ExcludeCaseSensitive {
+-		excludeProcessor = processors.NewExcludeCaseSensitive(excludeTotalPattern)
+-	} else {
+-		excludeProcessor = processors.NewExclude(excludeTotalPattern)
++	if len(cfg.ExcludePatterns) != 0 {
++		opts.Pattern = fmt.Sprintf("(%s)", strings.Join(cfg.ExcludePatterns, "|"))
+ 	}
+ 
+-	return excludeProcessor
++	return processors.NewExclude(opts)
+ }
+ 
+ func getExcludeRulesProcessor(cfg *config.Issues, log logutils.Log, files *fsutils.Files) processors.Processor {
+@@ -295,22 +290,12 @@ func getExcludeRulesProcessor(cfg *config.Issues, log logutils.Log, files *fsuti
+ 		}
+ 	}
+ 
+-	var excludeRulesProcessor processors.Processor
+-	if cfg.ExcludeCaseSensitive {
+-		excludeRulesProcessor = processors.NewExcludeRulesCaseSensitive(
+-			excludeRules,
+-			files,
+-			log.Child(logutils.DebugKeyExcludeRules),
+-		)
+-	} else {
+-		excludeRulesProcessor = processors.NewExcludeRules(
+-			excludeRules,
+-			files,
+-			log.Child(logutils.DebugKeyExcludeRules),
+-		)
++	opts := processors.ExcludeRulesOptions{
++		Rules:         excludeRules,
++		CaseSensitive: cfg.ExcludeCaseSensitive,
+ 	}
+ 
+-	return excludeRulesProcessor
++	return processors.NewExcludeRules(log.Child(logutils.DebugKeyExcludeRules), files, opts)
+ }
+ 
+ func getSeverityRulesProcessor(cfg *config.Severity, log logutils.Log, files *fsutils.Files) processors.Processor {
+diff --git a/pkg/result/processors/base_rule.go b/pkg/result/processors/base_rule.go
+index b5e13880..88140bfa 100644
+--- a/pkg/result/processors/base_rule.go
++++ b/pkg/result/processors/base_rule.go
+@@ -8,6 +8,8 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
++const caseInsensitivePrefix = "(?i)"
++
+ type BaseRule struct {
+ 	Text       string
+ 	Source     string
+diff --git a/pkg/result/processors/exclude.go b/pkg/result/processors/exclude.go
+index 92959a32..ad684299 100644
+--- a/pkg/result/processors/exclude.go
++++ b/pkg/result/processors/exclude.go
+@@ -6,24 +6,37 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
++var _ Processor = Exclude{}
++
+ type Exclude struct {
++	name string
++
+ 	pattern *regexp.Regexp
+ }
+ 
+-var _ Processor = Exclude{}
++type ExcludeOptions struct {
++	Pattern       string
++	CaseSensitive bool
++}
+ 
+-func NewExclude(pattern string) *Exclude {
+-	var patternRe *regexp.Regexp
+-	if pattern != "" {
+-		patternRe = regexp.MustCompile("(?i)" + pattern)
++func NewExclude(opts ExcludeOptions) *Exclude {
++	p := &Exclude{name: "exclude"}
++
++	prefix := caseInsensitivePrefix
++	if opts.CaseSensitive {
++		p.name = "exclude-case-sensitive"
++		prefix = ""
+ 	}
+-	return &Exclude{
+-		pattern: patternRe,
++
++	if opts.Pattern != "" {
++		p.pattern = regexp.MustCompile(prefix + opts.Pattern)
+ 	}
++
++	return p
+ }
+ 
+ func (p Exclude) Name() string {
+-	return "exclude"
++	return p.name
+ }
+ 
+ func (p Exclude) Process(issues []result.Issue) ([]result.Issue, error) {
+@@ -37,23 +50,3 @@ func (p Exclude) Process(issues []result.Issue) ([]result.Issue, error) {
+ }
+ 
+ func (p Exclude) Finish() {}
+-
+-type ExcludeCaseSensitive struct {
+-	*Exclude
+-}
+-
+-var _ Processor = ExcludeCaseSensitive{}
+-
+-func NewExcludeCaseSensitive(pattern string) *ExcludeCaseSensitive {
+-	var patternRe *regexp.Regexp
+-	if pattern != "" {
+-		patternRe = regexp.MustCompile(pattern)
+-	}
+-	return &ExcludeCaseSensitive{
+-		&Exclude{pattern: patternRe},
+-	}
+-}
+-
+-func (p ExcludeCaseSensitive) Name() string {
+-	return "exclude-case-sensitive"
+-}
+diff --git a/pkg/result/processors/exclude_rules.go b/pkg/result/processors/exclude_rules.go
+index 2f7e30b4..c2eba63d 100644
+--- a/pkg/result/processors/exclude_rules.go
++++ b/pkg/result/processors/exclude_rules.go
+@@ -8,6 +8,8 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
++var _ Processor = ExcludeRules{}
++
+ type excludeRule struct {
+ 	baseRule
+ }
+@@ -17,43 +19,35 @@ type ExcludeRule struct {
+ }
+ 
+ type ExcludeRules struct {
+-	rules []excludeRule
+-	files *fsutils.Files
++	name string
++
+ 	log   logutils.Log
++	files *fsutils.Files
++
++	rules []excludeRule
+ }
+ 
+-func NewExcludeRules(rules []ExcludeRule, files *fsutils.Files, log logutils.Log) *ExcludeRules {
+-	r := &ExcludeRules{
++type ExcludeRulesOptions struct {
++	Rules         []ExcludeRule
++	CaseSensitive bool
++}
++
++func NewExcludeRules(log logutils.Log, files *fsutils.Files, opts ExcludeRulesOptions) *ExcludeRules {
++	p := &ExcludeRules{
++		name:  "exclude-rules",
+ 		files: files,
+ 		log:   log,
+ 	}
+-	r.rules = createRules(rules, "(?i)")
+-
+-	return r
+-}
+ 
+-func createRules(rules []ExcludeRule, prefix string) []excludeRule {
+-	parsedRules := make([]excludeRule, 0, len(rules))
+-	for _, rule := range rules {
+-		parsedRule := excludeRule{}
+-		parsedRule.linters = rule.Linters
+-		if rule.Text != "" {
+-			parsedRule.text = regexp.MustCompile(prefix + rule.Text)
+-		}
+-		if rule.Source != "" {
+-			parsedRule.source = regexp.MustCompile(prefix + rule.Source)
+-		}
+-		if rule.Path != "" {
+-			path := fsutils.NormalizePathInRegex(rule.Path)
+-			parsedRule.path = regexp.MustCompile(path)
+-		}
+-		if rule.PathExcept != "" {
+-			pathExcept := fsutils.NormalizePathInRegex(rule.PathExcept)
+-			parsedRule.pathExcept = regexp.MustCompile(pathExcept)
+-		}
+-		parsedRules = append(parsedRules, parsedRule)
++	prefix := caseInsensitivePrefix
++	if opts.CaseSensitive {
++		prefix = ""
++		p.name = "exclude-rules-case-sensitive"
+ 	}
+-	return parsedRules
++
++	p.rules = createRules(opts.Rules, prefix)
++
++	return p
+ }
+ 
+ func (p ExcludeRules) Process(issues []result.Issue) ([]result.Issue, error) {
+@@ -71,25 +65,35 @@ func (p ExcludeRules) Process(issues []result.Issue) ([]result.Issue, error) {
+ 	}), nil
+ }
+ 
+-func (ExcludeRules) Name() string { return "exclude-rules" }
+-func (ExcludeRules) Finish()      {}
++func (p ExcludeRules) Name() string { return p.name }
+ 
+-var _ Processor = ExcludeRules{}
++func (ExcludeRules) Finish() {}
+ 
+-type ExcludeRulesCaseSensitive struct {
+-	*ExcludeRules
+-}
++func createRules(rules []ExcludeRule, prefix string) []excludeRule {
++	parsedRules := make([]excludeRule, 0, len(rules))
+ 
+-func NewExcludeRulesCaseSensitive(rules []ExcludeRule, files *fsutils.Files, log logutils.Log) *ExcludeRulesCaseSensitive {
+-	r := &ExcludeRules{
+-		files: files,
+-		log:   log,
+-	}
+-	r.rules = createRules(rules, "")
++	for _, rule := range rules {
++		parsedRule := excludeRule{}
++		parsedRule.linters = rule.Linters
+ 
+-	return &ExcludeRulesCaseSensitive{r}
+-}
++		if rule.Text != "" {
++			parsedRule.text = regexp.MustCompile(prefix + rule.Text)
++		}
+ 
+-func (ExcludeRulesCaseSensitive) Name() string { return "exclude-rules-case-sensitive" }
++		if rule.Source != "" {
++			parsedRule.source = regexp.MustCompile(prefix + rule.Source)
++		}
++
++		if rule.Path != "" {
++			parsedRule.path = regexp.MustCompile(fsutils.NormalizePathInRegex(rule.Path))
++		}
++
++		if rule.PathExcept != "" {
++			parsedRule.pathExcept = regexp.MustCompile(fsutils.NormalizePathInRegex(rule.PathExcept))
++		}
+ 
+-var _ Processor = ExcludeCaseSensitive{}
++		parsedRules = append(parsedRules, parsedRule)
++	}
++
++	return parsedRules
++}
+diff --git a/pkg/result/processors/severity.go b/pkg/result/processors/severity.go
+index fdbbe322..2a21e9e5 100644
+--- a/pkg/result/processors/severity.go
++++ b/pkg/result/processors/severity.go
+@@ -48,7 +48,7 @@ func NewSeverity(log logutils.Log, files *fsutils.Files, opts SeverityOptions) *
+ 		override:        opts.Override,
+ 	}
+ 
+-	prefix := "(?i)"
++	prefix := caseInsensitivePrefix
+ 	if opts.CaseSensitive {
+ 		prefix = ""
+ 		p.name = "severity-rules-case-sensitive"

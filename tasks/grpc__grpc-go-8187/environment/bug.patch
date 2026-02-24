@@ -1,0 +1,413 @@
+diff --git a/balancer/base/balancer.go b/balancer/base/balancer.go
+index 4d576876..d5ed172a 100644
+--- a/balancer/base/balancer.go
++++ b/balancer/base/balancer.go
+@@ -41,7 +41,7 @@ func (bb *baseBuilder) Build(cc balancer.ClientConn, _ balancer.BuildOptions) ba
+ 		cc:            cc,
+ 		pickerBuilder: bb.pickerBuilder,
+ 
+-		subConns: resolver.NewAddressMapV2[balancer.SubConn](),
++		subConns: resolver.NewAddressMap(),
+ 		scStates: make(map[balancer.SubConn]connectivity.State),
+ 		csEvltr:  &balancer.ConnectivityStateEvaluator{},
+ 		config:   bb.config,
+@@ -65,7 +65,7 @@ type baseBalancer struct {
+ 	csEvltr *balancer.ConnectivityStateEvaluator
+ 	state   connectivity.State
+ 
+-	subConns *resolver.AddressMapV2[balancer.SubConn]
++	subConns *resolver.AddressMap
+ 	scStates map[balancer.SubConn]connectivity.State
+ 	picker   balancer.Picker
+ 	config   Config
+@@ -100,7 +100,7 @@ func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
+ 	// Successful resolution; clear resolver error and ensure we return nil.
+ 	b.resolverErr = nil
+ 	// addrsSet is the set converted from addrs, it's used for quick lookup of an address.
+-	addrsSet := resolver.NewAddressMapV2[any]()
++	addrsSet := resolver.NewAddressMap()
+ 	for _, a := range s.ResolverState.Addresses {
+ 		addrsSet.Set(a, nil)
+ 		if _, ok := b.subConns.Get(a); !ok {
+@@ -122,7 +122,8 @@ func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
+ 		}
+ 	}
+ 	for _, a := range b.subConns.Keys() {
+-		sc, _ := b.subConns.Get(a)
++		sci, _ := b.subConns.Get(a)
++		sc := sci.(balancer.SubConn)
+ 		// a was removed by resolver.
+ 		if _, ok := addrsSet.Get(a); !ok {
+ 			sc.Shutdown()
+@@ -172,7 +173,8 @@ func (b *baseBalancer) regeneratePicker() {
+ 
+ 	// Filter out all ready SCs from full subConn map.
+ 	for _, addr := range b.subConns.Keys() {
+-		sc, _ := b.subConns.Get(addr)
++		sci, _ := b.subConns.Get(addr)
++		sc := sci.(balancer.SubConn)
+ 		if st, ok := b.scStates[sc]; ok && st == connectivity.Ready {
+ 			readySCs[sc] = SubConnInfo{Address: addr}
+ 		}
+diff --git a/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go b/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go
+index d5ad4a5c..113181e6 100644
+--- a/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go
++++ b/balancer/pickfirst/pickfirstleaf/pickfirstleaf.go
+@@ -122,7 +122,7 @@ func (pickfirstBuilder) Build(cc balancer.ClientConn, bo balancer.BuildOptions)
+ 		target:          bo.Target.String(),
+ 		metricsRecorder: cc.MetricsRecorder(),
+ 
+-		subConns:              resolver.NewAddressMapV2[*scData](),
++		subConns:              resolver.NewAddressMap(),
+ 		state:                 connectivity.Connecting,
+ 		cancelConnectionTimer: func() {},
+ 	}
+@@ -220,7 +220,7 @@ type pickfirstBalancer struct {
+ 	// updates.
+ 	state connectivity.State
+ 	// scData for active subonns mapped by address.
+-	subConns              *resolver.AddressMapV2[*scData]
++	subConns              *resolver.AddressMap
+ 	addressList           addressList
+ 	firstPass             bool
+ 	numTF                 int
+@@ -319,7 +319,7 @@ func (b *pickfirstBalancer) UpdateClientConnState(state balancer.ClientConnState
+ 	prevAddr := b.addressList.currentAddress()
+ 	prevSCData, found := b.subConns.Get(prevAddr)
+ 	prevAddrsCount := b.addressList.size()
+-	isPrevRawConnectivityStateReady := found && prevSCData.rawConnectivityState == connectivity.Ready
++	isPrevRawConnectivityStateReady := found && prevSCData.(*scData).rawConnectivityState == connectivity.Ready
+ 	b.addressList.updateAddrs(newAddrs)
+ 
+ 	// If the previous ready SubConn exists in new address list,
+@@ -381,21 +381,21 @@ func (b *pickfirstBalancer) startFirstPassLocked() {
+ 	b.numTF = 0
+ 	// Reset the connection attempt record for existing SubConns.
+ 	for _, sd := range b.subConns.Values() {
+-		sd.connectionFailedInFirstPass = false
++		sd.(*scData).connectionFailedInFirstPass = false
+ 	}
+ 	b.requestConnectionLocked()
+ }
+ 
+ func (b *pickfirstBalancer) closeSubConnsLocked() {
+ 	for _, sd := range b.subConns.Values() {
+-		sd.subConn.Shutdown()
++		sd.(*scData).subConn.Shutdown()
+ 	}
+-	b.subConns = resolver.NewAddressMapV2[*scData]()
++	b.subConns = resolver.NewAddressMap()
+ }
+ 
+ // deDupAddresses ensures that each address appears only once in the slice.
+ func deDupAddresses(addrs []resolver.Address) []resolver.Address {
+-	seenAddrs := resolver.NewAddressMapV2[*scData]()
++	seenAddrs := resolver.NewAddressMap()
+ 	retAddrs := []resolver.Address{}
+ 
+ 	for _, addr := range addrs {
+@@ -481,7 +481,7 @@ func addressFamily(address string) ipAddrFamily {
+ // This ensures that the subchannel map accurately reflects the current set of
+ // addresses received from the name resolver.
+ func (b *pickfirstBalancer) reconcileSubConnsLocked(newAddrs []resolver.Address) {
+-	newAddrsMap := resolver.NewAddressMapV2[bool]()
++	newAddrsMap := resolver.NewAddressMap()
+ 	for _, addr := range newAddrs {
+ 		newAddrsMap.Set(addr, true)
+ 	}
+@@ -491,7 +491,7 @@ func (b *pickfirstBalancer) reconcileSubConnsLocked(newAddrs []resolver.Address)
+ 			continue
+ 		}
+ 		val, _ := b.subConns.Get(oldAddr)
+-		val.subConn.Shutdown()
++		val.(*scData).subConn.Shutdown()
+ 		b.subConns.Delete(oldAddr)
+ 	}
+ }
+@@ -500,12 +500,13 @@ func (b *pickfirstBalancer) reconcileSubConnsLocked(newAddrs []resolver.Address)
+ // becomes ready, which means that all other subConn must be shutdown.
+ func (b *pickfirstBalancer) shutdownRemainingLocked(selected *scData) {
+ 	b.cancelConnectionTimer()
+-	for _, sd := range b.subConns.Values() {
++	for _, v := range b.subConns.Values() {
++		sd := v.(*scData)
+ 		if sd.subConn != selected.subConn {
+ 			sd.subConn.Shutdown()
+ 		}
+ 	}
+-	b.subConns = resolver.NewAddressMapV2[*scData]()
++	b.subConns = resolver.NewAddressMap()
+ 	b.subConns.Set(selected.addr, selected)
+ }
+ 
+@@ -538,17 +539,18 @@ func (b *pickfirstBalancer) requestConnectionLocked() {
+ 			b.subConns.Set(curAddr, sd)
+ 		}
+ 
+-		switch sd.rawConnectivityState {
++		scd := sd.(*scData)
++		switch scd.rawConnectivityState {
+ 		case connectivity.Idle:
+-			sd.subConn.Connect()
++			scd.subConn.Connect()
+ 			b.scheduleNextConnectionLocked()
+ 			return
+ 		case connectivity.TransientFailure:
+ 			// The SubConn is being re-used and failed during a previous pass
+ 			// over the addressList. It has not completed backoff yet.
+ 			// Mark it as having failed and try the next address.
+-			sd.connectionFailedInFirstPass = true
+-			lastErr = sd.lastErr
++			scd.connectionFailedInFirstPass = true
++			lastErr = scd.lastErr
+ 			continue
+ 		case connectivity.Connecting:
+ 			// Wait for the connection attempt to complete or the timer to fire
+@@ -556,7 +558,7 @@ func (b *pickfirstBalancer) requestConnectionLocked() {
+ 			b.scheduleNextConnectionLocked()
+ 			return
+ 		default:
+-			b.logger.Errorf("SubConn with unexpected state %v present in SubConns map.", sd.rawConnectivityState)
++			b.logger.Errorf("SubConn with unexpected state %v present in SubConns map.", scd.rawConnectivityState)
+ 			return
+ 
+ 		}
+@@ -751,7 +753,8 @@ func (b *pickfirstBalancer) endFirstPassIfPossibleLocked(lastErr error) {
+ 	}
+ 	// Connect() has been called on all the SubConns. The first pass can be
+ 	// ended if all the SubConns have reported a failure.
+-	for _, sd := range b.subConns.Values() {
++	for _, v := range b.subConns.Values() {
++		sd := v.(*scData)
+ 		if !sd.connectionFailedInFirstPass {
+ 			return
+ 		}
+@@ -762,7 +765,8 @@ func (b *pickfirstBalancer) endFirstPassIfPossibleLocked(lastErr error) {
+ 		Picker:            &picker{err: lastErr},
+ 	})
+ 	// Start re-connecting all the SubConns that are already in IDLE.
+-	for _, sd := range b.subConns.Values() {
++	for _, v := range b.subConns.Values() {
++		sd := v.(*scData)
+ 		if sd.rawConnectivityState == connectivity.Idle {
+ 			sd.subConn.Connect()
+ 		}
+diff --git a/balancer/weightedroundrobin/balancer.go b/balancer/weightedroundrobin/balancer.go
+index acc86198..6487e481 100644
+--- a/balancer/weightedroundrobin/balancer.go
++++ b/balancer/weightedroundrobin/balancer.go
+@@ -104,7 +104,7 @@ func (bb) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Ba
+ 		ClientConn:       cc,
+ 		target:           bOpts.Target.String(),
+ 		metricsRecorder:  cc.MetricsRecorder(),
+-		addressWeights:   resolver.NewAddressMapV2[*endpointWeight](),
++		addressWeights:   resolver.NewAddressMap(),
+ 		endpointToWeight: resolver.NewEndpointMap(),
+ 		scToWeight:       make(map[balancer.SubConn]*endpointWeight),
+ 	}
+@@ -156,7 +156,7 @@ func (bb) Name() string {
+ // Caller must hold b.mu.
+ func (b *wrrBalancer) updateEndpointsLocked(endpoints []resolver.Endpoint) {
+ 	endpointSet := resolver.NewEndpointMap()
+-	addressSet := resolver.NewAddressMapV2[*endpointWeight]()
++	addressSet := resolver.NewAddressMap()
+ 	for _, endpoint := range endpoints {
+ 		endpointSet.Set(endpoint, nil)
+ 		for _, addr := range endpoint.Addresses {
+@@ -214,7 +214,7 @@ type wrrBalancer struct {
+ 	cfg              *lbConfig // active config
+ 	locality         string
+ 	stopPicker       *grpcsync.Event
+-	addressWeights   *resolver.AddressMapV2[*endpointWeight]
++	addressWeights   *resolver.AddressMap  // addr -> endpointWeight
+ 	endpointToWeight *resolver.EndpointMap // endpoint -> endpointWeight
+ 	scToWeight       map[balancer.SubConn]*endpointWeight
+ }
+@@ -329,7 +329,7 @@ func (b *wrrBalancer) NewSubConn(addrs []resolver.Address, opts balancer.NewSubC
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	b.scToWeight[sc] = ewi
++	b.scToWeight[sc] = ewi.(*endpointWeight)
+ 	return sc, nil
+ }
+ 
+diff --git a/resolver/map.go b/resolver/map.go
+index 4e8d8f44..975b4997 100644
+--- a/resolver/map.go
++++ b/resolver/map.go
+@@ -24,22 +24,16 @@ import (
+ 	"strings"
+ )
+ 
+-type addressMapEntry[T any] struct {
++type addressMapEntry struct {
+ 	addr  Address
+-	value T
++	value any
+ }
+ 
+-// AddressMap is an AddressMapV2[any].  It will be deleted in an upcoming
+-// release of grpc-go.
+-//
+-// Deprecated: use the generic AddressMapV2 type instead.
+-type AddressMap = AddressMapV2[any]
+-
+-// AddressMapV2 is a map of addresses to arbitrary values taking into account
++// AddressMap is a map of addresses to arbitrary values taking into account
+ // Attributes.  BalancerAttributes are ignored, as are Metadata and Type.
+ // Multiple accesses may not be performed concurrently.  Must be created via
+ // NewAddressMap; do not construct directly.
+-type AddressMapV2[T any] struct {
++type AddressMap struct {
+ 	// The underlying map is keyed by an Address with fields that we don't care
+ 	// about being set to their zero values. The only fields that we care about
+ 	// are `Addr`, `ServerName` and `Attributes`. Since we need to be able to
+@@ -53,30 +47,23 @@ type AddressMapV2[T any] struct {
+ 	// The value type of the map contains a slice of addresses which match the key
+ 	// in their `Addr` and `ServerName` fields and contain the corresponding value
+ 	// associated with them.
+-	m map[Address]addressMapEntryList[T]
++	m map[Address]addressMapEntryList
+ }
+ 
+ func toMapKey(addr *Address) Address {
+ 	return Address{Addr: addr.Addr, ServerName: addr.ServerName}
+ }
+ 
+-type addressMapEntryList[T any] []*addressMapEntry[T]
++type addressMapEntryList []*addressMapEntry
+ 
+-// NewAddressMap creates a new AddressMapV2[any].
+-//
+-// Deprecated: use the generic NewAddressMapV2 constructor instead.
++// NewAddressMap creates a new AddressMap.
+ func NewAddressMap() *AddressMap {
+-	return NewAddressMapV2[any]()
+-}
+-
+-// NewAddressMapV2 creates a new AddressMapV2.
+-func NewAddressMapV2[T any]() *AddressMapV2[T] {
+-	return &AddressMapV2[T]{m: make(map[Address]addressMapEntryList[T])}
++	return &AddressMap{m: make(map[Address]addressMapEntryList)}
+ }
+ 
+ // find returns the index of addr in the addressMapEntry slice, or -1 if not
+ // present.
+-func (l addressMapEntryList[T]) find(addr Address) int {
++func (l addressMapEntryList) find(addr Address) int {
+ 	for i, entry := range l {
+ 		// Attributes are the only thing to match on here, since `Addr` and
+ 		// `ServerName` are already equal.
+@@ -88,28 +75,28 @@ func (l addressMapEntryList[T]) find(addr Address) int {
+ }
+ 
+ // Get returns the value for the address in the map, if present.
+-func (a *AddressMapV2[T]) Get(addr Address) (value T, ok bool) {
++func (a *AddressMap) Get(addr Address) (value any, ok bool) {
+ 	addrKey := toMapKey(&addr)
+ 	entryList := a.m[addrKey]
+ 	if entry := entryList.find(addr); entry != -1 {
+ 		return entryList[entry].value, true
+ 	}
+-	return value, false
++	return nil, false
+ }
+ 
+ // Set updates or adds the value to the address in the map.
+-func (a *AddressMapV2[T]) Set(addr Address, value T) {
++func (a *AddressMap) Set(addr Address, value any) {
+ 	addrKey := toMapKey(&addr)
+ 	entryList := a.m[addrKey]
+ 	if entry := entryList.find(addr); entry != -1 {
+ 		entryList[entry].value = value
+ 		return
+ 	}
+-	a.m[addrKey] = append(entryList, &addressMapEntry[T]{addr: addr, value: value})
++	a.m[addrKey] = append(entryList, &addressMapEntry{addr: addr, value: value})
+ }
+ 
+ // Delete removes addr from the map.
+-func (a *AddressMapV2[T]) Delete(addr Address) {
++func (a *AddressMap) Delete(addr Address) {
+ 	addrKey := toMapKey(&addr)
+ 	entryList := a.m[addrKey]
+ 	entry := entryList.find(addr)
+@@ -126,7 +113,7 @@ func (a *AddressMapV2[T]) Delete(addr Address) {
+ }
+ 
+ // Len returns the number of entries in the map.
+-func (a *AddressMapV2[T]) Len() int {
++func (a *AddressMap) Len() int {
+ 	ret := 0
+ 	for _, entryList := range a.m {
+ 		ret += len(entryList)
+@@ -135,7 +122,7 @@ func (a *AddressMapV2[T]) Len() int {
+ }
+ 
+ // Keys returns a slice of all current map keys.
+-func (a *AddressMapV2[T]) Keys() []Address {
++func (a *AddressMap) Keys() []Address {
+ 	ret := make([]Address, 0, a.Len())
+ 	for _, entryList := range a.m {
+ 		for _, entry := range entryList {
+@@ -146,8 +133,8 @@ func (a *AddressMapV2[T]) Keys() []Address {
+ }
+ 
+ // Values returns a slice of all current map values.
+-func (a *AddressMapV2[T]) Values() []T {
+-	ret := make([]T, 0, a.Len())
++func (a *AddressMap) Values() []any {
++	ret := make([]any, 0, a.Len())
+ 	for _, entryList := range a.m {
+ 		for _, entry := range entryList {
+ 			ret = append(ret, entry.value)
+diff --git a/resolver/map_test.go b/resolver/map_test.go
+index 37b817b4..ab4daceb 100644
+--- a/resolver/map_test.go
++++ b/resolver/map_test.go
+@@ -52,7 +52,7 @@ var (
+ )
+ 
+ func (s) TestAddressMap_Length(t *testing.T) {
+-	addrMap := NewAddressMapV2[any]()
++	addrMap := NewAddressMap()
+ 	if got := addrMap.Len(); got != 0 {
+ 		t.Fatalf("addrMap.Len() = %v; want 0", got)
+ 	}
+@@ -72,7 +72,7 @@ func (s) TestAddressMap_Length(t *testing.T) {
+ }
+ 
+ func (s) TestAddressMap_Get(t *testing.T) {
+-	addrMap := NewAddressMapV2[any]()
++	addrMap := NewAddressMap()
+ 	addrMap.Set(addr1, 1)
+ 
+ 	if got, ok := addrMap.Get(addr2); ok || got != nil {
+@@ -109,7 +109,7 @@ func (s) TestAddressMap_Get(t *testing.T) {
+ }
+ 
+ func (s) TestAddressMap_Delete(t *testing.T) {
+-	addrMap := NewAddressMapV2[any]()
++	addrMap := NewAddressMap()
+ 	addrMap.Set(addr1, 1)
+ 	addrMap.Set(addr2, 2)
+ 	if got, want := addrMap.Len(), 2; got != want {
+@@ -132,7 +132,7 @@ func (s) TestAddressMap_Delete(t *testing.T) {
+ }
+ 
+ func (s) TestAddressMap_Keys(t *testing.T) {
+-	addrMap := NewAddressMapV2[any]()
++	addrMap := NewAddressMap()
+ 	addrMap.Set(addr1, 1)
+ 	addrMap.Set(addr2, 2)
+ 	addrMap.Set(addr3, 3)
+@@ -153,7 +153,7 @@ func (s) TestAddressMap_Keys(t *testing.T) {
+ }
+ 
+ func (s) TestAddressMap_Values(t *testing.T) {
+-	addrMap := NewAddressMapV2[any]()
++	addrMap := NewAddressMap()
+ 	addrMap.Set(addr1, 1)
+ 	addrMap.Set(addr2, 2)
+ 	addrMap.Set(addr3, 3)

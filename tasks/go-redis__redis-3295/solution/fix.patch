@@ -1,0 +1,280 @@
+diff --git a/README.md b/README.md
+index cfe97d37..335d32da 100644
+--- a/README.md
++++ b/README.md
+@@ -178,16 +178,18 @@ By default, go-redis automatically sends the client library name and version dur
+ 
+ #### Disabling Identity Verification
+ 
+-When connection identity verification is not required or needs to be explicitly disabled, a `DisableIndentity` configuration option exists. In V10 of this library, `DisableIndentity` will become `DisableIdentity` in order to fix the associated typo.
++When connection identity verification is not required or needs to be explicitly disabled, a `DisableIdentity` configuration option exists.
++Initially there was a typo and the option was named `DisableIndentity` instead of `DisableIdentity`. The misspelled option is marked as Deprecated and will be removed in V10 of this library.
++Although both options will work at the moment, the correct option is `DisableIdentity`. The deprecated option will be removed in V10 of this library, so please use the correct option name to avoid any issues.
+ 
+-To disable verification, set the `DisableIndentity` option to `true` in the Redis client options:
++To disable verification, set the `DisableIdentity` option to `true` in the Redis client options:
+ 
+ ```go
+ rdb := redis.NewClient(&redis.Options{
+     Addr:            "localhost:6379",
+     Password:        "",
+     DB:              0,
+-    DisableIndentity: true, // Disable set-info on connect
++    DisableIdentity: true, // Disable set-info on connect
+ })
+ ```
+ 
+diff --git a/options.go b/options.go
+index a350a02f..c572bbe7 100644
+--- a/options.go
++++ b/options.go
+@@ -148,9 +148,18 @@ type Options struct {
+ 	// Enables read only queries on slave/follower nodes.
+ 	readOnly bool
+ 
+-	// Disable set-lib on connect. Default is false.
++	// DisableIndentity - Disable set-lib on connect.
++	//
++	// default: false
++	//
++	// Deprecated: Use DisableIdentity instead.
+ 	DisableIndentity bool
+ 
++	// DisableIdentity is used to disable CLIENT SETINFO command on connect.
++	//
++	// default: false
++	DisableIdentity bool
++
+ 	// Add suffix to client name. Default is empty.
+ 	IdentitySuffix string
+ 
+diff --git a/osscluster.go b/osscluster.go
+index 1e9ee7de..b018cc9e 100644
+--- a/osscluster.go
++++ b/osscluster.go
+@@ -90,8 +90,19 @@ type ClusterOptions struct {
+ 	ConnMaxIdleTime time.Duration
+ 	ConnMaxLifetime time.Duration
+ 
+-	TLSConfig        *tls.Config
+-	DisableIndentity bool // Disable set-lib on connect. Default is false.
++	TLSConfig *tls.Config
++
++	// DisableIndentity - Disable set-lib on connect.
++	//
++	// default: false
++	//
++	// Deprecated: Use DisableIdentity instead.
++	DisableIndentity bool
++
++	// DisableIdentity is used to disable CLIENT SETINFO command on connect.
++	//
++	// default: false
++	DisableIdentity bool
+ 
+ 	IdentitySuffix string // Add suffix to client name. Default is empty.
+ 
+@@ -303,7 +314,8 @@ func (opt *ClusterOptions) clientOptions() *Options {
+ 		MaxActiveConns:   opt.MaxActiveConns,
+ 		ConnMaxIdleTime:  opt.ConnMaxIdleTime,
+ 		ConnMaxLifetime:  opt.ConnMaxLifetime,
+-		DisableIndentity: opt.DisableIndentity,
++		DisableIdentity:  opt.DisableIdentity,
++		DisableIndentity: opt.DisableIdentity,
+ 		IdentitySuffix:   opt.IdentitySuffix,
+ 		TLSConfig:        opt.TLSConfig,
+ 		// If ClusterSlots is populated, then we probably have an artificial
+diff --git a/redis.go b/redis.go
+index 533c63c3..e0159294 100644
+--- a/redis.go
++++ b/redis.go
+@@ -350,7 +350,7 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
+ 		return err
+ 	}
+ 
+-	if !c.opt.DisableIndentity {
++	if !c.opt.DisableIdentity && !c.opt.DisableIndentity {
+ 		libName := ""
+ 		libVer := Version()
+ 		if c.opt.IdentitySuffix != "" {
+@@ -359,7 +359,11 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
+ 		p := conn.Pipeline()
+ 		p.ClientSetInfo(ctx, WithLibraryName(libName))
+ 		p.ClientSetInfo(ctx, WithLibraryVersion(libVer))
+-		_, _ = p.Exec(ctx)
++		// Handle network errors (e.g. timeouts) in CLIENT SETINFO to avoid
++		// out of order responses later on.
++		if _, err = p.Exec(ctx); err != nil && !isRedisError(err) {
++			return err
++		}
+ 	}
+ 
+ 	if c.opt.OnConnect != nil {
+diff --git a/ring.go b/ring.go
+index 06a26020..0ff3f75b 100644
+--- a/ring.go
++++ b/ring.go
+@@ -98,9 +98,19 @@ type RingOptions struct {
+ 	TLSConfig *tls.Config
+ 	Limiter   Limiter
+ 
++	// DisableIndentity - Disable set-lib on connect.
++	//
++	// default: false
++	//
++	// Deprecated: Use DisableIdentity instead.
+ 	DisableIndentity bool
+-	IdentitySuffix   string
+-	UnstableResp3    bool
++
++	// DisableIdentity is used to disable CLIENT SETINFO command on connect.
++	//
++	// default: false
++	DisableIdentity bool
++	IdentitySuffix  string
++	UnstableResp3   bool
+ }
+ 
+ func (opt *RingOptions) init() {
+@@ -167,9 +177,11 @@ func (opt *RingOptions) clientOptions() *Options {
+ 		TLSConfig: opt.TLSConfig,
+ 		Limiter:   opt.Limiter,
+ 
++		DisableIdentity:  opt.DisableIdentity,
+ 		DisableIndentity: opt.DisableIndentity,
+-		IdentitySuffix:   opt.IdentitySuffix,
+-		UnstableResp3:    opt.UnstableResp3,
++
++		IdentitySuffix: opt.IdentitySuffix,
++		UnstableResp3:  opt.UnstableResp3,
+ 	}
+ }
+ 
+diff --git a/sentinel.go b/sentinel.go
+index 31569554..a4c9f53c 100644
+--- a/sentinel.go
++++ b/sentinel.go
+@@ -80,9 +80,20 @@ type FailoverOptions struct {
+ 
+ 	TLSConfig *tls.Config
+ 
++	// DisableIndentity - Disable set-lib on connect.
++	//
++	// default: false
++	//
++	// Deprecated: Use DisableIdentity instead.
+ 	DisableIndentity bool
+-	IdentitySuffix   string
+-	UnstableResp3    bool
++
++	// DisableIdentity is used to disable CLIENT SETINFO command on connect.
++	//
++	// default: false
++	DisableIdentity bool
++
++	IdentitySuffix string
++	UnstableResp3  bool
+ }
+ 
+ func (opt *FailoverOptions) clientOptions() *Options {
+@@ -118,9 +129,11 @@ func (opt *FailoverOptions) clientOptions() *Options {
+ 
+ 		TLSConfig: opt.TLSConfig,
+ 
++		DisableIdentity:  opt.DisableIdentity,
+ 		DisableIndentity: opt.DisableIndentity,
+-		IdentitySuffix:   opt.IdentitySuffix,
+-		UnstableResp3:    opt.UnstableResp3,
++
++		IdentitySuffix: opt.IdentitySuffix,
++		UnstableResp3:  opt.UnstableResp3,
+ 	}
+ }
+ 
+@@ -156,9 +169,11 @@ func (opt *FailoverOptions) sentinelOptions(addr string) *Options {
+ 
+ 		TLSConfig: opt.TLSConfig,
+ 
++		DisableIdentity:  opt.DisableIdentity,
+ 		DisableIndentity: opt.DisableIndentity,
+-		IdentitySuffix:   opt.IdentitySuffix,
+-		UnstableResp3:    opt.UnstableResp3,
++
++		IdentitySuffix: opt.IdentitySuffix,
++		UnstableResp3:  opt.UnstableResp3,
+ 	}
+ }
+ 
+@@ -197,8 +212,10 @@ func (opt *FailoverOptions) clusterOptions() *ClusterOptions {
+ 
+ 		TLSConfig: opt.TLSConfig,
+ 
++		DisableIdentity:  opt.DisableIdentity,
+ 		DisableIndentity: opt.DisableIndentity,
+-		IdentitySuffix:   opt.IdentitySuffix,
++
++		IdentitySuffix: opt.IdentitySuffix,
+ 	}
+ }
+ 
+diff --git a/universal.go b/universal.go
+index 3e3367e3..0a25bf22 100644
+--- a/universal.go
++++ b/universal.go
+@@ -61,14 +61,24 @@ type UniversalOptions struct {
+ 	RouteByLatency bool
+ 	RouteRandomly  bool
+ 
+-	// The sentinel master name.
+-	// Only failover clients.
+-
++	// MasterName is the sentinel master name.
++	// Only for failover clients.
+ 	MasterName string
+ 
++	// DisableIndentity - Disable set-lib on connect.
++	//
++	// default: false
++	//
++	// Deprecated: Use DisableIdentity instead.
+ 	DisableIndentity bool
+-	IdentitySuffix   string
+-	UnstableResp3    bool
++
++	// DisableIdentity is used to disable CLIENT SETINFO command on connect.
++	//
++	// default: false
++	DisableIdentity bool
++
++	IdentitySuffix string
++	UnstableResp3  bool
+ 
+ 	// IsClusterMode can be used when only one Addrs is provided (e.g. Elasticache supports setting up cluster mode with configuration endpoint).
+ 	IsClusterMode bool
+@@ -116,6 +126,7 @@ func (o *UniversalOptions) Cluster() *ClusterOptions {
+ 
+ 		TLSConfig: o.TLSConfig,
+ 
++		DisableIdentity:  o.DisableIdentity,
+ 		DisableIndentity: o.DisableIndentity,
+ 		IdentitySuffix:   o.IdentitySuffix,
+ 		UnstableResp3:    o.UnstableResp3,
+@@ -163,8 +174,9 @@ func (o *UniversalOptions) Failover() *FailoverOptions {
+ 
+ 		TLSConfig: o.TLSConfig,
+ 
+-		ReplicaOnly:     o.ReadOnly,
++		ReplicaOnly: o.ReadOnly,
+ 
++		DisableIdentity:  o.DisableIdentity,
+ 		DisableIndentity: o.DisableIndentity,
+ 		IdentitySuffix:   o.IdentitySuffix,
+ 		UnstableResp3:    o.UnstableResp3,
+@@ -209,6 +221,7 @@ func (o *UniversalOptions) Simple() *Options {
+ 
+ 		TLSConfig: o.TLSConfig,
+ 
++		DisableIdentity:  o.DisableIdentity,
+ 		DisableIndentity: o.DisableIndentity,
+ 		IdentitySuffix:   o.IdentitySuffix,
+ 		UnstableResp3:    o.UnstableResp3,

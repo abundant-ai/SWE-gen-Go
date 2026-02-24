@@ -1,0 +1,242 @@
+diff --git a/README.md b/README.md
+index 2009457..f9b3103 100644
+--- a/README.md
++++ b/README.md
+@@ -28,6 +28,7 @@ The name mux stands for "HTTP request multiplexer". Like the standard `http.Serv
+ * [Registered URLs](#registered-urls)
+ * [Walking Routes](#walking-routes)
+ * [Graceful Shutdown](#graceful-shutdown)
++* [Middleware](#middleware)
+ * [Full Example](#full-example)
+ 
+ ---
+@@ -447,6 +448,86 @@ func main() {
+ }
+ ```
+ 
++### Middleware
++
++Mux supports the addition of middlewares to a [Router](https://godoc.org/github.com/gorilla/mux#Router), which are executed in the order they are added if a match is found, including its subrouters.
++Middlewares are (typically) small pieces of code which take one request, do something with it, and pass it down to another middleware or the final handler. Some common use cases for middleware are request logging, header manipulation, or `ResponseWriter` hijacking.
++
++Mux middlewares are defined using the de facto standard type:
++
++```go
++type MiddlewareFunc func(http.Handler) http.Handler
++```
++
++Typically, the returned handler is a closure which does something with the http.ResponseWriter and http.Request passed to it, and then calls the handler passed as parameter to the MiddlewareFunc. This takes advantage of closures being able access variables from the context where they are created, while retaining the signature enforced by the receivers.
++
++A very basic middleware which logs the URI of the request being handled could be written as:
++
++```go
++func simpleMw(next http.Handler) http.Handler {
++    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++        // Do stuff here
++        log.Println(r.RequestURI)
++        // Call the next handler, which can be another middleware in the chain, or the final handler.
++        next.ServeHTTP(w, r)
++    })
++}
++```
++
++Middlewares can be added to a router using `Router.AddMiddlewareFunc()`:
++
++```go
++r := mux.NewRouter()
++r.HandleFunc("/", handler)
++r.AddMiddleware(simpleMw)
++```
++
++A more complex authentication middleware, which maps session token to users, could be written as:
++
++```go
++// Define our struct
++type authenticationMiddleware struct {
++	tokenUsers map[string]string
++}
++
++// Initialize it somewhere
++func (amw *authenticationMiddleware) Populate() {
++	amw.tokenUsers["00000000"] = "user0"
++	amw.tokenUsers["aaaaaaaa"] = "userA"
++	amw.tokenUsers["05f717e5"] = "randomUser"
++	amw.tokenUsers["deadbeef"] = "user0"
++}
++
++// Middleware function, which will be called for each request
++func (amw *authenticationMiddleware) Middleware(next http.Handler) http.Handler {
++    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++        token := r.Header.Get("X-Session-Token")
++        
++        if user, found := amw.tokenUsers[token]; found {
++        	// We found the token in our map
++        	log.Printf("Authenticated user %s\n", user)
++        	// Pass down the request to the next middleware (or final handler)
++        	next.ServeHTTP(w, r)
++        } else {
++        	// Write an error and stop the handler chain
++        	http.Error(w, "Forbidden", 403)
++        }
++    })
++}
++```
++
++```go
++r := mux.NewRouter()
++r.HandleFunc("/", handler)
++
++amw := authenticationMiddleware{}
++amw.Populate()
++
++r.AddMiddlewareFunc(amw.Middleware)
++```
++
++Note: The handler chain will be stopped if your middleware doesn't call `next.ServeHTTP()` with the corresponding parameters. This can be used to abort a request if the middleware writer wants to. Middlewares *should* write to `ResponseWriter` if they *are* going to terminate the request, and they *should not* write to `ResponseWriter` if they *are not* going to terminate it.
++
+ ## Full Example
+ 
+ Here's a complete, runnable example of a small `mux` based server:
+diff --git a/doc.go b/doc.go
+index cce30b2..013f088 100644
+--- a/doc.go
++++ b/doc.go
+@@ -238,5 +238,70 @@ as well:
+ 	url, err := r.Get("article").URL("subdomain", "news",
+ 	                                 "category", "technology",
+ 	                                 "id", "42")
++
++Since **vX.Y.Z**, mux supports the addition of middlewares to a [Router](https://godoc.org/github.com/gorilla/mux#Router), which are executed if a
++match is found (including subrouters). Middlewares are defined using the de facto standard type:
++
++	type MiddlewareFunc func(http.Handler) http.Handler
++
++Typically, the returned handler is a closure which does something with the http.ResponseWriter and http.Request passed to it, and then calls the handler passed as parameter to the MiddlewareFunc (closures can access variables from the context where they are created).
++
++A very basic middleware which logs the URI of the request being handled could be written as:
++
++	func simpleMw(next http.Handler) http.Handler {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			// Do stuff here
++			log.Println(r.RequestURI)
++			// Call the next handler, which can be another middleware in the chain, or the final handler.
++			next.ServeHTTP(w, r)
++		})
++	}
++
++Middlewares can be added to a router using `Router.Use()`:
++
++	r := mux.NewRouter()
++	r.HandleFunc("/", handler)
++	r.AddMiddleware(simpleMw)
++
++A more complex authentication middleware, which maps session token to users, could be written as:
++
++	// Define our struct
++	type authenticationMiddleware struct {
++		tokenUsers map[string]string
++	}
++
++	// Initialize it somewhere
++	func (amw *authenticationMiddleware) Populate() {
++		amw.tokenUsers["00000000"] = "user0"
++		amw.tokenUsers["aaaaaaaa"] = "userA"
++		amw.tokenUsers["05f717e5"] = "randomUser"
++		amw.tokenUsers["deadbeef"] = "user0"
++	}
++
++	// Middleware function, which will be called for each request
++	func (amw *authenticationMiddleware) Middleware(next http.Handler) http.Handler {
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			token := r.Header.Get("X-Session-Token")
++
++			if user, found := amw.tokenUsers[token]; found {
++				// We found the token in our map
++				log.Printf("Authenticated user %s\n", user)
++				next.ServeHTTP(w, r)
++			} else {
++				http.Error(w, "Forbidden", 403)
++			}
++		})
++	}
++
++	r := mux.NewRouter()
++	r.HandleFunc("/", handler)
++
++	amw := authenticationMiddleware{}
++	amw.Populate()
++
++	r.Use(amw.Middleware)
++
++Note: The handler chain will be stopped if your middleware doesn't call `next.ServeHTTP()` with the corresponding parameters. This can be used to abort a request if the middleware writer wants to.
++
+ */
+ package mux
+diff --git a/middleware.go b/middleware.go
+new file mode 100644
+index 0000000..8f89867
+--- /dev/null
++++ b/middleware.go
+@@ -0,0 +1,28 @@
++package mux
++
++import "net/http"
++
++// MiddlewareFunc is a function which receives an http.Handler and returns another http.Handler.
++// Typically, the returned handler is a closure which does something with the http.ResponseWriter and http.Request passed
++// to it, and then calls the handler passed as parameter to the MiddlewareFunc.
++type MiddlewareFunc func(http.Handler) http.Handler
++
++// middleware interface is anything which implements a MiddlewareFunc named Middleware.
++type middleware interface {
++	Middleware(handler http.Handler) http.Handler
++}
++
++// MiddlewareFunc also implements the middleware interface.
++func (mw MiddlewareFunc) Middleware(handler http.Handler) http.Handler {
++	return mw(handler)
++}
++
++// Use appends a MiddlewareFunc to the chain. Middleware can be used to intercept or otherwise modify requests and/or responses, and are executed in the order that they are applied to the Router.
++func (r *Router) Use(mwf MiddlewareFunc) {
++	r.middlewares = append(r.middlewares, mwf)
++}
++
++// useInterface appends a middleware to the chain. Middleware can be used to intercept or otherwise modify requests and/or responses, and are executed in the order that they are applied to the Router.
++func (r *Router) useInterface(mw middleware) {
++	r.middlewares = append(r.middlewares, mw)
++}
+diff --git a/mux.go b/mux.go
+index 5fd5fa8..efabd24 100644
+--- a/mux.go
++++ b/mux.go
+@@ -63,6 +63,8 @@ type Router struct {
+ 	KeepContext bool
+ 	// see Router.UseEncodedPath(). This defines a flag for all routes.
+ 	useEncodedPath bool
++	// Slice of middlewares to be called after a match is found
++	middlewares []middleware
+ }
+ 
+ // Match attempts to match the given request against the router's registered routes.
+@@ -79,6 +81,12 @@ type Router struct {
+ func (r *Router) Match(req *http.Request, match *RouteMatch) bool {
+ 	for _, route := range r.routes {
+ 		if route.Match(req, match) {
++			// Build middleware chain if no error was found
++			if match.MatchErr == nil {
++				for i := len(r.middlewares) - 1; i >= 0; i-- {
++					match.Handler = r.middlewares[i].Middleware(match.Handler)
++				}
++			}
+ 			return true
+ 		}
+ 	}
+@@ -147,6 +155,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+ 	if !r.KeepContext {
+ 		defer contextClear(req)
+ 	}
++
+ 	handler.ServeHTTP(w, req)
+ }
+ 

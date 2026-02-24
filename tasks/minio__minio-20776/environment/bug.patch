@@ -1,0 +1,454 @@
+diff --git a/cmd/erasure-healing-common.go b/cmd/erasure-healing-common.go
+index 24c6a3b9a..7c3c8a4d8 100644
+--- a/cmd/erasure-healing-common.go
++++ b/cmd/erasure-healing-common.go
+@@ -277,21 +277,23 @@ func partNeedsHealing(partErrs []int) bool {
+ 	return slices.IndexFunc(partErrs, func(i int) bool { return i != checkPartSuccess && i != checkPartUnknown }) > -1
+ }
+ 
+-func countPartNotSuccess(partErrs []int) (c int) {
+-	for _, pe := range partErrs {
+-		if pe != checkPartSuccess {
+-			c++
+-		}
+-	}
+-	return
++func hasPartErr(partErrs []int) bool {
++	return slices.IndexFunc(partErrs, func(i int) bool { return i != checkPartSuccess }) > -1
+ }
+ 
+-// checkObjectWithAllParts sets partsMetadata and onlineDisks when xl.meta is inexistant/corrupted or outdated
+-// it also checks if the status of each part (corrupted, missing, ok) in each drive
+-func checkObjectWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetadata []FileInfo,
++// disksWithAllParts - This function needs to be called with
++// []StorageAPI returned by listOnlineDisks. Returns,
++//
++// - disks which have all parts specified in the latest xl.meta.
++//
++//   - slice of errors about the state of data files on disk - can have
++//     a not-found error or a hash-mismatch error.
++func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetadata []FileInfo,
+ 	errs []error, latestMeta FileInfo, filterByETag bool, bucket, object string,
+ 	scanMode madmin.HealScanMode,
+-) (dataErrsByDisk map[int][]int, dataErrsByPart map[int][]int) {
++) (availableDisks []StorageAPI, dataErrsByDisk map[int][]int, dataErrsByPart map[int][]int) {
++	availableDisks = make([]StorageAPI, len(onlineDisks))
++
+ 	dataErrsByDisk = make(map[int][]int, len(onlineDisks))
+ 	for i := range onlineDisks {
+ 		dataErrsByDisk[i] = make([]int, len(latestMeta.Parts))
+@@ -332,12 +334,12 @@ func checkObjectWithAllParts(ctx context.Context, onlineDisks []StorageAPI, part
+ 
+ 	metaErrs := make([]error, len(errs))
+ 
+-	for i := range onlineDisks {
++	for i, onlineDisk := range onlineDisks {
+ 		if errs[i] != nil {
+ 			metaErrs[i] = errs[i]
+ 			continue
+ 		}
+-		if onlineDisks[i] == OfflineDisk {
++		if onlineDisk == OfflineDisk {
+ 			metaErrs[i] = errDiskNotFound
+ 			continue
+ 		}
+@@ -353,7 +355,6 @@ func checkObjectWithAllParts(ctx context.Context, onlineDisks []StorageAPI, part
+ 		if corrupted {
+ 			metaErrs[i] = errFileCorrupt
+ 			partsMetadata[i] = FileInfo{}
+-			onlineDisks[i] = nil
+ 			continue
+ 		}
+ 
+@@ -361,7 +362,6 @@ func checkObjectWithAllParts(ctx context.Context, onlineDisks []StorageAPI, part
+ 			if !meta.IsValid() {
+ 				partsMetadata[i] = FileInfo{}
+ 				metaErrs[i] = errFileCorrupt
+-				onlineDisks[i] = nil
+ 				continue
+ 			}
+ 
+@@ -372,7 +372,6 @@ func checkObjectWithAllParts(ctx context.Context, onlineDisks []StorageAPI, part
+ 					// might have the right erasure distribution.
+ 					partsMetadata[i] = FileInfo{}
+ 					metaErrs[i] = errFileCorrupt
+-					onlineDisks[i] = nil
+ 					continue
+ 				}
+ 			}
+@@ -441,5 +440,20 @@ func checkObjectWithAllParts(ctx context.Context, onlineDisks []StorageAPI, part
+ 			dataErrsByDisk[disk][part] = dataErrsByPart[part][disk]
+ 		}
+ 	}
++
++	for i, onlineDisk := range onlineDisks {
++		if metaErrs[i] == nil {
++			meta := partsMetadata[i]
++			if meta.Deleted || meta.IsRemote() || !hasPartErr(dataErrsByDisk[i]) {
++				// All parts verified, mark it as all data available.
++				availableDisks[i] = onlineDisk
++				continue
++			}
++		}
++
++		// upon errors just make that disk's fileinfo invalid
++		partsMetadata[i] = FileInfo{}
++	}
++
+ 	return
+ }
+diff --git a/cmd/erasure-healing-common_test.go b/cmd/erasure-healing-common_test.go
+index b33371357..a3a973646 100644
+--- a/cmd/erasure-healing-common_test.go
++++ b/cmd/erasure-healing-common_test.go
+@@ -313,11 +313,11 @@ func TestListOnlineDisks(t *testing.T) {
+ 				t.Fatalf("Expected modTime to be equal to %v but was found to be %v",
+ 					test.expectedTime, modTime)
+ 			}
+-			_, _ = checkObjectWithAllParts(ctx, onlineDisks, partsMetadata,
++			availableDisks, _, _ := disksWithAllParts(ctx, onlineDisks, partsMetadata,
+ 				test.errs, fi, false, bucket, object, madmin.HealDeepScan)
+ 
+ 			if test._tamperBackend != noTamper {
+-				if tamperedIndex != -1 && onlineDisks[tamperedIndex] != nil {
++				if tamperedIndex != -1 && availableDisks[tamperedIndex] != nil {
+ 					t.Fatalf("Drive (%v) with part.1 missing is not a drive with available data",
+ 						erasureDisks[tamperedIndex])
+ 				}
+@@ -495,11 +495,11 @@ func TestListOnlineDisksSmallObjects(t *testing.T) {
+ 					test.expectedTime, modTime)
+ 			}
+ 
+-			_, _ = checkObjectWithAllParts(ctx, onlineDisks, partsMetadata,
++			availableDisks, _, _ := disksWithAllParts(ctx, onlineDisks, partsMetadata,
+ 				test.errs, fi, false, bucket, object, madmin.HealDeepScan)
+ 
+ 			if test._tamperBackend != noTamper {
+-				if tamperedIndex != -1 && onlineDisks[tamperedIndex] != nil {
++				if tamperedIndex != -1 && availableDisks[tamperedIndex] != nil {
+ 					t.Fatalf("Drive (%v) with part.1 missing is not a drive with available data",
+ 						erasureDisks[tamperedIndex])
+ 				}
+@@ -545,7 +545,6 @@ func TestDisksWithAllParts(t *testing.T) {
+ 
+ 	// Test 1: Test that all disks are returned without any failures with
+ 	// unmodified meta data
+-	erasureDisks = s.getDisks()
+ 	partsMetadata, errs := readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
+ 	if err != nil {
+ 		t.Fatalf("Failed to read xl meta data %v", err)
+@@ -558,10 +557,14 @@ func TestDisksWithAllParts(t *testing.T) {
+ 
+ 	erasureDisks, _, _ = listOnlineDisks(erasureDisks, partsMetadata, errs, readQuorum)
+ 
+-	dataErrsPerDisk, _ := checkObjectWithAllParts(ctx, erasureDisks, partsMetadata,
++	filteredDisks, _, dataErrsPerDisk := disksWithAllParts(ctx, erasureDisks, partsMetadata,
+ 		errs, fi, false, bucket, object, madmin.HealDeepScan)
+ 
+-	for diskIndex, disk := range erasureDisks {
++	if len(filteredDisks) != len(erasureDisks) {
++		t.Errorf("Unexpected number of drives: %d", len(filteredDisks))
++	}
++
++	for diskIndex, disk := range filteredDisks {
+ 		if partNeedsHealing(dataErrsPerDisk[diskIndex]) {
+ 			t.Errorf("Unexpected error: %v", dataErrsPerDisk[diskIndex])
+ 		}
+@@ -572,15 +575,17 @@ func TestDisksWithAllParts(t *testing.T) {
+ 	}
+ 
+ 	// Test 2: Not synchronized modtime
+-	erasureDisks = s.getDisks()
+ 	partsMetadataBackup := partsMetadata[0]
+ 	partsMetadata[0].ModTime = partsMetadata[0].ModTime.Add(-1 * time.Hour)
+ 
+ 	errs = make([]error, len(erasureDisks))
+-	_, _ = checkObjectWithAllParts(ctx, erasureDisks, partsMetadata,
++	filteredDisks, _, _ = disksWithAllParts(ctx, erasureDisks, partsMetadata,
+ 		errs, fi, false, bucket, object, madmin.HealDeepScan)
+ 
+-	for diskIndex, disk := range erasureDisks {
++	if len(filteredDisks) != len(erasureDisks) {
++		t.Errorf("Unexpected number of drives: %d", len(filteredDisks))
++	}
++	for diskIndex, disk := range filteredDisks {
+ 		if diskIndex == 0 && disk != nil {
+ 			t.Errorf("Drive not filtered as expected, drive: %d", diskIndex)
+ 		}
+@@ -591,15 +596,17 @@ func TestDisksWithAllParts(t *testing.T) {
+ 	partsMetadata[0] = partsMetadataBackup // Revert before going to the next test
+ 
+ 	// Test 3: Not synchronized DataDir
+-	erasureDisks = s.getDisks()
+ 	partsMetadataBackup = partsMetadata[1]
+ 	partsMetadata[1].DataDir = "foo-random"
+ 
+ 	errs = make([]error, len(erasureDisks))
+-	_, _ = checkObjectWithAllParts(ctx, erasureDisks, partsMetadata,
++	filteredDisks, _, _ = disksWithAllParts(ctx, erasureDisks, partsMetadata,
+ 		errs, fi, false, bucket, object, madmin.HealDeepScan)
+ 
+-	for diskIndex, disk := range erasureDisks {
++	if len(filteredDisks) != len(erasureDisks) {
++		t.Errorf("Unexpected number of drives: %d", len(filteredDisks))
++	}
++	for diskIndex, disk := range filteredDisks {
+ 		if diskIndex == 1 && disk != nil {
+ 			t.Errorf("Drive not filtered as expected, drive: %d", diskIndex)
+ 		}
+@@ -610,7 +617,6 @@ func TestDisksWithAllParts(t *testing.T) {
+ 	partsMetadata[1] = partsMetadataBackup // Revert before going to the next test
+ 
+ 	// Test 4: key = disk index, value = part name with hash mismatch
+-	erasureDisks = s.getDisks()
+ 	diskFailures := make(map[int]string)
+ 	diskFailures[0] = "part.1"
+ 	diskFailures[3] = "part.1"
+@@ -631,18 +637,29 @@ func TestDisksWithAllParts(t *testing.T) {
+ 	}
+ 
+ 	errs = make([]error, len(erasureDisks))
+-	dataErrsPerDisk, _ = checkObjectWithAllParts(ctx, erasureDisks, partsMetadata,
++	filteredDisks, dataErrsPerDisk, _ = disksWithAllParts(ctx, erasureDisks, partsMetadata,
+ 		errs, fi, false, bucket, object, madmin.HealDeepScan)
+ 
+-	for diskIndex := range erasureDisks {
++	if len(filteredDisks) != len(erasureDisks) {
++		t.Errorf("Unexpected number of drives: %d", len(filteredDisks))
++	}
++
++	for diskIndex, disk := range filteredDisks {
+ 		if _, ok := diskFailures[diskIndex]; ok {
++			if disk != nil {
++				t.Errorf("Drive not filtered as expected, drive: %d", diskIndex)
++			}
+ 			if !partNeedsHealing(dataErrsPerDisk[diskIndex]) {
+ 				t.Errorf("Disk expected to be healed, driveIndex: %d", diskIndex)
+ 			}
+ 		} else {
++			if disk == nil {
++				t.Errorf("Drive erroneously filtered, driveIndex: %d", diskIndex)
++			}
+ 			if partNeedsHealing(dataErrsPerDisk[diskIndex]) {
+ 				t.Errorf("Disk not expected to be healed, driveIndex: %d", diskIndex)
+ 			}
++
+ 		}
+ 	}
+ }
+diff --git a/cmd/erasure-healing.go b/cmd/erasure-healing.go
+index 11b525e3c..25b8de031 100644
+--- a/cmd/erasure-healing.go
++++ b/cmd/erasure-healing.go
+@@ -161,33 +161,33 @@ var (
+ 
+ // Only heal on disks where we are sure that healing is needed. We can expand
+ // this list as and when we figure out more errors can be added to this list safely.
+-func shouldHealObjectOnDisk(erErr error, partsErrs []int, meta FileInfo, latestMeta FileInfo) (bool, bool, error) {
++func shouldHealObjectOnDisk(erErr error, partsErrs []int, meta FileInfo, latestMeta FileInfo) (bool, error) {
+ 	if errors.Is(erErr, errFileNotFound) || errors.Is(erErr, errFileVersionNotFound) || errors.Is(erErr, errFileCorrupt) {
+-		return true, true, erErr
++		return true, erErr
+ 	}
+ 	if erErr == nil {
+ 		if meta.XLV1 {
+ 			// Legacy means heal always
+ 			// always check first.
+-			return true, true, errLegacyXLMeta
++			return true, errLegacyXLMeta
+ 		}
+ 		if !latestMeta.Equals(meta) {
+-			return true, true, errOutdatedXLMeta
++			return true, errOutdatedXLMeta
+ 		}
+ 		if !meta.Deleted && !meta.IsRemote() {
+ 			// If xl.meta was read fine but there may be problem with the part.N files.
+ 			for _, partErr := range partsErrs {
+ 				if partErr == checkPartFileNotFound {
+-					return true, false, errPartMissing
++					return true, errPartMissing
+ 				}
+ 				if partErr == checkPartFileCorrupt {
+-					return true, false, errPartCorrupt
++					return true, errPartCorrupt
+ 				}
+ 			}
+ 		}
+-		return false, false, nil
++		return false, nil
+ 	}
+-	return false, false, erErr
++	return false, erErr
+ }
+ 
+ const (
+@@ -363,7 +363,16 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object
+ 	// No modtime quorum
+ 	filterDisksByETag := quorumETag != ""
+ 
+-	dataErrsByDisk, dataErrsByPart := checkObjectWithAllParts(ctx, onlineDisks, partsMetadata,
++	// List of disks having all parts as per latest metadata.
++	// NOTE: do not pass in latestDisks to diskWithAllParts since
++	// the diskWithAllParts needs to reach the drive to ensure
++	// validity of the metadata content, we should make sure that
++	// we pass in disks as is for it to be verified. Once verified
++	// the disksWithAllParts() returns the actual disks that can be
++	// used here for reconstruction. This is done to ensure that
++	// we do not skip drives that have inconsistent metadata to be
++	// skipped from purging when they are stale.
++	availableDisks, dataErrsByDisk, dataErrsByPart := disksWithAllParts(ctx, onlineDisks, partsMetadata,
+ 		errs, latestMeta, filterDisksByETag, bucket, object, scanMode)
+ 
+ 	var erasure Erasure
+@@ -385,15 +394,12 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object
+ 	// data state and a list of outdated disks on which data needs
+ 	// to be healed.
+ 	outDatedDisks := make([]StorageAPI, len(storageDisks))
+-	disksToHealCount, xlMetaToHealCount := 0, 0
+-	for i := range onlineDisks {
+-		yes, isMeta, reason := shouldHealObjectOnDisk(errs[i], dataErrsByDisk[i], partsMetadata[i], latestMeta)
++	disksToHealCount := 0
++	for i := range availableDisks {
++		yes, reason := shouldHealObjectOnDisk(errs[i], dataErrsByDisk[i], partsMetadata[i], latestMeta)
+ 		if yes {
+ 			outDatedDisks[i] = storageDisks[i]
+ 			disksToHealCount++
+-			if isMeta {
+-				xlMetaToHealCount++
+-			}
+ 		}
+ 
+ 		driveState := objectErrToDriveState(reason)
+@@ -410,6 +416,16 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object
+ 		})
+ 	}
+ 
++	if isAllNotFound(errs) {
++		// File is fully gone, fileInfo is empty.
++		err := errFileNotFound
++		if versionID != "" {
++			err = errFileVersionNotFound
++		}
++		return er.defaultHealResult(FileInfo{}, storageDisks, storageEndpoints, errs,
++			bucket, object, versionID), err
++	}
++
+ 	if disksToHealCount == 0 {
+ 		// Nothing to heal!
+ 		return result, nil
+@@ -421,23 +437,13 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object
+ 		return result, nil
+ 	}
+ 
+-	cannotHeal := !latestMeta.XLV1 && !latestMeta.Deleted && xlMetaToHealCount > latestMeta.Erasure.ParityBlocks
++	cannotHeal := !latestMeta.XLV1 && !latestMeta.Deleted && disksToHealCount > latestMeta.Erasure.ParityBlocks
+ 	if cannotHeal && quorumETag != "" {
+ 		// This is an object that is supposed to be removed by the dangling code
+ 		// but we noticed that ETag is the same for all objects, let's give it a shot
+ 		cannotHeal = false
+ 	}
+ 
+-	if !latestMeta.Deleted && !latestMeta.IsRemote() {
+-		// check if there is a part that lost its quorum
+-		for _, partErrs := range dataErrsByPart {
+-			if countPartNotSuccess(partErrs) > latestMeta.Erasure.ParityBlocks {
+-				cannotHeal = true
+-				break
+-			}
+-		}
+-	}
+-
+ 	if cannotHeal {
+ 		// Allow for dangling deletes, on versions that have DataDir missing etc.
+ 		// this would end up restoring the correct readable versions.
+@@ -476,15 +482,16 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object
+ 	tmpID := mustGetUUID()
+ 	migrateDataDir := mustGetUUID()
+ 
+-	if !latestMeta.Deleted && len(latestMeta.Erasure.Distribution) != len(onlineDisks) {
+-		err := fmt.Errorf("unexpected file distribution (%v) from online disks (%v), looks like backend disks have been manually modified refusing to heal %s/%s(%s)",
+-			latestMeta.Erasure.Distribution, onlineDisks, bucket, object, versionID)
+-		healingLogOnceIf(ctx, err, "heal-object-online-disks")
++	// Reorder so that we have data disks first and parity disks next.
++	if !latestMeta.Deleted && len(latestMeta.Erasure.Distribution) != len(availableDisks) {
++		err := fmt.Errorf("unexpected file distribution (%v) from available disks (%v), looks like backend disks have been manually modified refusing to heal %s/%s(%s)",
++			latestMeta.Erasure.Distribution, availableDisks, bucket, object, versionID)
++		healingLogOnceIf(ctx, err, "heal-object-available-disks")
+ 		return er.defaultHealResult(latestMeta, storageDisks, storageEndpoints, errs,
+ 			bucket, object, versionID), err
+ 	}
+ 
+-	latestDisks := shuffleDisks(onlineDisks, latestMeta.Erasure.Distribution)
++	latestDisks := shuffleDisks(availableDisks, latestMeta.Erasure.Distribution)
+ 
+ 	if !latestMeta.Deleted && len(latestMeta.Erasure.Distribution) != len(outDatedDisks) {
+ 		err := fmt.Errorf("unexpected file distribution (%v) from outdated disks (%v), looks like backend disks have been manually modified refusing to heal %s/%s(%s)",
+@@ -555,10 +562,6 @@ func (er *erasureObjects) healObject(ctx context.Context, bucket string, object
+ 				if disk == OfflineDisk {
+ 					continue
+ 				}
+-				thisPartErrs := shuffleCheckParts(dataErrsByPart[partIndex], latestMeta.Erasure.Distribution)
+-				if thisPartErrs[i] != checkPartSuccess {
+-					continue
+-				}
+ 				checksumInfo := copyPartsMetadata[i].Erasure.GetChecksumInfo(partNumber)
+ 				partPath := pathJoin(object, srcDataDir, fmt.Sprintf("part.%d", partNumber))
+ 				readers[i] = newBitrotReader(disk, copyPartsMetadata[i].Data, bucket, partPath, tillOffset, checksumAlgo,
+diff --git a/cmd/erasure-metadata-utils.go b/cmd/erasure-metadata-utils.go
+index 067d3609b..56bfd8137 100644
+--- a/cmd/erasure-metadata-utils.go
++++ b/cmd/erasure-metadata-utils.go
+@@ -295,34 +295,34 @@ func shuffleDisksAndPartsMetadata(disks []StorageAPI, partsMetadata []FileInfo,
+ 	return shuffledDisks, shuffledPartsMetadata
+ }
+ 
+-func shuffleWithDist[T any](input []T, distribution []int) []T {
++// Return shuffled partsMetadata depending on distribution.
++func shufflePartsMetadata(partsMetadata []FileInfo, distribution []int) (shuffledPartsMetadata []FileInfo) {
+ 	if distribution == nil {
+-		return input
++		return partsMetadata
+ 	}
+-	shuffled := make([]T, len(input))
+-	for index := range input {
++	shuffledPartsMetadata = make([]FileInfo, len(partsMetadata))
++	// Shuffle slice xl metadata for expected distribution.
++	for index := range partsMetadata {
+ 		blockIndex := distribution[index]
+-		shuffled[blockIndex-1] = input[index]
++		shuffledPartsMetadata[blockIndex-1] = partsMetadata[index]
+ 	}
+-	return shuffled
+-}
+-
+-// Return shuffled partsMetadata depending on distribution.
+-func shufflePartsMetadata(partsMetadata []FileInfo, distribution []int) []FileInfo {
+-	return shuffleWithDist[FileInfo](partsMetadata, distribution)
+-}
+-
+-// shuffleCheckParts - shuffle CheckParts slice depending on the
+-// erasure distribution.
+-func shuffleCheckParts(parts []int, distribution []int) []int {
+-	return shuffleWithDist[int](parts, distribution)
++	return shuffledPartsMetadata
+ }
+ 
+ // shuffleDisks - shuffle input disks slice depending on the
+ // erasure distribution. Return shuffled slice of disks with
+ // their expected distribution.
+-func shuffleDisks(disks []StorageAPI, distribution []int) []StorageAPI {
+-	return shuffleWithDist[StorageAPI](disks, distribution)
++func shuffleDisks(disks []StorageAPI, distribution []int) (shuffledDisks []StorageAPI) {
++	if distribution == nil {
++		return disks
++	}
++	shuffledDisks = make([]StorageAPI, len(disks))
++	// Shuffle disks for expected distribution.
++	for index := range disks {
++		blockIndex := distribution[index]
++		shuffledDisks[blockIndex-1] = disks[index]
++	}
++	return shuffledDisks
+ }
+ 
+ // evalDisks - returns a new slice of disks where nil is set if

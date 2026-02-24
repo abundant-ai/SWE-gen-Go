@@ -1,0 +1,248 @@
+diff --git a/echo.go b/echo.go
+index 6d87260..7b7487f 100644
+--- a/echo.go
++++ b/echo.go
+@@ -6,6 +6,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"log"
+ 	"net/http"
+ 	"path/filepath"
+ 	"reflect"
+@@ -15,7 +16,7 @@ import (
+ 
+ 	"encoding/xml"
+ 
+-	"github.com/labstack/gommon/log"
++	"github.com/labstack/gommon/color"
+ 	"golang.org/x/net/http2"
+ 	"golang.org/x/net/websocket"
+ )
+@@ -34,7 +35,8 @@ type (
+ 		pool                    sync.Pool
+ 		debug                   bool
+ 		hook                    http.HandlerFunc
+-		router                  *Router
++		// stripTrailingSlash      bool
++		router *Router
+ 	}
+ 
+ 	Route struct {
+@@ -177,8 +179,6 @@ var (
+ 	methodNotAllowedHandler = func(c *Context) error {
+ 		return NewHTTPError(http.StatusMethodNotAllowed)
+ 	}
+-
+-	logger = log.New("echo")
+ )
+ 
+ // New creates an instance of Echo.
+@@ -193,6 +193,9 @@ func New() (e *Echo) {
+ 	// Defaults
+ 	//----------
+ 
++	if runtime.GOOS == "windows" {
++		e.DisableColoredLog()
++	}
+ 	e.HTTP2()
+ 	e.defaultHTTPErrorHandler = func(err error, c *Context) {
+ 		code := http.StatusInternalServerError
+@@ -207,15 +210,10 @@ func New() (e *Echo) {
+ 		if !c.response.committed {
+ 			http.Error(c.response, msg, code)
+ 		}
+-		log.Error(err)
++		log.Println(err)
+ 	}
+ 	e.SetHTTPErrorHandler(e.defaultHTTPErrorHandler)
+ 	e.SetBinder(&binder{})
+-
+-	// Logger
+-	log.SetPrefix("echo")
+-	log.SetLevel(log.INFO)
+-
+ 	return
+ }
+ 
+@@ -224,14 +222,9 @@ func (e *Echo) Router() *Router {
+ 	return e.router
+ }
+ 
+-// SetOutput sets the output destination for the logger.
+-func SetOutput(w io.Writer) {
+-	log.SetOutput(w)
+-}
+-
+-// SetLogLevel sets the log level for global logger. The default value is `log.INFO`.
+-func SetLogLevel(l log.Level) {
+-	log.SetLevel(l)
++// DisableColoredLog disables colored log.
++func (e *Echo) DisableColoredLog() {
++	color.Disable()
+ }
+ 
+ // HTTP2 enables HTTP2 support.
+@@ -276,6 +269,11 @@ func (e *Echo) Hook(h http.HandlerFunc) {
+ 	e.hook = h
+ }
+ 
++// StripTrailingSlash enables removing trailing slash from the request path.
++// func (e *Echo) StripTrailingSlash() {
++// 	e.stripTrailingSlash = true
++// }
++
+ // Use adds handler to the middleware chain.
+ func (e *Echo) Use(m ...Middleware) {
+ 	for _, h := range m {
+@@ -535,7 +533,7 @@ func (e *Echo) run(s *http.Server, files ...string) {
+ 	} else if len(files) == 2 {
+ 		log.Fatal(s.ListenAndServeTLS(files[0], files[1]))
+ 	} else {
+-		log.Fatal("invalid TLS configuration")
++		log.Fatal("echo => invalid TLS configuration")
+ 	}
+ }
+ 
+@@ -590,7 +588,7 @@ func wrapMiddleware(m Middleware) MiddlewareFunc {
+ 	case func(http.ResponseWriter, *http.Request):
+ 		return wrapHTTPHandlerFuncMW(m)
+ 	default:
+-		panic("unknown middleware")
++		panic("echo => unknown middleware")
+ 	}
+ }
+ 
+@@ -636,7 +634,7 @@ func wrapHandler(h Handler) HandlerFunc {
+ 			return nil
+ 		}
+ 	default:
+-		panic("unknown handler")
++		panic("echo => unknown handler")
+ 	}
+ }
+ 
+diff --git a/middleware/logger.go b/middleware/logger.go
+index a5538e2..53c9d5a 100644
+--- a/middleware/logger.go
++++ b/middleware/logger.go
+@@ -1,12 +1,12 @@
+ package middleware
+ 
+ import (
++	"log"
+ 	"net"
+ 	"time"
+ 
+ 	"github.com/labstack/echo"
+ 	"github.com/labstack/gommon/color"
+-	"github.com/labstack/gommon/log"
+ )
+ 
+ func Logger() echo.MiddlewareFunc {
+@@ -47,7 +47,7 @@ func Logger() echo.MiddlewareFunc {
+ 				code = color.Cyan(n)
+ 			}
+ 
+-			log.Info("%s %s %s %s %s %d", remoteAddr, method, path, code, stop.Sub(start), size)
++			log.Printf("%s %s %s %s %s %d", remoteAddr, method, path, code, stop.Sub(start), size)
+ 			return nil
+ 		}
+ 	}
+diff --git a/middleware/logger_test.go b/middleware/logger_test.go
+index 2e576c3..c915645 100644
+--- a/middleware/logger_test.go
++++ b/middleware/logger_test.go
+@@ -3,12 +3,12 @@ package middleware
+ import (
+ 	"bytes"
+ 	"errors"
++	"log"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"testing"
+ 
+ 	"github.com/labstack/echo"
+-	"github.com/labstack/gommon/log"
+ 	"github.com/stretchr/testify/assert"
+ )
+ 
+@@ -54,6 +54,7 @@ func TestLogger(t *testing.T) {
+ func TestLoggerIPAddress(t *testing.T) {
+ 	buf := &bytes.Buffer{}
+ 	log.SetOutput(buf)
++
+ 	ip := "127.0.0.1"
+ 
+ 	e := echo.New()
+diff --git a/middleware/recover.go b/middleware/recover.go
+index 9bc266c..b62edb5 100644
+--- a/middleware/recover.go
++++ b/middleware/recover.go
+@@ -18,7 +18,7 @@ func Recover() echo.MiddlewareFunc {
+ 				if err := recover(); err != nil {
+ 					trace := make([]byte, 1<<16)
+ 					n := runtime.Stack(trace, true)
+-					c.Error(fmt.Errorf("panic recover\n %v\n stack trace %d bytes\n %s",
++					c.Error(fmt.Errorf("echo => panic recover\n %v\n stack trace %d bytes\n %s",
+ 						err, n, trace[:n]))
+ 				}
+ 			}()
+diff --git a/response.go b/response.go
+index 2eacc72..af9cfc3 100644
+--- a/response.go
++++ b/response.go
+@@ -2,10 +2,11 @@ package echo
+ 
+ import (
+ 	"bufio"
++	"log"
+ 	"net"
+ 	"net/http"
+ 
+-	"github.com/labstack/gommon/log"
++	"github.com/labstack/gommon/color"
+ )
+ 
+ type (
+@@ -35,7 +36,8 @@ func (r *Response) Writer() http.ResponseWriter {
+ 
+ func (r *Response) WriteHeader(code int) {
+ 	if r.committed {
+-		log.Warn("response already committed")
++		// TODO: Warning
++		log.Printf("echo => %s", color.Yellow("response already committed"))
+ 		return
+ 	}
+ 	r.status = code
+diff --git a/website/content/guide/customization.md b/website/content/guide/customization.md
+index d01b344..782682d 100644
+--- a/website/content/guide/customization.md
++++ b/website/content/guide/customization.md
+@@ -25,11 +25,9 @@ and message `HTTPError.Message`.
+ 
+ Enables/disables debug mode.
+ 
+-### Log output
++### Disable colored log
+ 
+-`echo#SetOutput(w io.Writer)`
+-
+-SetOutput sets the output destination for the global logger.
++`Echo#DisableColoredLog()`
+ 
+ ### Hook
+ 
+diff --git a/website/content/guide/request.md b/website/content/guide/request.md
+index e747ca2..c8fe141 100644
+--- a/website/content/guide/request.md
++++ b/website/content/guide/request.md
+@@ -14,7 +14,7 @@ menu:
+ 
+ ```go
+ e.Use(func(c *echo.Context) error {
+-    println(c.Path()) // Prints `/users/:name`
++    log.Println(c.Path()) // Prints `/users/:name`
+     return nil
+ })
+ e.Get("/users/:name", func(c *echo.Context) error) {

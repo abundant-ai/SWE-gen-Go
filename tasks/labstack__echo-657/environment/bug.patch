@@ -1,0 +1,176 @@
+diff --git a/echo.go b/echo.go
+index a8e9c31..d336d39 100644
+--- a/echo.go
++++ b/echo.go
+@@ -58,7 +58,6 @@ import (
+ type (
+ 	// Echo is the top-level framework instance.
+ 	Echo struct {
+-		server           engine.Server
+ 		premiddleware    []MiddlewareFunc
+ 		middleware       []MiddlewareFunc
+ 		maxParam         *int
+@@ -570,20 +569,16 @@ func (e *Echo) ServeHTTP(req engine.Request, res engine.Response) {
+ }
+ 
+ // Run starts the HTTP server.
+-func (e *Echo) Run(s engine.Server) error {
+-	e.server = s
++func (e *Echo) Run(s engine.Server) {
+ 	s.SetHandler(e)
+ 	s.SetLogger(e.logger)
+ 	if e.Debug() {
+ 		e.SetLogLevel(glog.DEBUG)
+ 		e.logger.Debug("running in debug mode")
+ 	}
+-	return s.Start()
+-}
+-
+-// Stop stops the HTTP server.
+-func (e *Echo) Stop() error {
+-	return e.server.Stop()
++	if err := s.Start(); err != nil {
++		panic(fmt.Sprintf("echo: %v", err))
++	}
+ }
+ 
+ // NewHTTPError creates a new HTTPError instance.
+diff --git a/engine/engine.go b/engine/engine.go
+index 5d7daae..b1ed6c4 100644
+--- a/engine/engine.go
++++ b/engine/engine.go
+@@ -21,9 +21,6 @@ type (
+ 
+ 		// Start starts the HTTP server.
+ 		Start() error
+-
+-		// Stop stops the HTTP server by closing underlying TCP connection.
+-		Stop() error
+ 	}
+ 
+ 	// Request defines the interface for HTTP request.
+@@ -208,7 +205,6 @@ type (
+ 		Listener     net.Listener  // Custom `net.Listener`. If set, server accepts connections on it.
+ 		TLSCertFile  string        // TLS certificate file path.
+ 		TLSKeyFile   string        // TLS key file path.
+-		DisableHTTP2 bool          // Disables HTTP/2.
+ 		ReadTimeout  time.Duration // Maximum duration before timing out read of the request.
+ 		WriteTimeout time.Duration // Maximum duration before timing out write of the response.
+ 	}
+diff --git a/engine/fasthttp/server.go b/engine/fasthttp/server.go
+index 37d738f..1380f7f 100644
+--- a/engine/fasthttp/server.go
++++ b/engine/fasthttp/server.go
+@@ -109,12 +109,6 @@ func (s *Server) Start() error {
+ 
+ }
+ 
+-// Stop implements `engine.Server#Stop` function.
+-func (s *Server) Stop() error {
+-	// TODO: implement `engine.Server#Stop` function
+-	return nil
+-}
+-
+ func (s *Server) startDefaultListener() error {
+ 	c := s.config
+ 	if c.TLSCertFile != "" && c.TLSKeyFile != "" {
+diff --git a/engine/standard/server.go b/engine/standard/server.go
+index cd9643c..3ada02d 100644
+--- a/engine/standard/server.go
++++ b/engine/standard/server.go
+@@ -1,11 +1,8 @@
+ package standard
+ 
+ import (
+-	"crypto/tls"
+-	"net"
+ 	"net/http"
+ 	"sync"
+-	"time"
+ 
+ 	"github.com/labstack/echo"
+ 	"github.com/labstack/echo/engine"
+@@ -105,35 +102,21 @@ func (s *Server) SetLogger(l log.Logger) {
+ // Start implements `engine.Server#Start` function.
+ func (s *Server) Start() error {
+ 	if s.config.Listener == nil {
+-		ln, err := net.Listen("tcp", s.config.Address)
+-		if err != nil {
+-			return err
+-		}
+-
+-		if s.config.TLSCertFile != "" && s.config.TLSKeyFile != "" {
+-			config := &tls.Config{
+-				NextProtos: []string{"http/1.1"},
+-			}
+-			if !s.config.DisableHTTP2 {
+-				config.NextProtos = append(config.NextProtos, "h2")
+-			}
+-			config.Certificates = make([]tls.Certificate, 1)
+-			config.Certificates[0], err = tls.LoadX509KeyPair(s.config.TLSCertFile, s.config.TLSKeyFile)
+-			if err != nil {
+-				return err
+-			}
+-			s.config.Listener = tls.NewListener(tcpKeepAliveListener{ln.(*net.TCPListener)}, config)
+-		} else {
+-			s.config.Listener = tcpKeepAliveListener{ln.(*net.TCPListener)}
+-		}
++		return s.startDefaultListener()
+ 	}
++	return s.startCustomListener()
++}
+ 
+-	return s.Serve(s.config.Listener)
++func (s *Server) startDefaultListener() error {
++	c := s.config
++	if c.TLSCertFile != "" && c.TLSKeyFile != "" {
++		return s.ListenAndServeTLS(c.TLSCertFile, c.TLSKeyFile)
++	}
++	return s.ListenAndServe()
+ }
+ 
+-// Stop implements `engine.Server#Stop` function.
+-func (s *Server) Stop() error {
+-	return s.config.Listener.Close()
++func (s *Server) startCustomListener() error {
++	return s.Serve(s.config.Listener)
+ }
+ 
+ // ServeHTTP implements `http.Handler` interface.
+@@ -187,21 +170,3 @@ func WrapMiddleware(m func(http.Handler) http.Handler) echo.MiddlewareFunc {
+ 		}
+ 	}
+ }
+-
+-// tcpKeepAliveListener sets TCP keep-alive timeouts on accepted
+-// connections. It's used by ListenAndServe and ListenAndServeTLS so
+-// dead TCP connections (e.g. closing laptop mid-download) eventually
+-// go away.
+-type tcpKeepAliveListener struct {
+-	*net.TCPListener
+-}
+-
+-func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
+-	tc, err := ln.AcceptTCP()
+-	if err != nil {
+-		return
+-	}
+-	tc.SetKeepAlive(true)
+-	tc.SetKeepAlivePeriod(3 * time.Minute)
+-	return tc, nil
+-}
+diff --git a/test/server.go b/test/server.go
+index b6f2815..fdd925a 100644
+--- a/test/server.go
++++ b/test/server.go
+@@ -88,10 +88,6 @@ func (s *Server) Start() error {
+ 	return s.startCustomListener()
+ }
+ 
+-func (s *Server) Stop() error {
+-	return nil
+-}
+-
+ func (s *Server) startDefaultListener() error {
+ 	c := s.config
+ 	if c.TLSCertFile != "" && c.TLSKeyFile != "" {

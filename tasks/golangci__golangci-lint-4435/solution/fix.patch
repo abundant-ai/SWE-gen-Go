@@ -1,0 +1,1191 @@
+diff --git a/pkg/commands/run.go b/pkg/commands/run.go
+index e47af1ab..b5b2daee 100644
+--- a/pkg/commands/run.go
++++ b/pkg/commands/run.go
+@@ -43,8 +43,6 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/timeutils"
+ )
+ 
+-const defaultFileMode = 0644
+-
+ const defaultTimeout = time.Minute
+ 
+ const (
+@@ -82,6 +80,8 @@ type runCommand struct {
+ 
+ 	dbManager *lintersdb.Manager
+ 
++	printer *printers.Printer
++
+ 	log        logutils.Log
+ 	debugf     logutils.DebugFunc
+ 	reportData *report.Data
+@@ -178,6 +178,13 @@ func (c *runCommand) preRunE(_ *cobra.Command, _ []string) error {
+ 
+ 	c.dbManager = dbManager
+ 
++	printer, err := printers.NewPrinter(c.log, c.cfg, c.reportData)
++	if err != nil {
++		return err
++	}
++
++	c.printer = printer
++
+ 	c.goenv = goutil.NewEnv(c.log.Child(logutils.DebugKeyGoEnv))
+ 
+ 	c.fileCache = fsutils.NewFileCache()
+@@ -314,20 +321,12 @@ func (c *runCommand) runAndPrint(ctx context.Context, args []string) error {
+ 
+ 	issues, err := c.runAnalysis(ctx, args)
+ 	if err != nil {
+-		return err // XXX: don't loose type
++		return err // XXX: don't lose type
+ 	}
+ 
+-	formats := strings.Split(c.cfg.Output.Format, ",")
+-	for _, format := range formats {
+-		out := strings.SplitN(format, ":", 2)
+-		if len(out) < 2 {
+-			out = append(out, "")
+-		}
+-
+-		err := c.printReports(issues, out[1], out[0])
+-		if err != nil {
+-			return err
+-		}
++	err = c.printer.Print(issues)
++	if err != nil {
++		return err
+ 	}
+ 
+ 	c.printStats(issues)
+@@ -391,80 +390,6 @@ func (c *runCommand) setExitCodeIfIssuesFound(issues []result.Issue) {
+ 	}
+ }
+ 
+-func (c *runCommand) printReports(issues []result.Issue, path, format string) error {
+-	w, shouldClose, err := c.createWriter(path)
+-	if err != nil {
+-		return fmt.Errorf("can't create output for %s: %w", path, err)
+-	}
+-
+-	p, err := c.createPrinter(format, w)
+-	if err != nil {
+-		if file, ok := w.(io.Closer); shouldClose && ok {
+-			_ = file.Close()
+-		}
+-		return err
+-	}
+-
+-	if err = p.Print(issues); err != nil {
+-		if file, ok := w.(io.Closer); shouldClose && ok {
+-			_ = file.Close()
+-		}
+-		return fmt.Errorf("can't print %d issues: %w", len(issues), err)
+-	}
+-
+-	if file, ok := w.(io.Closer); shouldClose && ok {
+-		_ = file.Close()
+-	}
+-
+-	return nil
+-}
+-
+-func (c *runCommand) createWriter(path string) (io.Writer, bool, error) {
+-	if path == "" || path == "stdout" {
+-		return logutils.StdOut, false, nil
+-	}
+-	if path == "stderr" {
+-		return logutils.StdErr, false, nil
+-	}
+-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, defaultFileMode)
+-	if err != nil {
+-		return nil, false, err
+-	}
+-	return f, true, nil
+-}
+-
+-func (c *runCommand) createPrinter(format string, w io.Writer) (printers.Printer, error) {
+-	var p printers.Printer
+-	switch format {
+-	case config.OutFormatJSON:
+-		p = printers.NewJSON(c.reportData, w)
+-	case config.OutFormatColoredLineNumber, config.OutFormatLineNumber:
+-		p = printers.NewText(c.cfg.Output.PrintIssuedLine,
+-			format == config.OutFormatColoredLineNumber, c.cfg.Output.PrintLinterName,
+-			c.log.Child(logutils.DebugKeyTextPrinter), w)
+-	case config.OutFormatTab, config.OutFormatColoredTab:
+-		p = printers.NewTab(c.cfg.Output.PrintLinterName,
+-			format == config.OutFormatColoredTab,
+-			c.log.Child(logutils.DebugKeyTabPrinter), w)
+-	case config.OutFormatCheckstyle:
+-		p = printers.NewCheckstyle(w)
+-	case config.OutFormatCodeClimate:
+-		p = printers.NewCodeClimate(w)
+-	case config.OutFormatHTML:
+-		p = printers.NewHTML(w)
+-	case config.OutFormatJunitXML:
+-		p = printers.NewJunitXML(w)
+-	case config.OutFormatGithubActions:
+-		p = printers.NewGithub(w)
+-	case config.OutFormatTeamCity:
+-		p = printers.NewTeamCity(w)
+-	default:
+-		return nil, fmt.Errorf("unknown output format %s", format)
+-	}
+-
+-	return p, nil
+-}
+-
+ func (c *runCommand) printStats(issues []result.Issue) {
+ 	if !c.cfg.Run.ShowStats {
+ 		return
+@@ -682,7 +607,7 @@ func formatMemory(memBytes uint64) string {
+ 	return fmt.Sprintf("%dmb", memBytes/Mb)
+ }
+ 
+-// --- Related to cache.
++// Related to cache.
+ 
+ func initHashSalt(version string, cfg *config.Config) error {
+ 	binSalt, err := computeBinarySalt(version)
+diff --git a/pkg/printers/github.go b/pkg/printers/github.go
+index f471d5a8..e396119d 100644
+--- a/pkg/printers/github.go
++++ b/pkg/printers/github.go
+@@ -8,16 +8,16 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+-type github struct {
++type GitHub struct {
+ 	w io.Writer
+ }
+ 
+ const defaultGithubSeverity = "error"
+ 
+-// NewGithub output format outputs issues according to GitHub actions format:
++// NewGitHub output format outputs issues according to GitHub actions format:
+ // https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-error-message
+-func NewGithub(w io.Writer) Printer {
+-	return &github{w: w}
++func NewGitHub(w io.Writer) *GitHub {
++	return &GitHub{w: w}
+ }
+ 
+ // print each line as: ::error file=app.js,line=10,col=15::Something went wrong
+@@ -41,7 +41,7 @@ func formatIssueAsGithub(issue *result.Issue) string {
+ 	return ret
+ }
+ 
+-func (p *github) Print(issues []result.Issue) error {
++func (p *GitHub) Print(issues []result.Issue) error {
+ 	for ind := range issues {
+ 		_, err := fmt.Fprintln(p.w, formatIssueAsGithub(&issues[ind]))
+ 		if err != nil {
+diff --git a/pkg/printers/printer.go b/pkg/printers/printer.go
+index ce3116fa..97e2b5d3 100644
+--- a/pkg/printers/printer.go
++++ b/pkg/printers/printer.go
+@@ -1,9 +1,141 @@
+ package printers
+ 
+ import (
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"strings"
++
++	"github.com/golangci/golangci-lint/pkg/config"
++	"github.com/golangci/golangci-lint/pkg/logutils"
++	"github.com/golangci/golangci-lint/pkg/report"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+-type Printer interface {
++const defaultFileMode = 0644
++
++type issuePrinter interface {
+ 	Print(issues []result.Issue) error
+ }
++
++// Printer prints issues
++type Printer struct {
++	cfg        *config.Config
++	reportData *report.Data
++
++	log logutils.Log
++
++	stdOut io.Writer
++	stdErr io.Writer
++}
++
++// NewPrinter creates a new Printer.
++func NewPrinter(log logutils.Log, cfg *config.Config, reportData *report.Data) (*Printer, error) {
++	if log == nil {
++		return nil, errors.New("missing log argument in constructor")
++	}
++	if cfg == nil {
++		return nil, errors.New("missing config argument in constructor")
++	}
++	if reportData == nil {
++		return nil, errors.New("missing reportData argument in constructor")
++	}
++
++	return &Printer{
++		cfg:        cfg,
++		reportData: reportData,
++		log:        log,
++		stdOut:     logutils.StdOut,
++		stdErr:     logutils.StdErr,
++	}, nil
++}
++
++// Print prints issues based on the formats defined
++func (c *Printer) Print(issues []result.Issue) error {
++	formats := strings.Split(c.cfg.Output.Format, ",")
++
++	for _, item := range formats {
++		format, path, _ := strings.Cut(item, ":")
++		err := c.printReports(issues, path, format)
++		if err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func (c *Printer) printReports(issues []result.Issue, path, format string) error {
++	w, shouldClose, err := c.createWriter(path)
++	if err != nil {
++		return fmt.Errorf("can't create output for %s: %w", path, err)
++	}
++
++	defer func() {
++		if file, ok := w.(io.Closer); shouldClose && ok {
++			_ = file.Close()
++		}
++	}()
++
++	p, err := c.createPrinter(format, w)
++	if err != nil {
++		return err
++	}
++
++	if err = p.Print(issues); err != nil {
++		return fmt.Errorf("can't print %d issues: %w", len(issues), err)
++	}
++
++	return nil
++}
++
++func (c *Printer) createWriter(path string) (io.Writer, bool, error) {
++	if path == "" || path == "stdout" {
++		return c.stdOut, false, nil
++	}
++
++	if path == "stderr" {
++		return c.stdErr, false, nil
++	}
++
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, defaultFileMode)
++	if err != nil {
++		return nil, false, err
++	}
++
++	return f, true, nil
++}
++
++func (c *Printer) createPrinter(format string, w io.Writer) (issuePrinter, error) {
++	var p issuePrinter
++
++	switch format {
++	case config.OutFormatJSON:
++		p = NewJSON(c.reportData, w)
++	case config.OutFormatColoredLineNumber, config.OutFormatLineNumber:
++		p = NewText(c.cfg.Output.PrintIssuedLine,
++			format == config.OutFormatColoredLineNumber, c.cfg.Output.PrintLinterName,
++			c.log.Child(logutils.DebugKeyTextPrinter), w)
++	case config.OutFormatTab, config.OutFormatColoredTab:
++		p = NewTab(c.cfg.Output.PrintLinterName,
++			format == config.OutFormatColoredTab,
++			c.log.Child(logutils.DebugKeyTabPrinter), w)
++	case config.OutFormatCheckstyle:
++		p = NewCheckstyle(w)
++	case config.OutFormatCodeClimate:
++		p = NewCodeClimate(w)
++	case config.OutFormatHTML:
++		p = NewHTML(w)
++	case config.OutFormatJunitXML:
++		p = NewJunitXML(w)
++	case config.OutFormatGithubActions:
++		p = NewGitHub(w)
++	case config.OutFormatTeamCity:
++		p = NewTeamCity(w)
++	default:
++		return nil, fmt.Errorf("unknown output format %s", format)
++	}
++
++	return p, nil
++}
+diff --git a/pkg/printers/testdata/golden-github-actions.txt b/pkg/printers/testdata/golden-github-actions.txt
+new file mode 100644
+index 00000000..93704a48
+--- /dev/null
++++ b/pkg/printers/testdata/golden-github-actions.txt
+@@ -0,0 +1,22 @@
++::error file=pkg/experimental/myplugin/myplugin.go,line=13,col=1::don't use `init` function (gochecknoinits)
++::error file=pkg/lint/lintersdb/builder_plugin.go,line=59,col=69::hugeParam: settings is heavy (80 bytes); consider passing it by pointer (gocritic)
++::error file=pkg/printers/printer_test.go,line=6::File is not `goimports`-ed with -local github.com/golangci/golangci-lint (goimports)
++::error file=pkg/config/issues.go,line=107,col=13::struct of size 144 bytes could be of size 128 bytes (maligned)
++::error file=pkg/config/linters_settings.go,line=200,col=22::struct of size 3144 bytes could be of size 3096 bytes (maligned)
++::error file=pkg/config/linters_settings.go,line=383,col=25::struct of size 72 bytes could be of size 64 bytes (maligned)
++::error file=pkg/config/linters_settings.go,line=470,col=22::struct of size 72 bytes could be of size 56 bytes (maligned)
++::error file=pkg/config/linters_settings.go,line=482,col=23::struct of size 136 bytes could be of size 128 bytes (maligned)
++::error file=pkg/config/linters_settings.go,line=584,col=27::struct of size 64 bytes could be of size 56 bytes (maligned)
++::error file=pkg/config/linters_settings.go,line=591,col=20::struct of size 88 bytes could be of size 80 bytes (maligned)
++::error file=pkg/config/linters_settings.go,line=710,col=25::struct of size 40 bytes could be of size 32 bytes (maligned)
++::error file=pkg/config/linters_settings.go,line=762,col=21::struct of size 112 bytes could be of size 104 bytes (maligned)
++::error file=pkg/config/linters_settings.go,line=787,col=23::struct of size 32 bytes could be of size 24 bytes (maligned)
++::error file=pkg/config/linters_settings.go,line=817,col=23::struct of size 40 bytes could be of size 32 bytes (maligned)
++::error file=pkg/config/linters_settings.go,line=902,col=25::struct of size 80 bytes could be of size 72 bytes (maligned)
++::error file=pkg/config/linters_settings.go,line=928,col=18::struct of size 112 bytes could be of size 96 bytes (maligned)
++::error file=pkg/config/run.go,line=6,col=10::struct of size 168 bytes could be of size 160 bytes (maligned)
++::error file=pkg/lint/linter/config.go,line=36,col=13::struct of size 128 bytes could be of size 120 bytes (maligned)
++::error file=pkg/golinters/govet_test.go,line=70,col=23::struct of size 96 bytes could be of size 88 bytes (maligned)
++::error file=pkg/result/processors/diff.go,line=17,col=11::struct of size 64 bytes could be of size 56 bytes (maligned)
++::warning file=pkg/experimental/myplugin/myplugin.go,line=49,col=14::unused-parameter: parameter 'pass' seems to be unused, consider removing or renaming it as _ (revive)
++::error file=pkg/commands/run.go,line=47,col=7::const `defaultFileMode` is unused (unused)
+diff --git a/pkg/printers/testdata/golden-json.json b/pkg/printers/testdata/golden-json.json
+new file mode 100644
+index 00000000..c0e6e679
+--- /dev/null
++++ b/pkg/printers/testdata/golden-json.json
+@@ -0,0 +1 @@
++{"Issues":[{"FromLinter":"gochecknoinits","Text":"don't use `init` function","Severity":"","SourceLines":["func init() {"],"Replacement":null,"Pos":{"Filename":"pkg/experimental/myplugin/myplugin.go","Offset":162,"Line":13,"Column":1},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"gocritic","Text":"hugeParam: settings is heavy (80 bytes); consider passing it by pointer","Severity":"","SourceLines":["func (b *PluginBuilder) loadConfig(cfg *config.Config, name string, settings config.CustomLinterSettings) (*linter.Config, error) {"],"Replacement":null,"Pos":{"Filename":"pkg/lint/lintersdb/builder_plugin.go","Offset":1480,"Line":59,"Column":69},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"goimports","Text":"File is not `goimports`-ed with -local github.com/golangci/golangci-lint","Severity":"","SourceLines":[""],"Replacement":{"NeedOnlyDelete":false,"NewLines":["","\t\"github.com/stretchr/testify/require\"",""],"Inline":null},"Pos":{"Filename":"pkg/printers/printer_test.go","Offset":0,"Line":6,"Column":0},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 144 bytes could be of size 128 bytes","Severity":"","SourceLines":["type Issues struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/issues.go","Offset":3338,"Line":107,"Column":13},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 3144 bytes could be of size 3096 bytes","Severity":"","SourceLines":["type LintersSettings struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/linters_settings.go","Offset":4576,"Line":200,"Column":22},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 72 bytes could be of size 64 bytes","Severity":"","SourceLines":["type ExhaustiveSettings struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/linters_settings.go","Offset":10829,"Line":383,"Column":25},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 72 bytes could be of size 56 bytes","Severity":"","SourceLines":["type GoConstSettings struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/linters_settings.go","Offset":14399,"Line":470,"Column":22},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 136 bytes could be of size 128 bytes","Severity":"","SourceLines":["type GoCriticSettings struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/linters_settings.go","Offset":14934,"Line":482,"Column":23},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 64 bytes could be of size 56 bytes","Severity":"","SourceLines":["type GosmopolitanSettings struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/linters_settings.go","Offset":18601,"Line":584,"Column":27},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 88 bytes could be of size 80 bytes","Severity":"","SourceLines":["type GovetSettings struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/linters_settings.go","Offset":18867,"Line":591,"Column":20},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 40 bytes could be of size 32 bytes","Severity":"","SourceLines":["type NoLintLintSettings struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/linters_settings.go","Offset":22337,"Line":710,"Column":25},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 112 bytes could be of size 104 bytes","Severity":"","SourceLines":["type ReviveSettings struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/linters_settings.go","Offset":24019,"Line":762,"Column":21},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 32 bytes could be of size 24 bytes","Severity":"","SourceLines":["type SlogLintSettings struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/linters_settings.go","Offset":24648,"Line":787,"Column":23},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 40 bytes could be of size 32 bytes","Severity":"","SourceLines":["type TagAlignSettings struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/linters_settings.go","Offset":25936,"Line":817,"Column":23},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 80 bytes could be of size 72 bytes","Severity":"","SourceLines":["type VarnamelenSettings struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/linters_settings.go","Offset":28758,"Line":902,"Column":25},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 112 bytes could be of size 96 bytes","Severity":"","SourceLines":["type WSLSettings struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/linters_settings.go","Offset":29898,"Line":928,"Column":18},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 168 bytes could be of size 160 bytes","Severity":"","SourceLines":["type Run struct {"],"Replacement":null,"Pos":{"Filename":"pkg/config/run.go","Offset":112,"Line":6,"Column":10},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 128 bytes could be of size 120 bytes","Severity":"","SourceLines":["type Config struct {"],"Replacement":null,"Pos":{"Filename":"pkg/lint/linter/config.go","Offset":1329,"Line":36,"Column":13},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 96 bytes could be of size 88 bytes","Severity":"","SourceLines":["\tfor _, tc := range []struct {"],"Replacement":null,"Pos":{"Filename":"pkg/golinters/govet_test.go","Offset":1804,"Line":70,"Column":23},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"maligned","Text":"struct of size 64 bytes could be of size 56 bytes","Severity":"","SourceLines":["type Diff struct {"],"Replacement":null,"Pos":{"Filename":"pkg/result/processors/diff.go","Offset":233,"Line":17,"Column":11},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"revive","Text":"unused-parameter: parameter 'pass' seems to be unused, consider removing or renaming it as _","Severity":"warning","SourceLines":["\t\t\tRun: func(pass *analysis.Pass) (any, error) {"],"Replacement":null,"LineRange":{"From":49,"To":49},"Pos":{"Filename":"pkg/experimental/myplugin/myplugin.go","Offset":921,"Line":49,"Column":14},"ExpectNoLint":false,"ExpectedNoLintLinter":""},{"FromLinter":"unused","Text":"const `defaultFileMode` is unused","Severity":"","SourceLines":["const defaultFileMode = 0644"],"Replacement":null,"Pos":{"Filename":"pkg/commands/run.go","Offset":1209,"Line":47,"Column":7},"ExpectNoLint":false,"ExpectedNoLintLinter":""}],"Report":{"Warnings":[{"Tag":"runner","Text":"The linter 'maligned' is deprecated (since v1.38.0) due to: The repository of the linter has been archived by the owner. Replaced by govet 'fieldalignment'."}],"Linters":[{"Name":"asasalint"},{"Name":"asciicheck"},{"Name":"bidichk"},{"Name":"bodyclose","Enabled":true},{"Name":"containedctx"},{"Name":"contextcheck"},{"Name":"cyclop"},{"Name":"decorder"},{"Name":"deadcode"},{"Name":"depguard","Enabled":true},{"Name":"dogsled","Enabled":true},{"Name":"dupl","Enabled":true},{"Name":"dupword"},{"Name":"durationcheck"},{"Name":"errcheck","Enabled":true,"EnabledByDefault":true},{"Name":"errchkjson"},{"Name":"errname"},{"Name":"errorlint","Enabled":true},{"Name":"execinquery"},{"Name":"exhaustive"},{"Name":"exhaustivestruct"},{"Name":"exhaustruct"},{"Name":"exportloopref","Enabled":true},{"Name":"forbidigo"},{"Name":"forcetypeassert"},{"Name":"funlen","Enabled":true},{"Name":"gci"},{"Name":"ginkgolinter"},{"Name":"gocheckcompilerdirectives","Enabled":true},{"Name":"gochecknoglobals"},{"Name":"gochecknoinits","Enabled":true},{"Name":"gochecksumtype"},{"Name":"gocognit"},{"Name":"goconst","Enabled":true},{"Name":"gocritic","Enabled":true},{"Name":"gocyclo","Enabled":true},{"Name":"godot"},{"Name":"godox"},{"Name":"goerr113"},{"Name":"gofmt","Enabled":true},{"Name":"gofumpt"},{"Name":"goheader"},{"Name":"goimports","Enabled":true},{"Name":"golint"},{"Name":"gomnd","Enabled":true},{"Name":"gomoddirectives"},{"Name":"gomodguard"},{"Name":"goprintffuncname","Enabled":true},{"Name":"gosec","Enabled":true},{"Name":"gosimple","Enabled":true,"EnabledByDefault":true},{"Name":"gosmopolitan"},{"Name":"govet","Enabled":true,"EnabledByDefault":true},{"Name":"grouper"},{"Name":"ifshort"},{"Name":"importas"},{"Name":"inamedparam"},{"Name":"ineffassign","Enabled":true,"EnabledByDefault":true},{"Name":"interfacebloat"},{"Name":"interfacer"},{"Name":"ireturn"},{"Name":"lll","Enabled":true},{"Name":"loggercheck"},{"Name":"maintidx"},{"Name":"makezero"},{"Name":"maligned","Enabled":true},{"Name":"mirror"},{"Name":"misspell","Enabled":true},{"Name":"musttag"},{"Name":"nakedret","Enabled":true},{"Name":"nestif"},{"Name":"nilerr"},{"Name":"nilnil"},{"Name":"nlreturn"},{"Name":"noctx","Enabled":true},{"Name":"nonamedreturns"},{"Name":"nosnakecase"},{"Name":"nosprintfhostport"},{"Name":"paralleltest"},{"Name":"perfsprint"},{"Name":"prealloc"},{"Name":"predeclared"},{"Name":"promlinter"},{"Name":"protogetter"},{"Name":"reassign"},{"Name":"revive","Enabled":true},{"Name":"rowserrcheck"},{"Name":"sloglint"},{"Name":"scopelint"},{"Name":"sqlclosecheck"},{"Name":"spancheck"},{"Name":"staticcheck","Enabled":true,"EnabledByDefault":true},{"Name":"structcheck"},{"Name":"stylecheck","Enabled":true},{"Name":"tagalign"},{"Name":"tagliatelle"},{"Name":"tenv"},{"Name":"testableexamples"},{"Name":"testifylint"},{"Name":"testpackage"},{"Name":"thelper"},{"Name":"tparallel"},{"Name":"typecheck","Enabled":true,"EnabledByDefault":true},{"Name":"unconvert","Enabled":true},{"Name":"unparam","Enabled":true},{"Name":"unused","Enabled":true,"EnabledByDefault":true},{"Name":"usestdlibvars"},{"Name":"varcheck"},{"Name":"varnamelen"},{"Name":"wastedassign"},{"Name":"whitespace","Enabled":true},{"Name":"wrapcheck"},{"Name":"wsl"},{"Name":"zerologlint"},{"Name":"nolintlint","Enabled":true}]}}
+diff --git a/pkg/printers/testdata/golden-line-number.txt b/pkg/printers/testdata/golden-line-number.txt
+new file mode 100644
+index 00000000..d735cf68
+--- /dev/null
++++ b/pkg/printers/testdata/golden-line-number.txt
+@@ -0,0 +1,22 @@
++pkg/experimental/myplugin/myplugin.go:13:1: don't use `init` function
++pkg/lint/lintersdb/builder_plugin.go:59:69: hugeParam: settings is heavy (80 bytes); consider passing it by pointer
++pkg/printers/printer_test.go:6: File is not `goimports`-ed with -local github.com/golangci/golangci-lint
++pkg/config/issues.go:107:13: struct of size 144 bytes could be of size 128 bytes
++pkg/config/linters_settings.go:200:22: struct of size 3144 bytes could be of size 3096 bytes
++pkg/config/linters_settings.go:383:25: struct of size 72 bytes could be of size 64 bytes
++pkg/config/linters_settings.go:470:22: struct of size 72 bytes could be of size 56 bytes
++pkg/config/linters_settings.go:482:23: struct of size 136 bytes could be of size 128 bytes
++pkg/config/linters_settings.go:584:27: struct of size 64 bytes could be of size 56 bytes
++pkg/config/linters_settings.go:591:20: struct of size 88 bytes could be of size 80 bytes
++pkg/config/linters_settings.go:710:25: struct of size 40 bytes could be of size 32 bytes
++pkg/config/linters_settings.go:762:21: struct of size 112 bytes could be of size 104 bytes
++pkg/config/linters_settings.go:787:23: struct of size 32 bytes could be of size 24 bytes
++pkg/config/linters_settings.go:817:23: struct of size 40 bytes could be of size 32 bytes
++pkg/config/linters_settings.go:902:25: struct of size 80 bytes could be of size 72 bytes
++pkg/config/linters_settings.go:928:18: struct of size 112 bytes could be of size 96 bytes
++pkg/config/run.go:6:10: struct of size 168 bytes could be of size 160 bytes
++pkg/lint/linter/config.go:36:13: struct of size 128 bytes could be of size 120 bytes
++pkg/golinters/govet_test.go:70:23: struct of size 96 bytes could be of size 88 bytes
++pkg/result/processors/diff.go:17:11: struct of size 64 bytes could be of size 56 bytes
++pkg/experimental/myplugin/myplugin.go:49:14: unused-parameter: parameter 'pass' seems to be unused, consider removing or renaming it as _
++pkg/commands/run.go:47:7: const `defaultFileMode` is unused
+diff --git a/pkg/printers/testdata/in-issues.json b/pkg/printers/testdata/in-issues.json
+new file mode 100644
+index 00000000..86378851
+--- /dev/null
++++ b/pkg/printers/testdata/in-issues.json
+@@ -0,0 +1,389 @@
++ [
++    {
++      "FromLinter": "gochecknoinits",
++      "Text": "don't use `init` function",
++      "Severity": "",
++      "SourceLines": [
++        "func init() {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/experimental/myplugin/myplugin.go",
++        "Offset": 162,
++        "Line": 13,
++        "Column": 1
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "gocritic",
++      "Text": "hugeParam: settings is heavy (80 bytes); consider passing it by pointer",
++      "Severity": "",
++      "SourceLines": [
++        "func (b *PluginBuilder) loadConfig(cfg *config.Config, name string, settings config.CustomLinterSettings) (*linter.Config, error) {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/lint/lintersdb/builder_plugin.go",
++        "Offset": 1480,
++        "Line": 59,
++        "Column": 69
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "goimports",
++      "Text": "File is not `goimports`-ed with -local github.com/golangci/golangci-lint",
++      "Severity": "",
++      "SourceLines": [
++        ""
++      ],
++      "Replacement": {
++        "NeedOnlyDelete": false,
++        "NewLines": [
++          "",
++          "\t\"github.com/stretchr/testify/require\"",
++          ""
++        ],
++        "Inline": null
++      },
++      "Pos": {
++        "Filename": "pkg/printers/printer_test.go",
++        "Offset": 0,
++        "Line": 6,
++        "Column": 0
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 144 bytes could be of size 128 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type Issues struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/issues.go",
++        "Offset": 3338,
++        "Line": 107,
++        "Column": 13
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 3144 bytes could be of size 3096 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type LintersSettings struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/linters_settings.go",
++        "Offset": 4576,
++        "Line": 200,
++        "Column": 22
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 72 bytes could be of size 64 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type ExhaustiveSettings struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/linters_settings.go",
++        "Offset": 10829,
++        "Line": 383,
++        "Column": 25
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 72 bytes could be of size 56 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type GoConstSettings struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/linters_settings.go",
++        "Offset": 14399,
++        "Line": 470,
++        "Column": 22
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 136 bytes could be of size 128 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type GoCriticSettings struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/linters_settings.go",
++        "Offset": 14934,
++        "Line": 482,
++        "Column": 23
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 64 bytes could be of size 56 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type GosmopolitanSettings struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/linters_settings.go",
++        "Offset": 18601,
++        "Line": 584,
++        "Column": 27
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 88 bytes could be of size 80 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type GovetSettings struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/linters_settings.go",
++        "Offset": 18867,
++        "Line": 591,
++        "Column": 20
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 40 bytes could be of size 32 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type NoLintLintSettings struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/linters_settings.go",
++        "Offset": 22337,
++        "Line": 710,
++        "Column": 25
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 112 bytes could be of size 104 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type ReviveSettings struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/linters_settings.go",
++        "Offset": 24019,
++        "Line": 762,
++        "Column": 21
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 32 bytes could be of size 24 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type SlogLintSettings struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/linters_settings.go",
++        "Offset": 24648,
++        "Line": 787,
++        "Column": 23
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 40 bytes could be of size 32 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type TagAlignSettings struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/linters_settings.go",
++        "Offset": 25936,
++        "Line": 817,
++        "Column": 23
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 80 bytes could be of size 72 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type VarnamelenSettings struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/linters_settings.go",
++        "Offset": 28758,
++        "Line": 902,
++        "Column": 25
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 112 bytes could be of size 96 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type WSLSettings struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/linters_settings.go",
++        "Offset": 29898,
++        "Line": 928,
++        "Column": 18
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 168 bytes could be of size 160 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type Run struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/config/run.go",
++        "Offset": 112,
++        "Line": 6,
++        "Column": 10
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 128 bytes could be of size 120 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type Config struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/lint/linter/config.go",
++        "Offset": 1329,
++        "Line": 36,
++        "Column": 13
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 96 bytes could be of size 88 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "\tfor _, tc := range []struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/golinters/govet_test.go",
++        "Offset": 1804,
++        "Line": 70,
++        "Column": 23
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "maligned",
++      "Text": "struct of size 64 bytes could be of size 56 bytes",
++      "Severity": "",
++      "SourceLines": [
++        "type Diff struct {"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/result/processors/diff.go",
++        "Offset": 233,
++        "Line": 17,
++        "Column": 11
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "revive",
++      "Text": "unused-parameter: parameter 'pass' seems to be unused, consider removing or renaming it as _",
++      "Severity": "warning",
++      "SourceLines": [
++        "\t\t\tRun: func(pass *analysis.Pass) (any, error) {"
++      ],
++      "Replacement": null,
++      "LineRange": {
++        "From": 49,
++        "To": 49
++      },
++      "Pos": {
++        "Filename": "pkg/experimental/myplugin/myplugin.go",
++        "Offset": 921,
++        "Line": 49,
++        "Column": 14
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    },
++    {
++      "FromLinter": "unused",
++      "Text": "const `defaultFileMode` is unused",
++      "Severity": "",
++      "SourceLines": [
++        "const defaultFileMode = 0644"
++      ],
++      "Replacement": null,
++      "Pos": {
++        "Filename": "pkg/commands/run.go",
++        "Offset": 1209,
++        "Line": 47,
++        "Column": 7
++      },
++      "ExpectNoLint": false,
++      "ExpectedNoLintLinter": ""
++    }
++  ]
++
+diff --git a/pkg/printers/testdata/in-report-data.json b/pkg/printers/testdata/in-report-data.json
+new file mode 100644
+index 00000000..a6ed3e2d
+--- /dev/null
++++ b/pkg/printers/testdata/in-report-data.json
+@@ -0,0 +1,395 @@
++{
++    "Warnings": [
++      {
++        "Tag": "runner",
++        "Text": "The linter 'maligned' is deprecated (since v1.38.0) due to: The repository of the linter has been archived by the owner. Replaced by govet 'fieldalignment'."
++      }
++    ],
++    "Linters": [
++      {
++        "Name": "asasalint"
++      },
++      {
++        "Name": "asciicheck"
++      },
++      {
++        "Name": "bidichk"
++      },
++      {
++        "Name": "bodyclose",
++        "Enabled": true
++      },
++      {
++        "Name": "containedctx"
++      },
++      {
++        "Name": "contextcheck"
++      },
++      {
++        "Name": "cyclop"
++      },
++      {
++        "Name": "decorder"
++      },
++      {
++        "Name": "deadcode"
++      },
++      {
++        "Name": "depguard",
++        "Enabled": true
++      },
++      {
++        "Name": "dogsled",
++        "Enabled": true
++      },
++      {
++        "Name": "dupl",
++        "Enabled": true
++      },
++      {
++        "Name": "dupword"
++      },
++      {
++        "Name": "durationcheck"
++      },
++      {
++        "Name": "errcheck",
++        "Enabled": true,
++        "EnabledByDefault": true
++      },
++      {
++        "Name": "errchkjson"
++      },
++      {
++        "Name": "errname"
++      },
++      {
++        "Name": "errorlint",
++        "Enabled": true
++      },
++      {
++        "Name": "execinquery"
++      },
++      {
++        "Name": "exhaustive"
++      },
++      {
++        "Name": "exhaustivestruct"
++      },
++      {
++        "Name": "exhaustruct"
++      },
++      {
++        "Name": "exportloopref",
++        "Enabled": true
++      },
++      {
++        "Name": "forbidigo"
++      },
++      {
++        "Name": "forcetypeassert"
++      },
++      {
++        "Name": "funlen",
++        "Enabled": true
++      },
++      {
++        "Name": "gci"
++      },
++      {
++        "Name": "ginkgolinter"
++      },
++      {
++        "Name": "gocheckcompilerdirectives",
++        "Enabled": true
++      },
++      {
++        "Name": "gochecknoglobals"
++      },
++      {
++        "Name": "gochecknoinits",
++        "Enabled": true
++      },
++      {
++        "Name": "gochecksumtype"
++      },
++      {
++        "Name": "gocognit"
++      },
++      {
++        "Name": "goconst",
++        "Enabled": true
++      },
++      {
++        "Name": "gocritic",
++        "Enabled": true
++      },
++      {
++        "Name": "gocyclo",
++        "Enabled": true
++      },
++      {
++        "Name": "godot"
++      },
++      {
++        "Name": "godox"
++      },
++      {
++        "Name": "goerr113"
++      },
++      {
++        "Name": "gofmt",
++        "Enabled": true
++      },
++      {
++        "Name": "gofumpt"
++      },
++      {
++        "Name": "goheader"
++      },
++      {
++        "Name": "goimports",
++        "Enabled": true
++      },
++      {
++        "Name": "golint"
++      },
++      {
++        "Name": "gomnd",
++        "Enabled": true
++      },
++      {
++        "Name": "gomoddirectives"
++      },
++      {
++        "Name": "gomodguard"
++      },
++      {
++        "Name": "goprintffuncname",
++        "Enabled": true
++      },
++      {
++        "Name": "gosec",
++        "Enabled": true
++      },
++      {
++        "Name": "gosimple",
++        "Enabled": true,
++        "EnabledByDefault": true
++      },
++      {
++        "Name": "gosmopolitan"
++      },
++      {
++        "Name": "govet",
++        "Enabled": true,
++        "EnabledByDefault": true
++      },
++      {
++        "Name": "grouper"
++      },
++      {
++        "Name": "ifshort"
++      },
++      {
++        "Name": "importas"
++      },
++      {
++        "Name": "inamedparam"
++      },
++      {
++        "Name": "ineffassign",
++        "Enabled": true,
++        "EnabledByDefault": true
++      },
++      {
++        "Name": "interfacebloat"
++      },
++      {
++        "Name": "interfacer"
++      },
++      {
++        "Name": "ireturn"
++      },
++      {
++        "Name": "lll",
++        "Enabled": true
++      },
++      {
++        "Name": "loggercheck"
++      },
++      {
++        "Name": "maintidx"
++      },
++      {
++        "Name": "makezero"
++      },
++      {
++        "Name": "maligned",
++        "Enabled": true
++      },
++      {
++        "Name": "mirror"
++      },
++      {
++        "Name": "misspell",
++        "Enabled": true
++      },
++      {
++        "Name": "musttag"
++      },
++      {
++        "Name": "nakedret",
++        "Enabled": true
++      },
++      {
++        "Name": "nestif"
++      },
++      {
++        "Name": "nilerr"
++      },
++      {
++        "Name": "nilnil"
++      },
++      {
++        "Name": "nlreturn"
++      },
++      {
++        "Name": "noctx",
++        "Enabled": true
++      },
++      {
++        "Name": "nonamedreturns"
++      },
++      {
++        "Name": "nosnakecase"
++      },
++      {
++        "Name": "nosprintfhostport"
++      },
++      {
++        "Name": "paralleltest"
++      },
++      {
++        "Name": "perfsprint"
++      },
++      {
++        "Name": "prealloc"
++      },
++      {
++        "Name": "predeclared"
++      },
++      {
++        "Name": "promlinter"
++      },
++      {
++        "Name": "protogetter"
++      },
++      {
++        "Name": "reassign"
++      },
++      {
++        "Name": "revive",
++        "Enabled": true
++      },
++      {
++        "Name": "rowserrcheck"
++      },
++      {
++        "Name": "sloglint"
++      },
++      {
++        "Name": "scopelint"
++      },
++      {
++        "Name": "sqlclosecheck"
++      },
++      {
++        "Name": "spancheck"
++      },
++      {
++        "Name": "staticcheck",
++        "Enabled": true,
++        "EnabledByDefault": true
++      },
++      {
++        "Name": "structcheck"
++      },
++      {
++        "Name": "stylecheck",
++        "Enabled": true
++      },
++      {
++        "Name": "tagalign"
++      },
++      {
++        "Name": "tagliatelle"
++      },
++      {
++        "Name": "tenv"
++      },
++      {
++        "Name": "testableexamples"
++      },
++      {
++        "Name": "testifylint"
++      },
++      {
++        "Name": "testpackage"
++      },
++      {
++        "Name": "thelper"
++      },
++      {
++        "Name": "tparallel"
++      },
++      {
++        "Name": "typecheck",
++        "Enabled": true,
++        "EnabledByDefault": true
++      },
++      {
++        "Name": "unconvert",
++        "Enabled": true
++      },
++      {
++        "Name": "unparam",
++        "Enabled": true
++      },
++      {
++        "Name": "unused",
++        "Enabled": true,
++        "EnabledByDefault": true
++      },
++      {
++        "Name": "usestdlibvars"
++      },
++      {
++        "Name": "varcheck"
++      },
++      {
++        "Name": "varnamelen"
++      },
++      {
++        "Name": "wastedassign"
++      },
++      {
++        "Name": "whitespace",
++        "Enabled": true
++      },
++      {
++        "Name": "wrapcheck"
++      },
++      {
++        "Name": "wsl"
++      },
++      {
++        "Name": "zerologlint"
++      },
++      {
++        "Name": "nolintlint",
++        "Enabled": true
++      }
++    ]
++  }
++

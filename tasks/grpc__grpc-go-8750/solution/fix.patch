@@ -1,0 +1,144 @@
+diff --git a/internal/xds/balancer/clusterresolver/configbuilder.go b/internal/xds/balancer/clusterresolver/configbuilder.go
+index 3d8e0897..6aabc935 100644
+--- a/internal/xds/balancer/clusterresolver/configbuilder.go
++++ b/internal/xds/balancer/clusterresolver/configbuilder.go
+@@ -21,6 +21,7 @@ package clusterresolver
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"slices"
+ 	"sort"
+ 
+ 	"google.golang.org/grpc/internal/balancer/weight"
+@@ -265,10 +266,13 @@ func priorityLocalitiesToClusterImpl(localities []xdsresource.Locality, priority
+ 			if endpoint.HealthStatus != xdsresource.EndpointHealthStatusHealthy && endpoint.HealthStatus != xdsresource.EndpointHealthStatusUnknown {
+ 				continue
+ 			}
+-			resolverEndpoint := resolver.Endpoint{}
+-			for _, as := range endpoint.Addresses {
+-				resolverEndpoint.Addresses = append(resolverEndpoint.Addresses, resolver.Address{Addr: as})
+-			}
++
++			// Create a copy of endpoint.ResolverEndpoint to avoid race between
++			// the xDS Client (which owns this shared object in its cache) and
++			// the Cluster Resolver (which is trying to modify attributes).
++			resolverEndpoint := endpoint.ResolverEndpoint
++			resolverEndpoint.Addresses = slices.Clone(endpoint.ResolverEndpoint.Addresses)
++
+ 			resolverEndpoint = hierarchy.SetInEndpoint(resolverEndpoint, []string{priorityName, localityStr})
+ 			resolverEndpoint = xdsinternal.SetLocalityIDInEndpoint(resolverEndpoint, locality.ID)
+ 			// "To provide the xds_wrr_locality load balancer information about
+diff --git a/internal/xds/xdsclient/xdsresource/type_eds.go b/internal/xds/xdsclient/xdsresource/type_eds.go
+index 39b2ba74..c6dc0c09 100644
+--- a/internal/xds/xdsclient/xdsresource/type_eds.go
++++ b/internal/xds/xdsclient/xdsresource/type_eds.go
+@@ -19,6 +19,7 @@ package xdsresource
+ 
+ import (
+ 	"google.golang.org/grpc/internal/xds/clients"
++	"google.golang.org/grpc/resolver"
+ 	"google.golang.org/protobuf/types/known/anypb"
+ )
+ 
+@@ -48,13 +49,13 @@ const (
+ )
+ 
+ // Endpoint contains information of an endpoint.
++// TODO(i/8757) : Replace Endpoint with resolver.Endpoint struct.
+ type Endpoint struct {
+-	Addresses    []string
+-	HealthStatus EndpointHealthStatus
+-	Weight       uint32
+-	HashKey      string
+-	Metadata     map[string]any
+-	Hostname     string
++	ResolverEndpoint resolver.Endpoint
++	HealthStatus     EndpointHealthStatus
++	Weight           uint32
++	HashKey          string
++	Metadata         map[string]any
+ }
+ 
+ // Locality contains information of a locality.
+diff --git a/internal/xds/xdsclient/xdsresource/unmarshal_eds.go b/internal/xds/xdsclient/xdsresource/unmarshal_eds.go
+index ebf47961..4ec13324 100644
+--- a/internal/xds/xdsclient/xdsresource/unmarshal_eds.go
++++ b/internal/xds/xdsclient/xdsresource/unmarshal_eds.go
+@@ -30,10 +30,34 @@ import (
+ 	"google.golang.org/grpc/internal/pretty"
+ 	xdsinternal "google.golang.org/grpc/internal/xds"
+ 	"google.golang.org/grpc/internal/xds/clients"
++	"google.golang.org/grpc/resolver"
+ 	"google.golang.org/protobuf/proto"
+ 	"google.golang.org/protobuf/types/known/anypb"
+ )
+ 
++// hostnameKeyType is the key to store the hostname attribute in
++// a resolver.Endpoint.
++type hostnameKeyType struct{}
++
++// setHostname returns a copy of the given endpoint with hostname added
++// as an attribute.
++func setHostname(endpoint resolver.Endpoint, hostname string) resolver.Endpoint {
++	// Only set if non-empty; xds_cluster_impl uses this to trigger :authority
++	// rewriting.
++	if hostname == "" {
++		return endpoint
++	}
++	endpoint.Attributes = endpoint.Attributes.WithValue(hostnameKeyType{}, hostname)
++	return endpoint
++}
++
++// HostnameFromEndpoint returns the hostname attribute of endpoint. If this
++// attribute is not set, it returns the empty string.
++func HostnameFromEndpoint(endpoint resolver.Endpoint) string {
++	hostname, _ := endpoint.Attributes.Value(hostnameKeyType{}).(string)
++	return hostname
++}
++
+ func unmarshalEndpointsResource(r *anypb.Any) (string, EndpointsUpdate, error) {
+ 	r, err := UnwrapResource(r)
+ 	if err != nil {
+@@ -102,7 +126,9 @@ func parseEndpoints(lbEndpoints []*v3endpointpb.LbEndpoint, uniqueEndpointAddrs
+ 			}
+ 		}
+ 
++		address := []resolver.Address{}
+ 		for _, a := range addrs {
++			address = append(address, resolver.Address{Addr: a})
+ 			if uniqueEndpointAddrs[a] {
+ 				return nil, fmt.Errorf("duplicate endpoint with the same address %s", a)
+ 			}
+@@ -126,13 +152,14 @@ func parseEndpoints(lbEndpoints []*v3endpointpb.LbEndpoint, uniqueEndpointAddrs
+ 				hashKey = hashKeyFromMetadata(endpointMetadata)
+ 			}
+ 		}
++		endpoint := resolver.Endpoint{Addresses: address}
++		endpoint = setHostname(endpoint, lbEndpoint.GetEndpoint().GetHostname())
+ 		endpoints = append(endpoints, Endpoint{
+-			HealthStatus: EndpointHealthStatus(lbEndpoint.GetHealthStatus()),
+-			Addresses:    addrs,
+-			Weight:       weight,
+-			HashKey:      hashKey,
+-			Metadata:     endpointMetadata,
+-			Hostname:     lbEndpoint.GetEndpoint().GetHostname(),
++			ResolverEndpoint: endpoint,
++			HealthStatus:     EndpointHealthStatus(lbEndpoint.GetHealthStatus()),
++			Weight:           weight,
++			HashKey:          hashKey,
++			Metadata:         endpointMetadata,
+ 		})
+ 	}
+ 	return endpoints, nil
+diff --git a/resolver/resolver.go b/resolver/resolver.go
+index 8e6af951..598ed21a 100644
+--- a/resolver/resolver.go
++++ b/resolver/resolver.go
+@@ -182,6 +182,7 @@ type BuildOptions struct {
+ 
+ // An Endpoint is one network endpoint, or server, which may have multiple
+ // addresses with which it can be accessed.
++// TODO(i/8773) : make resolver.Endpoint and resolver.Address immutable
+ type Endpoint struct {
+ 	// Addresses contains a list of addresses used to access this endpoint.
+ 	Addresses []Address

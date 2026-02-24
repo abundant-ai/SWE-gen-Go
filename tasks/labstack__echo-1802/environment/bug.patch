@@ -1,0 +1,282 @@
+diff --git a/middleware/middleware.go b/middleware/middleware.go
+index a7ad73a..6bdb0eb 100644
+--- a/middleware/middleware.go
++++ b/middleware/middleware.go
+@@ -2,6 +2,7 @@ package middleware
+ 
+ import (
+ 	"net/http"
++	"net/url"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
+@@ -48,39 +49,30 @@ func rewriteRulesRegex(rewrite map[string]string) map[*regexp.Regexp]string {
+ 	return rulesRegex
+ }
+ 
+-func rewriteURL(rewriteRegex map[*regexp.Regexp]string, req *http.Request) error {
+-	if len(rewriteRegex) == 0 {
+-		return nil
+-	}
++func rewritePath(rewriteRegex map[*regexp.Regexp]string, req *http.Request) {
++	for k, v := range rewriteRegex {
++		rawPath := req.URL.RawPath
++		if rawPath != "" {
++			// RawPath is only set when there has been escaping done. In that case Path must be deduced from rewritten RawPath
++			// because encoded Path could match rules that RawPath did not
++			if replacer := captureTokens(k, rawPath); replacer != nil {
++				rawPath = replacer.Replace(v)
+ 
+-	// Depending how HTTP request is sent RequestURI could contain Scheme://Host/path or be just /path.
+-	// We only want to use path part for rewriting and therefore trim prefix if it exists
+-	rawURI := req.RequestURI
+-	if rawURI != "" && rawURI[0] != '/' {
+-		prefix := ""
+-		if req.URL.Scheme != "" {
+-			prefix = req.URL.Scheme + "://"
+-		}
+-		if req.URL.Host != "" {
+-			prefix += req.URL.Host // host or host:port
+-		}
+-		if prefix != "" {
+-			rawURI = strings.TrimPrefix(rawURI, prefix)
+-		}
+-	}
++				req.URL.RawPath = rawPath
++				req.URL.Path, _ = url.PathUnescape(rawPath)
+ 
+-	for k, v := range rewriteRegex {
+-		if replacer := captureTokens(k, rawURI); replacer != nil {
+-			url, err := req.URL.Parse(replacer.Replace(v))
+-			if err != nil {
+-				return err
++				return // rewrite only once
+ 			}
+-			req.URL = url
+ 
+-			return nil // rewrite only once
++			continue
++		}
++
++		if replacer := captureTokens(k, req.URL.Path); replacer != nil {
++			req.URL.Path = replacer.Replace(v)
++
++			return // rewrite only once
+ 		}
+ 	}
+-	return nil
+ }
+ 
+ // DefaultSkipper returns false which processes the middleware.
+diff --git a/middleware/middleware_test.go b/middleware/middleware_test.go
+index 44f4414..bc14c53 100644
+--- a/middleware/middleware_test.go
++++ b/middleware/middleware_test.go
+@@ -8,13 +8,11 @@ import (
+ 	"testing"
+ )
+ 
+-func TestRewriteURL(t *testing.T) {
++func TestRewritePath(t *testing.T) {
+ 	var testCases = []struct {
+ 		whenURL       string
+ 		expectPath    string
+ 		expectRawPath string
+-		expectQuery   string
+-		expectErr     string
+ 	}{
+ 		{
+ 			whenURL:       "http://localhost:8080/old",
+@@ -30,7 +28,6 @@ func TestRewriteURL(t *testing.T) {
+ 			whenURL:       "http://localhost:8080/users/+_+/orders/___++++?test=1",
+ 			expectPath:    "/user/+_+/order/___++++",
+ 			expectRawPath: "",
+-			expectQuery:   "test=1",
+ 		},
+ 		{
+ 			whenURL:       "http://localhost:8080/users/%20a/orders/%20aa",
+@@ -38,10 +35,9 @@ func TestRewriteURL(t *testing.T) {
+ 			expectRawPath: "",
+ 		},
+ 		{
+-			whenURL:       "http://localhost:8080/%47%6f%2f?test=1",
++			whenURL:       "http://localhost:8080/%47%6f%2f",
+ 			expectPath:    "/Go/",
+ 			expectRawPath: "/%47%6f%2f",
+-			expectQuery:   "test=1",
+ 		},
+ 		{
+ 			whenURL:       "/users/jill/orders/T%2FcO4lW%2Ft%2FVp%2F",
+@@ -53,40 +49,21 @@ func TestRewriteURL(t *testing.T) {
+ 			expectPath:    "/user/jill/order/T/cO4lW/t/Vp/",
+ 			expectRawPath: "/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F",
+ 		},
+-		{
+-			whenURL:       "http://localhost:8080/static",
+-			expectPath:    "/static/path",
+-			expectRawPath: "",
+-			expectQuery:   "role=AUTHOR&limit=1000",
+-		},
+-		{
+-			whenURL:       "/static",
+-			expectPath:    "/static/path",
+-			expectRawPath: "",
+-			expectQuery:   "role=AUTHOR&limit=1000",
+-		},
+ 	}
+ 
+ 	rules := map[*regexp.Regexp]string{
+ 		regexp.MustCompile("^/old$"):                      "/new",
+ 		regexp.MustCompile("^/users/(.*?)/orders/(.*?)$"): "/user/$1/order/$2",
+-		regexp.MustCompile("^/static$"):                   "/static/path?role=AUTHOR&limit=1000",
+ 	}
+ 
+ 	for _, tc := range testCases {
+ 		t.Run(tc.whenURL, func(t *testing.T) {
+ 			req := httptest.NewRequest(http.MethodGet, tc.whenURL, nil)
+ 
+-			err := rewriteURL(rules, req)
++			rewritePath(rules, req)
+ 
+-			if tc.expectErr != "" {
+-				assert.EqualError(t, err, tc.expectErr)
+-			} else {
+-				assert.NoError(t, err)
+-			}
+ 			assert.Equal(t, tc.expectPath, req.URL.Path)       // Path field is stored in decoded form: /%47%6f%2f becomes /Go/.
+ 			assert.Equal(t, tc.expectRawPath, req.URL.RawPath) // RawPath, an optional field which only gets set if the default encoding is different from Path.
+-			assert.Equal(t, tc.expectQuery, req.URL.RawQuery)
+ 		})
+ 	}
+ }
+diff --git a/middleware/proxy.go b/middleware/proxy.go
+index 6f01f3a..63eec5a 100644
+--- a/middleware/proxy.go
++++ b/middleware/proxy.go
+@@ -231,9 +231,8 @@ func ProxyWithConfig(config ProxyConfig) echo.MiddlewareFunc {
+ 			tgt := config.Balancer.Next(c)
+ 			c.Set(config.ContextKey, tgt)
+ 
+-			if err := rewriteURL(config.RegexRewrite, req); err != nil {
+-				return err
+-			}
++			// Set rewrite path and raw path
++			rewritePath(config.RegexRewrite, req)
+ 
+ 			// Fix header
+ 			// Basically it's not good practice to unconditionally pass incoming x-real-ip header to upstream.
+diff --git a/middleware/proxy_test.go b/middleware/proxy_test.go
+index 93daf73..591981e 100644
+--- a/middleware/proxy_test.go
++++ b/middleware/proxy_test.go
+@@ -245,16 +245,12 @@ func TestProxyRewrite(t *testing.T) {
+ 
+ func TestProxyRewriteRegex(t *testing.T) {
+ 	// Setup
+-	receivedRequestURI := make(chan string, 1)
+-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		// RequestURI is the unmodified request-target of the Request-Line (RFC 7230, Section 3.1.1) as sent by the client to a server
+-		// we need unmodified target to see if we are encoding/decoding the url in addition to rewrite/replace logic
+-		// if original request had `%2F` we should not magically decode it to `/` as it would change what was requested
+-		receivedRequestURI <- r.RequestURI
+-	}))
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+ 	defer upstream.Close()
+-	tmpUrL, _ := url.Parse(upstream.URL)
+-	rrb := NewRoundRobinBalancer([]*ProxyTarget{{Name: "upstream", URL: tmpUrL}})
++	url, _ := url.Parse(upstream.URL)
++	rrb := NewRoundRobinBalancer([]*ProxyTarget{{Name: "upstream", URL: url}})
++	req := httptest.NewRequest(http.MethodGet, "/", nil)
++	rec := httptest.NewRecorder()
+ 
+ 	// Rewrite
+ 	e := echo.New()
+@@ -283,21 +279,14 @@ func TestProxyRewriteRegex(t *testing.T) {
+ 		{"/c/ignore1/test/this", http.StatusOK, "/v3/test/this"},
+ 		{"/x/ignore/test", http.StatusOK, "/v4/test"},
+ 		{"/y/foo/bar", http.StatusOK, "/v5/bar/foo"},
+-		// NB: fragment is not added by golang httputil.NewSingleHostReverseProxy implementation
+-		// $2 = `bar?q=1#frag`, $1 = `foo`. replaced uri = `/v5/bar?q=1#frag/foo` but httputil.NewSingleHostReverseProxy does not send `#frag/foo` (currently)
+-		{"/y/foo/bar?q=1#frag", http.StatusOK, "/v5/bar?q=1"},
+ 	}
+ 
+ 	for _, tc := range testCases {
+ 		t.Run(tc.requestPath, func(t *testing.T) {
+-			targetURL, _ := url.Parse(tc.requestPath)
+-			req := httptest.NewRequest(http.MethodGet, targetURL.String(), nil)
+-			rec := httptest.NewRecorder()
+-
++			req.URL, _ = url.Parse(tc.requestPath)
++			rec = httptest.NewRecorder()
+ 			e.ServeHTTP(rec, req)
+-
+-			actualRequestURI := <-receivedRequestURI
+-			assert.Equal(t, tc.expectPath, actualRequestURI)
++			assert.Equal(t, tc.expectPath, req.URL.EscapedPath())
+ 			assert.Equal(t, tc.statusCode, rec.Code)
+ 		})
+ 	}
+diff --git a/middleware/rewrite.go b/middleware/rewrite.go
+index e5b0a6b..c05d5d8 100644
+--- a/middleware/rewrite.go
++++ b/middleware/rewrite.go
+@@ -72,9 +72,9 @@ func RewriteWithConfig(config RewriteConfig) echo.MiddlewareFunc {
+ 				return next(c)
+ 			}
+ 
+-			if err := rewriteURL(config.RegexRules, c.Request()); err != nil {
+-				return err
+-			}
++			req := c.Request()
++			// Set rewrite path and raw path
++			rewritePath(config.RegexRules, req)
+ 			return next(c)
+ 		}
+ 	}
+diff --git a/middleware/rewrite_test.go b/middleware/rewrite_test.go
+index 0ac04bb..cff2714 100644
+--- a/middleware/rewrite_test.go
++++ b/middleware/rewrite_test.go
+@@ -220,8 +220,6 @@ func TestEchoRewriteWithRegexRules(t *testing.T) {
+ func TestEchoRewriteReplacementEscaping(t *testing.T) {
+ 	e := echo.New()
+ 
+-	// NOTE: these are incorrect regexps as they do not factor in that URI we are replacing could contain ? (query) and # (fragment) parts
+-	// so in reality they append query and fragment part as `$1` matches everything after that prefix
+ 	e.Pre(RewriteWithConfig(RewriteConfig{
+ 		Rules: map[string]string{
+ 			"^/a/*": "/$1?query=param",
+@@ -230,7 +228,6 @@ func TestEchoRewriteReplacementEscaping(t *testing.T) {
+ 		RegexRules: map[*regexp.Regexp]string{
+ 			regexp.MustCompile("^/x/(.*)"): "/$1?query=param",
+ 			regexp.MustCompile("^/y/(.*)"): "/$1;part#one",
+-			regexp.MustCompile("^/z/(.*)"): "/$1?test=1#escaped%20test",
+ 		},
+ 	}))
+ 
+@@ -239,15 +236,13 @@ func TestEchoRewriteReplacementEscaping(t *testing.T) {
+ 
+ 	testCases := []struct {
+ 		requestPath string
+-		expect      string
++		expectPath  string
+ 	}{
+ 		{"/unmatched", "/unmatched"},
+ 		{"/a/test", "/test?query=param"},
+ 		{"/b/foo/bar", "/foo/bar;part#one"},
+ 		{"/x/test", "/test?query=param"},
+ 		{"/y/foo/bar", "/foo/bar;part#one"},
+-		{"/z/foo/b%20ar", "/foo/b%20ar?test=1#escaped%20test"},
+-		{"/z/foo/b%20ar?nope=1#yes", "/foo/b%20ar?nope=1#yes?test=1%23escaped%20test"}, // example of appending
+ 	}
+ 
+ 	for _, tc := range testCases {
+@@ -255,7 +250,7 @@ func TestEchoRewriteReplacementEscaping(t *testing.T) {
+ 			req = httptest.NewRequest(http.MethodGet, tc.requestPath, nil)
+ 			rec = httptest.NewRecorder()
+ 			e.ServeHTTP(rec, req)
+-			assert.Equal(t, tc.expect, req.URL.String())
++			assert.Equal(t, tc.expectPath, req.URL.Path)
+ 		})
+ 	}
+ }

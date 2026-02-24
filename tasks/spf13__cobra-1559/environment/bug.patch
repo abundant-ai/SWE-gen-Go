@@ -1,0 +1,288 @@
+diff --git a/command.go b/command.go
+index c853913..60b9c45 100644
+--- a/command.go
++++ b/command.go
+@@ -1097,6 +1097,12 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
+ 
+ 	// initialize help at the last point to allow for user overriding
+ 	c.InitDefaultHelpCmd()
++	// initialize completion at the last point to allow for user overriding
++	c.InitDefaultCompletionCmd()
++
++	// Now that all commands have been created, let's make sure all groups
++	// are properly created also
++	c.checkCommandGroups()
+ 
+ 	args := c.args
+ 
+@@ -1108,16 +1114,9 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
+ 		args = os.Args[1:]
+ 	}
+ 
+-	// initialize the __complete command to be used for shell completion
++	// initialize the hidden command to be used for shell completion
+ 	c.initCompleteCmd(args)
+ 
+-	// initialize the default completion command
+-	c.InitDefaultCompletionCmd(args...)
+-
+-	// Now that all commands have been created, let's make sure all groups
+-	// are properly created also
+-	c.checkCommandGroups()
+-
+ 	var flags []string
+ 	if c.TraverseChildren {
+ 		cmd, flags, err = c.Traverse(args)
+diff --git a/completions.go b/completions.go
+index b25fc66..cd899c7 100644
+--- a/completions.go
++++ b/completions.go
+@@ -711,8 +711,8 @@ func checkIfFlagCompletion(finalCmd *Command, args []string, lastArg string) (*p
+ // 1- the feature has been explicitly disabled by the program,
+ // 2- c has no subcommands (to avoid creating one),
+ // 3- c already has a 'completion' command provided by the program.
+-func (c *Command) InitDefaultCompletionCmd(args ...string) {
+-	if c.CompletionOptions.DisableDefaultCmd {
++func (c *Command) InitDefaultCompletionCmd() {
++	if c.CompletionOptions.DisableDefaultCmd || !c.HasSubCommands() {
+ 		return
+ 	}
+ 
+@@ -725,16 +725,6 @@ func (c *Command) InitDefaultCompletionCmd(args ...string) {
+ 
+ 	haveNoDescFlag := !c.CompletionOptions.DisableNoDescFlag && !c.CompletionOptions.DisableDescriptions
+ 
+-	// Special case to know if there are sub-commands or not.
+-	hasSubCommands := false
+-	for _, cmd := range c.commands {
+-		if cmd.Name() != ShellCompRequestCmd && cmd.Name() != helpCommandName {
+-			// We found a real sub-command (not 'help' or '__complete')
+-			hasSubCommands = true
+-			break
+-		}
+-	}
+-
+ 	completionCmd := &Command{
+ 		Use:   compCmdName,
+ 		Short: "Generate the autocompletion script for the specified shell",
+@@ -748,22 +738,6 @@ See each sub-command's help for details on how to use the generated script.
+ 	}
+ 	c.AddCommand(completionCmd)
+ 
+-	if !hasSubCommands {
+-		// If the 'completion' command will be the only sub-command,
+-		// we only create it if it is actually being called.
+-		// This avoids breaking programs that would suddenly find themselves with
+-		// a subcommand, which would prevent them from accepting arguments.
+-		// We also create the 'completion' command if the user is triggering
+-		// shell completion for it (prog __complete completion '')
+-		subCmd, cmdArgs, err := c.Find(args)
+-		if err != nil || subCmd.Name() != compCmdName &&
+-			!(subCmd.Name() == ShellCompRequestCmd && len(cmdArgs) > 1 && cmdArgs[0] == compCmdName) {
+-			// The completion command is not being called or being completed so we remove it.
+-			c.RemoveCommand(completionCmd)
+-			return
+-		}
+-	}
+-
+ 	out := c.OutOrStdout()
+ 	noDesc := c.CompletionOptions.DisableDescriptions
+ 	shortDesc := "Generate the autocompletion script for %s"
+diff --git a/completions_test.go b/completions_test.go
+index 5859573..a8f378e 100644
+--- a/completions_test.go
++++ b/completions_test.go
+@@ -2465,7 +2465,7 @@ func TestDefaultCompletionCmd(t *testing.T) {
+ 		Run:  emptyRun,
+ 	}
+ 
+-	// Test that when there are no sub-commands, the completion command is not created if it is not called directly.
++	// Test that no completion command is created if there are not other sub-commands
+ 	assertNoErr(t, rootCmd.Execute())
+ 	for _, cmd := range rootCmd.commands {
+ 		if cmd.Name() == compCmdName {
+@@ -2474,17 +2474,6 @@ func TestDefaultCompletionCmd(t *testing.T) {
+ 		}
+ 	}
+ 
+-	// Test that when there are no sub-commands, the completion command is created when it is called directly.
+-	_, err := executeCommand(rootCmd, compCmdName)
+-	if err != nil {
+-		t.Errorf("Unexpected error: %v", err)
+-	}
+-	// Reset the arguments
+-	rootCmd.args = nil
+-	// Remove completion command for the next test
+-	removeCompCmd(rootCmd)
+-
+-	// Add a sub-command
+ 	subCmd := &Command{
+ 		Use: "sub",
+ 		Run: emptyRun,
+@@ -2606,42 +2595,6 @@ func TestDefaultCompletionCmd(t *testing.T) {
+ 
+ func TestCompleteCompletion(t *testing.T) {
+ 	rootCmd := &Command{Use: "root", Args: NoArgs, Run: emptyRun}
+-
+-	// Test that when there are no sub-commands, the 'completion' command is not completed
+-	// (because it is not created).
+-	output, err := executeCommand(rootCmd, ShellCompNoDescRequestCmd, "completion")
+-	if err != nil {
+-		t.Errorf("Unexpected error: %v", err)
+-	}
+-
+-	expected := strings.Join([]string{
+-		":0",
+-		"Completion ended with directive: ShellCompDirectiveDefault", ""}, "\n")
+-
+-	if output != expected {
+-		t.Errorf("expected: %q, got: %q", expected, output)
+-	}
+-
+-	// Test that when there are no sub-commands, completion can be triggered for the default
+-	// 'completion' command
+-	output, err = executeCommand(rootCmd, ShellCompNoDescRequestCmd, "completion", "")
+-	if err != nil {
+-		t.Errorf("Unexpected error: %v", err)
+-	}
+-
+-	expected = strings.Join([]string{
+-		"bash",
+-		"fish",
+-		"powershell",
+-		"zsh",
+-		":4",
+-		"Completion ended with directive: ShellCompDirectiveNoFileComp", ""}, "\n")
+-
+-	if output != expected {
+-		t.Errorf("expected: %q, got: %q", expected, output)
+-	}
+-
+-	// Add a sub-command
+ 	subCmd := &Command{
+ 		Use: "sub",
+ 		Run: emptyRun,
+@@ -2649,12 +2602,12 @@ func TestCompleteCompletion(t *testing.T) {
+ 	rootCmd.AddCommand(subCmd)
+ 
+ 	// Test sub-commands of the completion command
+-	output, err = executeCommand(rootCmd, ShellCompNoDescRequestCmd, "completion", "")
++	output, err := executeCommand(rootCmd, ShellCompNoDescRequestCmd, "completion", "")
+ 	if err != nil {
+ 		t.Errorf("Unexpected error: %v", err)
+ 	}
+ 
+-	expected = strings.Join([]string{
++	expected := strings.Join([]string{
+ 		"bash",
+ 		"fish",
+ 		"powershell",
+@@ -3789,94 +3742,3 @@ func TestDisableDescriptions(t *testing.T) {
+ 		})
+ 	}
+ }
+-
+-// A test to make sure the InitDefaultCompletionCmd function works as expected
+-// in case a project calls it directly.
+-func TestInitDefaultCompletionCmd(t *testing.T) {
+-
+-	testCases := []struct {
+-		desc          string
+-		hasChildCmd   bool
+-		args          []string
+-		expectCompCmd bool
+-	}{
+-		{
+-			desc:          "no child command and not calling the completion command",
+-			hasChildCmd:   false,
+-			args:          []string{"somearg"},
+-			expectCompCmd: false,
+-		},
+-		{
+-			desc:          "no child command but calling the completion command",
+-			hasChildCmd:   false,
+-			args:          []string{"completion"},
+-			expectCompCmd: true,
+-		},
+-		{
+-			desc:          "no child command but calling __complete on the root command",
+-			hasChildCmd:   false,
+-			args:          []string{"__complete", ""},
+-			expectCompCmd: false,
+-		},
+-		{
+-			desc:          "no child command but calling __complete on the completion command",
+-			hasChildCmd:   false,
+-			args:          []string{"__complete", "completion", ""},
+-			expectCompCmd: true,
+-		},
+-		{
+-			desc:          "with child command",
+-			hasChildCmd:   true,
+-			args:          []string{"child"},
+-			expectCompCmd: true,
+-		},
+-		{
+-			desc:          "no child command not passing args",
+-			hasChildCmd:   false,
+-			args:          nil,
+-			expectCompCmd: false,
+-		},
+-		{
+-			desc:          "with child command not passing args",
+-			hasChildCmd:   true,
+-			args:          nil,
+-			expectCompCmd: true,
+-		},
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.desc, func(t *testing.T) {
+-			rootCmd := &Command{Use: "root", Run: emptyRun}
+-			childCmd := &Command{Use: "child", Run: emptyRun}
+-
+-			expectedNumSubCommands := 0
+-			if tc.hasChildCmd {
+-				rootCmd.AddCommand(childCmd)
+-				expectedNumSubCommands++
+-			}
+-
+-			if tc.expectCompCmd {
+-				expectedNumSubCommands++
+-			}
+-
+-			if len(tc.args) > 0 && tc.args[0] == "__complete" {
+-				expectedNumSubCommands++
+-			}
+-
+-			// Setup the __complete command to mimic real world scenarios
+-			rootCmd.initCompleteCmd(tc.args)
+-
+-			// Call the InitDefaultCompletionCmd function directly
+-			if tc.args == nil {
+-				rootCmd.InitDefaultCompletionCmd()
+-			} else {
+-				rootCmd.InitDefaultCompletionCmd(tc.args...)
+-			}
+-
+-			// Check if the completion command was added
+-			if len(rootCmd.Commands()) != expectedNumSubCommands {
+-				t.Errorf("Expected %d subcommands, got %d", expectedNumSubCommands, len(rootCmd.Commands()))
+-			}
+-		})
+-	}
+-}
+diff --git a/site/content/completions/_index.md b/site/content/completions/_index.md
+index 6ba71e7..02257ad 100644
+--- a/site/content/completions/_index.md
++++ b/site/content/completions/_index.md
+@@ -8,8 +8,7 @@ The currently supported shells are:
+ - PowerShell
+ 
+ Cobra will automatically provide your program with a fully functional `completion` command,
+-similarly to how it provides the `help` command. If there are no other subcommands, the
+-default `completion` command will be hidden, but still functional.
++similarly to how it provides the `help` command.
+ 
+ ## Creating your own completion command
+ 

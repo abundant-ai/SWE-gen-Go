@@ -1,0 +1,21 @@
+#!/bin/bash
+
+cd /app/src
+
+export GO111MODULE=on
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+mkdir -p "."
+cp "/tests/completions_test.go" "completions_test.go"
+
+# Run tests from the specific test file modified in this PR
+# completions_test.go - run all tests in the current package
+go test -v .
+test_status=$?
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+exit "$test_status"

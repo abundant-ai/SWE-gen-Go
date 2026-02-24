@@ -1,0 +1,467 @@
+diff --git a/.golangci.example.yml b/.golangci.example.yml
+index 484f7dfb..95abb3c4 100644
+--- a/.golangci.example.yml
++++ b/.golangci.example.yml
+@@ -62,6 +62,10 @@ run:
+ output:
+   # colored-line-number|line-number|json|tab|checkstyle|code-climate|junit-xml|github-actions
+   # default is "colored-line-number"
++  # multiple can be specified by separating them by comma, output can be provided
++  # for each of them by separating format name and path by colon symbol.
++  # Output path can be either `stdout`, `stderr` or path to the file to write to.
++  # Example "checkstyle:report.json,colored-line-number"
+   format: colored-line-number
+ 
+   # print lines of code with issue, default is true
+diff --git a/pkg/commands/run.go b/pkg/commands/run.go
+index ac2e7046..f75fa82f 100644
+--- a/pkg/commands/run.go
++++ b/pkg/commands/run.go
+@@ -26,6 +26,8 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/result/processors"
+ )
+ 
++const defaultFileMode = 0644
++
+ func getDefaultIssueExcludeHelp() string {
+ 	parts := []string{"Use or not use default excludes:"}
+ 	for _, ep := range config.DefaultExcludePatterns {
+@@ -400,44 +402,89 @@ func (e *Executor) runAndPrint(ctx context.Context, args []string) error {
+ 		return err // XXX: don't loose type
+ 	}
+ 
+-	p, err := e.createPrinter()
+-	if err != nil {
+-		return err
++	formats := strings.Split(e.cfg.Output.Format, ",")
++	for _, format := range formats {
++		out := strings.SplitN(format, ":", 2)
++		if len(out) < 2 {
++			out = append(out, "")
++		}
++
++		err := e.printReports(ctx, issues, out[1], out[0])
++		if err != nil {
++			return err
++		}
+ 	}
+ 
+ 	e.setExitCodeIfIssuesFound(issues)
+ 
++	e.fileCache.PrintStats(e.log)
++
++	return nil
++}
++
++func (e *Executor) printReports(ctx context.Context, issues []result.Issue, path, format string) error {
++	w, shouldClose, err := e.createWriter(path)
++	if err != nil {
++		return fmt.Errorf("can't create output for %s: %w", path, err)
++	}
++
++	p, err := e.createPrinter(format, w)
++	if err != nil {
++		if file, ok := w.(io.Closer); shouldClose && ok {
++			_ = file.Close()
++		}
++		return err
++	}
++
+ 	if err = p.Print(ctx, issues); err != nil {
++		if file, ok := w.(io.Closer); shouldClose && ok {
++			_ = file.Close()
++		}
+ 		return fmt.Errorf("can't print %d issues: %s", len(issues), err)
+ 	}
+ 
+-	e.fileCache.PrintStats(e.log)
++	if file, ok := w.(io.Closer); shouldClose && ok {
++		_ = file.Close()
++	}
+ 
+ 	return nil
+ }
+ 
+-func (e *Executor) createPrinter() (printers.Printer, error) {
++func (e *Executor) createWriter(path string) (io.Writer, bool, error) {
++	if path == "" || path == "stdout" {
++		return logutils.StdOut, false, nil
++	}
++	if path == "stderr" {
++		return logutils.StdErr, false, nil
++	}
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, defaultFileMode)
++	if err != nil {
++		return nil, false, err
++	}
++	return f, true, nil
++}
++
++func (e *Executor) createPrinter(format string, w io.Writer) (printers.Printer, error) {
+ 	var p printers.Printer
+-	format := e.cfg.Output.Format
+ 	switch format {
+ 	case config.OutFormatJSON:
+-		p = printers.NewJSON(&e.reportData)
++		p = printers.NewJSON(&e.reportData, w)
+ 	case config.OutFormatColoredLineNumber, config.OutFormatLineNumber:
+ 		p = printers.NewText(e.cfg.Output.PrintIssuedLine,
+ 			format == config.OutFormatColoredLineNumber, e.cfg.Output.PrintLinterName,
+-			e.log.Child("text_printer"))
++			e.log.Child("text_printer"), w)
+ 	case config.OutFormatTab:
+-		p = printers.NewTab(e.cfg.Output.PrintLinterName, e.log.Child("tab_printer"))
++		p = printers.NewTab(e.cfg.Output.PrintLinterName, e.log.Child("tab_printer"), w)
+ 	case config.OutFormatCheckstyle:
+-		p = printers.NewCheckstyle()
++		p = printers.NewCheckstyle(w)
+ 	case config.OutFormatCodeClimate:
+-		p = printers.NewCodeClimate()
++		p = printers.NewCodeClimate(w)
+ 	case config.OutFormatHTML:
+-		p = printers.NewHTML()
++		p = printers.NewHTML(w)
+ 	case config.OutFormatJunitXML:
+-		p = printers.NewJunitXML()
++		p = printers.NewJunitXML(w)
+ 	case config.OutFormatGithubActions:
+-		p = printers.NewGithub()
++		p = printers.NewGithub(w)
+ 	default:
+ 		return nil, fmt.Errorf("unknown output format %s", format)
+ 	}
+diff --git a/pkg/printers/checkstyle.go b/pkg/printers/checkstyle.go
+index c5b948a9..3cd1fa4c 100644
+--- a/pkg/printers/checkstyle.go
++++ b/pkg/printers/checkstyle.go
+@@ -4,10 +4,10 @@ import (
+ 	"context"
+ 	"encoding/xml"
+ 	"fmt"
++	"io"
+ 
+ 	"github.com/go-xmlfmt/xmlfmt"
+ 
+-	"github.com/golangci/golangci-lint/pkg/logutils"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+@@ -32,13 +32,15 @@ type checkstyleError struct {
+ 
+ const defaultCheckstyleSeverity = "error"
+ 
+-type Checkstyle struct{}
++type Checkstyle struct {
++	w io.Writer
++}
+ 
+-func NewCheckstyle() *Checkstyle {
+-	return &Checkstyle{}
++func NewCheckstyle(w io.Writer) *Checkstyle {
++	return &Checkstyle{w: w}
+ }
+ 
+-func (Checkstyle) Print(ctx context.Context, issues []result.Issue) error {
++func (p Checkstyle) Print(ctx context.Context, issues []result.Issue) error {
+ 	out := checkstyleOutput{
+ 		Version: "5.0",
+ 	}
+@@ -82,6 +84,10 @@ func (Checkstyle) Print(ctx context.Context, issues []result.Issue) error {
+ 		return err
+ 	}
+ 
+-	fmt.Fprintf(logutils.StdOut, "%s%s\n", xml.Header, xmlfmt.FormatXML(string(data), "", "  "))
++	_, err = fmt.Fprintf(p.w, "%s%s\n", xml.Header, xmlfmt.FormatXML(string(data), "", "  "))
++	if err != nil {
++		return err
++	}
++
+ 	return nil
+ }
+diff --git a/pkg/printers/codeclimate.go b/pkg/printers/codeclimate.go
+index d4e5b5e0..8127632e 100644
+--- a/pkg/printers/codeclimate.go
++++ b/pkg/printers/codeclimate.go
+@@ -4,8 +4,8 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"io"
+ 
+-	"github.com/golangci/golangci-lint/pkg/logutils"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+@@ -24,10 +24,11 @@ type CodeClimateIssue struct {
+ }
+ 
+ type CodeClimate struct {
++	w io.Writer
+ }
+ 
+-func NewCodeClimate() *CodeClimate {
+-	return &CodeClimate{}
++func NewCodeClimate(w io.Writer) *CodeClimate {
++	return &CodeClimate{w: w}
+ }
+ 
+ func (p CodeClimate) Print(ctx context.Context, issues []result.Issue) error {
+@@ -52,6 +53,9 @@ func (p CodeClimate) Print(ctx context.Context, issues []result.Issue) error {
+ 		return err
+ 	}
+ 
+-	fmt.Fprint(logutils.StdOut, string(outputJSON))
++	_, err = fmt.Fprint(p.w, string(outputJSON))
++	if err != nil {
++		return err
++	}
+ 	return nil
+ }
+diff --git a/pkg/printers/github.go b/pkg/printers/github.go
+index c7186ac2..6a4d05d4 100644
+--- a/pkg/printers/github.go
++++ b/pkg/printers/github.go
+@@ -3,20 +3,21 @@ package printers
+ import (
+ 	"context"
+ 	"fmt"
++	"io"
+ 
+-	"github.com/golangci/golangci-lint/pkg/logutils"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+ type github struct {
++	w io.Writer
+ }
+ 
+ const defaultGithubSeverity = "error"
+ 
+ // NewGithub output format outputs issues according to GitHub actions format:
+ // https://help.github.com/en/actions/reference/workflow-commands-for-github-actions#setting-an-error-message
+-func NewGithub() Printer {
+-	return &github{}
++func NewGithub(w io.Writer) Printer {
++	return &github{w: w}
+ }
+ 
+ // print each line as: ::error file=app.js,line=10,col=15::Something went wrong
+@@ -35,9 +36,9 @@ func formatIssueAsGithub(issue *result.Issue) string {
+ 	return ret
+ }
+ 
+-func (g *github) Print(_ context.Context, issues []result.Issue) error {
++func (p *github) Print(_ context.Context, issues []result.Issue) error {
+ 	for ind := range issues {
+-		_, err := fmt.Fprintln(logutils.StdOut, formatIssueAsGithub(&issues[ind]))
++		_, err := fmt.Fprintln(p.w, formatIssueAsGithub(&issues[ind]))
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/pkg/printers/html.go b/pkg/printers/html.go
+index 65ab753b..3d82d7d8 100644
+--- a/pkg/printers/html.go
++++ b/pkg/printers/html.go
+@@ -4,9 +4,9 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"html/template"
++	"io"
+ 	"strings"
+ 
+-	"github.com/golangci/golangci-lint/pkg/logutils"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+@@ -123,13 +123,15 @@ type htmlIssue struct {
+ 	Code   string
+ }
+ 
+-type HTML struct{}
++type HTML struct {
++	w io.Writer
++}
+ 
+-func NewHTML() *HTML {
+-	return &HTML{}
++func NewHTML(w io.Writer) *HTML {
++	return &HTML{w: w}
+ }
+ 
+-func (h HTML) Print(_ context.Context, issues []result.Issue) error {
++func (p HTML) Print(_ context.Context, issues []result.Issue) error {
+ 	var htmlIssues []htmlIssue
+ 
+ 	for i := range issues {
+@@ -151,5 +153,5 @@ func (h HTML) Print(_ context.Context, issues []result.Issue) error {
+ 		return err
+ 	}
+ 
+-	return t.Execute(logutils.StdOut, struct{ Issues []htmlIssue }{Issues: htmlIssues})
++	return t.Execute(p.w, struct{ Issues []htmlIssue }{Issues: htmlIssues})
+ }
+diff --git a/pkg/printers/json.go b/pkg/printers/json.go
+index d68b82c2..cfef51f5 100644
+--- a/pkg/printers/json.go
++++ b/pkg/printers/json.go
+@@ -3,20 +3,21 @@ package printers
+ import (
+ 	"context"
+ 	"encoding/json"
+-	"fmt"
++	"io"
+ 
+-	"github.com/golangci/golangci-lint/pkg/logutils"
+ 	"github.com/golangci/golangci-lint/pkg/report"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+ type JSON struct {
+ 	rd *report.Data
++	w  io.Writer
+ }
+ 
+-func NewJSON(rd *report.Data) *JSON {
++func NewJSON(rd *report.Data, w io.Writer) *JSON {
+ 	return &JSON{
+ 		rd: rd,
++		w:  w,
+ 	}
+ }
+ 
+@@ -34,11 +35,5 @@ func (p JSON) Print(ctx context.Context, issues []result.Issue) error {
+ 		res.Issues = []result.Issue{}
+ 	}
+ 
+-	outputJSON, err := json.Marshal(res)
+-	if err != nil {
+-		return err
+-	}
+-
+-	fmt.Fprint(logutils.StdOut, string(outputJSON))
+-	return nil
++	return json.NewEncoder(p.w).Encode(res)
+ }
+diff --git a/pkg/printers/junitxml.go b/pkg/printers/junitxml.go
+index 9277cd66..7a68821e 100644
+--- a/pkg/printers/junitxml.go
++++ b/pkg/printers/junitxml.go
+@@ -3,9 +3,9 @@ package printers
+ import (
+ 	"context"
+ 	"encoding/xml"
++	"io"
+ 	"strings"
+ 
+-	"github.com/golangci/golangci-lint/pkg/logutils"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+@@ -35,13 +35,14 @@ type failureXML struct {
+ }
+ 
+ type JunitXML struct {
++	w io.Writer
+ }
+ 
+-func NewJunitXML() *JunitXML {
+-	return &JunitXML{}
++func NewJunitXML(w io.Writer) *JunitXML {
++	return &JunitXML{w: w}
+ }
+ 
+-func (JunitXML) Print(ctx context.Context, issues []result.Issue) error {
++func (p JunitXML) Print(ctx context.Context, issues []result.Issue) error {
+ 	suites := make(map[string]testSuiteXML) // use a map to group by file
+ 
+ 	for ind := range issues {
+@@ -70,7 +71,7 @@ func (JunitXML) Print(ctx context.Context, issues []result.Issue) error {
+ 		res.TestSuites = append(res.TestSuites, val)
+ 	}
+ 
+-	enc := xml.NewEncoder(logutils.StdOut)
++	enc := xml.NewEncoder(p.w)
+ 	enc.Indent("", "  ")
+ 	if err := enc.Encode(res); err != nil {
+ 		return err
+diff --git a/pkg/printers/tab.go b/pkg/printers/tab.go
+index d3cdce67..4a126bde 100644
+--- a/pkg/printers/tab.go
++++ b/pkg/printers/tab.go
+@@ -15,12 +15,14 @@ import (
+ type Tab struct {
+ 	printLinterName bool
+ 	log             logutils.Log
++	w               io.Writer
+ }
+ 
+-func NewTab(printLinterName bool, log logutils.Log) *Tab {
++func NewTab(printLinterName bool, log logutils.Log, w io.Writer) *Tab {
+ 	return &Tab{
+ 		printLinterName: printLinterName,
+ 		log:             log,
++		w:               w,
+ 	}
+ }
+ 
+@@ -30,7 +32,7 @@ func (p Tab) SprintfColored(ca color.Attribute, format string, args ...interface
+ }
+ 
+ func (p *Tab) Print(ctx context.Context, issues []result.Issue) error {
+-	w := tabwriter.NewWriter(logutils.StdOut, 0, 0, 2, ' ', 0)
++	w := tabwriter.NewWriter(p.w, 0, 0, 2, ' ', 0)
+ 
+ 	for i := range issues {
+ 		p.printIssue(&issues[i], w)
+diff --git a/pkg/printers/text.go b/pkg/printers/text.go
+index 18145288..c8960e0e 100644
+--- a/pkg/printers/text.go
++++ b/pkg/printers/text.go
+@@ -3,6 +3,7 @@ package printers
+ import (
+ 	"context"
+ 	"fmt"
++	"io"
+ 	"strings"
+ 
+ 	"github.com/fatih/color"
+@@ -17,14 +18,16 @@ type Text struct {
+ 	printLinterName bool
+ 
+ 	log logutils.Log
++	w   io.Writer
+ }
+ 
+-func NewText(printIssuedLine, useColors, printLinterName bool, log logutils.Log) *Text {
++func NewText(printIssuedLine, useColors, printLinterName bool, log logutils.Log, w io.Writer) *Text {
+ 	return &Text{
+ 		printIssuedLine: printIssuedLine,
+ 		useColors:       useColors,
+ 		printLinterName: printLinterName,
+ 		log:             log,
++		w:               w,
+ 	}
+ }
+ 
+@@ -61,12 +64,12 @@ func (p Text) printIssue(i *result.Issue) {
+ 	if i.Pos.Column != 0 {
+ 		pos += fmt.Sprintf(":%d", i.Pos.Column)
+ 	}
+-	fmt.Fprintf(logutils.StdOut, "%s: %s\n", pos, text)
++	fmt.Fprintf(p.w, "%s: %s\n", pos, text)
+ }
+ 
+ func (p Text) printSourceCode(i *result.Issue) {
+ 	for _, line := range i.SourceLines {
+-		fmt.Fprintln(logutils.StdOut, line)
++		fmt.Fprintln(p.w, line)
+ 	}
+ }
+ 
+@@ -87,5 +90,5 @@ func (p Text) printUnderLinePointer(i *result.Issue) {
+ 		}
+ 	}
+ 
+-	fmt.Fprintf(logutils.StdOut, "%s%s\n", string(prefixRunes), p.SprintfColored(color.FgYellow, "^"))
++	fmt.Fprintf(p.w, "%s%s\n", string(prefixRunes), p.SprintfColored(color.FgYellow, "^"))
+ }

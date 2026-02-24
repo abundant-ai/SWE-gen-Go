@@ -1,0 +1,295 @@
+diff --git a/.golangci.next.reference.yml b/.golangci.next.reference.yml
+index 7cae1c89..cdedd51d 100644
+--- a/.golangci.next.reference.yml
++++ b/.golangci.next.reference.yml
+@@ -535,8 +535,6 @@ linters-settings:
+         # Default: "original"
+         list-mode: lax
+         # List of file globs that will match this list of settings to compare against.
+-        # By default, if a path is relative, it is relative to the directory where the golangci-lint command is executed.
+-        # The placeholder '${base-path}' is substituted with a path relative to the mode defined with `run.relative-path-mode`.
+         # Default: $all
+         files:
+           - "!**/*_a _file.go"
+@@ -1366,11 +1364,11 @@ linters-settings:
+         # Default: ""
+         failOn: dsl,import
+         # Comma-separated list of file paths containing ruleguard rules.
+-        # By default, if a path is relative, it is relative to the directory where the golangci-lint command is executed.
+-        # The placeholder '${base-path}' is substituted with a path relative to the mode defined with `run.relative-path-mode`.
++        # If a path is relative, it is relative to the directory where the golangci-lint command is executed.
++        # The special '${configDir}' variable is substituted with the absolute directory containing the golangci-lint config file.
+         # Glob patterns such as 'rules-*.go' may be specified.
+         # Default: ""
+-        rules: '${base-path}/ruleguard/rules-*.go,${base-path}/myrule1.go'
++        rules: '${configDir}/ruleguard/rules-*.go,${configDir}/myrule1.go'
+         # Comma-separated list of enabled groups or skip empty to enable everything.
+         # Tags can be defined with # character prefix.
+         # Default: "<all>"
+@@ -1463,8 +1461,6 @@ linters-settings:
+       # limitations under the License.
+     # As alternative of directive 'template', you may put the path to file with the template source.
+     # Useful if you need to load the template from a specific file.
+-    # By default, if a path is relative, it is relative to the directory where the golangci-lint command is executed.
+-    # The placeholder '${base-path}' is substituted with a path relative to the mode defined with `run.relative-path-mode`.
+     # Default: ""
+     template-path: /path/to/my/template.tmpl
+ 
+@@ -4172,7 +4168,7 @@ run:
+   # - `gitroot`: the paths will be relative to the git root (the parent directory of `.git`).
+   # - `cfg`: the paths will be relative to the configuration file.
+   # - `wd` (NOT recommended): the paths will be relative to the place where golangci-lint is run.
+-  # Default: cfg
++  # Default: wd
+   relative-path-mode: gomod
+ 
+   # Exit code when at least one issue was found.
+diff --git a/pkg/fsutils/basepath.go b/pkg/fsutils/basepath.go
+index f0f4bc76..97d6aced 100644
+--- a/pkg/fsutils/basepath.go
++++ b/pkg/fsutils/basepath.go
+@@ -2,8 +2,8 @@ package fsutils
+ 
+ import (
+ 	"bytes"
+-	"cmp"
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"os/exec"
+ 	"path/filepath"
+@@ -24,7 +24,10 @@ func AllRelativePathModes() []string {
+ }
+ 
+ func GetBasePath(ctx context.Context, mode, cfgDir string) (string, error) {
+-	mode = cmp.Or(mode, RelativePathModeCfg)
++	if mode == "" {
++		// TODO(ldez): v2 the default should be cfg or gomod.
++		mode = RelativePathModeWd
++	}
+ 
+ 	switch mode {
+ 	case RelativePathModeCfg:
+@@ -59,7 +62,7 @@ func GetBasePath(ctx context.Context, mode, cfgDir string) (string, error) {
+ 		return wd, nil
+ 
+ 	default:
+-		return "", fmt.Errorf("unknown relative path mode: %s", mode)
++		return "", errors.New("unknown relative path mode")
+ 	}
+ }
+ 
+diff --git a/pkg/golinters/gocritic/gocritic.go b/pkg/golinters/gocritic/gocritic.go
+index 0b9be7d2..0fa4c63d 100644
+--- a/pkg/golinters/gocritic/gocritic.go
++++ b/pkg/golinters/gocritic/gocritic.go
+@@ -60,6 +60,7 @@ Dynamic rules are written declaratively with AST patterns, filters, report messa
+ 		WithContextSetter(func(context *linter.Context) {
+ 			wrapper.replacer = strings.NewReplacer(
+ 				internal.PlaceholderBasePath, context.Cfg.GetBasePath(),
++				internal.PlaceholderConfigDir, context.Cfg.GetConfigDir(), //nolint:staticcheck // It must be removed in v2.
+ 			)
+ 
+ 			wrapper.init(context.Log, settings)
+diff --git a/pkg/golinters/gocritic/testdata/gocritic_configDir.go b/pkg/golinters/gocritic/testdata/gocritic_configDir.go
+new file mode 100644
+index 00000000..e4cd0221
+--- /dev/null
++++ b/pkg/golinters/gocritic/testdata/gocritic_configDir.go
+@@ -0,0 +1,72 @@
++//golangcitest:args -Egocritic
++//golangcitest:config_path testdata/gocritic_configDir.yml
++package testdata
++
++import (
++	"flag"
++	"io"
++	"log"
++	"strings"
++)
++
++var _ = *flag.Bool("global1", false, "") // want `flagDeref: immediate deref in \*flag.Bool\(.global1., false, ..\) is most likely an error; consider using flag\.BoolVar`
++
++type size1 struct {
++	a [12]bool
++}
++
++type size2 struct {
++	size1
++	b [12]bool
++}
++
++func gocriticAppendAssign() {
++	var positives, negatives []int
++	positives = append(negatives, 1)
++	negatives = append(negatives, -1)
++	log.Print(positives, negatives)
++}
++
++func gocriticDupSubExpr(x bool) {
++	if x && x { // want "dupSubExpr: suspicious identical LHS and RHS.*"
++		log.Print("x is true")
++	}
++}
++
++func gocriticHugeParamSize1(ss size1) {
++	log.Print(ss)
++}
++
++func gocriticHugeParamSize2(ss size2) { // want "hugeParam: ss is heavy \\(24 bytes\\); consider passing it by pointer"
++	log.Print(ss)
++}
++
++func gocriticHugeParamSize2Ptr(ss *size2) {
++	log.Print(*ss)
++}
++
++func gocriticSwitchTrue() {
++	switch true {
++	case false:
++		log.Print("false")
++	default:
++		log.Print("default")
++	}
++}
++
++func goCriticPreferStringWriter(w interface {
++	io.Writer
++	io.StringWriter
++}) {
++	w.Write([]byte("test")) // want "ruleguard: w\\.WriteString\\(\"test\"\\) should be preferred.*"
++}
++
++func gocriticStringSimplify() {
++	s := "Most of the time, travellers worry about their luggage."
++	s = strings.Replace(s, ",", "", -1) // want "ruleguard: this Replace call can be simplified.*"
++	log.Print(s)
++}
++
++func gocriticRuleWrapperFunc() {
++	strings.Replace("abcabc", "a", "d", -1) // want "ruleguard: this Replace call can be simplified.*"
++}
+diff --git a/pkg/golinters/gocritic/testdata/gocritic_configDir.yml b/pkg/golinters/gocritic/testdata/gocritic_configDir.yml
+new file mode 100644
+index 00000000..a4088504
+--- /dev/null
++++ b/pkg/golinters/gocritic/testdata/gocritic_configDir.yml
+@@ -0,0 +1,16 @@
++version: "2"
++
++linters-settings:
++  gocritic:
++    disabled-checks:
++      - appendAssign
++      - switchTrue
++    enabled-checks:
++      - hugeParam
++      - ruleguard
++    settings:
++      hugeParam:
++        sizeThreshold: 24
++      ruleguard:
++        failOn: dsl,import
++        rules: '${configDir}/ruleguard/preferWriteString.go,${configDir}/ruleguard/stringsSimplify.go'
+diff --git a/pkg/golinters/internal/commons.go b/pkg/golinters/internal/commons.go
+index f00b6ceb..ebb0b13a 100644
+--- a/pkg/golinters/internal/commons.go
++++ b/pkg/golinters/internal/commons.go
+@@ -5,5 +5,11 @@ import "github.com/golangci/golangci-lint/pkg/logutils"
+ // LinterLogger must be use only when the context logger is not available.
+ var LinterLogger = logutils.NewStderrLog(logutils.DebugKeyLinter)
+ 
+-// PlaceholderBasePath used inside linters to evaluate relative paths.
+-const PlaceholderBasePath = "${base-path}"
++// Placeholders used inside linters to evaluate relative paths.
++const (
++	PlaceholderBasePath = "${base-path}"
++	// Deprecated: it must be removed in v2.
++	// [PlaceholderBasePath] will be the only one placeholder as it is a dynamic value based on
++	// [github.com/golangci/golangci-lint/pkg/config.Run.RelativePathMode].
++	PlaceholderConfigDir = "${configDir}"
++)
+diff --git a/pkg/lint/lintersdb/builder_plugin_go.go b/pkg/lint/lintersdb/builder_plugin_go.go
+index 15d0a258..e9f6931f 100644
+--- a/pkg/lint/lintersdb/builder_plugin_go.go
++++ b/pkg/lint/lintersdb/builder_plugin_go.go
+@@ -83,7 +83,15 @@ func (b *PluginGoBuilder) loadConfig(cfg *config.Config, name string, settings *
+ // or the linter does not implement the AnalyzerPlugin interface.
+ func (b *PluginGoBuilder) getAnalyzerPlugin(cfg *config.Config, path string, settings any) ([]*analysis.Analyzer, error) {
+ 	if !filepath.IsAbs(path) {
+-		basePath, err := fsutils.GetBasePath(context.Background(), cfg.Run.RelativePathMode, cfg.GetConfigDir())
++		// Hack for compatibility:
++		// the previous default (v1) was `cfg` but `fsutils.GetBasePath` defaults on `wd`.
++		// TODO(ldez): should be removed in v2.
++		relativePathMode := cfg.Run.RelativePathMode
++		if relativePathMode == "" {
++			relativePathMode = fsutils.RelativePathModeCfg
++		}
++
++		basePath, err := fsutils.GetBasePath(context.Background(), relativePathMode, cfg.GetConfigDir())
+ 		if err != nil {
+ 			return nil, fmt.Errorf("get base path: %w", err)
+ 		}
+diff --git a/test/run_test.go b/test/run_test.go
+index 84e6d139..8fad2e6f 100644
+--- a/test/run_test.go
++++ b/test/run_test.go
+@@ -548,12 +548,12 @@ func TestPathPrefix(t *testing.T) {
+ 	}{
+ 		{
+ 			desc:    "empty",
+-			pattern: "^test/testdata/withtests/",
++			pattern: "^testdata/withtests/",
+ 		},
+ 		{
+ 			desc:    "prefixed",
+ 			args:    []string{"--path-prefix=cool"},
+-			pattern: "^cool/test/testdata/withtests",
++			pattern: "^cool/testdata/withtests",
+ 		},
+ 	}
+ 
+diff --git a/test/testdata/configs/default_exclude.yml b/test/testdata/configs/default_exclude.yml
+index eb719139..087e4bcc 100644
+--- a/test/testdata/configs/default_exclude.yml
++++ b/test/testdata/configs/default_exclude.yml
+@@ -6,6 +6,3 @@ linters:
+       - std-error-handling
+       - common-false-positives
+       - legacy
+-
+-run:
+-  relative-path-mode: wd
+diff --git a/test/testdata/configs/multiple-issues-fix.yml b/test/testdata/configs/multiple-issues-fix.yml
+index 6ab63fd8..2ea2120b 100644
+--- a/test/testdata/configs/multiple-issues-fix.yml
++++ b/test/testdata/configs/multiple-issues-fix.yml
+@@ -6,6 +6,3 @@ formatters:
+   settings:
+     gofumpt:
+       extra-rules: true
+-
+-run:
+-  relative-path-mode: wd
+diff --git a/test/testdata/configs/output.yml b/test/testdata/configs/output.yml
+index 81e14d86..485487f2 100644
+--- a/test/testdata/configs/output.yml
++++ b/test/testdata/configs/output.yml
+@@ -6,6 +6,3 @@ linters-settings:
+     ignore-words:
+       - langauge
+       - Dialogue
+-
+-run:
+-  relative-path-mode: wd
+diff --git a/test/testdata/configs/path-except.yml b/test/testdata/configs/path-except.yml
+index d07a62f8..44a60814 100644
+--- a/test/testdata/configs/path-except.yml
++++ b/test/testdata/configs/path-except.yml
+@@ -14,6 +14,3 @@ linters:
+       - path-except: _test\.go
+         linters:
+           - forbidigo
+-
+-run:
+-  relative-path-mode: wd

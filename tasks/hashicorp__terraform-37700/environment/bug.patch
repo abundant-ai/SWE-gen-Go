@@ -1,0 +1,550 @@
+diff --git a/internal/plans/deferring/deferred.go b/internal/plans/deferring/deferred.go
+index 4a9a17b71a..e5d89122a6 100644
+--- a/internal/plans/deferring/deferred.go
++++ b/internal/plans/deferring/deferred.go
+@@ -7,7 +7,6 @@ import (
+ 	"fmt"
+ 	"sync"
+ 
+-	"github.com/hashicorp/hcl/v2"
+ 	"github.com/zclconf/go-cty/cty"
+ 
+ 	"github.com/hashicorp/terraform/internal/addrs"
+@@ -730,51 +729,64 @@ func (d *Deferred) ReportActionDeferred(addr addrs.AbsActionInstance, reason pro
+ 	configMap.Put(addr, reason)
+ }
+ 
+-// ShouldDeferActionInvocation returns true if there is a reason to defer the
+-// action invocation instance. We want to defer an action invocation only if
+-// the triggering resource was deferred. In addition, we will check if the
+-// underlying action was deferred via a reference, and consider it an error if
+-// the triggering resource wasn't also deferred.
+-//
+-// The reason behind the slightly different behaviour here, is that if an
+-// action invocation is deferred, then that implies the triggering action
+-// should also be deferred.
+-//
+-// We don't yet have the capability to retroactively defer a resource, so for
+-// now actions initiating deferrals themselves is considered an error.
+-func (d *Deferred) ShouldDeferActionInvocation(ai plans.ActionInvocationInstance, triggerRange *hcl.Range) (bool, tfdiags.Diagnostics) {
++// ShouldDeferActionInvocation returns true if there is a reason to defer the action invocation instance
++// We want to defer an action invocation if
++// a) the resource was deferred
++// or
++// b) a previously run action was deferred
++func (d *Deferred) ShouldDeferActionInvocation(ai plans.ActionInvocationInstance) bool {
+ 	d.mu.Lock()
+ 	defer d.mu.Unlock()
+ 
+-	var diags tfdiags.Diagnostics
++	// The expansion of the action itself is deferred
++	if ai.Addr.Action.Key == addrs.WildcardKey {
++		return true
++	}
++
++	if c, ok := d.actionExpansionDeferred.GetOk(ai.Addr.ConfigAction()); ok {
++		if c.Has(ai.Addr) {
++			return true
++		}
++
++		for _, k := range c.Keys() {
++			if k.Action.Key == addrs.WildcardKey {
++				return true
++			}
++		}
++	}
++
++	if d.partialExpandedActionsDeferred.Has(ai.Addr.ConfigAction()) {
++		return true
++	}
+ 
+ 	// We only want to defer actions that are lifecycle triggered
+ 	at, ok := ai.ActionTrigger.(*plans.LifecycleActionTrigger)
+ 	if !ok {
+-		return false, diags
++		return false
+ 	}
+ 
+ 	// If the resource was deferred, we also need to defer any action potentially triggering from this
+ 	if configResourceMap, ok := d.resourceInstancesDeferred.GetOk(at.TriggeringResourceAddr.ConfigResource()); ok {
+ 		if configResourceMap.Has(at.TriggeringResourceAddr) {
+-			return true, diags
++			return true
+ 		}
+ 	}
+ 
+-	if c, ok := d.actionExpansionDeferred.GetOk(ai.Addr.ConfigAction()); ok {
+-		if c.Has(ai.Addr) {
+-			// Then in this case, the resource wasn't deferred but the action
+-			// was and so we will consider this to be an error.
+-			diags = diags.Append(&hcl.Diagnostic{
+-				Severity: hcl.DiagError,
+-				Summary:  "Invalid action deferral",
+-				Detail:   fmt.Sprintf("The action %s was marked as deferred, but was triggered by a non-deferred resource %s. To work around this, use the -target argument to first apply only the resources that the action block depends on.", ai.Addr, at.TriggeringResourceAddr),
+-				Subject:  triggerRange,
+-			})
++	// Since all actions plan in order we can just check if an action for this resource instance
++	// has been deferred already
++	for _, deferred := range d.actionInvocationDeferred {
++		deferredAt, deferredOk := deferred.ActionInvocationInstance.ActionTrigger.(*plans.LifecycleActionTrigger)
++		if !deferredOk {
++			continue // We only care about lifecycle triggered actions here
++		}
++
++		if deferredAt.TriggeringResourceAddr.Equal(at.TriggeringResourceAddr) {
++			return true
+ 		}
+ 	}
+ 
+-	return false, diags
++	// We found no reason, so we return false
++	return false
+ }
+ 
+ // ShouldDeferAction returns true if the action should be deferred. This is the case if a
+diff --git a/internal/terraform/context_plan_actions_test.go b/internal/terraform/context_plan_actions_test.go
+index 2dfd0854c1..b928fd6252 100644
+--- a/internal/terraform/context_plan_actions_test.go
++++ b/internal/terraform/context_plan_actions_test.go
+@@ -1818,7 +1818,7 @@ resource "test_object" "a" {
+ 				expectPlanActionCalled: true,
+ 				planOpts: &PlanOpts{
+ 					Mode:            plans.NormalMode,
+-					DeferralAllowed: true, // actions should ignore this setting
++					DeferralAllowed: true,
+ 				},
+ 				planActionFn: func(*testing.T, providers.PlanActionRequest) providers.PlanActionResponse {
+ 					return providers.PlanActionResponse{
+@@ -1827,13 +1827,25 @@ resource "test_object" "a" {
+ 						},
+ 					}
+ 				},
+-				expectPlanDiagnostics: func(m *configs.Config) tfdiags.Diagnostics {
+-					return tfdiags.Diagnostics{
+-						tfdiags.Sourceless(
+-							tfdiags.Error,
+-							"Provider deferred changes when Terraform did not allow deferrals",
+-							`The provider signaled a deferred action for "action.test_action.hello", but in this context deferrals are disabled. This is a bug in the provider, please file an issue with the provider developers.`,
+-						),
++
++				assertPlan: func(t *testing.T, p *plans.Plan) {
++					if len(p.Changes.ActionInvocations) != 0 {
++						t.Fatalf("expected 0 actions in plan, got %d", len(p.Changes.ActionInvocations))
++					}
++
++					if len(p.DeferredActionInvocations) != 1 {
++						t.Fatalf("expected 1 deferred action in plan, got %d", len(p.DeferredActionInvocations))
++					}
++					deferredActionInvocation := p.DeferredActionInvocations[0]
++					if deferredActionInvocation.DeferredReason != providers.DeferredReasonAbsentPrereq {
++						t.Fatalf("expected deferred action to be deferred due to absent prereq, but got %s", deferredActionInvocation.DeferredReason)
++					}
++					if deferredActionInvocation.ActionInvocationInstanceSrc.ActionTrigger.(*plans.LifecycleActionTrigger).TriggeringResourceAddr.String() != "test_object.a" {
++						t.Fatalf("expected deferred action to be triggered by test_object.a, but got %s", deferredActionInvocation.ActionInvocationInstanceSrc.ActionTrigger.(*plans.LifecycleActionTrigger).TriggeringResourceAddr.String())
++					}
++
++					if deferredActionInvocation.ActionInvocationInstanceSrc.Addr.String() != "action.test_action.hello" {
++						t.Fatalf("expected deferred action to be triggered by action.test_action.hello, but got %s", deferredActionInvocation.ActionInvocationInstanceSrc.Addr.String())
+ 					}
+ 				},
+ 			},
+@@ -1876,17 +1888,37 @@ resource "test_object" "a" {
+ 						},
+ 					}
+ 				},
+-				expectPlanDiagnostics: func(m *configs.Config) tfdiags.Diagnostics {
+-					// for now, it's just an error for any deferrals but when
+-					// this gets implemented we should check that all the
+-					// actions are deferred even though only one of them
+-					// was actually marked as deferred.
+-					return tfdiags.Diagnostics{
+-						tfdiags.Sourceless(
+-							tfdiags.Error,
+-							"Provider deferred changes when Terraform did not allow deferrals",
+-							`The provider signaled a deferred action for "action.test_action.hello", but in this context deferrals are disabled. This is a bug in the provider, please file an issue with the provider developers.`,
+-						),
++
++				assertPlan: func(t *testing.T, p *plans.Plan) {
++					if len(p.Changes.ActionInvocations) != 0 {
++						t.Fatalf("expected 0 actions in plan, got %d", len(p.Changes.ActionInvocations))
++					}
++
++					if len(p.DeferredActionInvocations) != 2 {
++						t.Fatalf("expected 2 deferred actions in plan, got %d", len(p.DeferredActionInvocations))
++					}
++					firstDeferredActionInvocation := p.DeferredActionInvocations[0]
++					if firstDeferredActionInvocation.DeferredReason != providers.DeferredReasonAbsentPrereq {
++						t.Fatalf("expected deferred action to be deferred due to absent prereq, but got %s", firstDeferredActionInvocation.DeferredReason)
++					}
++					if firstDeferredActionInvocation.ActionInvocationInstanceSrc.ActionTrigger.(*plans.LifecycleActionTrigger).TriggeringResourceAddr.String() != "test_object.a" {
++						t.Fatalf("expected deferred action to be triggered by test_object.a, but got %s", firstDeferredActionInvocation.ActionInvocationInstanceSrc.ActionTrigger.(*plans.LifecycleActionTrigger).TriggeringResourceAddr.String())
++					}
++
++					if firstDeferredActionInvocation.ActionInvocationInstanceSrc.Addr.String() != "action.test_action.hello" {
++						t.Fatalf("expected deferred action to be triggered by action.test_action.hello, but got %s", firstDeferredActionInvocation.ActionInvocationInstanceSrc.Addr.String())
++					}
++
++					secondDeferredActionInvocation := p.DeferredActionInvocations[1]
++					if secondDeferredActionInvocation.DeferredReason != providers.DeferredReasonDeferredPrereq {
++						t.Fatalf("expected second deferred action to be deferred due to deferred prereq, but got %s", secondDeferredActionInvocation.DeferredReason)
++					}
++					if secondDeferredActionInvocation.ActionInvocationInstanceSrc.ActionTrigger.(*plans.LifecycleActionTrigger).TriggeringResourceAddr.String() != "test_object.a" {
++						t.Fatalf("expected second deferred action to be triggered by test_object.a, but got %s", secondDeferredActionInvocation.ActionInvocationInstanceSrc.ActionTrigger.(*plans.LifecycleActionTrigger).TriggeringResourceAddr.String())
++					}
++
++					if secondDeferredActionInvocation.ActionInvocationInstanceSrc.Addr.String() != "action.ecosystem.world" {
++						t.Fatalf("expected second deferred action to be triggered by action.ecosystem.world, but got %s", secondDeferredActionInvocation.ActionInvocationInstanceSrc.Addr.String())
+ 					}
+ 				},
+ 			},
+@@ -1933,17 +1965,50 @@ resource "test_object" "a" {
+ 						},
+ 					}
+ 				},
+-				expectPlanDiagnostics: func(m *configs.Config) tfdiags.Diagnostics {
+-					// for now, it's just an error for any deferrals but when
+-					// this gets implemented we should check that all the
+-					// actions are deferred even though only one of them
+-					// was actually marked as deferred.
+-					return tfdiags.Diagnostics{
+-						tfdiags.Sourceless(
+-							tfdiags.Error,
+-							"Provider deferred changes when Terraform did not allow deferrals",
+-							`The provider signaled a deferred action for "action.test_action.hello", but in this context deferrals are disabled. This is a bug in the provider, please file an issue with the provider developers.`,
+-						),
++
++				assertPlan: func(t *testing.T, p *plans.Plan) {
++					if len(p.Changes.ActionInvocations) != 0 {
++						t.Fatalf("expected 0 actions in plan, got %d", len(p.Changes.ActionInvocations))
++					}
++
++					if len(p.DeferredActionInvocations) != 2 {
++						t.Fatalf("expected 2 deferred actions in plan, got %d", len(p.DeferredActionInvocations))
++					}
++					firstDeferredActionInvocation := p.DeferredActionInvocations[0]
++					if firstDeferredActionInvocation.DeferredReason != providers.DeferredReasonAbsentPrereq {
++						t.Fatalf("expected deferred action to be deferred due to absent prereq, but got %s", firstDeferredActionInvocation.DeferredReason)
++					}
++					if firstDeferredActionInvocation.ActionInvocationInstanceSrc.ActionTrigger.(*plans.LifecycleActionTrigger).TriggeringResourceAddr.String() != "test_object.a" {
++						t.Fatalf("expected deferred action to be triggered by test_object.a, but got %s", firstDeferredActionInvocation.ActionInvocationInstanceSrc.ActionTrigger.(*plans.LifecycleActionTrigger).TriggeringResourceAddr.String())
++					}
++
++					if firstDeferredActionInvocation.ActionInvocationInstanceSrc.Addr.String() != "action.test_action.hello" {
++						t.Fatalf("expected deferred action to be triggered by action.test_action.hello, but got %s", firstDeferredActionInvocation.ActionInvocationInstanceSrc.Addr.String())
++					}
++
++					secondDeferredActionInvocation := p.DeferredActionInvocations[1]
++					if secondDeferredActionInvocation.DeferredReason != providers.DeferredReasonDeferredPrereq {
++						t.Fatalf("expected second deferred action to be deferred due to deferred prereq, but got %s", secondDeferredActionInvocation.DeferredReason)
++					}
++					if secondDeferredActionInvocation.ActionInvocationInstanceSrc.ActionTrigger.(*plans.LifecycleActionTrigger).TriggeringResourceAddr.String() != "test_object.a" {
++						t.Fatalf("expected second deferred action to be triggered by test_object.a, but got %s", secondDeferredActionInvocation.ActionInvocationInstanceSrc.ActionTrigger.(*plans.LifecycleActionTrigger).TriggeringResourceAddr.String())
++					}
++
++					if secondDeferredActionInvocation.ActionInvocationInstanceSrc.Addr.String() != "action.ecosystem.world" {
++						t.Fatalf("expected second deferred action to be triggered by action.ecosystem.world, but got %s", secondDeferredActionInvocation.ActionInvocationInstanceSrc.Addr.String())
++					}
++
++					if len(p.DeferredResources) != 1 {
++						t.Fatalf("expected 1 resource to be deferred, got %d", len(p.DeferredResources))
++					}
++					deferredResource := p.DeferredResources[0]
++
++					if deferredResource.ChangeSrc.Addr.String() != "test_object.a" {
++						t.Fatalf("Expected resource %s to be deferred, but it was not", deferredResource.ChangeSrc.Addr)
++					}
++
++					if deferredResource.DeferredReason != providers.DeferredReasonDeferredPrereq {
++						t.Fatalf("Expected deferred reason to be deferred prereq, got %s", deferredResource.DeferredReason)
+ 					}
+ 				},
+ 			},
+@@ -2065,17 +2130,26 @@ resource "test_object" "a" {
+ 						},
+ 					},
+ 				},
+-				assertPlanDiagnostics: func(t *testing.T, diagnostics tfdiags.Diagnostics) {
+-					if len(diagnostics) != 1 {
+-						t.Fatal("wrong number of diagnostics")
++				assertPlan: func(t *testing.T, p *plans.Plan) {
++					if len(p.DeferredActionInvocations) != 1 {
++						t.Fatalf("expected exactly one invocation, and found %d", len(p.DeferredActionInvocations))
+ 					}
+ 
+-					if diagnostics[0].Severity() != tfdiags.Error {
+-						t.Error("expected error severity")
++					if p.DeferredActionInvocations[0].DeferredReason != providers.DeferredReasonDeferredPrereq {
++						t.Fatalf("expected.DeferredReasonDeferredPrereq, got %s", p.DeferredActionInvocations[0].DeferredReason)
+ 					}
+ 
+-					if diagnostics[0].Description().Summary != "Invalid for_each argument" {
+-						t.Errorf("expected for_each argument to be source of error but was %s", diagnostics[0].Description().Summary)
++					ai := p.DeferredActionInvocations[0].ActionInvocationInstanceSrc
++					if ai.Addr.String() != `action.test_action.hello["a"]` {
++						t.Fatalf(`expected action invocation for action.test_action.hello["a"], got %s`, ai.Addr.String())
++					}
++
++					if len(p.DeferredResources) != 1 {
++						t.Fatalf("expected 1 deferred resource, got %d", len(p.DeferredResources))
++					}
++
++					if p.DeferredResources[0].ChangeSrc.Addr.String() != "test_object.a" {
++						t.Fatalf("expected test_object.a, got %s", p.DeferredResources[0].ChangeSrc.Addr.String())
+ 					}
+ 				},
+ 			},
+@@ -2261,17 +2335,42 @@ resource "test_object" "a" {
+ 					}
+ 				},
+ 
+-				assertPlanDiagnostics: func(t *testing.T, diagnostics tfdiags.Diagnostics) {
+-					if len(diagnostics) != 1 {
+-						t.Fatal("wrong number of diagnostics")
++				assertPlan: func(t *testing.T, p *plans.Plan) {
++					if len(p.DeferredActionInvocations) != 1 {
++						t.Errorf("Expected 1 deferred action invocation, got %d", len(p.DeferredActionInvocations))
++					}
++					if p.DeferredActionInvocations[0].ActionInvocationInstanceSrc.Addr.String() != "action.test_action.hello" {
++						t.Errorf("Expected action. test_action.hello, got %s", p.DeferredActionInvocations[0].ActionInvocationInstanceSrc.Addr.String())
++					}
++					if p.DeferredActionInvocations[0].DeferredReason != providers.DeferredReasonDeferredPrereq {
++						t.Errorf("Expected DeferredReasonDeferredPrereq, got %s", p.DeferredActionInvocations[0].DeferredReason)
+ 					}
+ 
+-					if diagnostics[0].Severity() != tfdiags.Error {
+-						t.Error("expected error diagnostics")
++					if len(p.DeferredResources) != 2 {
++						t.Fatalf("Expected 2 deferred resources, got %d", len(p.DeferredResources))
+ 					}
+ 
+-					if diagnostics[0].Description().Summary != "Invalid action deferral" {
+-						t.Errorf("expected deferral to be source of error was %s", diagnostics[0].Description().Summary)
++					slices.SortFunc(p.DeferredResources, func(a, b *plans.DeferredResourceInstanceChangeSrc) int {
++						if a.ChangeSrc.Addr.Less(b.ChangeSrc.Addr) {
++							return -1
++						}
++						if b.ChangeSrc.Addr.Less(a.ChangeSrc.Addr) {
++							return 1
++						}
++						return 0
++					})
++
++					if p.DeferredResources[0].ChangeSrc.Addr.String() != "test_object.a" {
++						t.Errorf("Expected test_object.a to be first, got %s", p.DeferredResources[0].ChangeSrc.Addr.String())
++					}
++					if p.DeferredResources[0].DeferredReason != providers.DeferredReasonDeferredPrereq {
++						t.Errorf("Expected DeferredReasonDeferredPrereq, got %s", p.DeferredResources[0].DeferredReason)
++					}
++					if p.DeferredResources[1].ChangeSrc.Addr.String() != "test_object.origin" {
++						t.Errorf("Expected test_object.origin to be second, got %s", p.DeferredResources[1].ChangeSrc.Addr.String())
++					}
++					if p.DeferredResources[1].DeferredReason != providers.DeferredReasonAbsentPrereq {
++						t.Errorf("Expected DeferredReasonAbsentPrereq, got %s", p.DeferredResources[1].DeferredReason)
+ 					}
+ 				},
+ 			},
+diff --git a/internal/terraform/node_action.go b/internal/terraform/node_action.go
+index 21ec1c39d6..9647e754bb 100644
+--- a/internal/terraform/node_action.go
++++ b/internal/terraform/node_action.go
+@@ -76,23 +76,27 @@ func (n *nodeExpandActionDeclaration) DynamicExpand(ctx EvalContext) (*Graph, tf
+ 
+ 		_, knownInstKeys, haveUnknownKeys := expander.ActionInstanceKeys(absActAddr)
+ 		if haveUnknownKeys {
+-			// this should never happen, n.recordActionData explicitly sets
+-			// allowUnknown to be false, so we should pick up diagnostics
+-			// during that call instance reaching this branch.
+-			panic("found unknown keys in action instance")
+-		}
+-
+-		// Expand the action instances for this module.
+-		for _, knownInstKey := range knownInstKeys {
+ 			node := NodeActionDeclarationInstance{
+-				Addr:             absActAddr.Instance(knownInstKey),
++				Addr:             absActAddr.Instance(addrs.WildcardKey),
+ 				Config:           &n.Config,
+ 				Schema:           n.Schema,
+ 				ResolvedProvider: n.ResolvedProvider,
+ 				Dependencies:     n.Dependencies,
+ 			}
+-
+ 			g.Add(&node)
++		} else {
++			// Expand the action instances for this module.
++			for _, knownInstKey := range knownInstKeys {
++				node := NodeActionDeclarationInstance{
++					Addr:             absActAddr.Instance(knownInstKey),
++					Config:           &n.Config,
++					Schema:           n.Schema,
++					ResolvedProvider: n.ResolvedProvider,
++					Dependencies:     n.Dependencies,
++				}
++
++				g.Add(&node)
++			}
+ 		}
+ 
+ 		addRootNodeToGraph(&g)
+@@ -109,15 +113,16 @@ func (n *nodeExpandActionDeclaration) recordActionData(ctx EvalContext, addr add
+ 	// to expand the module here to create all resources.
+ 	expander := ctx.InstanceExpander()
+ 
+-	// For now, action instances cannot evaluate to unknown. When an action
+-	// would have an unknown instance key, we'd want to defer executing that
+-	// action, and in turn defer executing the triggering resource. Delayed
+-	// deferrals are not currently possible (we need to reconfigure exactly how
+-	// deferrals are checked) so for now deferred actions are simply blocked.
++	// Allowing unknown values in count and for_each is a top-level plan option.
++	//
++	// If this is false then the codepaths that handle unknown values below
++	// become unreachable, because the evaluate functions will reject unknown
++	// values as an error.
++	allowUnknown := ctx.Deferrals().DeferralAllowed()
+ 
+ 	switch {
+ 	case n.Config.Count != nil:
+-		count, countDiags := evaluateCountExpression(n.Config.Count, ctx, false)
++		count, countDiags := evaluateCountExpression(n.Config.Count, ctx, allowUnknown)
+ 		diags = diags.Append(countDiags)
+ 		if countDiags.HasErrors() {
+ 			return diags
+@@ -126,13 +131,12 @@ func (n *nodeExpandActionDeclaration) recordActionData(ctx EvalContext, addr add
+ 		if count >= 0 {
+ 			expander.SetActionCount(addr.Module, n.Addr.Action, count)
+ 		} else {
+-			// this should not be possible as allowUnknown was set to false
+-			// in the evaluateCountExpression function call.
+-			panic("evaluateCountExpression returned unknown")
++			// -1 represents "unknown"
++			expander.SetActionCountUnknown(addr.Module, n.Addr.Action)
+ 		}
+ 
+ 	case n.Config.ForEach != nil:
+-		forEach, known, forEachDiags := evaluateForEachExpression(n.Config.ForEach, ctx, false)
++		forEach, known, forEachDiags := evaluateForEachExpression(n.Config.ForEach, ctx, allowUnknown)
+ 		diags = diags.Append(forEachDiags)
+ 		if forEachDiags.HasErrors() {
+ 			return diags
+@@ -143,9 +147,7 @@ func (n *nodeExpandActionDeclaration) recordActionData(ctx EvalContext, addr add
+ 		if known {
+ 			expander.SetActionForEach(addr.Module, n.Addr.Action, forEach)
+ 		} else {
+-			// this should not be possible as allowUnknown was set to false
+-			// in the evaluateForEachExpression function call.
+-			panic("evaluateForEachExpression returned unknown")
++			expander.SetActionForEachUnknown(addr.Module, n.Addr.Action)
+ 		}
+ 
+ 	default:
+diff --git a/internal/terraform/node_action_instance.go b/internal/terraform/node_action_instance.go
+index cec79da1d5..f27a3d5352 100644
+--- a/internal/terraform/node_action_instance.go
++++ b/internal/terraform/node_action_instance.go
+@@ -6,6 +6,7 @@ package terraform
+ import (
+ 	"github.com/zclconf/go-cty/cty"
+ 
++	"github.com/hashicorp/hcl/v2"
+ 	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/configs"
+ 	"github.com/hashicorp/terraform/internal/lang/langrefs"
+@@ -43,8 +44,22 @@ func (n *NodeActionDeclarationInstance) Path() addrs.ModuleInstance {
+ 
+ func (n *NodeActionDeclarationInstance) Execute(ctx EvalContext, _ walkOperation) tfdiags.Diagnostics {
+ 	var diags tfdiags.Diagnostics
+-
+ 	deferrals := ctx.Deferrals()
++
++	if n.Addr.Action.Key == addrs.WildcardKey {
++		if deferrals.DeferralAllowed() {
++			deferrals.ReportActionDeferred(n.Addr, providers.DeferredReasonInstanceCountUnknown)
++		} else {
++			diags = diags.Append(&hcl.Diagnostic{
++				Severity: hcl.DiagError,
++				Summary:  "Action expansion was deferred",
++				Detail:   "Deferral is not allowed in this context",
++				Subject:  n.Config.DeclRange.Ptr(),
++			})
++		}
++		return diags
++	}
++
+ 	if deferrals.DeferralAllowed() && deferrals.ShouldDeferAction(n.Dependencies) {
+ 		deferrals.ReportActionDeferred(n.Addr, providers.DeferredReasonDeferredPrereq)
+ 		return diags
+diff --git a/internal/terraform/node_action_trigger_instance_plan.go b/internal/terraform/node_action_trigger_instance_plan.go
+index 68cf1f913a..dfb10f2674 100644
+--- a/internal/terraform/node_action_trigger_instance_plan.go
++++ b/internal/terraform/node_action_trigger_instance_plan.go
+@@ -77,20 +77,20 @@ func (n *nodeActionTriggerPlanInstance) Execute(ctx EvalContext, operation walkO
+ 	}
+ 	change := ctx.Changes().GetResourceInstanceChange(n.lifecycleActionTrigger.resourceAddress, n.lifecycleActionTrigger.resourceAddress.CurrentObject().DeposedKey)
+ 
+-	deferred, moreDiags := deferrals.ShouldDeferActionInvocation(ai, n.lifecycleActionTrigger.invokingSubject)
+-	diags = diags.Append(moreDiags)
+-	if deferred {
++	// If we should defer the action invocation, we need to report it and if the resource instance
++	// was not deferred (and therefore was planned) we need to retroactively remove the change
++	if deferrals.ShouldDeferActionInvocation(ai) {
+ 		deferrals.ReportActionInvocationDeferred(ai, providers.DeferredReasonDeferredPrereq)
+-		return diags
+-	}
+-
+-	if moreDiags.HasErrors() {
+-		return diags
++		if change != nil {
++			ctx.Changes().RemoveResourceInstanceChange(change.Addr, change.Addr.CurrentObject().DeposedKey)
++			deferrals.ReportResourceInstanceDeferred(change.Addr, providers.DeferredReasonDeferredPrereq, change)
++		}
++		return nil
+ 	}
+ 
+ 	if change == nil {
+ 		// nothing to do (this may be a refresh )
+-		return diags
++		return nil
+ 	}
+ 
+ 	if n.lifecycleActionTrigger == nil {
+@@ -151,12 +151,10 @@ func (n *nodeActionTriggerPlanInstance) Execute(ctx EvalContext, operation walkO
+ 	// We remove the marks for planning, we will record the sensitive values in the plans.ActionInvocationInstance
+ 	unmarkedConfig, _ := actionInstance.ConfigValue.UnmarkDeepWithPaths()
+ 
+-	cc := ctx.ClientCapabilities()
+-	cc.DeferralAllowed = false // for now, deferrals in actions are always disabled
+ 	resp := provider.PlanAction(providers.PlanActionRequest{
+ 		ActionType:         n.actionAddress.Action.Action.Type,
+ 		ProposedActionData: unmarkedConfig,
+-		ClientCapabilities: cc,
++		ClientCapabilities: ctx.ClientCapabilities(),
+ 	})
+ 
+ 	if len(resp.Diagnostics) > 0 {
+@@ -176,9 +174,7 @@ func (n *nodeActionTriggerPlanInstance) Execute(ctx EvalContext, operation walkO
+ 			Subject:  n.lifecycleActionTrigger.invokingSubject,
+ 		})
+ 	}
+-	if resp.Deferred != nil {
+-		// we always set allow_deferrals to be false for actions, so this
+-		// should not happen
++	if resp.Deferred != nil && !deferrals.DeferralAllowed() {
+ 		diags = diags.Append(deferring.UnexpectedProviderDeferralDiagnostic(n.actionAddress))
+ 	}
+ 	if resp.Diagnostics.HasErrors() {
+@@ -190,6 +186,16 @@ func (n *nodeActionTriggerPlanInstance) Execute(ctx EvalContext, operation walkO
+ 		eventSpecificAi := ai.DeepCopy()
+ 		// We need to set the triggering event on the action invocation
+ 		eventSpecificAi.ActionTrigger = n.lifecycleActionTrigger.ActionTrigger(triggeredEvent)
++
++		// If the action is deferred, we need to also defer the resource instance
++		if resp.Deferred != nil {
++			deferrals.ReportActionInvocationDeferred(*eventSpecificAi, resp.Deferred.Reason)
++			ctx.Changes().RemoveResourceInstanceChange(change.Addr, change.Addr.CurrentObject().DeposedKey)
++			deferrals.ReportResourceInstanceDeferred(change.Addr, providers.DeferredReasonDeferredPrereq, change)
++
++			return diags
++		}
++
+ 		ctx.Changes().AppendActionInvocation(eventSpecificAi)
+ 	}
+ 	return diags

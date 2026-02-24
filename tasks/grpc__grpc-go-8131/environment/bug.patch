@@ -1,0 +1,817 @@
+diff --git a/test/xds/xds_client_ignore_resource_deletion_test.go b/test/xds/xds_client_ignore_resource_deletion_test.go
+index d4bc7ee1..8210d472 100644
+--- a/test/xds/xds_client_ignore_resource_deletion_test.go
++++ b/test/xds/xds_client_ignore_resource_deletion_test.go
+@@ -23,14 +23,12 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"net"
+-	"strings"
+ 	"sync"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/google/uuid"
+ 	"google.golang.org/grpc"
+-	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/connectivity"
+ 	"google.golang.org/grpc/credentials/insecure"
+ 	"google.golang.org/grpc/internal"
+@@ -39,7 +37,6 @@ import (
+ 	"google.golang.org/grpc/internal/testutils/xds/e2e"
+ 	"google.golang.org/grpc/internal/xds/bootstrap"
+ 	"google.golang.org/grpc/resolver"
+-	"google.golang.org/grpc/status"
+ 	"google.golang.org/grpc/xds"
+ 
+ 	clusterpb "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+@@ -204,7 +201,7 @@ func testResourceDeletionIgnored(t *testing.T, initialResource func(string) e2e.
+ // deleted by the xDSClient when a resource is missing the xDS response and subsequent
+ // RPCs fail.
+ func testResourceDeletionNotIgnored(t *testing.T, initialResource func(string) e2e.UpdateOptions, updateResource func(r *e2e.UpdateOptions)) {
+-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
++	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout*1000)
+ 	t.Cleanup(cancel)
+ 	mgmtServer := e2e.StartManagementServer(t, e2e.ManagementServerOptions{})
+ 	nodeID := uuid.New().String()
+@@ -233,19 +230,14 @@ func testResourceDeletionNotIgnored(t *testing.T, initialResource func(string) e
+ 		t.Fatal(err)
+ 	}
+ 
+-	// Spin up go routines to verify RPCs fail after the update. The xDS node ID
+-	// needs to be part of the error seen by the RPC caller.
++	// Spin up go routines to verify RPCs fail after the update.
+ 	client := testgrpc.NewTestServiceClient(cc)
+ 	wg := sync.WaitGroup{}
+ 	wg.Add(2)
+ 	go func() {
+ 		defer wg.Done()
+ 		for ; ctx.Err() == nil; <-time.After(10 * time.Millisecond) {
+-			_, err := client.EmptyCall(ctx, &testpb.Empty{})
+-			if err == nil {
+-				continue
+-			}
+-			if status.Code(err) == codes.Unavailable && strings.Contains(err.Error(), nodeID) {
++			if _, err := client.EmptyCall(ctx, &testpb.Empty{}); err != nil {
+ 				return
+ 			}
+ 		}
+@@ -253,11 +245,7 @@ func testResourceDeletionNotIgnored(t *testing.T, initialResource func(string) e
+ 	go func() {
+ 		defer wg.Done()
+ 		for ; ctx.Err() == nil; <-time.After(10 * time.Millisecond) {
+-			_, err := client.UnaryCall(ctx, &testpb.SimpleRequest{})
+-			if err == nil {
+-				continue
+-			}
+-			if status.Code(err) == codes.Unavailable && strings.Contains(err.Error(), nodeID) {
++			if _, err := client.UnaryCall(ctx, &testpb.SimpleRequest{}); err != nil {
+ 				return
+ 			}
+ 		}
+@@ -288,7 +276,7 @@ func generateBootstrapContents(t *testing.T, serverURI string, ignoreResourceDel
+ 	}
+ 	bootstrapContents, err := bootstrap.NewContentsForTesting(bootstrap.ConfigOptionsForTesting{
+ 		Servers:                            serverCfgs,
+-		Node:                               fmt.Appendf(nil, `{"id": "%s"}`, nodeID),
++		Node:                               []byte(fmt.Sprintf(`{"id": "%s"}`, nodeID)),
+ 		ServerListenerResourceNameTemplate: e2e.ServerListenerResourceNameTemplate,
+ 	})
+ 	if err != nil {
+diff --git a/xds/internal/balancer/cdsbalancer/cdsbalancer.go b/xds/internal/balancer/cdsbalancer/cdsbalancer.go
+index f282b43c..3f055a29 100644
+--- a/xds/internal/balancer/cdsbalancer/cdsbalancer.go
++++ b/xds/internal/balancer/cdsbalancer/cdsbalancer.go
+@@ -430,21 +430,6 @@ func (b *cdsBalancer) ExitIdle() {
+ 	})
+ }
+ 
+-// Node ID needs to be manually added to errors generated in the following
+-// scenarios:
+-//   - resource-does-not-exist: since the xDS watch API uses a separate callback
+-//     instead of returning an error value. TODO(gRFC A88): Once A88 is
+-//     implemented, the xDS client will be able to add the node ID to
+-//     resource-does-not-exist errors as well, and we can get rid of this
+-//     special handling.
+-//   - received a good update from the xDS client, but the update either contains
+-//     an invalid security configuration or contains invalid aggragate cluster
+-//     config.
+-func (b *cdsBalancer) annotateErrorWithNodeID(err error) error {
+-	nodeID := b.xdsClient.BootstrapConfig().Node().GetId()
+-	return fmt.Errorf("[xDS node id: %v]: %w", nodeID, err)
+-}
+-
+ // Handles a good Cluster update from the xDS client. Kicks off the discovery
+ // mechanism generation process from the top-level cluster and if the cluster
+ // graph is resolved, generates child policy config and pushes it down.
+@@ -474,7 +459,7 @@ func (b *cdsBalancer) onClusterUpdate(name string, update xdsresource.ClusterUpd
+ 			// If the security config is invalid, for example, if the provider
+ 			// instance is not found in the bootstrap config, we need to put the
+ 			// channel in transient failure.
+-			b.onClusterError(name, b.annotateErrorWithNodeID(fmt.Errorf("received Cluster resource contains invalid security config: %v", err)))
++			b.onClusterError(name, fmt.Errorf("received Cluster resource contains invalid security config: %v", err))
+ 			return
+ 		}
+ 	}
+@@ -482,12 +467,12 @@ func (b *cdsBalancer) onClusterUpdate(name string, update xdsresource.ClusterUpd
+ 	clustersSeen := make(map[string]bool)
+ 	dms, ok, err := b.generateDMsForCluster(b.lbCfg.ClusterName, 0, nil, clustersSeen)
+ 	if err != nil {
+-		b.onClusterError(b.lbCfg.ClusterName, b.annotateErrorWithNodeID(fmt.Errorf("failed to generate discovery mechanisms: %v", err)))
++		b.onClusterError(b.lbCfg.ClusterName, fmt.Errorf("failed to generate discovery mechanisms: %v", err))
+ 		return
+ 	}
+ 	if ok {
+ 		if len(dms) == 0 {
+-			b.onClusterError(b.lbCfg.ClusterName, b.annotateErrorWithNodeID(fmt.Errorf("aggregate cluster graph has no leaf clusters")))
++			b.onClusterError(b.lbCfg.ClusterName, fmt.Errorf("aggregate cluster graph has no leaf clusters"))
+ 			return
+ 		}
+ 		// Child policy is built the first time we resolve the cluster graph.
+@@ -572,7 +557,7 @@ func (b *cdsBalancer) onClusterError(name string, err error) {
+ //
+ // Only executed in the context of a serializer callback.
+ func (b *cdsBalancer) onClusterResourceNotFound(name string) {
+-	err := b.annotateErrorWithNodeID(xdsresource.NewErrorf(xdsresource.ErrorTypeResourceNotFound, "cluster %q not found", name))
++	err := xdsresource.NewErrorf(xdsresource.ErrorTypeResourceNotFound, "cluster %q not found", name)
+ 	b.closeChildPolicyAndReportTF(err)
+ }
+ 
+diff --git a/xds/internal/balancer/cdsbalancer/cdsbalancer_test.go b/xds/internal/balancer/cdsbalancer/cdsbalancer_test.go
+index 6d228991..f8309ab0 100644
+--- a/xds/internal/balancer/cdsbalancer/cdsbalancer_test.go
++++ b/xds/internal/balancer/cdsbalancer/cdsbalancer_test.go
+@@ -19,6 +19,7 @@ package cdsbalancer
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"strings"
+@@ -300,22 +301,6 @@ func compareLoadBalancingConfig(ctx context.Context, lbCfgCh chan serviceconfig.
+ 	return nil
+ }
+ 
+-func verifyRPCError(gotErr error, wantCode codes.Code, wantErr, wantNodeID string) error {
+-	if gotErr == nil {
+-		return fmt.Errorf("RPC succeeded when expecting an error with code %v, message %q and nodeID %q", wantCode, wantErr, wantNodeID)
+-	}
+-	if gotCode := status.Code(gotErr); gotCode != wantCode {
+-		return fmt.Errorf("RPC failed with code: %v, want code %v", gotCode, wantCode)
+-	}
+-	if !strings.Contains(gotErr.Error(), wantErr) {
+-		return fmt.Errorf("RPC failed with error: %v, want %q", gotErr, wantErr)
+-	}
+-	if !strings.Contains(gotErr.Error(), wantNodeID) {
+-		return fmt.Errorf("RPC failed with error: %v, want nodeID %q", gotErr, wantNodeID)
+-	}
+-	return nil
+-}
+-
+ // Tests the functionality that handles LB policy configuration. Verifies that
+ // the appropriate xDS resource is requested corresponding to the provided LB
+ // policy configuration. Also verifies that when the LB policy receives the same
+@@ -724,13 +709,15 @@ func (s) TestClusterUpdate_Failure(t *testing.T) {
+ 
+ 	testutils.AwaitState(ctx, t, cc, connectivity.TransientFailure)
+ 
+-	// Ensure that the NACK error and the xDS node ID are propagated to the RPC
+-	// caller.
++	// Ensure that the NACK error is propagated to the RPC caller.
+ 	const wantClusterNACKErr = "unsupported config_source_specifier"
+ 	client := testgrpc.NewTestServiceClient(cc)
+ 	_, err := client.EmptyCall(ctx, &testpb.Empty{})
+-	if err := verifyRPCError(err, codes.Unavailable, wantClusterNACKErr, nodeID); err != nil {
+-		t.Fatal(err)
++	if code := status.Code(err); code != codes.Unavailable {
++		t.Fatalf("EmptyCall() failed with code: %v, want %v", code, codes.Unavailable)
++	}
++	if err != nil && !strings.Contains(err.Error(), wantClusterNACKErr) {
++		t.Fatalf("EmptyCall() failed with err: %v, want err containing: %v", err, wantClusterNACKErr)
+ 	}
+ 
+ 	// Start a test service backend.
+@@ -824,10 +811,8 @@ func (s) TestResolverError(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 
+-	// Push a resolver error that is not a resource-not-found error. Here, we
+-	// assume that errors from the xDS client or from the xDS resolver contain
+-	// the xDS node ID.
+-	resolverErr := fmt.Errorf("[xds node id: %s]: resolver-error-not-a-resource-not-found-error", nodeID)
++	// Push a resolver error that is not a resource-not-found error.
++	resolverErr := errors.New("resolver-error-not-a-resource-not-found-error")
+ 	r.ReportError(resolverErr)
+ 
+ 	testutils.AwaitState(ctx, t, cc, connectivity.TransientFailure)
+@@ -841,8 +826,11 @@ func (s) TestResolverError(t *testing.T) {
+ 	// Ensure that the resolver error is propagated to the RPC caller.
+ 	client := testgrpc.NewTestServiceClient(cc)
+ 	_, err = client.EmptyCall(ctx, &testpb.Empty{})
+-	if err := verifyRPCError(err, codes.Unavailable, resolverErr.Error(), nodeID); err != nil {
+-		t.Fatal(err)
++	if code := status.Code(err); code != codes.Unavailable {
++		t.Fatalf("EmptyCall() failed with code: %v, want %v", code, codes.Unavailable)
++	}
++	if err != nil && !strings.Contains(err.Error(), resolverErr.Error()) {
++		t.Fatalf("EmptyCall() failed with err: %v, want %v", err, resolverErr)
+ 	}
+ 
+ 	// Also verify that the watch for the cluster resource is not cancelled.
+@@ -903,15 +891,8 @@ func (s) TestResolverError(t *testing.T) {
+ 		t.Fatal("Timeout when waiting for resolver error to be pushed to the child policy")
+ 	}
+ 
+-	// Push a resource-not-found-error this time around. Our xDS resolver does
+-	// not send this error though. When an LDS or RDS resource is missing, the
+-	// xDS resolver instead sends an erroring config selector which returns an
+-	// error at RPC time with the xDS node ID, for new RPCs. Once ongoing RPCs
+-	// complete, the xDS resolver will send an empty service config with no
+-	// addresses, which will result in pick_first being configured on the
+-	// channel. And pick_first will put the channel in TRANSIENT_FAILURE since
+-	// it would have received an update with no addresses.
+-	resolverErr = fmt.Errorf("[xds node id: %s]: %w", nodeID, xdsresource.NewError(xdsresource.ErrorTypeResourceNotFound, "xds resource not found error"))
++	// Push a resource-not-found-error this time around.
++	resolverErr = xdsresource.NewError(xdsresource.ErrorTypeResourceNotFound, "xds resource not found error")
+ 	r.ReportError(resolverErr)
+ 
+ 	// Wait for the CDS resource to be not requested anymore, or the connection
+@@ -933,10 +914,11 @@ func (s) TestResolverError(t *testing.T) {
+ 
+ 	testutils.AwaitState(ctx, t, cc, connectivity.TransientFailure)
+ 
+-	// Ensure that the resolver error is propagated to the RPC caller.
+-	_, err = client.EmptyCall(ctx, &testpb.Empty{})
+-	if err := verifyRPCError(err, codes.Unavailable, resolverErr.Error(), nodeID); err != nil {
+-		t.Fatal(err)
++	// Ensure RPC fails with Unavailable. The actual error message depends on
++	// the picker returned from the priority LB policy, and therefore not
++	// checking for it here.
++	if _, err := client.EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.Unavailable {
++		t.Fatalf("EmptyCall() failed with code: %v, want %v", status.Code(err), codes.Unavailable)
+ 	}
+ }
+ 
+@@ -998,12 +980,14 @@ func (s) TestClusterUpdate_ResourceNotFound(t *testing.T) {
+ 
+ 	testutils.AwaitState(ctx, t, cc, connectivity.TransientFailure)
+ 
+-	// Ensure RPC fails with Unavailable status code and the error message is
+-	// meaningful and contains the xDS node ID.
++	// Ensure RPC fails with Unavailable.
+ 	wantErr := fmt.Sprintf("cluster %q not found", clusterName)
+ 	_, err := client.EmptyCall(ctx, &testpb.Empty{})
+-	if err := verifyRPCError(err, codes.Unavailable, wantErr, nodeID); err != nil {
+-		t.Fatal(err)
++	if status.Code(err) != codes.Unavailable {
++		t.Fatalf("EmptyCall() failed with code: %v, want %v", status.Code(err), codes.Unavailable)
++	}
++	if !strings.Contains(err.Error(), wantErr) {
++		t.Fatalf("EmptyCall() failed with error: %v, want %v", err, wantErr)
+ 	}
+ 
+ 	// Re-add the cluster resource to the management server.
+diff --git a/xds/internal/balancer/priority/balancer.go b/xds/internal/balancer/priority/balancer.go
+index 194e0319..761f6eea 100644
+--- a/xds/internal/balancer/priority/balancer.go
++++ b/xds/internal/balancer/priority/balancer.go
+@@ -210,9 +210,6 @@ func (b *priorityBalancer) UpdateClientConnState(s balancer.ClientConnState) err
+ }
+ 
+ func (b *priorityBalancer) ResolverError(err error) {
+-	if b.logger.V(2) {
+-		b.logger.Infof("Received error from the resolver: %v", err)
+-	}
+ 	b.bg.ResolverError(err)
+ }
+ 
+diff --git a/xds/internal/resolver/cluster_specifier_plugin_test.go b/xds/internal/resolver/cluster_specifier_plugin_test.go
+index 7f1144b8..4f807e39 100644
+--- a/xds/internal/resolver/cluster_specifier_plugin_test.go
++++ b/xds/internal/resolver/cluster_specifier_plugin_test.go
+@@ -115,7 +115,7 @@ func (s) TestResolverClusterSpecifierPlugin(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 	nodeID := uuid.New().String()
+-	mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++	mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 	// Configure resources on the management server.
+ 	listeners := []*v3listenerpb.Listener{e2e.DefaultClientListener(defaultTestServiceName, defaultTestRouteConfigName)}
+@@ -205,7 +205,7 @@ func (s) TestXDSResolverDelayedOnCommittedCSP(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 	nodeID := uuid.New().String()
+-	mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++	mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 	// Configure resources on the management server.
+ 	listeners := []*v3listenerpb.Listener{e2e.DefaultClientListener(defaultTestServiceName, defaultTestRouteConfigName)}
+diff --git a/xds/internal/resolver/helpers_test.go b/xds/internal/resolver/helpers_test.go
+index cdb9511b..708b51bb 100644
+--- a/xds/internal/resolver/helpers_test.go
++++ b/xds/internal/resolver/helpers_test.go
+@@ -28,7 +28,6 @@ import (
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/google/go-cmp/cmp/cmpopts"
+-	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/internal"
+ 	"google.golang.org/grpc/internal/grpctest"
+ 	iresolver "google.golang.org/grpc/internal/resolver"
+@@ -36,7 +35,6 @@ import (
+ 	"google.golang.org/grpc/internal/testutils/xds/e2e"
+ 	"google.golang.org/grpc/resolver"
+ 	"google.golang.org/grpc/serviceconfig"
+-	"google.golang.org/grpc/status"
+ 	xdsresolver "google.golang.org/grpc/xds/internal/resolver"
+ 	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource/version"
+ 
+@@ -182,40 +180,19 @@ func verifyNoUpdateFromResolver(ctx context.Context, t *testing.T, stateCh chan
+ 	}
+ }
+ 
+-// waitForErrorFromResolver waits for the resolver to push an error and verifies
+-// that it matches the expected error and contains the expected node ID.
+-func waitForErrorFromResolver(ctx context.Context, errCh chan error, wantErr, wantNodeID string) error {
++// verifyErrorFromResolver waits for the resolver to push an error and verifies
++// that it matches the expected error.
++func verifyErrorFromResolver(ctx context.Context, t *testing.T, errCh chan error, wantErr string) {
++	t.Helper()
++
+ 	select {
+ 	case <-ctx.Done():
+-		return fmt.Errorf("timeout when waiting for error to be propagated to the ClientConn")
++		t.Fatal("Timeout when waiting for error to be propagated to the ClientConn")
+ 	case gotErr := <-errCh:
+-		if gotErr == nil {
+-			return fmt.Errorf("got nil error from resolver, want %q", wantErr)
+-		}
+-		if !strings.Contains(gotErr.Error(), wantErr) {
+-			return fmt.Errorf("got error from resolver %q, want %q", gotErr, wantErr)
++		if gotErr == nil || !strings.Contains(gotErr.Error(), wantErr) {
++			t.Fatalf("Received error from resolver %q, want %q", gotErr, wantErr)
+ 		}
+-		if !strings.Contains(gotErr.Error(), wantNodeID) {
+-			return fmt.Errorf("got error from resolver %q, want nodeID %q", gotErr, wantNodeID)
+-		}
+-	}
+-	return nil
+-}
+-
+-func verifyResolverError(gotErr error, wantCode codes.Code, wantErr, wantNodeID string) error {
+-	if gotErr == nil {
+-		return fmt.Errorf("got nil error from resolver, want error with code %v", wantCode)
+-	}
+-	if !strings.Contains(gotErr.Error(), wantErr) {
+-		return fmt.Errorf("got error from resolver %q, want %q", gotErr, wantErr)
+-	}
+-	if gotCode := status.Code(gotErr); gotCode != wantCode {
+-		return fmt.Errorf("got error from resolver with code %v, want %v", gotCode, wantCode)
+-	}
+-	if !strings.Contains(gotErr.Error(), wantNodeID) {
+-		return fmt.Errorf("got error from resolver %q, want nodeID %q", gotErr, wantNodeID)
+ 	}
+-	return nil
+ }
+ 
+ // Spins up an xDS management server and sets up an xDS bootstrap configuration
+@@ -227,7 +204,7 @@ func verifyResolverError(gotErr error, wantCode codes.Code, wantErr, wantNodeID
+ //   - A channel to read requested RouteConfiguration resource names
+ //   - Contents of the bootstrap configuration pointing to xDS management
+ //     server
+-func setupManagementServerForTest(t *testing.T, nodeID string) (*e2e.ManagementServer, chan []string, chan []string, []byte) {
++func setupManagementServerForTest(ctx context.Context, t *testing.T, nodeID string) (*e2e.ManagementServer, chan []string, chan []string, []byte) {
+ 	t.Helper()
+ 
+ 	listenerResourceNamesCh := make(chan []string, 1)
+diff --git a/xds/internal/resolver/serviceconfig.go b/xds/internal/resolver/serviceconfig.go
+index 02e6a73e..ca9f2c01 100644
+--- a/xds/internal/resolver/serviceconfig.go
++++ b/xds/internal/resolver/serviceconfig.go
+@@ -125,34 +125,8 @@ func (r route) String() string {
+ 	return fmt.Sprintf("%s -> { clusters: %v, maxStreamDuration: %v }", r.m.String(), r.clusters, r.maxStreamDuration)
+ }
+ 
+-// stoppableConfigSelector extends the iresolver.ConfigSelector interface with a
+-// stop() method. This makes it possible to swap the current config selector
+-// with an erroring config selector when the LDS or RDS resource is not found on
+-// the management server.
+-type stoppableConfigSelector interface {
+-	iresolver.ConfigSelector
+-	stop()
+-}
+-
+-// erroringConfigSelector always returns an error, with the xDS node ID included
+-// in the error message. It is used to swap out the current config selector
+-// when the LDS or RDS resource is not found on the management server.
+-type erroringConfigSelector struct {
+-	err error
+-}
+-
+-func newErroringConfigSelector(xdsNodeID string) *erroringConfigSelector {
+-	return &erroringConfigSelector{err: annotateErrorWithNodeID(status.Errorf(codes.Unavailable, "no valid clusters"), xdsNodeID)}
+-}
+-
+-func (cs *erroringConfigSelector) SelectConfig(iresolver.RPCInfo) (*iresolver.RPCConfig, error) {
+-	return nil, cs.err
+-}
+-func (cs *erroringConfigSelector) stop() {}
+-
+ type configSelector struct {
+ 	r                *xdsResolver
+-	xdsNodeID        string
+ 	virtualHost      virtualHost
+ 	routes           []route
+ 	clusters         map[string]*clusterInfo
+@@ -162,14 +136,10 @@ type configSelector struct {
+ var errNoMatchedRouteFound = status.Errorf(codes.Unavailable, "no matched route was found")
+ var errUnsupportedClientRouteAction = status.Errorf(codes.Unavailable, "matched route does not have a supported route action type")
+ 
+-// annotateErrorWithNodeID annotates the given error with the provided xDS node
+-// ID. This is used by the real config selector when it runs into errors, and
+-// also by the erroring config selector.
+-func annotateErrorWithNodeID(err error, nodeID string) error {
+-	return fmt.Errorf("[xDS node id: %s]: %w", nodeID, err)
+-}
+-
+ func (cs *configSelector) SelectConfig(rpcInfo iresolver.RPCInfo) (*iresolver.RPCConfig, error) {
++	if cs == nil {
++		return nil, status.Errorf(codes.Unavailable, "no valid clusters")
++	}
+ 	var rt *route
+ 	// Loop through routes in order and select first match.
+ 	for _, r := range cs.routes {
+@@ -180,16 +150,16 @@ func (cs *configSelector) SelectConfig(rpcInfo iresolver.RPCInfo) (*iresolver.RP
+ 	}
+ 
+ 	if rt == nil || rt.clusters == nil {
+-		return nil, annotateErrorWithNodeID(errNoMatchedRouteFound, cs.xdsNodeID)
++		return nil, errNoMatchedRouteFound
+ 	}
+ 
+ 	if rt.actionType != xdsresource.RouteActionRoute {
+-		return nil, annotateErrorWithNodeID(errUnsupportedClientRouteAction, cs.xdsNodeID)
++		return nil, errUnsupportedClientRouteAction
+ 	}
+ 
+ 	cluster, ok := rt.clusters.Next().(*routeCluster)
+ 	if !ok {
+-		return nil, annotateErrorWithNodeID(status.Errorf(codes.Internal, "error retrieving cluster for match: %v (%T)", cluster, cluster), cs.xdsNodeID)
++		return nil, status.Errorf(codes.Internal, "error retrieving cluster for match: %v (%T)", cluster, cluster)
+ 	}
+ 
+ 	// Add a ref to the selected cluster, as this RPC needs this cluster until
+@@ -199,7 +169,7 @@ func (cs *configSelector) SelectConfig(rpcInfo iresolver.RPCInfo) (*iresolver.RP
+ 
+ 	interceptor, err := cs.newInterceptor(rt, cluster)
+ 	if err != nil {
+-		return nil, annotateErrorWithNodeID(err, cs.xdsNodeID)
++		return nil, err
+ 	}
+ 
+ 	lbCtx := clustermanager.SetPickedCluster(rpcInfo.Context, cluster.name)
+diff --git a/xds/internal/resolver/watch_service_test.go b/xds/internal/resolver/watch_service_test.go
+index 7df159c6..4f2a21e5 100644
+--- a/xds/internal/resolver/watch_service_test.go
++++ b/xds/internal/resolver/watch_service_test.go
+@@ -46,7 +46,7 @@ func (s) TestServiceWatch_ListenerPointsToNewRouteConfiguration(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 	nodeID := uuid.New().String()
+-	mgmtServer, lisCh, routeCfgCh, bc := setupManagementServerForTest(t, nodeID)
++	mgmtServer, lisCh, routeCfgCh, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 	// Configure resources on the management server.
+ 	listeners := []*v3listenerpb.Listener{e2e.DefaultClientListener(defaultTestServiceName, defaultTestRouteConfigName)}
+@@ -103,7 +103,7 @@ func (s) TestServiceWatch_ListenerPointsToInlineRouteConfiguration(t *testing.T)
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 	nodeID := uuid.New().String()
+-	mgmtServer, lisCh, routeCfgCh, bc := setupManagementServerForTest(t, nodeID)
++	mgmtServer, lisCh, routeCfgCh, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 	// Configure resources on the management server.
+ 	listeners := []*v3listenerpb.Listener{e2e.DefaultClientListener(defaultTestServiceName, defaultTestRouteConfigName)}
+diff --git a/xds/internal/resolver/xds_resolver.go b/xds/internal/resolver/xds_resolver.go
+index 5378371b..c333447e 100644
+--- a/xds/internal/resolver/xds_resolver.go
++++ b/xds/internal/resolver/xds_resolver.go
+@@ -249,7 +249,7 @@ type xdsResolver struct {
+ 	// cluster that includes a ref count and load balancing configuration.
+ 	activeClusters map[string]*clusterInfo
+ 
+-	curConfigSelector stoppableConfigSelector
++	curConfigSelector *configSelector
+ }
+ 
+ // ResolveNow is a no-op at this point.
+@@ -284,26 +284,22 @@ func (r *xdsResolver) Close() {
+ // false if an error occurs while sending an update to the channel.
+ //
+ // Only executed in the context of a serializer callback.
+-func (r *xdsResolver) sendNewServiceConfig(cs stoppableConfigSelector) bool {
++func (r *xdsResolver) sendNewServiceConfig(cs *configSelector) bool {
+ 	// Delete entries from r.activeClusters with zero references;
+ 	// otherwise serviceConfigJSON will generate a config including
+ 	// them.
+ 	r.pruneActiveClusters()
+ 
+-	errCS, ok := cs.(*erroringConfigSelector)
+-	if ok && len(r.activeClusters) == 0 {
++	if cs == nil && len(r.activeClusters) == 0 {
+ 		// There are no clusters and we are sending a failing configSelector.
+ 		// Send an empty config, which picks pick-first, with no address, and
+ 		// puts the ClientConn into transient failure.
+-		//
+-		// This call to UpdateState is expected to return ErrBadResolverState
+-		// since pick_first doesn't like an update with no addresses.
+-		r.cc.UpdateState(resolver.State{ServiceConfig: r.cc.ParseServiceConfig("{}")})
+-
+-		// Send a resolver error to pick_first so that RPCs will fail with a
+-		// more meaningful error, as opposed to one that says that pick_first
+-		// received no addresses.
+-		r.cc.ReportError(errCS.err)
++		if err := r.cc.UpdateState(resolver.State{ServiceConfig: r.cc.ParseServiceConfig("{}")}); err != nil {
++			if r.logger.V(2) {
++				r.logger.Infof("Channel rejected new state (with empty service config) with error: %v", err)
++			}
++			return false
++		}
+ 		return true
+ 	}
+ 
+@@ -330,8 +326,7 @@ func (r *xdsResolver) sendNewServiceConfig(cs stoppableConfigSelector) bool {
+ // Only executed in the context of a serializer callback.
+ func (r *xdsResolver) newConfigSelector() *configSelector {
+ 	cs := &configSelector{
+-		r:         r,
+-		xdsNodeID: r.xdsClient.BootstrapConfig().Node().GetId(),
++		r: r,
+ 		virtualHost: virtualHost{
+ 			httpFilterConfigOverride: r.currentVirtualHost.HTTPFilterConfigOverride,
+ 			retryConfig:              r.currentVirtualHost.RetryConfig,
+@@ -443,16 +438,14 @@ func (r *xdsResolver) onResolutionComplete() {
+ 
+ 	cs := r.newConfigSelector()
+ 	if !r.sendNewServiceConfig(cs) {
+-		// Channel didn't like the update we provided (unexpected); erase
++		// JSON error creating the service config (unexpected); erase
+ 		// this config selector and ignore this update, continuing with
+ 		// the previous config selector.
+ 		cs.stop()
+ 		return
+ 	}
+ 
+-	if r.curConfigSelector != nil {
+-		r.curConfigSelector.stop()
+-	}
++	r.curConfigSelector.stop()
+ 	r.curConfigSelector = cs
+ }
+ 
+@@ -484,21 +477,18 @@ func (r *xdsResolver) onError(err error) {
+ // Only executed in the context of a serializer callback.
+ func (r *xdsResolver) onResourceNotFound() {
+ 	// We cannot remove clusters from the service config that have ongoing RPCs.
+-	// Instead, what we can do is to send an erroring config selector
++	// Instead, what we can do is to send an erroring (nil) config selector
+ 	// along with normal service config. This will ensure that new RPCs will
+ 	// fail, and once the active RPCs complete, the reference counts on the
+ 	// clusters will come down to zero. At that point, we will send an empty
+ 	// service config with no addresses. This results in the pick-first
+ 	// LB policy being configured on the channel, and since there are no
+ 	// address, pick-first will put the channel in TRANSIENT_FAILURE.
+-	cs := newErroringConfigSelector(r.xdsClient.BootstrapConfig().Node().GetId())
+-	r.sendNewServiceConfig(cs)
++	r.sendNewServiceConfig(nil)
+ 
+ 	// Stop and dereference the active config selector, if one exists.
+-	if r.curConfigSelector != nil {
+-		r.curConfigSelector.stop()
+-	}
+-	r.curConfigSelector = cs
++	r.curConfigSelector.stop()
++	r.curConfigSelector = nil
+ }
+ 
+ // Only executed in the context of a serializer callback.
+diff --git a/xds/internal/resolver/xds_resolver_test.go b/xds/internal/resolver/xds_resolver_test.go
+index 49ddf814..8916c4e8 100644
+--- a/xds/internal/resolver/xds_resolver_test.go
++++ b/xds/internal/resolver/xds_resolver_test.go
+@@ -41,6 +41,7 @@ import (
+ 	"google.golang.org/grpc/metadata"
+ 	"google.golang.org/grpc/resolver"
+ 	"google.golang.org/grpc/serviceconfig"
++	"google.golang.org/grpc/status"
+ 	"google.golang.org/grpc/xds/internal/balancer/clustermanager"
+ 	"google.golang.org/grpc/xds/internal/balancer/ringhash"
+ 	"google.golang.org/grpc/xds/internal/httpfilter"
+@@ -164,7 +165,7 @@ func (s) TestResolverResourceName(t *testing.T) {
+ 			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 			defer cancel()
+ 			nodeID := uuid.New().String()
+-			mgmtServer, lisCh, _, _ := setupManagementServerForTest(t, nodeID)
++			mgmtServer, lisCh, _, _ := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 			// Create a bootstrap configuration with test options.
+ 			opts := bootstrap.ConfigOptionsForTesting{
+@@ -299,7 +300,7 @@ func (s) TestResolverBadServiceUpdate(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 	nodeID := uuid.New().String()
+-	mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++	mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 	// Configure a listener resource that is expected to be NACKed because it
+ 	// does not contain the `RouteSpecifier` field in the HTTPConnectionManager.
+@@ -322,9 +323,7 @@ func (s) TestResolverBadServiceUpdate(t *testing.T) {
+ 	// Build the resolver and expect an error update from it.
+ 	stateCh, errCh, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, bc)
+ 	wantErr := "no RouteSpecifier"
+-	if err := waitForErrorFromResolver(ctx, errCh, wantErr, nodeID); err != nil {
+-		t.Fatal(err)
+-	}
++	verifyErrorFromResolver(ctx, t, errCh, wantErr)
+ 
+ 	// Configure good listener and route configuration resources on the
+ 	// management server.
+@@ -338,9 +337,7 @@ func (s) TestResolverBadServiceUpdate(t *testing.T) {
+ 	// Configure another bad resource on the management server and expect an
+ 	// error update from the resolver.
+ 	configureResourcesOnManagementServer(ctx, t, mgmtServer, nodeID, []*v3listenerpb.Listener{lis}, nil)
+-	if err := waitForErrorFromResolver(ctx, errCh, wantErr, nodeID); err != nil {
+-		t.Fatal(err)
+-	}
++	verifyErrorFromResolver(ctx, t, errCh, wantErr)
+ }
+ 
+ // TestResolverGoodServiceUpdate tests the case where the resource returned by
+@@ -407,7 +404,7 @@ func (s) TestResolverGoodServiceUpdate(t *testing.T) {
+ 			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 			defer cancel()
+ 			nodeID := uuid.New().String()
+-			mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++			mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 			// Configure the management server with a good listener resource and a
+ 			// route configuration resource, as specified by the test case.
+@@ -448,7 +445,7 @@ func (s) TestResolverRequestHash(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 	nodeID := uuid.New().String()
+-	mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++	mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 	// Configure the management server with a good listener resource and a
+ 	// route configuration resource that specifies a hash policy.
+@@ -511,7 +508,7 @@ func (s) TestResolverRemovedWithRPCs(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 	nodeID := uuid.New().String()
+-	mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++	mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 	// Configure resources on the management server.
+ 	listeners := []*v3listenerpb.Listener{e2e.DefaultClientListener(defaultTestServiceName, defaultTestRouteConfigName)}
+@@ -540,8 +537,8 @@ func (s) TestResolverRemovedWithRPCs(t *testing.T) {
+ 	// return an erroring config selector which will fail new RPCs.
+ 	cs = verifyUpdateFromResolver(ctx, t, stateCh, wantDefaultServiceConfig)
+ 	_, err = cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
+-	if err := verifyResolverError(err, codes.Unavailable, "no valid clusters", nodeID); err != nil {
+-		t.Fatal(err)
++	if err == nil || status.Code(err) != codes.Unavailable {
++		t.Fatalf("cs.SelectConfig() returned: %v, want: %v", err, codes.Unavailable)
+ 	}
+ 
+ 	// "Finish the RPC"; this could cause a panic if the resolver doesn't
+@@ -613,14 +610,14 @@ func (s) TestResolverRemovedResource(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 	nodeID := uuid.New().String()
+-	mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++	mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 	// Configure resources on the management server.
+ 	listeners := []*v3listenerpb.Listener{e2e.DefaultClientListener(defaultTestServiceName, defaultTestRouteConfigName)}
+ 	routes := []*v3routepb.RouteConfiguration{e2e.DefaultRouteConfig(defaultTestRouteConfigName, defaultTestServiceName, defaultTestClusterName)}
+ 	configureResourcesOnManagementServer(ctx, t, mgmtServer, nodeID, listeners, routes)
+ 
+-	stateCh, errCh, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, bc)
++	stateCh, _, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, bc)
+ 
+ 	// Read the update pushed by the resolver to the ClientConn.
+ 	cs := verifyUpdateFromResolver(ctx, t, stateCh, wantDefaultServiceConfig)
+@@ -646,9 +643,9 @@ func (s) TestResolverRemovedResource(t *testing.T) {
+ 	cs = verifyUpdateFromResolver(ctx, t, stateCh, wantDefaultServiceConfig)
+ 
+ 	// "Make another RPC" by invoking the config selector.
+-	_, err = cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
+-	if err := verifyResolverError(err, codes.Unavailable, "no valid clusters", nodeID); err != nil {
+-		t.Fatal(err)
++	res, err = cs.SelectConfig(iresolver.RPCInfo{Context: ctx, Method: "/service/method"})
++	if err == nil || status.Code(err) != codes.Unavailable {
++		t.Fatalf("cs.SelectConfig() got %v, %v, expected UNAVAILABLE error", res, err)
+ 	}
+ 
+ 	// In the meantime, an empty ServiceConfig update should have been sent.
+@@ -665,16 +662,6 @@ func (s) TestResolverRemovedResource(t *testing.T) {
+ 			t.Fatalf("Got service config:\n%s \nWant service config:\n%s", cmp.Diff(nil, state.ServiceConfig.Config), cmp.Diff(nil, wantSCParsed.Config))
+ 		}
+ 	}
+-
+-	// The xDS resolver is expected to report an error to the channel.
+-	select {
+-	case <-ctx.Done():
+-		t.Fatalf("Timeout waiting for an error from the resolver: %v", ctx.Err())
+-	case err := <-errCh:
+-		if err := verifyResolverError(err, codes.Unavailable, "no valid clusters", nodeID); err != nil {
+-			t.Fatal(err)
+-		}
+-	}
+ }
+ 
+ // Tests the case where the resolver receives max stream duration as part of the
+@@ -687,7 +674,7 @@ func (s) TestResolverMaxStreamDuration(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 	nodeID := uuid.New().String()
+-	mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++	mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 	stateCh, _, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, bc)
+ 
+@@ -820,7 +807,7 @@ func (s) TestResolverDelayedOnCommitted(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 	nodeID := uuid.New().String()
+-	mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++	mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 	// Configure resources on the management server.
+ 	listeners := []*v3listenerpb.Listener{e2e.DefaultClientListener(defaultTestServiceName, defaultTestRouteConfigName)}
+@@ -930,7 +917,7 @@ func (s) TestResolverMultipleLDSUpdates(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 	nodeID := uuid.New().String()
+-	mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++	mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 	// Configure the management server with a listener resource, but no route
+ 	// configuration resource.
+@@ -988,7 +975,7 @@ func (s) TestResolverWRR(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+ 	nodeID := uuid.New().String()
+-	mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++	mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 	stateCh, _, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, bc)
+ 
+@@ -1187,7 +1174,7 @@ func (s) TestConfigSelector_FailureCases(t *testing.T) {
+ 			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 			defer cancel()
+ 			nodeID := uuid.New().String()
+-			mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++			mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 			// Build an xDS resolver.
+ 			stateCh, _, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, bc)
+@@ -1201,8 +1188,8 @@ func (s) TestConfigSelector_FailureCases(t *testing.T) {
+ 
+ 			// Ensure that it returns the expected error.
+ 			_, err := cs.SelectConfig(iresolver.RPCInfo{Method: methodName, Context: ctx})
+-			if err := verifyResolverError(err, codes.Unavailable, test.wantErr, nodeID); err != nil {
+-				t.Fatal(err)
++			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
++				t.Errorf("SelectConfig(_) = _, %v; want _, Contains(%v)", err, test.wantErr)
+ 			}
+ 		})
+ 	}
+@@ -1426,7 +1413,7 @@ func (s) TestXDSResolverHTTPFilters(t *testing.T) {
+ 			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 			defer cancel()
+ 			nodeID := uuid.New().String()
+-			mgmtServer, _, _, bc := setupManagementServerForTest(t, nodeID)
++			mgmtServer, _, _, bc := setupManagementServerForTest(ctx, t, nodeID)
+ 
+ 			// Build an xDS resolver.
+ 			stateCh, _, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, bc)
+diff --git a/xds/internal/xdsclient/xdsresource/errors.go b/xds/internal/xdsclient/xdsresource/errors.go
+index f90d30b3..06909fbd 100644
+--- a/xds/internal/xdsclient/xdsresource/errors.go
++++ b/xds/internal/xdsclient/xdsresource/errors.go
+@@ -70,9 +70,9 @@ func NewError(t ErrorType, message string) error {
+ }
+ 
+ // ErrType returns the error's type.
+-func ErrType(err error) ErrorType {
++func ErrType(e error) ErrorType {
+ 	var xe *xdsClientError
+-	if errors.As(err, &xe) {
++	if ok := errors.As(e, &xe); ok {
+ 		return xe.t
+ 	}
+ 	return ErrorTypeUnknown

@@ -1,0 +1,119 @@
+diff --git a/context.go b/context.go
+index 0cee48c..544b4da 100644
+--- a/context.go
++++ b/context.go
+@@ -2,7 +2,6 @@ package echo
+ 
+ import (
+ 	"bytes"
+-	"encoding/json"
+ 	"encoding/xml"
+ 	"fmt"
+ 	"io"
+@@ -457,17 +456,16 @@ func (c *context) String(code int, s string) (err error) {
+ }
+ 
+ func (c *context) jsonPBlob(code int, callback string, i interface{}) (err error) {
+-	enc := json.NewEncoder(c.response)
+-	_, pretty := c.QueryParams()["pretty"]
+-	if c.echo.Debug || pretty {
+-		enc.SetIndent("", "  ")
++	indent := ""
++	if _, pretty := c.QueryParams()["pretty"]; c.echo.Debug || pretty {
++		indent = defaultIndent
+ 	}
+ 	c.writeContentType(MIMEApplicationJavaScriptCharsetUTF8)
+ 	c.response.WriteHeader(code)
+ 	if _, err = c.response.Write([]byte(callback + "(")); err != nil {
+ 		return
+ 	}
+-	if err = enc.Encode(i); err != nil {
++	if err = c.echo.JSONSerializer.Serialize(c, i, indent); err != nil {
+ 		return
+ 	}
+ 	if _, err = c.response.Write([]byte(");")); err != nil {
+@@ -477,13 +475,9 @@ func (c *context) jsonPBlob(code int, callback string, i interface{}) (err error
+ }
+ 
+ func (c *context) json(code int, i interface{}, indent string) error {
+-	enc := json.NewEncoder(c.response)
+-	if indent != "" {
+-		enc.SetIndent("", indent)
+-	}
+ 	c.writeContentType(MIMEApplicationJSONCharsetUTF8)
+ 	c.response.Status = code
+-	return enc.Encode(i)
++	return c.echo.JSONSerializer.Serialize(c, i, indent)
+ }
+ 
+ func (c *context) JSON(code int, i interface{}) (err error) {
+diff --git a/echo.go b/echo.go
+index dd0cbf3..afb1e27 100644
+--- a/echo.go
++++ b/echo.go
+@@ -90,6 +90,7 @@ type (
+ 		HidePort         bool
+ 		HTTPErrorHandler HTTPErrorHandler
+ 		Binder           Binder
++		JSONSerializer   JSONSerializer
+ 		Validator        Validator
+ 		Renderer         Renderer
+ 		Logger           Logger
+@@ -125,6 +126,12 @@ type (
+ 		Validate(i interface{}) error
+ 	}
+ 
++	// JSONSerializer is the interface that encodes and decodes JSON to and from interfaces.
++	JSONSerializer interface {
++		Serialize(c Context, i interface{}, indent string) error
++		Deserialize(c Context, i interface{}) error
++	}
++
+ 	// Renderer is the interface that wraps the Render function.
+ 	Renderer interface {
+ 		Render(io.Writer, string, interface{}, Context) error
+@@ -315,6 +322,7 @@ func New() (e *Echo) {
+ 	e.TLSServer.Handler = e
+ 	e.HTTPErrorHandler = e.DefaultHTTPErrorHandler
+ 	e.Binder = &DefaultBinder{}
++	e.JSONSerializer = &DefaultJSONSerializer{}
+ 	e.Logger.SetLevel(log.ERROR)
+ 	e.StdLogger = stdLog.New(e.Logger.Output(), e.Logger.Prefix()+": ", 0)
+ 	e.pool.New = func() interface{} {
+diff --git a/json.go b/json.go
+new file mode 100644
+index 0000000..16b2d05
+--- /dev/null
++++ b/json.go
+@@ -0,0 +1,31 @@
++package echo
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++)
++
++// DefaultJSONSerializer implements JSON encoding using encoding/json.
++type DefaultJSONSerializer struct{}
++
++// Serialize converts an interface into a json and writes it to the response.
++// You can optionally use the indent parameter to produce pretty JSONs.
++func (d DefaultJSONSerializer) Serialize(c Context, i interface{}, indent string) error {
++	enc := json.NewEncoder(c.Response())
++	if indent != "" {
++		enc.SetIndent("", indent)
++	}
++	return enc.Encode(i)
++}
++
++// Deserialize reads a JSON from a request body and converts it into an interface.
++func (d DefaultJSONSerializer) Deserialize(c Context, i interface{}) error {
++	err := json.NewDecoder(c.Request().Body).Decode(i)
++	if ute, ok := err.(*json.UnmarshalTypeError); ok {
++		return NewHTTPError(http.StatusBadRequest, fmt.Sprintf("Unmarshal type error: expected=%v, got=%v, field=%v, offset=%v", ute.Type, ute.Value, ute.Field, ute.Offset)).SetInternal(err)
++	} else if se, ok := err.(*json.SyntaxError); ok {
++		return NewHTTPError(http.StatusBadRequest, fmt.Sprintf("Syntax error: offset=%v, error=%v", se.Offset, se.Error())).SetInternal(err)
++	}
++	return err
++}

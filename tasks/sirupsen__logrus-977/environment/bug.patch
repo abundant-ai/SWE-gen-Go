@@ -1,0 +1,184 @@
+diff --git a/README.md b/README.md
+index e7450a8..2040b42 100644
+--- a/README.md
++++ b/README.md
+@@ -354,7 +354,6 @@ The built-in logging formatters are:
+     [github.com/mattn/go-colorable](https://github.com/mattn/go-colorable).
+   * When colors are enabled, levels are truncated to 4 characters by default. To disable
+     truncation set the `DisableLevelTruncation` field to `true`.
+-  * When outputting to a TTY, it's often helpful to visually scan down a column where all the levels are the same width. Setting the `PadLevelText` field to `true` enables this behavior, by adding padding to the level text.
+   * All options are listed in the [generated docs](https://godoc.org/github.com/sirupsen/logrus#TextFormatter).
+ * `logrus.JSONFormatter`. Logs fields as JSON.
+   * All options are listed in the [generated docs](https://godoc.org/github.com/sirupsen/logrus#JSONFormatter).
+diff --git a/text_formatter.go b/text_formatter.go
+index f08563e..e01587c 100644
+--- a/text_formatter.go
++++ b/text_formatter.go
+@@ -6,11 +6,9 @@ import (
+ 	"os"
+ 	"runtime"
+ 	"sort"
+-	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
+-	"unicode/utf8"
+ )
+ 
+ const (
+@@ -59,10 +57,6 @@ type TextFormatter struct {
+ 	// Disables the truncation of the level text to 4 characters.
+ 	DisableLevelTruncation bool
+ 
+-	// PadLevelText Adds padding the level text so that all the levels output at the same length
+-	// PadLevelText is a superset of the DisableLevelTruncation option
+-	PadLevelText bool
+-
+ 	// QuoteEmptyFields will wrap empty fields in quotes if true
+ 	QuoteEmptyFields bool
+ 
+@@ -85,22 +79,12 @@ type TextFormatter struct {
+ 	CallerPrettyfier func(*runtime.Frame) (function string, file string)
+ 
+ 	terminalInitOnce sync.Once
+-
+-	// The max length of the level text, generated dynamically on init
+-	levelTextMaxLength int
+ }
+ 
+ func (f *TextFormatter) init(entry *Entry) {
+ 	if entry.Logger != nil {
+ 		f.isTerminal = checkIfTerminal(entry.Logger.Out)
+ 	}
+-	// Get the max length of the level text
+-	for _, level := range AllLevels {
+-		levelTextLength := utf8.RuneCount([]byte(level.String()))
+-		if levelTextLength > f.levelTextMaxLength {
+-			f.levelTextMaxLength = levelTextLength
+-		}
+-	}
+ }
+ 
+ func (f *TextFormatter) isColored() bool {
+@@ -233,18 +217,9 @@ func (f *TextFormatter) printColored(b *bytes.Buffer, entry *Entry, keys []strin
+ 	}
+ 
+ 	levelText := strings.ToUpper(entry.Level.String())
+-	if !f.DisableLevelTruncation && !f.PadLevelText {
++	if !f.DisableLevelTruncation {
+ 		levelText = levelText[0:4]
+ 	}
+-	if f.PadLevelText {
+-		// Generates the format string used in the next line, for example "%-6s" or "%-7s".
+-		// Based on the max level text length.
+-		formatString := "%-" + strconv.Itoa(f.levelTextMaxLength) + "s"
+-		// Formats the level text by appending spaces up to the max length, for example:
+-		// 	- "INFO   "
+-		//	- "WARNING"
+-		levelText = fmt.Sprintf(formatString, levelText)
+-	}
+ 
+ 	// Remove a single newline if it already exists in the message to keep
+ 	// the behavior of logrus text_formatter the same as the stdlib log package
+diff --git a/text_formatter_test.go b/text_formatter_test.go
+index 99b5d8c..9c5e6f0 100644
+--- a/text_formatter_test.go
++++ b/text_formatter_test.go
+@@ -172,97 +172,6 @@ func TestDisableLevelTruncation(t *testing.T) {
+ 	checkDisableTruncation(false, InfoLevel)
+ }
+ 
+-func TestPadLevelText(t *testing.T) {
+-	// A note for future maintainers / committers:
+-	//
+-	// This test denormalizes the level text as a part of its assertions.
+-	// Because of that, its not really a "unit test" of the PadLevelText functionality.
+-	// So! Many apologies to the potential future person who has to rewrite this test
+-	// when they are changing some completely unrelated functionality.
+-	params := []struct {
+-		name            string
+-		level           Level
+-		paddedLevelText string
+-	}{
+-		{
+-			name:            "PanicLevel",
+-			level:           PanicLevel,
+-			paddedLevelText: "PANIC  ", // 2 extra spaces
+-		},
+-		{
+-			name:            "FatalLevel",
+-			level:           FatalLevel,
+-			paddedLevelText: "FATAL  ", // 2 extra spaces
+-		},
+-		{
+-			name:            "ErrorLevel",
+-			level:           ErrorLevel,
+-			paddedLevelText: "ERROR  ", // 2 extra spaces
+-		},
+-		{
+-			name:  "WarnLevel",
+-			level: WarnLevel,
+-			// WARNING is already the max length, so we don't need to assert a paddedLevelText
+-		},
+-		{
+-			name:            "DebugLevel",
+-			level:           DebugLevel,
+-			paddedLevelText: "DEBUG  ", // 2 extra spaces
+-		},
+-		{
+-			name:            "TraceLevel",
+-			level:           TraceLevel,
+-			paddedLevelText: "TRACE  ", // 2 extra spaces
+-		},
+-		{
+-			name:            "InfoLevel",
+-			level:           InfoLevel,
+-			paddedLevelText: "INFO   ", // 3 extra spaces
+-		},
+-	}
+-
+-	// We create a "default" TextFormatter to do a control test.
+-	// We also create a TextFormatter with PadLevelText, which is the parameter we want to do our most relevant assertions against.
+-	tfDefault := TextFormatter{}
+-	tfWithPadding := TextFormatter{PadLevelText: true}
+-
+-	for _, val := range params {
+-		t.Run(val.name, func(t *testing.T) {
+-			// TextFormatter writes into these bytes.Buffers, and we make assertions about their contents later
+-			var bytesDefault bytes.Buffer
+-			var bytesWithPadding bytes.Buffer
+-
+-			// The TextFormatter instance and the bytes.Buffer instance are different here
+-			// all the other arguments are the same. We also initialize them so that they
+-			// fill in the value of levelTextMaxLength.
+-			tfDefault.init(&Entry{})
+-			tfDefault.printColored(&bytesDefault, &Entry{Level: val.level}, []string{}, nil, "")
+-			tfWithPadding.init(&Entry{})
+-			tfWithPadding.printColored(&bytesWithPadding, &Entry{Level: val.level}, []string{}, nil, "")
+-
+-			// turn the bytes back into a string so that we can actually work with the data
+-			logLineDefault := (&bytesDefault).String()
+-			logLineWithPadding := (&bytesWithPadding).String()
+-
+-			// Control: the level text should not be padded by default
+-			if val.paddedLevelText != "" && strings.Contains(logLineDefault, val.paddedLevelText) {
+-				t.Errorf("log line %q should not contain the padded level text %q by default", logLineDefault, val.paddedLevelText)
+-			}
+-
+-			// Assertion: the level text should still contain the string representation of the level
+-			if !strings.Contains(strings.ToLower(logLineWithPadding), val.level.String()) {
+-				t.Errorf("log line %q should contain the level text %q when padding is enabled", logLineWithPadding, val.level.String())
+-			}
+-
+-			// Assertion: the level text should be in its padded form now
+-			if val.paddedLevelText != "" && !strings.Contains(logLineWithPadding, val.paddedLevelText) {
+-				t.Errorf("log line %q should contain the padded level text %q when padding is enabled", logLineWithPadding, val.paddedLevelText)
+-			}
+-
+-		})
+-	}
+-}
+-
+ func TestDisableTimestampWithColoredOutput(t *testing.T) {
+ 	tf := &TextFormatter{DisableTimestamp: true, ForceColors: true}
+ 

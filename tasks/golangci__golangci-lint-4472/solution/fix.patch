@@ -1,0 +1,143 @@
+diff --git a/.golangci.reference.yml b/.golangci.reference.yml
+index 6a623977..27293fb8 100644
+--- a/.golangci.reference.yml
++++ b/.golangci.reference.yml
+@@ -2881,6 +2881,8 @@ severity:
+   # - GitHub: https://help.github.com/en/actions/reference/workflow-commands-for-github-actions#setting-an-error-message
+   # - TeamCity: https://www.jetbrains.com/help/teamcity/service-messages.html#Inspection+Instance
+   #
++  # `@linter` can be used as severity value to keep the severity from linters (e.g. revive, gosec, ...)
++  #
+   # Default: ""
+   default-severity: error
+ 
+@@ -2888,13 +2890,12 @@ severity:
+   # Default: false
+   case-sensitive: true
+ 
+-  # Don't override severity defined by linters.
+-  # Default: false
+-  keep-linter-severity: true
+-
+   # When a list of severity rules are provided, severity information will be added to lint issues.
+   # Severity rules have the same filtering capability as exclude rules
+   # except you are allowed to specify one matcher per severity rule.
++  #
++  # `@linter` can be used as severity value to keep the severity from linters (e.g. revive, gosec, ...)
++  #
+   # Only affects out formats that support setting severity information.
+   #
+   # Default: []
+diff --git a/pkg/config/severity.go b/pkg/config/severity.go
+index 49874c9a..a6d2c9ec 100644
+--- a/pkg/config/severity.go
++++ b/pkg/config/severity.go
+@@ -8,10 +8,9 @@ import (
+ const severityRuleMinConditionsCount = 1
+ 
+ type Severity struct {
+-	Default            string         `mapstructure:"default-severity"`
+-	CaseSensitive      bool           `mapstructure:"case-sensitive"`
+-	Rules              []SeverityRule `mapstructure:"rules"`
+-	KeepLinterSeverity bool           `mapstructure:"keep-linter-severity"` // TODO(ldez): in v2 should be changed to `Override`.
++	Default       string         `mapstructure:"default-severity"`
++	CaseSensitive bool           `mapstructure:"case-sensitive"`
++	Rules         []SeverityRule `mapstructure:"rules"`
+ }
+ 
+ func (s *Severity) Validate() error {
+diff --git a/pkg/lint/runner.go b/pkg/lint/runner.go
+index 78be9382..13daa3b3 100644
+--- a/pkg/lint/runner.go
++++ b/pkg/lint/runner.go
+@@ -302,7 +302,6 @@ func getSeverityRulesProcessor(cfg *config.Severity, log logutils.Log, files *fs
+ 		Default:       cfg.Default,
+ 		Rules:         severityRules,
+ 		CaseSensitive: cfg.CaseSensitive,
+-		Override:      !cfg.KeepLinterSeverity,
+ 	}
+ 
+ 	return processors.NewSeverity(log.Child(logutils.DebugKeySeverityRules), files, severityOpts)
+diff --git a/pkg/result/processors/severity.go b/pkg/result/processors/severity.go
+index 943b14a4..f087f951 100644
+--- a/pkg/result/processors/severity.go
++++ b/pkg/result/processors/severity.go
+@@ -8,6 +8,8 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
++const severityFromLinter = "@linter"
++
+ var _ Processor = &Severity{}
+ 
+ type severityRule struct {
+@@ -24,7 +26,6 @@ type SeverityOptions struct {
+ 	Default       string
+ 	Rules         []SeverityRule
+ 	CaseSensitive bool
+-	Override      bool
+ }
+ 
+ type Severity struct {
+@@ -36,7 +37,6 @@ type Severity struct {
+ 
+ 	defaultSeverity string
+ 	rules           []severityRule
+-	override        bool
+ }
+ 
+ func NewSeverity(log logutils.Log, files *fsutils.Files, opts SeverityOptions) *Severity {
+@@ -45,7 +45,6 @@ func NewSeverity(log logutils.Log, files *fsutils.Files, opts SeverityOptions) *
+ 		files:           files,
+ 		log:             log,
+ 		defaultSeverity: opts.Default,
+-		override:        opts.Override,
+ 	}
+ 
+ 	prefix := caseInsensitivePrefix
+@@ -64,29 +63,30 @@ func (p *Severity) Process(issues []result.Issue) ([]result.Issue, error) {
+ 		return issues, nil
+ 	}
+ 
+-	return transformIssues(issues, func(issue *result.Issue) *result.Issue {
+-		if issue.Severity != "" && !p.override {
+-			return issue
+-		}
+-
+-		for _, rule := range p.rules {
+-			rule := rule
++	return transformIssues(issues, p.transform), nil
++}
+ 
+-			ruleSeverity := p.defaultSeverity
+-			if rule.severity != "" {
+-				ruleSeverity = rule.severity
++func (p *Severity) transform(issue *result.Issue) *result.Issue {
++	for _, rule := range p.rules {
++		if rule.match(issue, p.files, p.log) {
++			if rule.severity == severityFromLinter || rule.severity == "" && p.defaultSeverity == severityFromLinter {
++				return issue
+ 			}
+ 
+-			if rule.match(issue, p.files, p.log) {
+-				issue.Severity = ruleSeverity
+-				return issue
++			issue.Severity = rule.severity
++			if issue.Severity == "" {
++				issue.Severity = p.defaultSeverity
+ 			}
++
++			return issue
+ 		}
++	}
+ 
++	if p.defaultSeverity != severityFromLinter {
+ 		issue.Severity = p.defaultSeverity
++	}
+ 
+-		return issue
+-	}), nil
++	return issue
+ }
+ 
+ func (p *Severity) Name() string { return p.name }

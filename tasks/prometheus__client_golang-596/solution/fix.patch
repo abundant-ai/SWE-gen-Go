@@ -1,0 +1,280 @@
+diff --git a/go.mod b/go.mod
+index 97cee81..3aee077 100644
+--- a/go.mod
++++ b/go.mod
+@@ -10,4 +10,5 @@ require (
+ 	github.com/prometheus/common v0.4.1
+ 	github.com/prometheus/procfs v0.0.2
+ 	github.com/stretchr/testify v1.3.0 // indirect
++	golang.org/x/sys v0.0.0-20181116152217-5ac8a444bdc5
+ )
+diff --git a/go.sum b/go.sum
+index 21c7bc0..1b68464 100644
+--- a/go.sum
++++ b/go.sum
+@@ -58,6 +58,7 @@ golang.org/x/sync v0.0.0-20181108010431-42b317875d0f/go.mod h1:RxMgew5VJxzue5/jJ
+ golang.org/x/sync v0.0.0-20181221193216-37e7f081c4d4 h1:YUO/7uOKsKeq9UokNS62b8FYywz3ker1l1vDZRCRefw=
+ golang.org/x/sync v0.0.0-20181221193216-37e7f081c4d4/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sys v0.0.0-20180905080454-ebe1bf3edb33/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
++golang.org/x/sys v0.0.0-20181116152217-5ac8a444bdc5 h1:mzjBh+S5frKOsOBobWIMAbXavqjmgO17k/2puhcFR94=
+ golang.org/x/sys v0.0.0-20181116152217-5ac8a444bdc5/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
+ gopkg.in/alecthomas/kingpin.v2 v2.2.6/go.mod h1:FMv+mEhP44yOT+4EoQTLFTRgOQ1FBLkstjWtayDeSgw=
+ gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+diff --git a/prometheus/process_collector.go b/prometheus/process_collector.go
+index 37d2026..5d01c31 100644
+--- a/prometheus/process_collector.go
++++ b/prometheus/process_collector.go
+@@ -16,8 +16,6 @@ package prometheus
+ import (
+ 	"errors"
+ 	"os"
+-
+-	"github.com/prometheus/procfs"
+ )
+ 
+ type processCollector struct {
+@@ -126,7 +124,7 @@ func NewProcessCollector(opts ProcessCollectorOpts) Collector {
+ 	}
+ 
+ 	// Set up process metric collection if supported by the runtime.
+-	if _, err := procfs.NewDefaultFS(); err == nil {
++	if canCollectProcess() {
+ 		c.collectFn = c.processCollect
+ 	} else {
+ 		c.collectFn = func(ch chan<- Metric) {
+@@ -153,46 +151,6 @@ func (c *processCollector) Collect(ch chan<- Metric) {
+ 	c.collectFn(ch)
+ }
+ 
+-func (c *processCollector) processCollect(ch chan<- Metric) {
+-	pid, err := c.pidFn()
+-	if err != nil {
+-		c.reportError(ch, nil, err)
+-		return
+-	}
+-
+-	p, err := procfs.NewProc(pid)
+-	if err != nil {
+-		c.reportError(ch, nil, err)
+-		return
+-	}
+-
+-	if stat, err := p.Stat(); err == nil {
+-		ch <- MustNewConstMetric(c.cpuTotal, CounterValue, stat.CPUTime())
+-		ch <- MustNewConstMetric(c.vsize, GaugeValue, float64(stat.VirtualMemory()))
+-		ch <- MustNewConstMetric(c.rss, GaugeValue, float64(stat.ResidentMemory()))
+-		if startTime, err := stat.StartTime(); err == nil {
+-			ch <- MustNewConstMetric(c.startTime, GaugeValue, startTime)
+-		} else {
+-			c.reportError(ch, c.startTime, err)
+-		}
+-	} else {
+-		c.reportError(ch, nil, err)
+-	}
+-
+-	if fds, err := p.FileDescriptorsLen(); err == nil {
+-		ch <- MustNewConstMetric(c.openFDs, GaugeValue, float64(fds))
+-	} else {
+-		c.reportError(ch, c.openFDs, err)
+-	}
+-
+-	if limits, err := p.Limits(); err == nil {
+-		ch <- MustNewConstMetric(c.maxFDs, GaugeValue, float64(limits.OpenFiles))
+-		ch <- MustNewConstMetric(c.maxVsize, GaugeValue, float64(limits.AddressSpace))
+-	} else {
+-		c.reportError(ch, nil, err)
+-	}
+-}
+-
+ func (c *processCollector) reportError(ch chan<- Metric, desc *Desc, err error) {
+ 	if !c.reportErrors {
+ 		return
+diff --git a/prometheus/process_collector_other.go b/prometheus/process_collector_other.go
+new file mode 100644
+index 0000000..3117461
+--- /dev/null
++++ b/prometheus/process_collector_other.go
+@@ -0,0 +1,65 @@
++// Copyright 2019 The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build !windows
++
++package prometheus
++
++import (
++	"github.com/prometheus/procfs"
++)
++
++func canCollectProcess() bool {
++	_, err := procfs.NewDefaultFS()
++	return err == nil
++}
++
++func (c *processCollector) processCollect(ch chan<- Metric) {
++	pid, err := c.pidFn()
++	if err != nil {
++		c.reportError(ch, nil, err)
++		return
++	}
++
++	p, err := procfs.NewProc(pid)
++	if err != nil {
++		c.reportError(ch, nil, err)
++		return
++	}
++
++	if stat, err := p.Stat(); err == nil {
++		ch <- MustNewConstMetric(c.cpuTotal, CounterValue, stat.CPUTime())
++		ch <- MustNewConstMetric(c.vsize, GaugeValue, float64(stat.VirtualMemory()))
++		ch <- MustNewConstMetric(c.rss, GaugeValue, float64(stat.ResidentMemory()))
++		if startTime, err := stat.StartTime(); err == nil {
++			ch <- MustNewConstMetric(c.startTime, GaugeValue, startTime)
++		} else {
++			c.reportError(ch, c.startTime, err)
++		}
++	} else {
++		c.reportError(ch, nil, err)
++	}
++
++	if fds, err := p.FileDescriptorsLen(); err == nil {
++		ch <- MustNewConstMetric(c.openFDs, GaugeValue, float64(fds))
++	} else {
++		c.reportError(ch, c.openFDs, err)
++	}
++
++	if limits, err := p.Limits(); err == nil {
++		ch <- MustNewConstMetric(c.maxFDs, GaugeValue, float64(limits.OpenFiles))
++		ch <- MustNewConstMetric(c.maxVsize, GaugeValue, float64(limits.AddressSpace))
++	} else {
++		c.reportError(ch, nil, err)
++	}
++}
+diff --git a/prometheus/process_collector_windows.go b/prometheus/process_collector_windows.go
+new file mode 100644
+index 0000000..e0b935d
+--- /dev/null
++++ b/prometheus/process_collector_windows.go
+@@ -0,0 +1,112 @@
++// Copyright 2019 The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package prometheus
++
++import (
++	"syscall"
++	"unsafe"
++
++	"golang.org/x/sys/windows"
++)
++
++func canCollectProcess() bool {
++	return true
++}
++
++var (
++	modpsapi    = syscall.NewLazyDLL("psapi.dll")
++	modkernel32 = syscall.NewLazyDLL("kernel32.dll")
++
++	procGetProcessMemoryInfo  = modpsapi.NewProc("GetProcessMemoryInfo")
++	procGetProcessHandleCount = modkernel32.NewProc("GetProcessHandleCount")
++)
++
++type processMemoryCounters struct {
++	// https://docs.microsoft.com/en-us/windows/desktop/api/psapi/ns-psapi-_process_memory_counters_ex
++	_                          uint32
++	PageFaultCount             uint32
++	PeakWorkingSetSize         uint64
++	WorkingSetSize             uint64
++	QuotaPeakPagedPoolUsage    uint64
++	QuotaPagedPoolUsage        uint64
++	QuotaPeakNonPagedPoolUsage uint64
++	QuotaNonPagedPoolUsage     uint64
++	PagefileUsage              uint64
++	PeakPagefileUsage          uint64
++	PrivateUsage               uint64
++}
++
++func getProcessMemoryInfo(handle windows.Handle) (processMemoryCounters, error) {
++	mem := processMemoryCounters{}
++	r1, _, err := procGetProcessMemoryInfo.Call(
++		uintptr(handle),
++		uintptr(unsafe.Pointer(&mem)),
++		uintptr(unsafe.Sizeof(mem)),
++	)
++	if r1 != 1 {
++		return mem, err
++	} else {
++		return mem, nil
++	}
++}
++
++func getProcessHandleCount(handle windows.Handle) (uint32, error) {
++	var count uint32
++	r1, _, err := procGetProcessHandleCount.Call(
++		uintptr(handle),
++		uintptr(unsafe.Pointer(&count)),
++	)
++	if r1 != 1 {
++		return 0, err
++	} else {
++		return count, nil
++	}
++}
++
++func (c *processCollector) processCollect(ch chan<- Metric) {
++	h, err := windows.GetCurrentProcess()
++	if err != nil {
++		c.reportError(ch, nil, err)
++		return
++	}
++
++	var startTime, exitTime, kernelTime, userTime windows.Filetime
++	err = windows.GetProcessTimes(h, &startTime, &exitTime, &kernelTime, &userTime)
++	if err != nil {
++		c.reportError(ch, nil, err)
++		return
++	}
++	ch <- MustNewConstMetric(c.startTime, GaugeValue, float64(startTime.Nanoseconds()/1e9))
++	ch <- MustNewConstMetric(c.cpuTotal, CounterValue, fileTimeToSeconds(kernelTime)+fileTimeToSeconds(userTime))
++
++	mem, err := getProcessMemoryInfo(h)
++	if err != nil {
++		c.reportError(ch, nil, err)
++		return
++	}
++	ch <- MustNewConstMetric(c.vsize, GaugeValue, float64(mem.PrivateUsage))
++	ch <- MustNewConstMetric(c.rss, GaugeValue, float64(mem.WorkingSetSize))
++
++	handles, err := getProcessHandleCount(h)
++	if err != nil {
++		c.reportError(ch, nil, err)
++		return
++	}
++	ch <- MustNewConstMetric(c.openFDs, GaugeValue, float64(handles))
++	ch <- MustNewConstMetric(c.maxFDs, GaugeValue, float64(16*1024*1024)) // Windows has a hard-coded max limit, not per-process.
++}
++
++func fileTimeToSeconds(ft windows.Filetime) float64 {
++	return float64(uint64(ft.HighDateTime)<<32+uint64(ft.LowDateTime)) / 1e7
++}

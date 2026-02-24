@@ -1,0 +1,306 @@
+diff --git a/README.md b/README.md
+index 72ac99b..7dd7f73 100644
+--- a/README.md
++++ b/README.md
+@@ -564,7 +564,11 @@ func bookableDate(
+ 
+ func main() {
+ 	route := gin.Default()
+-	binding.Validator.RegisterValidation("bookabledate", bookableDate)
++
++	if v, ok := binding.Validator.Engine().(*validator.Validate); ok {
++		v.RegisterValidation("bookabledate", bookableDate)
++	}
++
+ 	route.GET("/bookable", getBookable)
+ 	route.Run(":8085")
+ }
+@@ -580,13 +584,16 @@ func getBookable(c *gin.Context) {
+ ```
+ 
+ ```console
+-$ curl "localhost:8085/bookable?check_in=2017-08-16&check_out=2017-08-17"
++$ curl "localhost:8085/bookable?check_in=2018-04-16&check_out=2018-04-17"
+ {"message":"Booking dates are valid!"}
+ 
+-$ curl "localhost:8085/bookable?check_in=2017-08-15&check_out=2017-08-16"
++$ curl "localhost:8085/bookable?check_in=2018-03-08&check_out=2018-03-09"
+ {"error":"Key: 'Booking.CheckIn' Error:Field validation for 'CheckIn' failed on the 'bookabledate' tag"}
+ ```
+ 
++[Struct level validations](https://github.com/go-playground/validator/releases/tag/v8.7) can also be registed this way.
++See the [struct-lvl-validation example](examples/struct-lvl-validations) to learn more.
++
+ ### Only Bind Query String
+ 
+ `ShouldBindQuery` function only binds the query params and not the post data. See the [detail information](https://github.com/gin-gonic/gin/issues/742#issuecomment-315953017).
+diff --git a/binding/binding.go b/binding/binding.go
+index dc32d53..646eb80 100644
+--- a/binding/binding.go
++++ b/binding/binding.go
+@@ -6,8 +6,6 @@ package binding
+ 
+ import (
+ 	"net/http"
+-
+-	"gopkg.in/go-playground/validator.v8"
+ )
+ 
+ const (
+@@ -23,11 +21,18 @@ const (
+ 	MIMEMSGPACK2          = "application/msgpack"
+ )
+ 
++// Binding describes the interface which needs to be implemented for binding the
++// data present in the request such as JSON request body, query parameters or
++// the form POST.
+ type Binding interface {
+ 	Name() string
+ 	Bind(*http.Request, interface{}) error
+ }
+ 
++// StructValidator is the minimal interface which needs to be implemented in
++// order for it to be used as the validator engine for ensuring the correctness
++// of the reqest. Gin provides a default implementation for this using
++// https://github.com/go-playground/validator/tree/v8.18.2.
+ type StructValidator interface {
+ 	// ValidateStruct can receive any kind of type and it should never panic, even if the configuration is not right.
+ 	// If the received type is not a struct, any validation should be skipped and nil must be returned.
+@@ -36,14 +41,18 @@ type StructValidator interface {
+ 	// Otherwise nil must be returned.
+ 	ValidateStruct(interface{}) error
+ 
+-	// RegisterValidation adds a validation Func to a Validate's map of validators denoted by the key
+-	// NOTE: if the key already exists, the previous validation function will be replaced.
+-	// NOTE: this method is not thread-safe it is intended that these all be registered prior to any validation
+-	RegisterValidation(string, validator.Func) error
++	// Engine returns the underlying validator engine which powers the
++	// StructValidator implementation.
++	Engine() interface{}
+ }
+ 
++// Validator is the default validator which implements the StructValidator
++// interface. It uses https://github.com/go-playground/validator/tree/v8.18.2
++// under the hood.
+ var Validator StructValidator = &defaultValidator{}
+ 
++// These implement the Binding interface and can be used to bind the data
++// present in the request to struct instances.
+ var (
+ 	JSON          = jsonBinding{}
+ 	XML           = xmlBinding{}
+@@ -55,6 +64,8 @@ var (
+ 	MsgPack       = msgpackBinding{}
+ )
+ 
++// Default returns the appropriate Binding instance based on the HTTP method
++// and the content type.
+ func Default(method, contentType string) Binding {
+ 	if method == "GET" {
+ 		return Form
+diff --git a/binding/default_validator.go b/binding/default_validator.go
+index 6336bb6..c67aa8a 100644
+--- a/binding/default_validator.go
++++ b/binding/default_validator.go
+@@ -28,9 +28,13 @@ func (v *defaultValidator) ValidateStruct(obj interface{}) error {
+ 	return nil
+ }
+ 
+-func (v *defaultValidator) RegisterValidation(key string, fn validator.Func) error {
++// Engine returns the underlying validator engine which powers the default
++// Validator instance. This is useful if you want to register custom validations
++// or struct level validations. See validator GoDoc for more info -
++// https://godoc.org/gopkg.in/go-playground/validator.v8
++func (v *defaultValidator) Engine() interface{} {
+ 	v.lazyinit()
+-	return v.validate.RegisterValidation(key, fn)
++	return v.validate
+ }
+ 
+ func (v *defaultValidator) lazyinit() {
+diff --git a/binding/json.go b/binding/json.go
+index b7c856a..e928a8c 100644
+--- a/binding/json.go
++++ b/binding/json.go
+@@ -10,6 +10,9 @@ import (
+ 	"github.com/gin-gonic/gin/json"
+ )
+ 
++// EnableDecoderUseNumber is used to call the UseNumber method on the JSON
++// Decoder instance. UseNumber causes the Decoder to unmarshal a number into an
++// interface{} as a Number instead of as a float64.
+ var EnableDecoderUseNumber = false
+ 
+ type jsonBinding struct{}
+diff --git a/binding/validate_test.go b/binding/validate_test.go
+index 8ca7998..cb76063 100644
+--- a/binding/validate_test.go
++++ b/binding/validate_test.go
+@@ -214,11 +214,14 @@ func notOne(
+ 	return false
+ }
+ 
+-func TestRegisterValidation(t *testing.T) {
++func TestValidatorEngine(t *testing.T) {
+ 	// This validates that the function `notOne` matches
+ 	// the expected function signature by `defaultValidator`
+ 	// and by extension the validator library.
+-	err := Validator.RegisterValidation("notone", notOne)
++	engine, ok := Validator.Engine().(*validator.Validate)
++	assert.True(t, ok)
++
++	err := engine.RegisterValidation("notone", notOne)
+ 	// Check that we can register custom validation without error
+ 	assert.Nil(t, err)
+ 
+@@ -228,6 +231,6 @@ func TestRegisterValidation(t *testing.T) {
+ 
+ 	// Check that we got back non-nil errs
+ 	assert.NotNil(t, errs)
+-	// Check that the error matches expactation
++	// Check that the error matches expectation
+ 	assert.Error(t, errs, "", "", "notone")
+ }
+diff --git a/examples/custom-validation/server.go b/examples/custom-validation/server.go
+index 31d449f..dea0c30 100644
+--- a/examples/custom-validation/server.go
++++ b/examples/custom-validation/server.go
+@@ -30,7 +30,11 @@ func bookableDate(
+ 
+ func main() {
+ 	route := gin.Default()
+-	binding.Validator.RegisterValidation("bookabledate", bookableDate)
++
++	if v, ok := binding.Validator.Engine().(*validator.Validate); ok {
++		v.RegisterValidation("bookabledate", bookableDate)
++	}
++
+ 	route.GET("/bookable", getBookable)
+ 	route.Run(":8085")
+ }
+diff --git a/examples/struct-lvl-validations/README.md b/examples/struct-lvl-validations/README.md
+new file mode 100644
+index 0000000..1bd57f0
+--- /dev/null
++++ b/examples/struct-lvl-validations/README.md
+@@ -0,0 +1,50 @@
++## Struct level validations
++
++Validations can also be registered at the `struct` level when field level validations
++don't make much sense. This can also be used to solve cross-field validation elegantly.
++Additionally, it can be combined with tag validations. Struct Level validations run after
++the structs tag validations.
++
++### Example requests
++
++```shell
++# Validation errors are generated for struct tags as well as at the struct level
++$ curl -s -X POST http://localhost:8085/user \
++	-H 'content-type: application/json' \
++	-d '{}' | jq
++{
++  "error": "Key: 'User.Email' Error:Field validation for 'Email' failed on the 'required' tag\nKey: 'User.FirstName' Error:Field validation for 'FirstName' failed on the 'fnameorlname' tag\nKey: 'User.LastName' Error:Field validation for 'LastName' failed on the 'fnameorlname' tag",
++  "message": "User validation failed!"
++}
++
++# Validation fails at the struct level because neither first name nor last name are present
++$ curl -s -X POST http://localhost:8085/user \
++    -H 'content-type: application/json' \
++	-d '{"email": "george@vandaley.com"}' | jq
++{
++  "error": "Key: 'User.FirstName' Error:Field validation for 'FirstName' failed on the 'fnameorlname' tag\nKey: 'User.LastName' Error:Field validation for 'LastName' failed on the 'fnameorlname' tag",
++  "message": "User validation failed!"
++}
++
++# No validation errors when either first name or last name is present
++$ curl -X POST http://localhost:8085/user \
++    -H 'content-type: application/json' \
++	-d '{"fname": "George", "email": "george@vandaley.com"}'
++{"message":"User validation successful."}
++
++$ curl -X POST http://localhost:8085/user \
++    -H 'content-type: application/json' \
++	-d '{"lname": "Contanza", "email": "george@vandaley.com"}'
++{"message":"User validation successful."}
++
++$ curl -X POST http://localhost:8085/user \
++    -H 'content-type: application/json' \
++	-d '{"fname": "George", "lname": "Costanza", "email": "george@vandaley.com"}'
++{"message":"User validation successful."}
++```
++
++### Useful links
++
++- Validator docs - https://godoc.org/gopkg.in/go-playground/validator.v8#Validate.RegisterStructValidation
++- Struct level example - https://github.com/go-playground/validator/blob/v8.18.2/examples/struct-level/struct_level.go
++- Validator release notes - https://github.com/go-playground/validator/releases/tag/v8.7
+diff --git a/examples/struct-lvl-validations/server.go b/examples/struct-lvl-validations/server.go
+new file mode 100644
+index 0000000..be807b7
+--- /dev/null
++++ b/examples/struct-lvl-validations/server.go
+@@ -0,0 +1,64 @@
++package main
++
++import (
++	"net/http"
++	"reflect"
++
++	"github.com/gin-gonic/gin"
++	"github.com/gin-gonic/gin/binding"
++	validator "gopkg.in/go-playground/validator.v8"
++)
++
++// User contains user information.
++type User struct {
++	FirstName string `json:"fname"`
++	LastName  string `json:"lname"`
++	Email     string `binding:"required,email"`
++}
++
++// UserStructLevelValidation contains custom struct level validations that don't always
++// make sense at the field validation level. For example, this function validates that either
++// FirstName or LastName exist; could have done that with a custom field validation but then
++// would have had to add it to both fields duplicating the logic + overhead, this way it's
++// only validated once.
++//
++// NOTE: you may ask why wouldn't not just do this outside of validator. Doing this way
++// hooks right into validator and you can combine with validation tags and still have a
++// common error output format.
++func UserStructLevelValidation(v *validator.Validate, structLevel *validator.StructLevel) {
++	user := structLevel.CurrentStruct.Interface().(User)
++
++	if len(user.FirstName) == 0 && len(user.LastName) == 0 {
++		structLevel.ReportError(
++			reflect.ValueOf(user.FirstName), "FirstName", "fname", "fnameorlname",
++		)
++		structLevel.ReportError(
++			reflect.ValueOf(user.LastName), "LastName", "lname", "fnameorlname",
++		)
++	}
++
++	// plus can to more, even with different tag than "fnameorlname"
++}
++
++func main() {
++	route := gin.Default()
++
++	if v, ok := binding.Validator.Engine().(*validator.Validate); ok {
++		v.RegisterStructValidation(UserStructLevelValidation, User{})
++	}
++
++	route.POST("/user", validateUser)
++	route.Run(":8085")
++}
++
++func validateUser(c *gin.Context) {
++	var u User
++	if err := c.ShouldBindJSON(&u); err == nil {
++		c.JSON(http.StatusOK, gin.H{"message": "User validation successful."})
++	} else {
++		c.JSON(http.StatusBadRequest, gin.H{
++			"message": "User validation failed!",
++			"error":   err.Error(),
++		})
++	}
++}

@@ -1,0 +1,264 @@
+diff --git a/.changes/v1.14/BUG FIXES-20251124-150000.yaml b/.changes/v1.14/BUG FIXES-20251124-150000.yaml
+deleted file mode 100644
+index 798c4744cc..0000000000
+--- a/.changes/v1.14/BUG FIXES-20251124-150000.yaml	
++++ /dev/null
+@@ -1,5 +0,0 @@
+-kind: BUG FIXES
+-body: 'actions: make after_create & after_update actions run after the resource has applied'
+-time: 2025-11-24T15:00:00.316597+01:00
+-custom:
+-    Issue: "37936"
+diff --git a/internal/terraform/context_apply_action_test.go b/internal/terraform/context_apply_action_test.go
+index 07fe19009d..63bd0c170f 100644
+--- a/internal/terraform/context_apply_action_test.go
++++ b/internal/terraform/context_apply_action_test.go
+@@ -4,11 +4,9 @@
+ package terraform
+ 
+ import (
+-	"fmt"
+ 	"path/filepath"
+ 	"sync"
+ 	"testing"
+-	"time"
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/hashicorp/hcl/v2"
+@@ -2813,117 +2811,3 @@ func (a *actionHookCapture) Stopping() {}
+ func (a *actionHookCapture) PostStateUpdate(*states.State) (HookAction, error) {
+ 	return HookActionContinue, nil
+ }
+-
+-func TestContextApply_actions_after_trigger_runs_after_expanded_resource(t *testing.T) {
+-	m := testModuleInline(t, map[string]string{
+-		"main.tf": `
+-locals {
+-  each = toset(["one"])
+-}
+-action "action_example" "hello" {
+-  config {
+-    attr = "hello"
+-  }
+-}
+-resource "test_object" "a" {
+-  for_each = local.each
+-  name = each.value
+-  lifecycle {
+-    action_trigger {
+-      events  = [after_create]
+-      actions = [action.action_example.hello]
+-    }
+-  }
+-}
+-`,
+-	})
+-
+-	orderedCalls := []string{}
+-
+-	testProvider := &testing_provider.MockProvider{
+-		GetProviderSchemaResponse: &providers.GetProviderSchemaResponse{
+-			ResourceTypes: map[string]providers.Schema{
+-				"test_object": {
+-					Body: &configschema.Block{
+-						Attributes: map[string]*configschema.Attribute{
+-							"name": {
+-								Type:     cty.String,
+-								Optional: true,
+-							},
+-						},
+-					},
+-				},
+-			},
+-		},
+-		ApplyResourceChangeFn: func(arcr providers.ApplyResourceChangeRequest) providers.ApplyResourceChangeResponse {
+-			time.Sleep(100 * time.Millisecond)
+-			orderedCalls = append(orderedCalls, fmt.Sprintf("ApplyResourceChangeFn %s", arcr.TypeName))
+-			return providers.ApplyResourceChangeResponse{
+-				NewState:    arcr.PlannedState,
+-				NewIdentity: arcr.PlannedIdentity,
+-			}
+-		},
+-	}
+-
+-	actionProvider := &testing_provider.MockProvider{
+-		GetProviderSchemaResponse: &providers.GetProviderSchemaResponse{
+-			Actions: map[string]providers.ActionSchema{
+-				"action_example": {
+-					ConfigSchema: &configschema.Block{
+-						Attributes: map[string]*configschema.Attribute{
+-							"attr": {
+-								Type:     cty.String,
+-								Optional: true,
+-							},
+-						},
+-					},
+-				},
+-			},
+-			ResourceTypes: map[string]providers.Schema{},
+-		},
+-		InvokeActionFn: func(iar providers.InvokeActionRequest) providers.InvokeActionResponse {
+-			orderedCalls = append(orderedCalls, fmt.Sprintf("InvokeAction %s", iar.ActionType))
+-			return providers.InvokeActionResponse{
+-				Events: func(yield func(providers.InvokeActionEvent) bool) {
+-					yield(providers.InvokeActionEvent_Completed{})
+-				},
+-			}
+-		},
+-	}
+-
+-	hookCapture := newActionHookCapture()
+-	ctx := testContext2(t, &ContextOpts{
+-		Providers: map[addrs.Provider]providers.Factory{
+-			addrs.NewDefaultProvider("test"):   testProviderFuncFixed(testProvider),
+-			addrs.NewDefaultProvider("action"): testProviderFuncFixed(actionProvider),
+-		},
+-		Hooks: []Hook{
+-			&hookCapture,
+-		},
+-	})
+-
+-	// Just a sanity check that the module is valid
+-	diags := ctx.Validate(m, &ValidateOpts{})
+-	tfdiags.AssertNoDiagnostics(t, diags)
+-
+-	planOpts := SimplePlanOpts(plans.NormalMode, InputValues{})
+-
+-	plan, diags := ctx.Plan(m, nil, planOpts)
+-	tfdiags.AssertNoDiagnostics(t, diags)
+-
+-	if !plan.Applyable {
+-		t.Fatalf("plan is not applyable but should be")
+-	}
+-
+-	_, diags = ctx.Apply(plan, m, nil)
+-	tfdiags.AssertNoDiagnostics(t, diags)
+-
+-	expectedOrder := []string{
+-		"ApplyResourceChangeFn test_object",
+-		"InvokeAction action_example",
+-	}
+-
+-	if diff := cmp.Diff(expectedOrder, orderedCalls); diff != "" {
+-		t.Fatalf("expected calls in order did not match actual calls (-expected +actual):\n%s", diff)
+-	}
+-}
+diff --git a/internal/terraform/graph_builder_apply.go b/internal/terraform/graph_builder_apply.go
+index 0b33e88f04..8835a434e5 100644
+--- a/internal/terraform/graph_builder_apply.go
++++ b/internal/terraform/graph_builder_apply.go
+@@ -166,6 +166,8 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
+ 					relativeTiming: timing,
+ 				}
+ 			},
++			// we want before_* actions to run before and after_* actions to run after the resource
++			CreateNodesAsAfter: false,
+ 		},
+ 
+ 		&ActionInvokeApplyTransformer{
+diff --git a/internal/terraform/graph_builder_plan.go b/internal/terraform/graph_builder_plan.go
+index a443d13a72..4a395ed7e0 100644
+--- a/internal/terraform/graph_builder_plan.go
++++ b/internal/terraform/graph_builder_plan.go
+@@ -176,6 +176,9 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
+ 					nodeAbstractActionTriggerExpand: node,
+ 				}
+ 			},
++
++			// We plan all actions after the resource is handled
++			CreateNodesAsAfter: true,
+ 		},
+ 
+ 		&ActionInvokePlanTransformer{
+diff --git a/internal/terraform/transform_action_trigger_config.go b/internal/terraform/transform_action_trigger_config.go
+index 42ed56bc78..cb98d3e348 100644
+--- a/internal/terraform/transform_action_trigger_config.go
++++ b/internal/terraform/transform_action_trigger_config.go
+@@ -20,6 +20,7 @@ type ActionTriggerConfigTransformer struct {
+ 	queryPlanMode bool
+ 
+ 	ConcreteActionTriggerNodeFunc ConcreteActionTriggerNodeFunc
++	CreateNodesAsAfter            bool
+ }
+ 
+ func (t *ActionTriggerConfigTransformer) Transform(g *Graph) error {
+@@ -48,21 +49,13 @@ func (t *ActionTriggerConfigTransformer) transform(g *Graph, config *configs.Con
+ }
+ 
+ func (t *ActionTriggerConfigTransformer) transformSingle(g *Graph, config *configs.Config) error {
+-	// During plan we only want to create all triggers to run after the resource
+-	createNodesAsAfter := t.Operation == walkPlan
+-	// During apply we want all after trigger to also connect to the resource instance nodes
+-	connectToResourceInstanceNodes := t.Operation == walkApply
+ 	actionConfigs := addrs.MakeMap[addrs.ConfigAction, *configs.Action]()
+ 	for _, a := range config.Module.Actions {
+ 		actionConfigs.Put(a.Addr().InModule(config.Path), a)
+ 	}
+ 
+ 	resourceNodes := addrs.MakeMap[addrs.ConfigResource, []GraphNodeConfigResource]()
+-	resourceInstanceNodes := addrs.MakeMap[addrs.ConfigResource, []GraphNodeResourceInstance]()
+ 	for _, node := range g.Vertices() {
+-		if rin, ok := node.(GraphNodeResourceInstance); ok {
+-			resourceInstanceNodes.Put(rin.ResourceInstanceAddr().ConfigResource(), append(resourceInstanceNodes.Get(rin.ResourceInstanceAddr().ConfigResource()), rin))
+-		}
+ 		rn, ok := node.(GraphNodeConfigResource)
+ 		if !ok {
+ 			continue
+@@ -143,7 +136,7 @@ func (t *ActionTriggerConfigTransformer) transformSingle(g *Graph, config *confi
+ 
+ 				// If CreateNodesAsAfter is set we want all nodes to run after the resource
+ 				// If not we want expansion nodes only to exist if they are being used
+-				if !createNodesAsAfter && containsBeforeEvent {
++				if !t.CreateNodesAsAfter && containsBeforeEvent {
+ 					nat := t.ConcreteActionTriggerNodeFunc(abstract, RelativeActionTimingBefore)
+ 					g.Add(nat)
+ 
+@@ -151,11 +144,6 @@ func (t *ActionTriggerConfigTransformer) transformSingle(g *Graph, config *confi
+ 					for _, node := range resourceNode {
+ 						g.Connect(dag.BasicEdge(node, nat))
+ 					}
+-					if connectToResourceInstanceNodes {
+-						for _, node := range resourceInstanceNodes.Get(resourceAddr) {
+-							g.Connect(dag.BasicEdge(node, nat))
+-						}
+-					}
+ 
+ 					// We want to run after all prior nodes
+ 					for _, priorNode := range priorBeforeNodes {
+@@ -164,7 +152,7 @@ func (t *ActionTriggerConfigTransformer) transformSingle(g *Graph, config *confi
+ 					priorBeforeNodes = append(priorBeforeNodes, nat)
+ 				}
+ 
+-				if createNodesAsAfter || containsAfterEvent {
++				if t.CreateNodesAsAfter || containsAfterEvent {
+ 					nat := t.ConcreteActionTriggerNodeFunc(abstract, RelativeActionTimingAfter)
+ 					g.Add(nat)
+ 
+@@ -172,11 +160,6 @@ func (t *ActionTriggerConfigTransformer) transformSingle(g *Graph, config *confi
+ 					for _, node := range resourceNode {
+ 						g.Connect(dag.BasicEdge(nat, node))
+ 					}
+-					if connectToResourceInstanceNodes {
+-						for _, node := range resourceInstanceNodes.Get(resourceAddr) {
+-							g.Connect(dag.BasicEdge(nat, node))
+-						}
+-					}
+ 
+ 					// We want to run after all prior nodes
+ 					for _, priorNode := range priorAfterNodes {
+diff --git a/internal/terraform/transform_targets.go b/internal/terraform/transform_targets.go
+index 10fabdae37..b299e57ce9 100644
+--- a/internal/terraform/transform_targets.go
++++ b/internal/terraform/transform_targets.go
+@@ -231,11 +231,4 @@ func (t *TargetsTransformer) addVertexDependenciesToTargetedNodes(g *Graph, v da
+ 			}
+ 		}
+ 	}
+-	if _, ok := v.(*NodeApplyableResourceInstance); ok {
+-		for _, f := range g.UpEdges(v) {
+-			if _, ok := f.(*nodeActionTriggerApplyExpand); ok {
+-				t.addVertexDependenciesToTargetedNodes(g, f, targetedNodes, addrs)
+-			}
+-		}
+-	}
+ }

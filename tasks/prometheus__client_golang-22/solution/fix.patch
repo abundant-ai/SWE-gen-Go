@@ -1,0 +1,662 @@
+diff --git a/Makefile.TRAVIS b/Makefile.TRAVIS
+index 78a3a68..9a6b35b 100644
+--- a/Makefile.TRAVIS
++++ b/Makefile.TRAVIS
+@@ -20,7 +20,10 @@ preparation:
+ 	ln -sf "$(PWD)" $(PROMETHEUS_TARGET)
+ 
+ dependencies:
++	go get code.google.com/p/goprotobuf/proto
+ 	go get github.com/matttproud/gocheck
++	go get github.com/matttproud/golang_protobuf_extensions/ext
++	go get github.com/prometheus/client_model/go
+ 
+ test: dependencies preparation
+ 	$(MAKE) test
+diff --git a/extraction/discriminator.go b/extraction/discriminator.go
+index c0c9bdf..b443582 100644
+--- a/extraction/discriminator.go
++++ b/extraction/discriminator.go
+@@ -33,11 +33,10 @@ func ProcessorForRequestHeader(header http.Header) (Processor, error) {
+ 	}
+ 	switch mediatype {
+ 	case "application/vnd.google.protobuf":
+-		// BUG(matt): Version?
+ 		if params["proto"] != "io.prometheus.client.MetricFamily" {
+ 			return nil, fmt.Errorf("Unrecognized Protocol Message %s", params["proto"])
+ 		}
+-		if params["encoding"] != "varint record length-delimited" {
++		if params["encoding"] != "delimited" {
+ 			return nil, fmt.Errorf("Unsupported Encoding %s", params["encoding"])
+ 		}
+ 		return MetricFamilyProcessor, nil
+diff --git a/foo b/foo
+new file mode 100644
+index 0000000..e69de29
+diff --git a/prometheus/constants.go b/prometheus/constants.go
+index 3879587..a5197cc 100644
+--- a/prometheus/constants.go
++++ b/prometheus/constants.go
+@@ -28,9 +28,11 @@ const (
+ 
+ 	// The content type and schema information set on telemetry data responses.
+ 	TelemetryContentType = `application/json; schema="prometheus/telemetry"; version=` + APIVersion
++	// The content type and schema information set on telemetry data responses.
++	DelimitedTelemetryContentType = `application/vnd.google.protobuf; proto="io.prometheus.client.MetricFamily"; encoding="delimited"`
+ 
+ 	// The customary web services endpoint on which telemetric data is exposed.
+-	ExpositionResource = "/metrics.json"
++	ExpositionResource = "/metrics"
+ 
+ 	baseLabelsKey = "baseLabels"
+ 	docstringKey  = "docstring"
+diff --git a/prometheus/counter.go b/prometheus/counter.go
+index dd07f60..3d8b3e6 100644
+--- a/prometheus/counter.go
++++ b/prometheus/counter.go
+@@ -10,6 +10,10 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"sync"
++
++	dto "github.com/prometheus/client_model/go"
++
++	"code.google.com/p/goprotobuf/proto"
+ )
+ 
+ // TODO(matt): Refactor to de-duplicate behaviors.
+@@ -31,13 +35,13 @@ type counterVector struct {
+ 
+ func NewCounter() Counter {
+ 	return &counter{
+-		values: map[string]*counterVector{},
++		values: map[uint64]*counterVector{},
+ 	}
+ }
+ 
+ type counter struct {
+ 	mutex  sync.RWMutex
+-	values map[string]*counterVector
++	values map[uint64]*counterVector
+ }
+ 
+ func (metric *counter) Set(labels map[string]string, value float64) float64 {
+@@ -147,3 +151,31 @@ func (metric *counter) MarshalJSON() ([]byte, error) {
+ 		typeKey:  counterTypeValue,
+ 	})
+ }
++
++func (metric *counter) dumpChildren(f *dto.MetricFamily) {
++	metric.mutex.RLock()
++	defer metric.mutex.RUnlock()
++
++	f.Type = dto.MetricType_COUNTER.Enum()
++
++	for _, child := range metric.values {
++		c := &dto.Counter{
++			Value: proto.Float64(child.Value),
++		}
++
++		m := &dto.Metric{
++			Counter: c,
++		}
++
++		for name, value := range child.Labels {
++			p := &dto.LabelPair{
++				Name:  proto.String(name),
++				Value: proto.String(value),
++			}
++
++			m.Label = append(m.Label, p)
++		}
++
++		f.Metric = append(f.Metric, m)
++	}
++}
+diff --git a/prometheus/gauge.go b/prometheus/gauge.go
+index f6aa265..93eb174 100644
+--- a/prometheus/gauge.go
++++ b/prometheus/gauge.go
+@@ -10,6 +10,10 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"sync"
++
++	"code.google.com/p/goprotobuf/proto"
++
++	dto "github.com/prometheus/client_model/go"
+ )
+ 
+ // A gauge metric merely provides an instantaneous representation of a scalar
+@@ -28,13 +32,13 @@ type gaugeVector struct {
+ 
+ func NewGauge() Gauge {
+ 	return &gauge{
+-		values: map[string]*gaugeVector{},
++		values: map[uint64]*gaugeVector{},
+ 	}
+ }
+ 
+ type gauge struct {
+ 	mutex  sync.RWMutex
+-	values map[string]*gaugeVector
++	values map[uint64]*gaugeVector
+ }
+ 
+ func (metric *gauge) String() string {
+@@ -94,3 +98,31 @@ func (metric *gauge) MarshalJSON() ([]byte, error) {
+ 		valueKey: values,
+ 	})
+ }
++
++func (metric *gauge) dumpChildren(f *dto.MetricFamily) {
++	metric.mutex.RLock()
++	defer metric.mutex.RUnlock()
++
++	f.Type = dto.MetricType_GAUGE.Enum()
++
++	for _, child := range metric.values {
++		c := &dto.Gauge{
++			Value: proto.Float64(child.Value),
++		}
++
++		m := &dto.Metric{
++			Gauge: c,
++		}
++
++		for name, value := range child.Labels {
++			p := &dto.LabelPair{
++				Name:  proto.String(name),
++				Value: proto.String(value),
++			}
++
++			m.Label = append(m.Label, p)
++		}
++
++		f.Metric = append(f.Metric, m)
++	}
++}
+diff --git a/prometheus/histogram.go b/prometheus/histogram.go
+index 7631c3a..85389a2 100644
+--- a/prometheus/histogram.go
++++ b/prometheus/histogram.go
+@@ -13,6 +13,10 @@ import (
+ 	"math"
+ 	"strconv"
+ 	"sync"
++
++	dto "github.com/prometheus/client_model/go"
++
++	"code.google.com/p/goprotobuf/proto"
+ )
+ 
+ // This generates count-buckets of equal size distributed along the open
+@@ -75,7 +79,7 @@ type histogram struct {
+ 	// These are the buckets that capture samples as they are emitted to the
+ 	// histogram.  Please consult the reference interface and its implements for
+ 	// further details about behavior expectations.
+-	values map[string]*histogramVector
++	values map[uint64]*histogramVector
+ 	// These are the percentile values that will be reported on marshalling.
+ 	reportablePercentiles []float64
+ }
+@@ -157,7 +161,7 @@ func prospectiveIndexForPercentile(percentile float64, totalObservations int) in
+ }
+ 
+ // Determine the next bucket element when interim bucket intervals may be empty.
+-func (h histogram) nextNonEmptyBucketElement(signature string, currentIndex, bucketCount int, observationsByBucket []int) (*Bucket, int) {
++func (h histogram) nextNonEmptyBucketElement(signature uint64, currentIndex, bucketCount int, observationsByBucket []int) (*Bucket, int) {
+ 	for i := currentIndex; i < bucketCount; i++ {
+ 		if observationsByBucket[i] == 0 {
+ 			continue
+@@ -176,7 +180,7 @@ func (h histogram) nextNonEmptyBucketElement(signature string, currentIndex, buc
+ // longer contained by the bucket, the index of the last item is returned.  This
+ // may occur if the underlying bucket catalogs values and employs an eviction
+ // strategy.
+-func (h histogram) bucketForPercentile(signature string, percentile float64) (*Bucket, int) {
++func (h histogram) bucketForPercentile(signature uint64, percentile float64) (*Bucket, int) {
+ 	bucketCount := len(h.bucketStarts)
+ 
+ 	// This captures the quantity of samples in a given bucket's range.
+@@ -229,7 +233,7 @@ func (h histogram) bucketForPercentile(signature string, percentile float64) (*B
+ // Return the histogram's estimate of the value for a given percentile of
+ // collected samples.  The requested percentile is expected to be a real
+ // value within (0, 1.0].
+-func (h histogram) percentile(signature string, percentile float64) float64 {
++func (h histogram) percentile(signature uint64, percentile float64) float64 {
+ 	bucket, index := h.bucketForPercentile(signature, percentile)
+ 
+ 	return (*bucket).ValueForIndex(index)
+@@ -284,7 +288,7 @@ func NewHistogram(specification *HistogramSpecification) Histogram {
+ 		bucketMaker:           specification.BucketBuilder,
+ 		bucketStarts:          specification.Starts,
+ 		reportablePercentiles: specification.ReportablePercentiles,
+-		values:                map[string]*histogramVector{},
++		values:                map[uint64]*histogramVector{},
+ 	}
+ 
+ 	return metric
+@@ -301,3 +305,38 @@ func NewDefaultHistogram() Histogram {
+ 		},
+ 	)
+ }
++
++func (metric *histogram) dumpChildren(f *dto.MetricFamily) {
++	metric.mutex.RLock()
++	defer metric.mutex.RUnlock()
++
++	f.Type = dto.MetricType_SUMMARY.Enum()
++
++	for signature, child := range metric.values {
++		c := &dto.Summary{}
++
++		m := &dto.Metric{
++			Summary: c,
++		}
++
++		for name, value := range child.labels {
++			p := &dto.LabelPair{
++				Name:  proto.String(name),
++				Value: proto.String(value),
++			}
++
++			m.Label = append(m.Label, p)
++		}
++
++		for _, percentile := range metric.reportablePercentiles {
++			q := &dto.Quantile{
++				Quantile: proto.Float64(percentile),
++				Value:    proto.Float64(metric.percentile(signature, percentile)),
++			}
++
++			c.Quantile = append(c.Quantile, q)
++		}
++
++		f.Metric = append(f.Metric, m)
++	}
++}
+diff --git a/prometheus/metric.go b/prometheus/metric.go
+index 8d4d5da..70c3500 100644
+--- a/prometheus/metric.go
++++ b/prometheus/metric.go
+@@ -6,7 +6,11 @@
+ 
+ package prometheus
+ 
+-import "encoding/json"
++import (
++	"encoding/json"
++
++	dto "github.com/prometheus/client_model/go"
++)
+ 
+ // A Metric is something that can be exposed via the registry framework.
+ type Metric interface {
+@@ -16,4 +20,6 @@ type Metric interface {
+ 	ResetAll()
+ 	// Produce a human-consumable representation of the metric.
+ 	String() string
++	// dumpChildren populates the child metrics of the given family.
++	dumpChildren(*dto.MetricFamily)
+ }
+diff --git a/prometheus/registry.go b/prometheus/registry.go
+index 7adb487..dace634 100644
+--- a/prometheus/registry.go
++++ b/prometheus/registry.go
+@@ -19,25 +19,26 @@ import (
+ 	"strings"
+ 	"sync"
+ 	"time"
++
++	dto "github.com/prometheus/client_model/go"
++
++	"code.google.com/p/goprotobuf/proto"
++	"github.com/matttproud/golang_protobuf_extensions/ext"
++
++	"github.com/prometheus/client_golang/vendor/goautoneg"
+ )
+ 
+ const (
+-	acceptEncodingHeader     = "Accept-Encoding"
+ 	authorization            = "Authorization"
+ 	authorizationHeader      = "WWW-Authenticate"
+ 	authorizationHeaderValue = "Basic"
++
++	acceptEncodingHeader     = "Accept-Encoding"
+ 	contentEncodingHeader    = "Content-Encoding"
+ 	contentTypeHeader        = "Content-Type"
+ 	gzipAcceptEncodingValue  = "gzip"
+ 	gzipContentEncodingValue = "gzip"
+ 	jsonContentType          = "application/json"
+-	jsonSuffix               = ".json"
+-)
+-
+-var (
+-	abortOnMisuse             bool
+-	debugRegistration         bool
+-	useAggressiveSanityChecks bool
+ )
+ 
+ // container represents a top-level registered metric that encompasses its
+@@ -49,9 +50,23 @@ type container struct {
+ 	name       string
+ }
+ 
++type containers []*container
++
++func (c containers) Len() int {
++	return len(c)
++}
++
++func (c containers) Swap(i, j int) {
++	c[i], c[j] = c[j], c[i]
++}
++
++func (c containers) Less(i, j int) bool {
++	return c[i].name < c[j].name
++}
++
+ type registry struct {
+ 	mutex               sync.RWMutex
+-	signatureContainers map[string]container
++	signatureContainers map[uint64]*container
+ }
+ 
+ // Registry is a registrar where metrics are listed.
+@@ -72,8 +87,8 @@ type Registry interface {
+ // This builds a new metric registry.  It is not needed in the majority of
+ // cases.
+ func NewRegistry() Registry {
+-	return registry{
+-		signatureContainers: make(map[string]container),
++	return &registry{
++		signatureContainers: make(map[uint64]*container),
+ 	}
+ }
+ 
+@@ -83,33 +98,28 @@ func Register(name, docstring string, baseLabels map[string]string, metric Metri
+ }
+ 
+ // Implements json.Marshaler
+-func (r registry) MarshalJSON() (_ []byte, err error) {
+-	metrics := make([]interface{}, 0, len(r.signatureContainers))
++func (r *registry) MarshalJSON() ([]byte, error) {
++	containers := make(containers, 0, len(r.signatureContainers))
+ 
+-	keys := make([]string, 0, len(metrics))
+-	for key := range r.signatureContainers {
+-		keys = append(keys, key)
++	for _, container := range r.signatureContainers {
++		containers = append(containers, container)
+ 	}
+ 
+-	sort.Strings(keys)
++	sort.Sort(containers)
+ 
+-	for _, key := range keys {
+-		metrics = append(metrics, r.signatureContainers[key])
+-	}
+-
+-	return json.Marshal(metrics)
++	return json.Marshal(containers)
+ }
+ 
+ // isValidCandidate returns true if the candidate is acceptable for use.  In the
+ // event of any apparent incorrect use it will report the problem, invalidate
+ // the candidate, or outright abort.
+-func (r registry) isValidCandidate(name string, baseLabels map[string]string) (signature string, err error) {
++func (r *registry) isValidCandidate(name string, baseLabels map[string]string) (signature uint64, err error) {
+ 	if len(name) == 0 {
+ 		err = fmt.Errorf("unnamed metric named with baseLabels %s is invalid", baseLabels)
+ 
+-		if abortOnMisuse {
++		if *abortOnMisuse {
+ 			panic(err)
+-		} else if debugRegistration {
++		} else if *debugRegistration {
+ 			log.Println(err)
+ 		}
+ 	}
+@@ -117,13 +127,13 @@ func (r registry) isValidCandidate(name string, baseLabels map[string]string) (s
+ 	if _, contains := baseLabels[nameLabel]; contains {
+ 		err = fmt.Errorf("metric named %s with baseLabels %s contains reserved label name %s in baseLabels", name, baseLabels, nameLabel)
+ 
+-		if abortOnMisuse {
++		if *abortOnMisuse {
+ 			panic(err)
+-		} else if debugRegistration {
++		} else if *debugRegistration {
+ 			log.Println(err)
+ 		}
+ 
+-		return
++		return signature, err
+ 	}
+ 
+ 	baseLabels[nameLabel] = name
+@@ -131,34 +141,34 @@ func (r registry) isValidCandidate(name string, baseLabels map[string]string) (s
+ 
+ 	if _, contains := r.signatureContainers[signature]; contains {
+ 		err = fmt.Errorf("metric named %s with baseLabels %s is already registered", name, baseLabels)
+-		if abortOnMisuse {
++		if *abortOnMisuse {
+ 			panic(err)
+-		} else if debugRegistration {
++		} else if *debugRegistration {
+ 			log.Println(err)
+ 		}
+ 
+-		return
++		return signature, err
+ 	}
+ 
+-	if useAggressiveSanityChecks {
++	if *useAggressiveSanityChecks {
+ 		for _, container := range r.signatureContainers {
+ 			if container.name == name {
+ 				err = fmt.Errorf("metric named %s with baseLabels %s is already registered as %s and risks causing confusion", name, baseLabels, container.BaseLabels)
+-				if abortOnMisuse {
++				if *abortOnMisuse {
+ 					panic(err)
+-				} else if debugRegistration {
++				} else if *debugRegistration {
+ 					log.Println(err)
+ 				}
+ 
+-				return
++				return signature, err
+ 			}
+ 		}
+ 	}
+ 
+-	return
++	return signature, err
+ }
+ 
+-func (r registry) Register(name, docstring string, baseLabels map[string]string, metric Metric) (err error) {
++func (r *registry) Register(name, docstring string, baseLabels map[string]string, metric Metric) error {
+ 	r.mutex.Lock()
+ 	defer r.mutex.Unlock()
+ 
+@@ -168,25 +178,26 @@ func (r registry) Register(name, docstring string, baseLabels map[string]string,
+ 
+ 	signature, err := r.isValidCandidate(name, baseLabels)
+ 	if err != nil {
+-		return
++		return err
+ 	}
+ 
+-	r.signatureContainers[signature] = container{
++	r.signatureContainers[signature] = &container{
+ 		BaseLabels: baseLabels,
+ 		Docstring:  docstring,
+ 		Metric:     metric,
+ 		name:       name,
+ 	}
+ 
+-	return
++	return nil
+ }
+ 
+ // YieldBasicAuthExporter creates a http.HandlerFunc that is protected by HTTP's
+ // basic authentication.
+-func (register registry) YieldBasicAuthExporter(username, password string) http.HandlerFunc {
++func (register *registry) YieldBasicAuthExporter(username, password string) http.HandlerFunc {
+ 	// XXX: Work with Daniel to get this removed from the library, as it is really
+ 	//      superfluous and can be much more elegantly accomplished via
+ 	//      delegation.
++	log.Println("Registry.YieldBasicAuthExporter is deprecated.")
+ 	exporter := register.YieldExporter()
+ 
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+@@ -225,38 +236,81 @@ func decorateWriter(request *http.Request, writer http.ResponseWriter) io.Writer
+ 	return gziper
+ }
+ 
+-func (registry registry) YieldExporter() http.HandlerFunc {
++func (registry *registry) YieldExporter() http.HandlerFunc {
+ 	log.Println("Registry.YieldExporter is deprecated in favor of Registry.Handler.")
+ 
+ 	return registry.Handler()
+ }
+ 
+-func (registry registry) Handler() http.HandlerFunc {
++func (r *registry) dumpDelimitedPB(w io.Writer) {
++	r.mutex.RLock()
++	defer r.mutex.RUnlock()
++
++	f := new(dto.MetricFamily)
++	for _, container := range r.signatureContainers {
++		f.Reset()
++
++		f.Name = proto.String(container.name)
++		f.Help = proto.String(container.Docstring)
++
++		container.Metric.dumpChildren(f)
++
++		for name, value := range container.BaseLabels {
++			p := &dto.LabelPair{
++				Name:  proto.String(name),
++				Value: proto.String(value),
++			}
++
++			for _, child := range f.Metric {
++				child.Label = append(child.Label, p)
++			}
++		}
++
++		ext.WriteDelimited(w, f)
++	}
++}
++
++func (registry *registry) Handler() http.HandlerFunc {
+ 	return func(w http.ResponseWriter, r *http.Request) {
+ 		defer requestLatencyAccumulator(time.Now())
+ 
+ 		requestCount.Increment(nil)
+-		url := r.URL
++		header := w.Header()
+ 
+-		if strings.HasSuffix(url.Path, jsonSuffix) {
+-			header := w.Header()
+-			header.Set(contentTypeHeader, TelemetryContentType)
++		writer := decorateWriter(r, w)
+ 
+-			writer := decorateWriter(r, w)
++		if closer, ok := writer.(io.Closer); ok {
++			defer closer.Close()
++		}
+ 
+-			if closer, ok := writer.(io.Closer); ok {
+-				defer closer.Close()
++		accepts := goautoneg.ParseAccept(r.Header.Get("Accept"))
++		for _, accept := range accepts {
++			if accept.Type != "application" {
++				continue
+ 			}
+ 
+-			json.NewEncoder(writer).Encode(registry)
+-		} else {
+-			w.WriteHeader(http.StatusNotFound)
++			if accept.SubType == "vnd.google.protobuf" {
++				if accept.Params["proto"] != "io.prometheus.client.MetricFamily" {
++					continue
++				}
++				if accept.Params["encoding"] != "delimited" {
++					continue
++				}
++
++				header.Set(contentTypeHeader, DelimitedTelemetryContentType)
++				registry.dumpDelimitedPB(writer)
++
++				return
++			}
+ 		}
++
++		header.Set(contentTypeHeader, TelemetryContentType)
++		json.NewEncoder(writer).Encode(registry)
+ 	}
+ }
+ 
+-func init() {
+-	flag.BoolVar(&abortOnMisuse, FlagNamespace+"abortonmisuse", false, "abort if a semantic misuse is encountered (bool).")
+-	flag.BoolVar(&debugRegistration, FlagNamespace+"debugregistration", false, "display information about the metric registration process (bool).")
+-	flag.BoolVar(&useAggressiveSanityChecks, FlagNamespace+"useaggressivesanitychecks", false, "perform expensive validation of metrics (bool).")
+-}
++var (
++	abortOnMisuse             = flag.Bool(FlagNamespace+"abortonmisuse", false, "abort if a semantic misuse is encountered (bool).")
++	debugRegistration         = flag.Bool(FlagNamespace+"debugregistration", false, "display information about the metric registration process (bool).")
++	useAggressiveSanityChecks = flag.Bool(FlagNamespace+"useaggressivesanitychecks", false, "perform expensive validation of metrics (bool).")
++)
+diff --git a/prometheus/signature.go b/prometheus/signature.go
+index 237170d..075d387 100644
+--- a/prometheus/signature.go
++++ b/prometheus/signature.go
+@@ -7,35 +7,28 @@
+ package prometheus
+ 
+ import (
+-	"bytes"
++	"fmt"
++	"hash/fnv"
+ 	"sort"
+-)
+ 
+-const (
+-	delimiter = "|"
++	"github.com/prometheus/client_golang/model"
+ )
+ 
+ // LabelsToSignature provides a way of building a unique signature
+ // (i.e., fingerprint) for a given label set sequence.
+-func labelsToSignature(labels map[string]string) string {
+-	// TODO(matt): This is a wart, and we'll want to validate that collisions
+-	//             do not occur in less-than-diligent environments.
+-	cardinality := len(labels)
+-	keys := make([]string, 0, cardinality)
+-
+-	for label := range labels {
+-		keys = append(keys, label)
++func labelsToSignature(labels map[string]string) uint64 {
++	names := make(model.LabelNames, 0, len(labels))
++	for name := range labels {
++		names = append(names, model.LabelName(name))
+ 	}
+ 
+-	sort.Strings(keys)
++	sort.Sort(names)
+ 
+-	buffer := bytes.Buffer{}
++	hasher := fnv.New64a()
+ 
+-	for _, label := range keys {
+-		buffer.WriteString(label)
+-		buffer.WriteString(delimiter)
+-		buffer.WriteString(labels[label])
++	for _, name := range names {
++		fmt.Fprintf(hasher, string(name), labels[string(name)])
+ 	}
+ 
+-	return buffer.String()
++	return hasher.Sum64()
+ }

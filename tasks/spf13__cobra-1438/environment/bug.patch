@@ -1,0 +1,149 @@
+diff --git a/bash_completions.go b/bash_completions.go
+index 733f4d1..925e6e7 100644
+--- a/bash_completions.go
++++ b/bash_completions.go
+@@ -512,9 +512,7 @@ func writeLocalNonPersistentFlag(buf io.StringWriter, flag *pflag.Flag) {
+ 
+ // Setup annotations for go completions for registered flags
+ func prepareCustomAnnotationsForFlags(cmd *Command) {
+-	flagCompletionMutex.RLock()
+-	defer flagCompletionMutex.RUnlock()
+-	for flag := range flagCompletionFunctions {
++	for flag := range cmd.Root().flagCompletionFunctions {
+ 		// Make sure the completion script calls the __*_go_custom_completion function for
+ 		// every registered flag.  We need to do this here (and not when the flag was registered
+ 		// for completion) so that we can know the root command name for the prefix
+diff --git a/command.go b/command.go
+index 2cc1889..9f33a46 100644
+--- a/command.go
++++ b/command.go
+@@ -142,6 +142,9 @@ type Command struct {
+ 	// that we can use on every pflag set and children commands
+ 	globNormFunc func(f *flag.FlagSet, name string) flag.NormalizedName
+ 
++	//flagCompletionFunctions is map of flag completion functions.
++	flagCompletionFunctions map[*flag.Flag]func(cmd *Command, args []string, toComplete string) ([]string, ShellCompDirective)
++
+ 	// usageFunc is usage func defined by user.
+ 	usageFunc func(*Command) error
+ 	// usageTemplate is usage template defined by user.
+diff --git a/completions.go b/completions.go
+index b849b9c..4687674 100644
+--- a/completions.go
++++ b/completions.go
+@@ -4,7 +4,6 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"strings"
+-	"sync"
+ 
+ 	"github.com/spf13/pflag"
+ )
+@@ -18,12 +17,6 @@ const (
+ 	ShellCompNoDescRequestCmd = "__completeNoDesc"
+ )
+ 
+-// Global map of flag completion functions. Make sure to use flagCompletionMutex before you try to read and write from it.
+-var flagCompletionFunctions = map[*pflag.Flag]func(cmd *Command, args []string, toComplete string) ([]string, ShellCompDirective){}
+-
+-// lock for reading and writing from flagCompletionFunctions
+-var flagCompletionMutex = &sync.RWMutex{}
+-
+ // ShellCompDirective is a bit map representing the different behaviors the shell
+ // can be instructed to have once completions have been provided.
+ type ShellCompDirective int
+@@ -107,13 +100,15 @@ func (c *Command) RegisterFlagCompletionFunc(flagName string, f func(cmd *Comman
+ 	if flag == nil {
+ 		return fmt.Errorf("RegisterFlagCompletionFunc: flag '%s' does not exist", flagName)
+ 	}
+-	flagCompletionMutex.Lock()
+-	defer flagCompletionMutex.Unlock()
+ 
+-	if _, exists := flagCompletionFunctions[flag]; exists {
++	root := c.Root()
++	if _, exists := root.flagCompletionFunctions[flag]; exists {
+ 		return fmt.Errorf("RegisterFlagCompletionFunc: flag '%s' already registered", flagName)
+ 	}
+-	flagCompletionFunctions[flag] = f
++	if root.flagCompletionFunctions == nil {
++		root.flagCompletionFunctions = map[*pflag.Flag]func(cmd *Command, args []string, toComplete string) ([]string, ShellCompDirective){}
++	}
++	root.flagCompletionFunctions[flag] = f
+ 	return nil
+ }
+ 
+@@ -407,9 +402,7 @@ func (c *Command) getCompletions(args []string) (*Command, []string, ShellCompDi
+ 	// Find the completion function for the flag or command
+ 	var completionFn func(cmd *Command, args []string, toComplete string) ([]string, ShellCompDirective)
+ 	if flag != nil && flagCompletion {
+-		flagCompletionMutex.RLock()
+-		completionFn = flagCompletionFunctions[flag]
+-		flagCompletionMutex.RUnlock()
++		completionFn = c.Root().flagCompletionFunctions[flag]
+ 	} else {
+ 		completionFn = finalCmd.ValidArgsFunction
+ 	}
+diff --git a/completions_test.go b/completions_test.go
+index 70c455a..aea06a2 100644
+--- a/completions_test.go
++++ b/completions_test.go
+@@ -1971,41 +1971,6 @@ func TestFlagCompletionWithNotInterspersedArgs(t *testing.T) {
+ 	}
+ }
+ 
+-func TestFlagCompletionWorksRootCommandAddedAfterFlags(t *testing.T) {
+-	rootCmd := &Command{Use: "root", Run: emptyRun}
+-	childCmd := &Command{
+-		Use: "child",
+-		Run: emptyRun,
+-		ValidArgsFunction: func(cmd *Command, args []string, toComplete string) ([]string, ShellCompDirective) {
+-			return []string{"--validarg", "test"}, ShellCompDirectiveDefault
+-		},
+-	}
+-	childCmd.Flags().Bool("bool", false, "test bool flag")
+-	childCmd.Flags().String("string", "", "test string flag")
+-	_ = childCmd.RegisterFlagCompletionFunc("string", func(cmd *Command, args []string, toComplete string) ([]string, ShellCompDirective) {
+-		return []string{"myval"}, ShellCompDirectiveDefault
+-	})
+-
+-	// Important: This is a test for https://github.com/spf13/cobra/issues/1437
+-	// Only add the subcommand after RegisterFlagCompletionFunc was called, do not change this order!
+-	rootCmd.AddCommand(childCmd)
+-
+-	// Test that flag completion works for the subcmd
+-	output, err := executeCommand(rootCmd, ShellCompRequestCmd, "child", "--string", "")
+-	if err != nil {
+-		t.Errorf("Unexpected error: %v", err)
+-	}
+-
+-	expected := strings.Join([]string{
+-		"myval",
+-		":0",
+-		"Completion ended with directive: ShellCompDirectiveDefault", ""}, "\n")
+-
+-	if output != expected {
+-		t.Errorf("expected: %q, got: %q", expected, output)
+-	}
+-}
+-
+ func TestFlagCompletionInGoWithDesc(t *testing.T) {
+ 	rootCmd := &Command{
+ 		Use: "root",
+diff --git a/fish_completions.go b/fish_completions.go
+index bb57fd5..b0db323 100644
+--- a/fish_completions.go
++++ b/fish_completions.go
+@@ -152,11 +152,11 @@ function __%[1]s_prepare_completions
+             # We don't need descriptions anyway since there is only a single
+             # real completion which the shell will expand immediately.
+             set -l split (string split --max 1 \t $__%[1]s_comp_results[1])
+-
++        
+             # Fish won't add a space if the completion ends with any
+             # of the following characters: @=/:.,
+             set -l lastChar (string sub -s -1 -- $split)
+-            if not string match -r -q "[@=/:.,]" -- "$lastChar"
++            if not string match -r -q "[@=/:.,]" -- "$lastChar"                
+                 # In other cases, to support the "nospace" directive we trick the shell
+                 # by outputting an extra, longer completion.
+                 __%[1]s_debug "Adding second completion to perform nospace directive"

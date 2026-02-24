@@ -1,0 +1,24 @@
+#!/bin/bash
+
+cd /app/src
+
+# Set Go environment variables for testing
+export CI=true
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+mkdir -p "xds/internal/clients/xdsclient"
+cp "/tests/xds/internal/clients/xdsclient/channel_test.go" "xds/internal/clients/xdsclient/channel_test.go"
+mkdir -p "xds/internal/clients/xdsclient/test"
+cp "/tests/xds/internal/clients/xdsclient/test/misc_watchers_test.go" "xds/internal/clients/xdsclient/test/misc_watchers_test.go"
+
+# Run the specific test packages for this PR
+# Test files are in: xds/internal/clients/xdsclient/ and xds/internal/clients/xdsclient/test/
+go test -v -timeout 7m ./xds/internal/clients/xdsclient/... ./xds/internal/clients/xdsclient/test/...
+test_status=$?
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+exit "$test_status"

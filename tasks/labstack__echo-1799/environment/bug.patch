@@ -1,0 +1,599 @@
+diff --git a/echo.go b/echo.go
+index 0b49f41..1074ba4 100644
+--- a/echo.go
++++ b/echo.go
+@@ -629,12 +629,12 @@ func (e *Echo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	h := NotFoundHandler
+ 
+ 	if e.premiddleware == nil {
+-		e.findRouter(r.Host).Find(r.Method, GetPath(r), c)
++		e.findRouter(r.Host).Find(r.Method, r.URL.EscapedPath(), c)
+ 		h = c.Handler()
+ 		h = applyMiddleware(h, e.middleware...)
+ 	} else {
+ 		h = func(c Context) error {
+-			e.findRouter(r.Host).Find(r.Method, GetPath(r), c)
++			e.findRouter(r.Host).Find(r.Method, r.URL.EscapedPath(), c)
+ 			h := c.Handler()
+ 			h = applyMiddleware(h, e.middleware...)
+ 			return h(c)
+@@ -909,18 +909,6 @@ func WrapMiddleware(m func(http.Handler) http.Handler) MiddlewareFunc {
+ 	}
+ }
+ 
+-// GetPath returns RawPath, if it's empty returns Path from URL
+-// Difference between RawPath and Path is:
+-//  * Path is where request path is stored. Value is stored in decoded form: /%47%6f%2f becomes /Go/.
+-//  * RawPath is an optional field which only gets set if the default encoding is different from Path.
+-func GetPath(r *http.Request) string {
+-	path := r.URL.RawPath
+-	if path == "" {
+-		path = r.URL.Path
+-	}
+-	return path
+-}
+-
+ func (e *Echo) findRouter(host string) *Router {
+ 	if len(e.routers) > 0 {
+ 		if r, ok := e.routers[host]; ok {
+diff --git a/echo_test.go b/echo_test.go
+index 35c79cb..07661b9 100644
+--- a/echo_test.go
++++ b/echo_test.go
+@@ -468,46 +468,15 @@ func TestEchoRoutes(t *testing.T) {
+ 	}
+ }
+ 
+-func TestEchoServeHTTPPathEncoding(t *testing.T) {
++func TestEchoEncodedPath(t *testing.T) {
+ 	e := New()
+-	e.GET("/with/slash", func(c Context) error {
+-		return c.String(http.StatusOK, "/with/slash")
+-	})
+ 	e.GET("/:id", func(c Context) error {
+-		return c.String(http.StatusOK, c.Param("id"))
++		return c.NoContent(http.StatusOK)
+ 	})
+-
+-	var testCases = []struct {
+-		name         string
+-		whenURL      string
+-		expectURL    string
+-		expectStatus int
+-	}{
+-		{
+-			name:         "url with encoding is not decoded for routing",
+-			whenURL:      "/with%2Fslash",
+-			expectURL:    "with%2Fslash", // `%2F` is not decoded to `/` for routing
+-			expectStatus: http.StatusOK,
+-		},
+-		{
+-			name:         "url without encoding is used as is",
+-			whenURL:      "/with/slash",
+-			expectURL:    "/with/slash",
+-			expectStatus: http.StatusOK,
+-		},
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.name, func(t *testing.T) {
+-			req := httptest.NewRequest(http.MethodGet, tc.whenURL, nil)
+-			rec := httptest.NewRecorder()
+-
+-			e.ServeHTTP(rec, req)
+-
+-			assert.Equal(t, tc.expectStatus, rec.Code)
+-			assert.Equal(t, tc.expectURL, rec.Body.String())
+-		})
+-	}
++	req := httptest.NewRequest(http.MethodGet, "/with%2Fslash", nil)
++	rec := httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, http.StatusOK, rec.Code)
+ }
+ 
+ func TestEchoGroup(t *testing.T) {
+@@ -1242,49 +1211,3 @@ func TestEcho_StartServer(t *testing.T) {
+ 		})
+ 	}
+ }
+-
+-func benchmarkEchoRoutes(b *testing.B, routes []*Route) {
+-	e := New()
+-	req := httptest.NewRequest("GET", "/", nil)
+-	u := req.URL
+-	w := httptest.NewRecorder()
+-
+-	b.ReportAllocs()
+-
+-	// Add routes
+-	for _, route := range routes {
+-		e.Add(route.Method, route.Path, func(c Context) error {
+-			return nil
+-		})
+-	}
+-
+-	// Find routes
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		for _, route := range routes {
+-			req.Method = route.Method
+-			u.Path = route.Path
+-			e.ServeHTTP(w, req)
+-		}
+-	}
+-}
+-
+-func BenchmarkEchoStaticRoutes(b *testing.B) {
+-	benchmarkEchoRoutes(b, staticRoutes)
+-}
+-
+-func BenchmarkEchoStaticRoutesMisses(b *testing.B) {
+-	benchmarkEchoRoutes(b, staticRoutes)
+-}
+-
+-func BenchmarkEchoGitHubAPI(b *testing.B) {
+-	benchmarkEchoRoutes(b, gitHubAPI)
+-}
+-
+-func BenchmarkEchoGitHubAPIMisses(b *testing.B) {
+-	benchmarkEchoRoutes(b, gitHubAPI)
+-}
+-
+-func BenchmarkEchoParseAPI(b *testing.B) {
+-	benchmarkEchoRoutes(b, parseAPI)
+-}
+diff --git a/middleware/middleware.go b/middleware/middleware.go
+index 6bdb0eb..8381e3a 100644
+--- a/middleware/middleware.go
++++ b/middleware/middleware.go
+@@ -2,7 +2,6 @@ package middleware
+ 
+ import (
+ 	"net/http"
+-	"net/url"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
+@@ -51,26 +50,10 @@ func rewriteRulesRegex(rewrite map[string]string) map[*regexp.Regexp]string {
+ 
+ func rewritePath(rewriteRegex map[*regexp.Regexp]string, req *http.Request) {
+ 	for k, v := range rewriteRegex {
+-		rawPath := req.URL.RawPath
+-		if rawPath != "" {
+-			// RawPath is only set when there has been escaping done. In that case Path must be deduced from rewritten RawPath
+-			// because encoded Path could match rules that RawPath did not
+-			if replacer := captureTokens(k, rawPath); replacer != nil {
+-				rawPath = replacer.Replace(v)
+-
+-				req.URL.RawPath = rawPath
+-				req.URL.Path, _ = url.PathUnescape(rawPath)
+-
+-				return // rewrite only once
+-			}
+-
+-			continue
+-		}
+-
+-		if replacer := captureTokens(k, req.URL.Path); replacer != nil {
+-			req.URL.Path = replacer.Replace(v)
+-
+-			return // rewrite only once
++		replacerRawPath := captureTokens(k, req.URL.EscapedPath())
++		if replacerRawPath != nil {
++			replacerPath := captureTokens(k, req.URL.Path)
++			req.URL.RawPath, req.URL.Path = replacerRawPath.Replace(v), replacerPath.Replace(v)
+ 		}
+ 	}
+ }
+diff --git a/middleware/middleware_test.go b/middleware/middleware_test.go
+deleted file mode 100644
+index bc14c53..0000000
+--- a/middleware/middleware_test.go
++++ /dev/null
+@@ -1,69 +0,0 @@
+-package middleware
+-
+-import (
+-	"github.com/stretchr/testify/assert"
+-	"net/http"
+-	"net/http/httptest"
+-	"regexp"
+-	"testing"
+-)
+-
+-func TestRewritePath(t *testing.T) {
+-	var testCases = []struct {
+-		whenURL       string
+-		expectPath    string
+-		expectRawPath string
+-	}{
+-		{
+-			whenURL:       "http://localhost:8080/old",
+-			expectPath:    "/new",
+-			expectRawPath: "",
+-		},
+-		{ // encoded `ol%64` (decoded `old`) should not be rewritten to `/new`
+-			whenURL:       "/ol%64", // `%64` is decoded `d`
+-			expectPath:    "/old",
+-			expectRawPath: "/ol%64",
+-		},
+-		{
+-			whenURL:       "http://localhost:8080/users/+_+/orders/___++++?test=1",
+-			expectPath:    "/user/+_+/order/___++++",
+-			expectRawPath: "",
+-		},
+-		{
+-			whenURL:       "http://localhost:8080/users/%20a/orders/%20aa",
+-			expectPath:    "/user/ a/order/ aa",
+-			expectRawPath: "",
+-		},
+-		{
+-			whenURL:       "http://localhost:8080/%47%6f%2f",
+-			expectPath:    "/Go/",
+-			expectRawPath: "/%47%6f%2f",
+-		},
+-		{
+-			whenURL:       "/users/jill/orders/T%2FcO4lW%2Ft%2FVp%2F",
+-			expectPath:    "/user/jill/order/T/cO4lW/t/Vp/",
+-			expectRawPath: "/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F",
+-		},
+-		{ // do nothing, replace nothing
+-			whenURL:       "http://localhost:8080/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F",
+-			expectPath:    "/user/jill/order/T/cO4lW/t/Vp/",
+-			expectRawPath: "/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F",
+-		},
+-	}
+-
+-	rules := map[*regexp.Regexp]string{
+-		regexp.MustCompile("^/old$"):                      "/new",
+-		regexp.MustCompile("^/users/(.*?)/orders/(.*?)$"): "/user/$1/order/$2",
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.whenURL, func(t *testing.T) {
+-			req := httptest.NewRequest(http.MethodGet, tc.whenURL, nil)
+-
+-			rewritePath(rules, req)
+-
+-			assert.Equal(t, tc.expectPath, req.URL.Path)       // Path field is stored in decoded form: /%47%6f%2f becomes /Go/.
+-			assert.Equal(t, tc.expectRawPath, req.URL.RawPath) // RawPath, an optional field which only gets set if the default encoding is different from Path.
+-		})
+-	}
+-}
+diff --git a/middleware/proxy_test.go b/middleware/proxy_test.go
+index 591981e..eb72f16 100644
+--- a/middleware/proxy_test.go
++++ b/middleware/proxy_test.go
+@@ -75,12 +75,10 @@ func TestProxy(t *testing.T) {
+ 	rrb := NewRoundRobinBalancer(targets)
+ 	e = echo.New()
+ 	e.Use(Proxy(rrb))
+-
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	body = rec.Body.String()
+ 	assert.Equal(t, "target 1", body)
+-
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	body = rec.Body.String()
+@@ -96,7 +94,6 @@ func TestProxy(t *testing.T) {
+ 			return nil
+ 		},
+ 	}))
+-
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, "modified", rec.Body.String())
+@@ -111,7 +108,6 @@ func TestProxy(t *testing.T) {
+ 		}
+ 	}
+ 	rrb1 := NewRoundRobinBalancer(targets)
+-
+ 	e = echo.New()
+ 	e.Use(contextObserver)
+ 	e.Use(Proxy(rrb1))
+@@ -163,84 +159,54 @@ func TestProxyRealIPHeader(t *testing.T) {
+ }
+ 
+ func TestProxyRewrite(t *testing.T) {
+-	var testCases = []struct {
+-		whenPath         string
+-		expectProxiedURI string
+-		expectStatus     int
+-	}{
+-		{
+-			whenPath:         "/api/users",
+-			expectProxiedURI: "/users",
+-			expectStatus:     http.StatusOK,
+-		},
+-		{
+-			whenPath:         "/js/main.js",
+-			expectProxiedURI: "/public/javascripts/main.js",
+-			expectStatus:     http.StatusOK,
+-		},
+-		{
+-			whenPath:         "/old",
+-			expectProxiedURI: "/new",
+-			expectStatus:     http.StatusOK,
+-		},
+-		{
+-			whenPath:         "/users/jack/orders/1",
+-			expectProxiedURI: "/user/jack/order/1",
+-			expectStatus:     http.StatusOK,
+-		},
+-		{
+-			whenPath:         "/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F",
+-			expectProxiedURI: "/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F",
+-			expectStatus:     http.StatusOK,
+-		},
+-		{ // ` ` (space) is encoded by httpClient to `%20` when doing request to Echo. `%20` should not be double escaped when proxying request
+-			whenPath:         "/api/new users",
+-			expectProxiedURI: "/new%20users",
+-			expectStatus:     http.StatusOK,
+-		},
+-		{ // query params should be proxied and not be modified
+-			whenPath:         "/api/users?limit=10",
+-			expectProxiedURI: "/users?limit=10",
+-			expectStatus:     http.StatusOK,
+-		},
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.whenPath, func(t *testing.T) {
+-			receivedRequestURI := make(chan string, 1)
+-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-				// RequestURI is the unmodified request-target of the Request-Line (RFC 7230, Section 3.1.1) as sent by the client to a server
+-				// we need unmodified target to see if we are encoding/decoding the url in addition to rewrite/replace logic
+-				// if original request had `%2F` we should not magically decode it to `/` as it would change what was requested
+-				receivedRequestURI <- r.RequestURI
+-			}))
+-			defer upstream.Close()
+-			serverURL, _ := url.Parse(upstream.URL)
+-			rrb := NewRoundRobinBalancer([]*ProxyTarget{{Name: "upstream", URL: serverURL}})
+-
+-			// Rewrite
+-			e := echo.New()
+-			e.Use(ProxyWithConfig(ProxyConfig{
+-				Balancer: rrb,
+-				Rewrite: map[string]string{
+-					"/old":              "/new",
+-					"/api/*":            "/$1",
+-					"/js/*":             "/public/javascripts/$1",
+-					"/users/*/orders/*": "/user/$1/order/$2",
+-				},
+-			}))
+-
+-			targetURL, _ := serverURL.Parse(tc.whenPath)
+-			req := httptest.NewRequest(http.MethodGet, targetURL.String(), nil)
+-			rec := httptest.NewRecorder()
+-
+-			e.ServeHTTP(rec, req)
++	// Setup
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
++	defer upstream.Close()
++	url, _ := url.Parse(upstream.URL)
++	rrb := NewRoundRobinBalancer([]*ProxyTarget{{Name: "upstream", URL: url}})
++	req := httptest.NewRequest(http.MethodGet, "/", nil)
++	rec := httptest.NewRecorder()
+ 
+-			assert.Equal(t, tc.expectStatus, rec.Code)
+-			actualRequestURI := <-receivedRequestURI
+-			assert.Equal(t, tc.expectProxiedURI, actualRequestURI)
+-		})
+-	}
++	// Rewrite
++	e := echo.New()
++	e.Use(ProxyWithConfig(ProxyConfig{
++		Balancer: rrb,
++		Rewrite: map[string]string{
++			"/old":              "/new",
++			"/api/*":            "/$1",
++			"/js/*":             "/public/javascripts/$1",
++			"/users/*/orders/*": "/user/$1/order/$2",
++		},
++	}))
++	req.URL, _ = url.Parse("/api/users")
++	rec = httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/users", req.URL.EscapedPath())
++	assert.Equal(t, http.StatusOK, rec.Code)
++	req.URL, _ = url.Parse("/js/main.js")
++	rec = httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/public/javascripts/main.js", req.URL.EscapedPath())
++	assert.Equal(t, http.StatusOK, rec.Code)
++	req.URL, _ = url.Parse("/old")
++	rec = httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/new", req.URL.EscapedPath())
++	assert.Equal(t, http.StatusOK, rec.Code)
++	req.URL, _ = url.Parse("/users/jack/orders/1")
++	rec = httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/user/jack/order/1", req.URL.EscapedPath())
++	assert.Equal(t, http.StatusOK, rec.Code)
++	req.URL, _ = url.Parse("/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F")
++	rec = httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F", req.URL.EscapedPath())
++	assert.Equal(t, http.StatusOK, rec.Code)
++	req.URL, _ = url.Parse("/api/new users")
++	rec = httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/new%20users", req.URL.EscapedPath())
+ }
+ 
+ func TestProxyRewriteRegex(t *testing.T) {
+diff --git a/middleware/rewrite_test.go b/middleware/rewrite_test.go
+index cff2714..84006e3 100644
+--- a/middleware/rewrite_test.go
++++ b/middleware/rewrite_test.go
+@@ -12,9 +12,9 @@ import (
+ 	"github.com/stretchr/testify/assert"
+ )
+ 
+-func TestRewriteAfterRouting(t *testing.T) {
++//Assert expected with url.EscapedPath method to obtain the path.
++func TestRewrite(t *testing.T) {
+ 	e := echo.New()
+-	// middlewares added with `Use()` are executed after routing is done and do not affect which route handler is matched
+ 	e.Use(RewriteWithConfig(RewriteConfig{
+ 		Rules: map[string]string{
+ 			"/old":              "/new",
+@@ -23,71 +23,30 @@ func TestRewriteAfterRouting(t *testing.T) {
+ 			"/users/*/orders/*": "/user/$1/order/$2",
+ 		},
+ 	}))
+-	e.GET("/public/*", func(c echo.Context) error {
+-		return c.String(http.StatusOK, c.Param("*"))
+-	})
+-	e.GET("/*", func(c echo.Context) error {
+-		return c.String(http.StatusOK, c.Param("*"))
+-	})
+-
+-	var testCases = []struct {
+-		whenPath             string
+-		expectRoutePath      string
+-		expectRequestPath    string
+-		expectRequestRawPath string
+-	}{
+-		{
+-			whenPath:             "/api/users",
+-			expectRoutePath:      "api/users",
+-			expectRequestPath:    "/users",
+-			expectRequestRawPath: "",
+-		},
+-		{
+-			whenPath:             "/js/main.js",
+-			expectRoutePath:      "js/main.js",
+-			expectRequestPath:    "/public/javascripts/main.js",
+-			expectRequestRawPath: "",
+-		},
+-		{
+-			whenPath:             "/users/jack/orders/1",
+-			expectRoutePath:      "users/jack/orders/1",
+-			expectRequestPath:    "/user/jack/order/1",
+-			expectRequestRawPath: "",
+-		},
+-		{ // no rewrite rule matched. already encoded URL should not be double encoded or changed in any way
+-			whenPath:             "/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F",
+-			expectRoutePath:      "user/jill/order/T%2FcO4lW%2Ft%2FVp%2F",
+-			expectRequestPath:    "/user/jill/order/T/cO4lW/t/Vp/", // this is equal to `url.Parse(tc.whenPath)` result
+-			expectRequestRawPath: "/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F",
+-		},
+-		{ // just rewrite but do not touch encoding. already encoded URL should not be double encoded
+-			whenPath:             "/users/jill/orders/T%2FcO4lW%2Ft%2FVp%2F",
+-			expectRoutePath:      "users/jill/orders/T%2FcO4lW%2Ft%2FVp%2F",
+-			expectRequestPath:    "/user/jill/order/T/cO4lW/t/Vp/", // this is equal to `url.Parse(tc.whenPath)` result
+-			expectRequestRawPath: "/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F",
+-		},
+-		{ // ` ` (space) is encoded by httpClient to `%20` when doing request to Echo. `%20` should not be double escaped or changed in any way when rewriting request
+-			whenPath:             "/api/new users",
+-			expectRoutePath:      "api/new users",
+-			expectRequestPath:    "/new users",
+-			expectRequestRawPath: "",
+-		},
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.whenPath, func(t *testing.T) {
+-			target, _ := url.Parse(tc.whenPath)
+-			req := httptest.NewRequest(http.MethodGet, target.String(), nil)
+-			rec := httptest.NewRecorder()
+-
+-			e.ServeHTTP(rec, req)
+-
+-			assert.Equal(t, http.StatusOK, rec.Code)
+-			assert.Equal(t, tc.expectRoutePath, rec.Body.String())
+-			assert.Equal(t, tc.expectRequestPath, req.URL.Path)
+-			assert.Equal(t, tc.expectRequestRawPath, req.URL.RawPath)
+-		})
+-	}
++	req := httptest.NewRequest(http.MethodGet, "/", nil)
++	rec := httptest.NewRecorder()
++	req.URL, _ = url.Parse("/api/users")
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/users", req.URL.EscapedPath())
++	req.URL, _ = url.Parse("/js/main.js")
++	rec = httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/public/javascripts/main.js", req.URL.EscapedPath())
++	req.URL, _ = url.Parse("/old")
++	rec = httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/new", req.URL.EscapedPath())
++	req.URL, _ = url.Parse("/users/jack/orders/1")
++	rec = httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/user/jack/order/1", req.URL.EscapedPath())
++	req.URL, _ = url.Parse("/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F")
++	rec = httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F", req.URL.EscapedPath())
++	req.URL, _ = url.Parse("/api/new users")
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/new%20users", req.URL.EscapedPath())
+ }
+ 
+ // Issue #1086
+@@ -96,7 +55,6 @@ func TestEchoRewritePreMiddleware(t *testing.T) {
+ 	r := e.Router()
+ 
+ 	// Rewrite old url to new one
+-	// middlewares added with `Pre()` are executed before routing is done and therefore change which handler matches
+ 	e.Pre(Rewrite(map[string]string{
+ 		"/old": "/new",
+ 	},
+@@ -119,7 +77,6 @@ func TestRewriteWithConfigPreMiddleware_Issue1143(t *testing.T) {
+ 	e := echo.New()
+ 	r := e.Router()
+ 
+-	// middlewares added with `Pre()` are executed before routing is done and therefore change which handler matches
+ 	e.Pre(RewriteWithConfig(RewriteConfig{
+ 		Rules: map[string]string{
+ 			"/api/*/mgmt/proj/*/agt": "/api/$1/hosts/$2",
+@@ -215,42 +172,3 @@ func TestEchoRewriteWithRegexRules(t *testing.T) {
+ 		})
+ 	}
+ }
+-
+-// Ensure correct escaping as defined in replacement (issue #1798)
+-func TestEchoRewriteReplacementEscaping(t *testing.T) {
+-	e := echo.New()
+-
+-	e.Pre(RewriteWithConfig(RewriteConfig{
+-		Rules: map[string]string{
+-			"^/a/*": "/$1?query=param",
+-			"^/b/*": "/$1;part#one",
+-		},
+-		RegexRules: map[*regexp.Regexp]string{
+-			regexp.MustCompile("^/x/(.*)"): "/$1?query=param",
+-			regexp.MustCompile("^/y/(.*)"): "/$1;part#one",
+-		},
+-	}))
+-
+-	var rec *httptest.ResponseRecorder
+-	var req *http.Request
+-
+-	testCases := []struct {
+-		requestPath string
+-		expectPath  string
+-	}{
+-		{"/unmatched", "/unmatched"},
+-		{"/a/test", "/test?query=param"},
+-		{"/b/foo/bar", "/foo/bar;part#one"},
+-		{"/x/test", "/test?query=param"},
+-		{"/y/foo/bar", "/foo/bar;part#one"},
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.requestPath, func(t *testing.T) {
+-			req = httptest.NewRequest(http.MethodGet, tc.requestPath, nil)
+-			rec = httptest.NewRecorder()
+-			e.ServeHTTP(rec, req)
+-			assert.Equal(t, tc.expectPath, req.URL.Path)
+-		})
+-	}
+-}

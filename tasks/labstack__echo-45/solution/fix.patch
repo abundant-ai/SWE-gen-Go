@@ -1,0 +1,489 @@
+diff --git a/README.md b/README.md
+index bcb69d7..e7da65e 100644
+--- a/README.md
++++ b/README.md
+@@ -16,8 +16,9 @@ Echo is a fast HTTP router (zero memory allocation) and micro web framework in G
+ 		- `func(http.ResponseWriter, *http.Request)`
+ 		- `func(http.ResponseWriter, *http.Request) error`
+ 	- Handler
+-		- `func(*echo.Context)`
++		- `echo.HandlerFunc`
+ 		- `func(*echo.Context) error`
++		- `func(*echo.Context)`
+ 		- `http.Handler`
+ 		- `http.HandlerFunc`
+ 		- `func(http.ResponseWriter, *http.Request)`
+@@ -110,7 +111,7 @@ func main() {
+ ## Contribute
+ 
+ **Use issues for everything**
+- 
++
+ - Report problems
+ - Discuss before sending pull request
+ - Suggest new features
+diff --git a/context.go b/context.go
+index edaf7af..1a8c9bc 100644
+--- a/context.go
++++ b/context.go
+@@ -20,8 +20,9 @@ type (
+ )
+ 
+ // P returns path parameter by index.
+-func (c *Context) P(i int) (value string) {
+-	if i <= len(c.pnames) {
++func (c *Context) P(i uint8) (value string) {
++	l := uint8(len(c.pnames))
++	if i <= l {
+ 		value = c.pvalues[i]
+ 	}
+ 	return
+@@ -64,19 +65,19 @@ func (c *Context) JSON(code int, v interface{}) error {
+ }
+ 
+ // String sends a text/plain response with status code.
+-func (c *Context) String(code int, s string) (err error) {
++func (c *Context) String(code int, s string) error {
+ 	c.Response.Header().Set(HeaderContentType, MIMEText+"; charset=utf-8")
+ 	c.Response.WriteHeader(code)
+-	_, err = c.Response.Write([]byte(s))
+-	return
++	_, err := c.Response.Write([]byte(s))
++	return err
+ }
+ 
+ // HTML sends a text/html response with status code.
+-func (c *Context) HTML(code int, html string) (err error) {
++func (c *Context) HTML(code int, html string) error {
+ 	c.Response.Header().Set(HeaderContentType, MIMEHTML+"; charset=utf-8")
+ 	c.Response.WriteHeader(code)
+-	_, err = c.Response.Write([]byte(html))
+-	return
++	_, err := c.Response.Write([]byte(html))
++	return err
+ }
+ 
+ // NoContent sends a response with no body and a status code.
+diff --git a/echo.go b/echo.go
+index f2dbf71..1c671d6 100644
+--- a/echo.go
++++ b/echo.go
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"log"
+ 	"net/http"
+@@ -143,7 +144,7 @@ func New() (e *Echo) {
+ 	return
+ }
+ 
+-// Group creates a new sub router with prefix and inherits all properties from
++// Group creates a new sub router with prefix. It inherits all properties from
+ // the parent. Passing middleware overrides parent middleware.
+ func (e *Echo) Group(pfx string, m ...Middleware) *Echo {
+ 	g := *e
+@@ -155,13 +156,14 @@ func (e *Echo) Group(pfx string, m ...Middleware) *Echo {
+ 	return &g
+ }
+ 
+-// MaxParam sets the maximum allowed path parameters. Default is 5, good enough
+-// for many users.
++// MaxParam sets the maximum number of path parameters allowd for the application.
++// Default value is 5, good enough for many use cases.
+ func (e *Echo) MaxParam(n uint8) {
+ 	e.maxParam = n
+ }
+ 
+-// NotFoundHandler registers a custom NotFound handler.
++// NotFoundHandler registers a custom NotFound handler used by router in case it
++// doesn't find any registered handler for HTTP method and path.
+ func (e *Echo) NotFoundHandler(h Handler) {
+ 	e.notFoundHandler = wrapH(h)
+ }
+@@ -235,7 +237,7 @@ func (e *Echo) Trace(path string, h Handler) {
+ }
+ 
+ // URI generates a URI from handler.
+-func (e *Echo) URI(h Handler, params ...string) string {
++func (e *Echo) URI(h Handler, params ...interface{}) string {
+ 	uri := new(bytes.Buffer)
+ 	lp := len(params)
+ 	n := 0
+@@ -245,7 +247,7 @@ func (e *Echo) URI(h Handler, params ...string) string {
+ 			if path[i] == ':' && n < lp {
+ 				for ; i < l && path[i] != '/'; i++ {
+ 				}
+-				uri.WriteString(params[n])
++				uri.WriteString(fmt.Sprintf("%v", params[n]))
+ 				n++
+ 			}
+ 			if i < l {
+@@ -257,7 +259,7 @@ func (e *Echo) URI(h Handler, params ...string) string {
+ }
+ 
+ // URL is an alias for URI
+-func (e *Echo) URL(h Handler, params ...string) string {
++func (e *Echo) URL(h Handler, params ...interface{}) string {
+ 	return e.URI(h, params...)
+ }
+ 
+@@ -398,13 +400,15 @@ func wrapM(m Middleware) MiddlewareFunc {
+ // wraps Handler
+ func wrapH(h Handler) HandlerFunc {
+ 	switch h := h.(type) {
++	case HandlerFunc:
++		return h
++	case func(*Context) error:
++		return h
+ 	case func(*Context):
+ 		return func(c *Context) error {
+ 			h(c)
+ 			return nil
+ 		}
+-	case func(*Context) error:
+-		return h
+ 	case http.Handler, http.HandlerFunc:
+ 		return func(c *Context) error {
+ 			h.(http.Handler).ServeHTTP(c.Response, c.Request)
+diff --git a/router.go b/router.go
+index a64b814..f33bb55 100644
+--- a/router.go
++++ b/router.go
+@@ -13,11 +13,11 @@ type (
+ 		prefix   string
+ 		parent   *node
+ 		children children
+-		pchild   *node // Param child
+-		cchild   *node // Catch-all child
+-		handler  HandlerFunc
+-		pnames   []string
+-		echo     *Echo
++		// pchild   *node // Param child
++		// mchild   *node // Match-any child
++		handler HandlerFunc
++		pnames  []string
++		echo    *Echo
+ 	}
+ 	ntype    uint8
+ 	children []*node
+@@ -26,7 +26,7 @@ type (
+ const (
+ 	stype ntype = iota
+ 	ptype
+-	ctype
++	mtype
+ )
+ 
+ func NewRouter(e *Echo) (r *router) {
+@@ -64,9 +64,8 @@ func (r *router) Add(method, path string, h HandlerFunc, echo *Echo) {
+ 			}
+ 			r.insert(method, path[:i], nil, ptype, pnames, echo)
+ 		} else if path[i] == '*' {
+-			r.insert(method, path[:i], nil, stype, nil, echo)
+ 			pnames = append(pnames, "_name")
+-			r.insert(method, path[:l], h, ctype, pnames, echo)
++			r.insert(method, path[:i], h, mtype, pnames, echo)
+ 			return
+ 		}
+ 	}
+@@ -201,7 +200,7 @@ func (n *node) findPchild() *node {
+ 
+ func (n *node) findCchild() *node {
+ 	for _, c := range n.children {
+-		if c.typ == ctype {
++		if c.typ == mtype {
+ 			return c
+ 		}
+ 	}
+@@ -226,16 +225,21 @@ func (r *router) Find(method, path string, ctx *Context) (h HandlerFunc, echo *E
+ 	c := new(node) // Child node
+ 	n := 0         // Param counter
+ 
+-	// Search order static > param > catch-all
++	// Search order static > param > match-any
+ 	for {
+-		if search == "" || search == cn.prefix {
+-			if cn.handler != nil {
+-				// Found
+-				h = cn.handler
+-				ctx.pnames = cn.pnames
+-				echo = cn.echo
+-				return
++		if search == "" || search == cn.prefix || cn.typ == mtype {
++			// Found
++			h = cn.handler
++			echo = cn.echo
++			ctx.pnames = cn.pnames
++
++			// Match-any
++			if cn.typ == mtype {
++				println(search, cn.prefix)
++				ctx.pvalues[0] = search[len(cn.prefix):]
+ 			}
++
++			return
+ 		}
+ 
+ 		pl := len(cn.prefix)
+@@ -247,11 +251,6 @@ func (r *router) Find(method, path string, ctx *Context) (h HandlerFunc, echo *E
+ 			goto Up
+ 		}
+ 
+-		// Catch-all with empty value
+-		if len(search) == 0 {
+-			goto CatchAll
+-		}
+-
+ 		// Static node
+ 		c = cn.findSchild(search[0])
+ 		if c != nil {
+@@ -274,17 +273,6 @@ func (r *router) Find(method, path string, ctx *Context) (h HandlerFunc, echo *E
+ 			continue
+ 		}
+ 
+-		// Catch-all node
+-	CatchAll:
+-		// c = cn.cchild
+-		c = cn.findCchild()
+-		if c != nil {
+-			cn = c
+-			ctx.pvalues[n] = search
+-			search = "" // End search
+-			continue
+-		}
+-
+ 	Up:
+ 		tn := cn // Save current node
+ 		cn = cn.parent
+diff --git a/website/docs/guide.md b/website/docs/guide.md
+index bc9d517..5ab9688 100644
+--- a/website/docs/guide.md
++++ b/website/docs/guide.md
+@@ -1,6 +1,6 @@
+ # Guide
+ 
+-<!--- 
++<!---
+ 	Some info about guide
+ -->
+ 
+@@ -25,22 +25,184 @@ $ go get -u github.com/labstack/echo
+ Echo follows [Semantic Versioning](http://semver.org) managed through GitHub releases.
+ Specific version of Echo can be installed using any [package manager](https://github.com/avelino/awesome-go#package-management).
+ 
+-## Configuration
++## Customization
+ 
+-echo.MaxParam
++### Max path parameters
+ 
+-echo.NotFoundHandler
++`echo.MaxParam(n uint8)`
+ 
+-echo.HTTPErrorHandler
++Sets the maximum number of path parameters allowed for the application.
++Default value is **5**, [good enough](https://github.com/interagent/http-api-design#minimize-path-nesting)
++for many use cases. Restricting path parameters allows us to use memory efficiently.
++
++### Not found handler
++
++`echo.NotFoundHandler(h Handler)`
++
++Registers a custom NotFound handler. This handler is called in case router doesn't
++find matching route for the request.
++
++Default handler sends 404 "Not Found" response.
++
++### HTTP error handler
++
++`echo.HTTPErrorHandler(h HTTPErrorHandler)`
++
++Registers a centralized HTTP error handler.
++
++Default http error handler sends 500 "Internal Server Error" response.
+ 
+ ## Routing
+ 
+-## Request
++Echo's router is [fast, optimized](https://github.com/labstack/echo#benchmark) and
++flexible. It's based on [redix tree](http://en.wikipedia.org/wiki/Radix_tree)
++data structure which makes routing lookup really fast. It leverages
++[sync pool](https://golang.org/pkg/sync/#Pool) to reuse memory and achieve
++zero dynamic memory allocation with no garbage collection.
++
++Routes can be registered for any HTTP method, path and handler. For example, code
++below registers a route for method `GET`, path `/hello` and a handler which sends
++`Hello!` response.
++
++```go
++echo.Get("/hello", func(*echo.Context) {
++	c.String(http.StatusOK, "Hello!")
++})
++```
++
++Echo's default handler is `func(*echo.Context) error` where `echo.Context` primarily
++holds request and response objects. Echo also has a support for other types of
++handlers.
++
++<!-- TODO mention about not able to take advantage -->
++
++<!-- ### Groups -->
++
++### Path parameters
++
++URL path parameters can be extracted either by name `echo.Context.Param(name string) string` or by
++index `echo.Context.P(i uint8) string`. Getting parameter by index gives a slightly
++better performance.
++
++```go
++echo.Get("/users/:id", func(c *echo.Context) {
++	// By name
++	id := c.Param("id")
++
++	// By index
++	id := c.P(0)
++
++	c.String(http.StatusOK, id)
++})
++```
++
++### Match-any
++
++Matches zero or more characters in the path. For example, pattern `/users/*` will
++match
++
++- `/users/`
++- `/users/1`
++- `/users/1/files/1`
++- `/users/anything...`
++
++### Path matching order
++
++- Static
++- Param
++- Match any
++
++#### Example
++
++```go
++e.Get("/users/:id", func(c *echo.Context) {
++	c.String(http.StatusOK, "/users/:id")
++})
++
++e.Get("/users/new", func(c *echo.Context) {
++	c.String(http.StatusOK, "/users/new")
++})
++
++e.Get("/users/1/files/*", func(c *echo.Context) {
++	c.String(http.StatusOK, "/users/1/files/*")
++})
++```
++
++Above routes would resolve in order
++
++- `/users/new`
++- `/users/:id`
++- `/users/1/files/*`
++
++Routes can be written in any order.
++
++<!-- Different use cases -->
++
++### URI building
++
++`echo.URI` can be used generate URI for any handler with specified path parameters.
++It's helpful to centralize all your URI patterns which ease in refactoring your
++application.
++
++`echo.URI(h, 1)` will generate `/users/1` for the route registered below
+ 
+-## Middleware
++```go
++// Handler
++h := func(*echo.Context) {
++	c.String(http.StatusOK, "OK")
++}
++
++// Route
++e.Get("/users/:id", h)
++```
++
++<!-- ## Middleware -->
+ 
+ ## Response
+ 
+-## Static Content
++### JSON
++
++`context.JSON(code int, v interface{}) error` can be used to send a JSON response
++with status code.
++
++### String
++
++`context.String(code int, s string) error` can be used to send plain text response
++with status code.
++
++### HTML
++
++`func (c *Context) HTML(code int, html string) error` can be used to send an HTML
++response with status code.
++
++### Static files
++
++`echo.Static(path, root string)` can be used to serve static files. For example,
++code below serves all files from `public/scripts` directory for any path starting
++with `/scripts/`.
++
++```go
++e.Static("/scripts", "public/scripts")
++```
++
++### Serving a file
++
++`echo.ServeFile(path, file string)` can be used to serve a file. For example, code
++below serves welcome.html for path `/welcome`.
++
++```go
++e.ServeFile("/welcome", "welcome.html")
++```
++
++### Serving an index file
++
++`echo.Index(file string)` can be used to serve index file. For example, code below
++serves index.html for path `/`.
++
++```go
++e.Index("index.html")
++```
++
++<!-- ## Error Handling -->
+ 
+-## Error Handling
++<!-- Deployment -->
+diff --git a/website/docs/index.md b/website/docs/index.md
+index feee014..914019c 100644
+--- a/website/docs/index.md
++++ b/website/docs/index.md
+@@ -22,8 +22,9 @@ Echo is a fast HTTP router (zero memory allocation) and micro web framework in G
+ 		- `func(http.ResponseWriter, *http.Request)`
+ 		- `func(http.ResponseWriter, *http.Request) error`
+ 	- Handler
+-		- `func(*echo.Context)`
++		- `echo.HandlerFunc`
+ 		- `func(*echo.Context) error`
++		- `func(*echo.Context)`
+ 		- `http.Handler`
+ 		- `http.HandlerFunc`
+ 		- `func(http.ResponseWriter, *http.Request)`
+@@ -112,7 +113,7 @@ Hello, World! on the page.
+ ## Contribute
+ 
+ **Use issues for everything**
+- 
++
+ - Report problems
+ - Discuss before sending pull request
+ - Suggest new features

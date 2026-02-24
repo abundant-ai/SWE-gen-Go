@@ -1,0 +1,130 @@
+diff --git a/.changes/v1.14/BUG FIXES-20251124-150000.yaml b/.changes/v1.14/BUG FIXES-20251124-150000.yaml
+new file mode 100644
+index 0000000000..798c4744cc
+--- /dev/null
++++ b/.changes/v1.14/BUG FIXES-20251124-150000.yaml	
+@@ -0,0 +1,5 @@
++kind: BUG FIXES
++body: 'actions: make after_create & after_update actions run after the resource has applied'
++time: 2025-11-24T15:00:00.316597+01:00
++custom:
++    Issue: "37936"
+diff --git a/internal/terraform/graph_builder_apply.go b/internal/terraform/graph_builder_apply.go
+index d7af3fe627..7ea5a6a3a6 100644
+--- a/internal/terraform/graph_builder_apply.go
++++ b/internal/terraform/graph_builder_apply.go
+@@ -174,8 +174,6 @@ func (b *ApplyGraphBuilder) Steps() []GraphTransformer {
+ 					relativeTiming: timing,
+ 				}
+ 			},
+-			// we want before_* actions to run before and after_* actions to run after the resource
+-			CreateNodesAsAfter: false,
+ 		},
+ 
+ 		&ActionInvokeApplyTransformer{
+diff --git a/internal/terraform/graph_builder_plan.go b/internal/terraform/graph_builder_plan.go
+index 435b313137..3ef6ae3e18 100644
+--- a/internal/terraform/graph_builder_plan.go
++++ b/internal/terraform/graph_builder_plan.go
+@@ -183,9 +183,6 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
+ 					nodeAbstractActionTriggerExpand: node,
+ 				}
+ 			},
+-
+-			// We plan all actions after the resource is handled
+-			CreateNodesAsAfter: true,
+ 		},
+ 
+ 		&ActionInvokePlanTransformer{
+diff --git a/internal/terraform/transform_action_trigger_config.go b/internal/terraform/transform_action_trigger_config.go
+index cb98d3e348..42ed56bc78 100644
+--- a/internal/terraform/transform_action_trigger_config.go
++++ b/internal/terraform/transform_action_trigger_config.go
+@@ -20,7 +20,6 @@ type ActionTriggerConfigTransformer struct {
+ 	queryPlanMode bool
+ 
+ 	ConcreteActionTriggerNodeFunc ConcreteActionTriggerNodeFunc
+-	CreateNodesAsAfter            bool
+ }
+ 
+ func (t *ActionTriggerConfigTransformer) Transform(g *Graph) error {
+@@ -49,13 +48,21 @@ func (t *ActionTriggerConfigTransformer) transform(g *Graph, config *configs.Con
+ }
+ 
+ func (t *ActionTriggerConfigTransformer) transformSingle(g *Graph, config *configs.Config) error {
++	// During plan we only want to create all triggers to run after the resource
++	createNodesAsAfter := t.Operation == walkPlan
++	// During apply we want all after trigger to also connect to the resource instance nodes
++	connectToResourceInstanceNodes := t.Operation == walkApply
+ 	actionConfigs := addrs.MakeMap[addrs.ConfigAction, *configs.Action]()
+ 	for _, a := range config.Module.Actions {
+ 		actionConfigs.Put(a.Addr().InModule(config.Path), a)
+ 	}
+ 
+ 	resourceNodes := addrs.MakeMap[addrs.ConfigResource, []GraphNodeConfigResource]()
++	resourceInstanceNodes := addrs.MakeMap[addrs.ConfigResource, []GraphNodeResourceInstance]()
+ 	for _, node := range g.Vertices() {
++		if rin, ok := node.(GraphNodeResourceInstance); ok {
++			resourceInstanceNodes.Put(rin.ResourceInstanceAddr().ConfigResource(), append(resourceInstanceNodes.Get(rin.ResourceInstanceAddr().ConfigResource()), rin))
++		}
+ 		rn, ok := node.(GraphNodeConfigResource)
+ 		if !ok {
+ 			continue
+@@ -136,7 +143,7 @@ func (t *ActionTriggerConfigTransformer) transformSingle(g *Graph, config *confi
+ 
+ 				// If CreateNodesAsAfter is set we want all nodes to run after the resource
+ 				// If not we want expansion nodes only to exist if they are being used
+-				if !t.CreateNodesAsAfter && containsBeforeEvent {
++				if !createNodesAsAfter && containsBeforeEvent {
+ 					nat := t.ConcreteActionTriggerNodeFunc(abstract, RelativeActionTimingBefore)
+ 					g.Add(nat)
+ 
+@@ -144,6 +151,11 @@ func (t *ActionTriggerConfigTransformer) transformSingle(g *Graph, config *confi
+ 					for _, node := range resourceNode {
+ 						g.Connect(dag.BasicEdge(node, nat))
+ 					}
++					if connectToResourceInstanceNodes {
++						for _, node := range resourceInstanceNodes.Get(resourceAddr) {
++							g.Connect(dag.BasicEdge(node, nat))
++						}
++					}
+ 
+ 					// We want to run after all prior nodes
+ 					for _, priorNode := range priorBeforeNodes {
+@@ -152,7 +164,7 @@ func (t *ActionTriggerConfigTransformer) transformSingle(g *Graph, config *confi
+ 					priorBeforeNodes = append(priorBeforeNodes, nat)
+ 				}
+ 
+-				if t.CreateNodesAsAfter || containsAfterEvent {
++				if createNodesAsAfter || containsAfterEvent {
+ 					nat := t.ConcreteActionTriggerNodeFunc(abstract, RelativeActionTimingAfter)
+ 					g.Add(nat)
+ 
+@@ -160,6 +172,11 @@ func (t *ActionTriggerConfigTransformer) transformSingle(g *Graph, config *confi
+ 					for _, node := range resourceNode {
+ 						g.Connect(dag.BasicEdge(nat, node))
+ 					}
++					if connectToResourceInstanceNodes {
++						for _, node := range resourceInstanceNodes.Get(resourceAddr) {
++							g.Connect(dag.BasicEdge(nat, node))
++						}
++					}
+ 
+ 					// We want to run after all prior nodes
+ 					for _, priorNode := range priorAfterNodes {
+diff --git a/internal/terraform/transform_targets.go b/internal/terraform/transform_targets.go
+index b299e57ce9..10fabdae37 100644
+--- a/internal/terraform/transform_targets.go
++++ b/internal/terraform/transform_targets.go
+@@ -231,4 +231,11 @@ func (t *TargetsTransformer) addVertexDependenciesToTargetedNodes(g *Graph, v da
+ 			}
+ 		}
+ 	}
++	if _, ok := v.(*NodeApplyableResourceInstance); ok {
++		for _, f := range g.UpEdges(v) {
++			if _, ok := f.(*nodeActionTriggerApplyExpand); ok {
++				t.addVertexDependenciesToTargetedNodes(g, f, targetedNodes, addrs)
++			}
++		}
++	}
+ }

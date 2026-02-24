@@ -1,0 +1,24 @@
+#!/bin/bash
+
+cd /app/src
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+mkdir -p "extraction"
+cp "/tests/extraction/metricfamilyprocessor_test.go" "extraction/metricfamilyprocessor_test.go"
+mkdir -p "extraction"
+cp "/tests/extraction/processor0_0_1_test.go" "extraction/processor0_0_1_test.go"
+mkdir -p "extraction"
+cp "/tests/extraction/processor0_0_2_test.go" "extraction/processor0_0_2_test.go"
+mkdir -p "extraction"
+cp "/tests/extraction/textprocessor_test.go" "extraction/textprocessor_test.go"
+
+# Run tests for the extraction package
+go test -v github.com/prometheus/client_golang/extraction
+test_status=$?
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+exit "$test_status"

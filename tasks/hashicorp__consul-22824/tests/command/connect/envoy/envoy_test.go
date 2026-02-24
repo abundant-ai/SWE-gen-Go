@@ -1,0 +1,2027 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+package envoy
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/mitchellh/cli"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/consul/agent"
+	"github.com/hashicorp/consul/agent/xds"
+	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/envoyextensions/xdscommon"
+	"github.com/hashicorp/consul/sdk/testutil"
+)
+
+var update = flag.Bool("update", false, "update golden files")
+
+func TestEnvoyCommand_noTabs(t *testing.T) {
+	t.Parallel()
+	if strings.ContainsRune(New(nil).Help(), '\t') {
+		t.Fatal("help has tabs")
+	}
+}
+
+func TestEnvoyGateway_Validation(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		args   []string
+		output string
+	}{
+		{
+			"-register for non-gateway",
+			[]string{"-register", "-proxy-id", "not-a-gateway"},
+			"Auto-Registration can only be used for gateways",
+		},
+		{
+			"-mesh-gateway and -gateway cannot be combined",
+			[]string{"-register", "-mesh-gateway", "-gateway", "mesh"},
+			"The mesh-gateway flag is deprecated and cannot be used alongside the gateway flag",
+		},
+		{
+			"no proxy registration specified nor discovered",
+			[]string{""},
+			"No proxy ID specified",
+		},
+		{
+			"-register with nodename",
+			[]string{"-register", "-proxy-id", "gw-svc-id", "-node-name", "gw-node"},
+			"'-register' cannot be used with '-node-name'",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ui := cli.NewMockUi()
+			c := New(ui)
+			c.init()
+			c.checkDualStack = func() (bool, error) {
+				return false, nil
+			}
+
+			code := c.Run(tc.args)
+			if code == 0 {
+				t.Errorf("%s: expected non-zero exit", tc.name)
+			}
+
+			output := ui.ErrorWriter.String()
+			if !strings.Contains(output, tc.output) {
+				t.Errorf("expected %q to contain %q", output, tc.output)
+			}
+		})
+	}
+}
+
+// testSetAndResetEnv sets the env vars passed as KEY=value strings in the
+// current ENV and returns a func() that will undo it's work at the end of the
+// test for use with defer.
+func testSetAndResetEnv(t *testing.T, env []string) func() {
+	old := make(map[string]*string)
+	for _, e := range env {
+		pair := strings.SplitN(e, "=", 2)
+		current := os.Getenv(pair[0])
+		if current != "" {
+			old[pair[0]] = &current
+		} else {
+			// save it as a nil so we know to remove again
+			old[pair[0]] = nil
+		}
+		require.NoError(t, os.Setenv(pair[0], pair[1]))
+	}
+	// Return a func that will reset to old values
+	return func() {
+		for k, v := range old {
+			if v == nil {
+				os.Unsetenv(k)
+			} else {
+				os.Setenv(k, *v)
+			}
+		}
+	}
+}
+
+type generateConfigTestCase struct {
+	Name              string
+	TLSServer         bool
+	ACLEnabled        bool
+	Flags             []string
+	Env               []string
+	Files             map[string]string
+	ProxyConfig       map[string]interface{}
+	ProxyDefaults     api.ProxyConfigEntry
+	NamespacesEnabled bool
+	XDSPorts          agent.GRPCPorts // used to mock an agent's configured gRPC ports. Plaintext defaults to 8502 and TLS defaults to 8503.
+	AgentSelf110      bool            // fake the agent API from versions v1.10 and earlier
+	GRPCDisabled      bool
+	IsDualStack       bool
+	WantArgs          BootstrapTplArgs
+	WantErr           string
+	WantWarn          string
+}
+
+// This tests the args we use to generate the template directly because they
+// encapsulate all the argument and default handling code which is where most of
+// the logic is. We also allow generating golden files but only for cases that
+// pass the test of having their template args generated as expected.
+func TestGenerateConfig(t *testing.T) {
+
+	b, err := os.ReadFile("../../../test/ca/root.cer")
+	require.NoError(t, err)
+
+	rootPEM := string(b)
+	rootPEM = strings.ReplaceAll(rootPEM, "\n", "\\n")
+
+	b, err = os.ReadFile("../../../test/ca_path/cert1.crt")
+	require.NoError(t, err)
+	pathPEM := string(b)
+
+	b, err = os.ReadFile("../../../test/ca_path/cert2.crt")
+	require.NoError(t, err)
+	pathPEM += string(b)
+	pathPEM = strings.ReplaceAll(pathPEM, "\n", "\\n")
+
+	cases := []generateConfigTestCase{
+		{
+			Name:    "no-args",
+			Flags:   []string{},
+			Env:     []string{},
+			WantErr: "No proxy ID specified",
+		},
+		{
+			Name:    "node-name without proxy-id",
+			Flags:   []string{"-node-name", "test-node"},
+			WantErr: "'-node-name' requires '-proxy-id'",
+		},
+		{
+			Name:         "gRPC disabled",
+			Flags:        []string{"-proxy-id", "test-proxy"},
+			GRPCDisabled: true,
+			WantErr:      "agent has grpc disabled",
+		},
+		{
+			Name:  "defaults",
+			Flags: []string{"-proxy-id", "test-proxy"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502", // Note this is the gRPC port
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusBackendPort: "",
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:        "defaults-with-dual-stack",
+			Flags:       []string{"-proxy-id", "test-proxy"},
+			IsDualStack: true,
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: ipv6loopback,
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      ipv6loopback,
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name: "admin-bind-flag-with-dual-stack",
+			Flags: []string{"-proxy-id", "test-proxy",
+				"-admin-bind", "localhost:9999"},
+			IsDualStack: true,
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: ipv6loopback,
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      ipv4loopback,
+				AdminBindPort:         "9999",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "defaults-nodemeta",
+			Flags: []string{"-proxy-id", "test-proxy", "-node-name", "test-node"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				NodeName:     "test-node",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502", // Note this is the gRPC port
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusBackendPort: "",
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "telemetry-collector",
+			Flags: []string{"-proxy-id", "test-proxy"},
+			ProxyConfig: map[string]interface{}{
+				"envoy_telemetry_collector_bind_socket_dir": "/tmp/consul/telemetry-collector",
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name: "prometheus-metrics",
+			Flags: []string{"-proxy-id", "test-proxy",
+				"-prometheus-backend-port", "20100", "-prometheus-scrape-path", "/scrape-path"},
+			ProxyConfig: map[string]interface{}{
+				// When envoy_prometheus_bind_addr is set, if
+				// PrometheusBackendPort is set, there will be a
+				// "prometheus_backend" cluster in the Envoy configuration.
+				"envoy_prometheus_bind_addr": "0.0.0.0:9000",
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502", // Note this is the gRPC port
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusBackendPort: "20100",
+				PrometheusScrapePath:  "/scrape-path",
+			},
+		},
+		{
+			Name: "prometheus-metrics-tls-ca-file",
+			Flags: []string{"-proxy-id", "test-proxy",
+				"-prometheus-backend-port", "20100", "-prometheus-scrape-path", "/scrape-path",
+				"-prometheus-ca-file", "../../../test/key/ourdomain.cer", "-prometheus-cert-file", "../../../test/key/ourdomain_server.cer",
+				"-prometheus-key-file", "../../../test/key/ourdomain_server.key"},
+			ProxyConfig: map[string]interface{}{
+				// When envoy_prometheus_bind_addr is set, if
+				// PrometheusBackendPort is set, there will be a
+				// "prometheus_backend" cluster in the Envoy configuration.
+				"envoy_prometheus_bind_addr": "0.0.0.0:9000",
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502", // Note this is the gRPC port
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusBackendPort: "20100",
+				PrometheusScrapePath:  "/scrape-path",
+				PrometheusCAFile:      "../../../test/key/ourdomain.cer",
+				PrometheusCertFile:    "../../../test/key/ourdomain_server.cer",
+				PrometheusKeyFile:     "../../../test/key/ourdomain_server.key",
+			},
+		},
+		{
+			Name: "prometheus-metrics-tls-ca-path",
+			Flags: []string{"-proxy-id", "test-proxy",
+				"-prometheus-backend-port", "20100", "-prometheus-scrape-path", "/scrape-path",
+				"-prometheus-ca-path", "../../../test/ca_path", "-prometheus-cert-file", "../../../test/key/ourdomain_server.cer",
+				"-prometheus-key-file", "../../../test/key/ourdomain_server.key"},
+			ProxyConfig: map[string]interface{}{
+				// When envoy_prometheus_bind_addr is set, if
+				// PrometheusBackendPort is set, there will be a
+				// "prometheus_backend" cluster in the Envoy configuration.
+				"envoy_prometheus_bind_addr": "0.0.0.0:9000",
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502", // Note this is the gRPC port
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusBackendPort: "20100",
+				PrometheusScrapePath:  "/scrape-path",
+				PrometheusCAPath:      "../../../test/ca_path",
+				PrometheusCertFile:    "../../../test/key/ourdomain_server.cer",
+				PrometheusKeyFile:     "../../../test/key/ourdomain_server.key",
+			},
+		},
+		{
+			Name: "token-arg",
+			Flags: []string{"-proxy-id", "test-proxy",
+				"-token", "c9a52720-bf6c-4aa6-b8bc-66881a5ade95"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502", // Note this is the gRPC port
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				Token:                 "c9a52720-bf6c-4aa6-b8bc-66881a5ade95",
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "token-env",
+			Flags: []string{"-proxy-id", "test-proxy"},
+			Env: []string{
+				"CONSUL_HTTP_TOKEN=c9a52720-bf6c-4aa6-b8bc-66881a5ade95",
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502", // Note this is the gRPC port
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				Token:                 "c9a52720-bf6c-4aa6-b8bc-66881a5ade95",
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name: "token-file-arg",
+			Flags: []string{"-proxy-id", "test-proxy",
+				"-token-file", "@@TEMPDIR@@token.txt",
+			},
+			Files: map[string]string{
+				"token.txt": "c9a52720-bf6c-4aa6-b8bc-66881a5ade95",
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502", // Note this is the gRPC port
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				Token:                 "c9a52720-bf6c-4aa6-b8bc-66881a5ade95",
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "token-file-env",
+			Flags: []string{"-proxy-id", "test-proxy"},
+			Env: []string{
+				"CONSUL_HTTP_TOKEN_FILE=@@TEMPDIR@@token.txt",
+			},
+			Files: map[string]string{
+				"token.txt": "c9a52720-bf6c-4aa6-b8bc-66881a5ade95",
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502", // Note this is the gRPC port
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				Token:                 "c9a52720-bf6c-4aa6-b8bc-66881a5ade95",
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name: "grpc-addr-flag",
+			Flags: []string{"-proxy-id", "test-proxy",
+				"-grpc-addr", "localhost:9999"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "9999",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name: "grpc-addr-flag-with-dual-stack",
+			Flags: []string{"-proxy-id", "test-proxy",
+				"-grpc-addr", "localhost:9999"},
+			IsDualStack: true,
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: ipv4loopback,
+					AgentPort:    "9999",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      ipv6loopback,
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "grpc-addr-env",
+			Flags: []string{"-proxy-id", "test-proxy"},
+			Env: []string{
+				"CONSUL_GRPC_ADDR=localhost:9999",
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "9999",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name: "grpc-addr-unix",
+			Flags: []string{"-proxy-id", "test-proxy",
+				"-grpc-addr", "unix:///var/run/consul.sock"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentSocket: "/var/run/consul.sock",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name: "grpc-addr-unix-with-tls",
+			Flags: []string{"-proxy-id", "test-proxy",
+				"-grpc-ca-file", "../../../test/ca/root.cer",
+				"-grpc-addr", "unix:///var/run/consul.sock"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				GRPC: GRPC{
+					AgentSocket: "/var/run/consul.sock",
+					AgentTLS:    true,
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				AgentCAPEM:            rootPEM,
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:     "xds-addr-config",
+			Flags:    []string{"-proxy-id", "test-proxy"},
+			XDSPorts: agent.GRPCPorts{Plaintext: 9999, TLS: 0},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "9999",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:         "grpc-tls-addr-config",
+			Flags:        []string{"-proxy-id", "test-proxy", "-ca-file", "../../../test/ca/root.cer"},
+			XDSPorts:     agent.GRPCPorts{Plaintext: 9997, TLS: 9998},
+			AgentSelf110: false,
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "9998",
+					AgentTLS:     true,
+				},
+				AgentCAPEM:            "-----BEGIN CERTIFICATE-----\\nMIIEEzCCAvugAwIBAgIUIYIXKNRBFBPuuOit2D2CfVJAoDAwDQYJKoZIhvcNAQEL\\nBQAwgZgxCzAJBgNVBAYTAlVTMQswCQYDVQQIDAJDQTEWMBQGA1UEBwwNU2FuIEZy\\nYW5jaXNjbzEcMBoGA1UECgwTSGFzaGlDb3JwIFRlc3QgQ2VydDEMMAoGA1UECwwD\\nRGV2MRYwFAYDVQQDDA10ZXN0LmludGVybmFsMSAwHgYJKoZIhvcNAQkBFhF0ZXN0\\nQGludGVybmFsLmNvbTAeFw0yMzExMDIxNTUwMjlaFw0zMzEwMzAxNTUwMjlaMIGY\\nMQswCQYDVQQGEwJVUzELMAkGA1UECAwCQ0ExFjAUBgNVBAcMDVNhbiBGcmFuY2lz\\nY28xHDAaBgNVBAoME0hhc2hpQ29ycCBUZXN0IENlcnQxDDAKBgNVBAsMA0RldjEW\\nMBQGA1UEAwwNdGVzdC5pbnRlcm5hbDEgMB4GCSqGSIb3DQEJARYRdGVzdEBpbnRl\\ncm5hbC5jb20wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCIA00iG5Iv\\neRzZwf2P1Laih3eoiK2Wl1Re22cz2Pcpf6gb7agPguwU5Hco0DWzsnmek2Qyw9gl\\noroX1t7LbTW2rxbK1hP7PkFCwSxi9u8MZDaLF3a79bwbsYZzf3toeoz8DCBxo9bB\\nSSACj4uI/S+lUjMctQrK1nFjGoNUHfxioXPwIJH+TS/76TiZPu3Zj6kN6taVFNe3\\nISBNXW6Vg8E3koz+9Bwv0a6Ty7oFRoJXpsud1k/83Iy288jhYDuB56+ypUmcCNqG\\nT+e0Bn/VXHx26GXTx97cXSLJE+o+JrHZaI1TcQUL2Z5DJZVJRUg/wtcXggoMLVI1\\nO0enJm2jdmLXAgMBAAGjUzBRMB0GA1UdDgQWBBTmrmqnZIdFOj6vhCUAJKLZNUDw\\nFDAfBgNVHSMEGDAWgBTmrmqnZIdFOj6vhCUAJKLZNUDwFDAPBgNVHRMBAf8EBTAD\\nAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQB3j6gvalxq54hZSwVmVZPMzjdTVYRC11b0\\n6C9pWKsLwu+WINcs59ui8wpYVjcw1AK4/2I1Q7P4RgpSarAxG5tYIMB1xcfFKqBn\\nf/dDXexONgwpW6SoBJ58c7OB/aH8CenDT8Vwk3fwjYslOywbFRqBjH+PB8uTlu0e\\nD1fzjpcQCrQeA5VD4pjJAaTmi7bLVuH5XIya3++f/N3xOn53GVMUDO1OdFz8ZMvJ\\nWrrg7E/wMXB1b5Wo2n2ypVU4sejikSjg2nfdLojUWGMrZ8TuUnjFs88PeQ9CObAp\\nA36dLfs4JLF3sVOtqTd6BGwegDsmmllYO5Ky6I+laoLSHpGDEihS\\n-----END CERTIFICATE-----\\n",
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:         "deprecated-grpc-addr-config",
+			Flags:        []string{"-proxy-id", "test-proxy"},
+			XDSPorts:     agent.GRPCPorts{Plaintext: 9999, TLS: 0},
+			AgentSelf110: true,
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "9999",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:     "access-log-path",
+			Flags:    []string{"-proxy-id", "test-proxy", "-admin-access-log-path", "/some/path/access.log"},
+			WantWarn: "-admin-access-log-path is deprecated",
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/some/path/access.log",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:    "missing-ca-file",
+			Flags:   []string{"-proxy-id", "test-proxy", "-ca-file", "some/path"},
+			WantErr: "Error loading CA File: open some/path: no such file or directory",
+		},
+		{
+			Name:      "existing-ca-file",
+			TLSServer: true,
+			Flags:     []string{"-proxy-id", "test-proxy", "-grpc-ca-file", "../../../test/ca/root.cer"},
+			Env:       []string{"CONSUL_GRPC_ADDR=https://127.0.0.1:8502"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+					AgentTLS:     true,
+				},
+				AgentCAPEM:            rootPEM,
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:    "missing-ca-path",
+			Flags:   []string{"-proxy-id", "test-proxy", "-ca-path", "some/path"},
+			WantErr: "lstat some/path: no such file or directory",
+		},
+		{
+			Name:      "existing-ca-path",
+			TLSServer: true,
+			Flags:     []string{"-proxy-id", "test-proxy", "-grpc-ca-path", "../../../test/ca_path/"},
+			Env:       []string{"CONSUL_GRPC_ADDR=https://127.0.0.1:8502"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+					AgentTLS:     true,
+				},
+				AgentCAPEM:            pathPEM,
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "custom-bootstrap",
+			Flags: []string{"-proxy-id", "test-proxy"},
+			ProxyConfig: map[string]interface{}{
+				// Add a completely custom bootstrap template. Never mind if this is
+				// invalid envoy config just as long as it works and gets the variables
+				// interplated.
+				"envoy_bootstrap_json_tpl": `
+				{
+					"admin": {
+						"access_log": [
+						  {
+							"name": "envoy.access_loggers.file",
+							"typed_config": {
+							  "@type": "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog",
+							  "path": "/dev/null"
+							}
+						  }
+						],
+						"address": {
+							"socket_address": {
+								"address": "{{ .AdminBindAddress }}",
+								"port_value": {{ .AdminBindPort }}
+							}
+						}
+					},
+					"node": {
+						"cluster": "{{ .ProxyCluster }}",
+						"id": "{{ .ProxyID }}"
+					},
+					"custom_field": "foo"
+				}`,
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "extra_-single",
+			Flags: []string{"-proxy-id", "test-proxy"},
+			ProxyConfig: map[string]interface{}{
+				// Add a custom sections with interpolated variables. These are all
+				// invalid config syntax too but we are just testing they have the right
+				// effect.
+				"envoy_extra_static_clusters_json": `
+				{
+					"name": "fake_cluster_1"
+				}`,
+				"envoy_extra_static_listeners_json": `
+				{
+					"name": "fake_listener_1"
+				}`,
+				"envoy_extra_stats_sinks_json": `
+				{
+					"name": "fake_sink_1"
+				}`,
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "extra_-multiple",
+			Flags: []string{"-proxy-id", "test-proxy"},
+			ProxyConfig: map[string]interface{}{
+				// Add a custom sections with interpolated variables. These are all
+				// invalid config syntax too but we are just testing they have the right
+				// effect.
+				"envoy_extra_static_clusters_json": `
+				{
+					"name": "fake_cluster_1"
+				},
+				{
+					"name": "fake_cluster_2"
+				}`,
+				"envoy_extra_static_listeners_json": `
+				{
+					"name": "fake_listener_1"
+				},{
+					"name": "fake_listener_2"
+				}`,
+				"envoy_extra_stats_sinks_json": `
+				{
+					"name": "fake_sink_1"
+				} , { "name": "fake_sink_2" }`,
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "stats-config-override",
+			Flags: []string{"-proxy-id", "test-proxy"},
+			ProxyConfig: map[string]interface{}{
+				// Add a custom sections with interpolated variables. These are all
+				// invalid config syntax too but we are just testing they have the right
+				// effect.
+				"envoy_stats_config_json": `
+				{
+					"name": "fake_config"
+				}`,
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "zipkin-tracing-config",
+			Flags: []string{"-proxy-id", "test-proxy"},
+			ProxyConfig: map[string]interface{}{
+				// Add a custom sections with interpolated variables. These are all
+				// invalid config syntax too but we are just testing they have the right
+				// effect.
+				"envoy_tracing_json": `{
+					"http": {
+						"name": "envoy.zipkin",
+						"config": {
+							"collector_cluster": "zipkin",
+							"collector_endpoint": "/api/v1/spans"
+						}
+					}
+				}`,
+				// Need to setup the cluster to send that too as well
+				"envoy_extra_static_clusters_json": `{
+					"name": "zipkin",
+					"type": "STRICT_DNS",
+					"connect_timeout": "5s",
+					"load_assignment": {
+						"cluster_name": "zipkin",
+						"endpoints": [
+							{
+								"lb_endpoints": [
+									{
+										"endpoint": {
+											"address": {
+												"socket_address": {
+													"address": "zipkin.service.consul",
+													"port_value": 9411
+												}
+											}
+										}
+									}
+								]
+							}
+						]
+					}
+				}`,
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "CONSUL_HTTP_ADDR-with-https-scheme-does-not-affect-grpc-tls",
+			Flags: []string{"-proxy-id", "test-proxy", "-ca-file", "../../../test/ca/root.cer"},
+			Env:   []string{"CONSUL_HTTP_ADDR=https://127.0.0.1:8500"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+					AgentTLS:     false,
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "CONSUL_GRPC_ADDR-with-https-scheme-enables-tls",
+			Flags: []string{"-proxy-id", "test-proxy", "-ca-file", "../../../test/ca/root.cer"},
+			Env:   []string{"CONSUL_GRPC_ADDR=https://127.0.0.1:8502"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+					AgentTLS:     true,
+				},
+				AgentCAPEM:            rootPEM,
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		// Error case: TLS enabled but no CA material available
+		// Previously this would silently generate invalid bootstrap (empty trusted_ca),
+		// now it should return an error to properly inform the user of the misconfiguration.
+		{
+			Name:    "https-scheme-no-ca-error",
+			Flags:   []string{"-proxy-id", "test-proxy"},
+			Env:     []string{"CONSUL_GRPC_ADDR=https://127.0.0.1:8502"},
+			WantErr: "TLS is enabled for xDS connections but no CA certificates are available",
+		},
+		{
+			Name:  "both-CONSUL_HTTP_ADDR-TLS-and-CONSUL_GRPC_ADDR-PLAIN-is-plain",
+			Flags: []string{"-proxy-id", "test-proxy", "-ca-file", "../../../test/ca/root.cer"},
+			Env: []string{
+				"CONSUL_HTTP_ADDR=https://127.0.0.1:8500",
+				"CONSUL_GRPC_ADDR=http://127.0.0.1:8502",
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+					AgentTLS:     false,
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "both-CONSUL_HTTP_ADDR-PLAIN-and-CONSUL_GRPC_ADDR-TLS-is-tls",
+			Flags: []string{"-proxy-id", "test-proxy", "-ca-file", "../../../test/ca/root.cer"},
+			Env: []string{
+				"CONSUL_HTTP_ADDR=http://127.0.0.1:8500",
+				"CONSUL_GRPC_ADDR=https://127.0.0.1:8502",
+			},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				// Should resolve IP, note this might not resolve the same way
+				// everywhere which might make this test brittle but not sure what else
+				// to do.
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+					AgentTLS:     true,
+				},
+				AgentCAPEM:            rootPEM,
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "ingress-gateway",
+			Flags: []string{"-proxy-id", "ingress-gateway-1", "-gateway", "ingress"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster:       "ingress-gateway",
+				ProxyID:            "ingress-gateway-1",
+				ProxySourceService: "ingress-gateway",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "ingress-gateway-nodemeta",
+			Flags: []string{"-proxy-id", "ingress-gateway-1", "-node-name", "test-node"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "ingress-gateway-1",
+				ProxyID:      "ingress-gateway-1",
+				NodeName:     "test-node",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name: "envoy-readiness-probe",
+			Flags: []string{"-proxy-id", "test-proxy",
+				"-envoy-ready-bind-address", "127.0.0.1", "-envoy-ready-bind-port", "21000"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502", // Note this is the gRPC port
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusBackendPort: "",
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "ingress-gateway-address-specified",
+			Flags: []string{"-proxy-id", "ingress-gateway", "-gateway", "ingress", "-address", "1.2.3.4:7777"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster:       "ingress-gateway",
+				ProxyID:            "ingress-gateway",
+				ProxySourceService: "ingress-gateway",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "ingress-gateway-register-with-service-without-proxy-id",
+			Flags: []string{"-gateway", "ingress", "-register", "-service", "my-gateway", "-address", "127.0.0.1:7777"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster:       "my-gateway",
+				ProxyID:            "my-gateway",
+				ProxySourceService: "my-gateway",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "ingress-gateway-register-with-service-and-proxy-id",
+			Flags: []string{"-gateway", "ingress", "-register", "-service", "my-gateway", "-proxy-id", "my-gateway-123", "-address", "127.0.0.1:7777"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster:       "my-gateway",
+				ProxyID:            "my-gateway-123",
+				ProxySourceService: "my-gateway",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "ingress-gateway-no-auto-register",
+			Flags: []string{"-gateway", "ingress", "-address", "127.0.0.1:7777"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster:       "ingress-gateway",
+				ProxyID:            "ingress-gateway",
+				ProxySourceService: "ingress-gateway",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:  "access-logs-enabled",
+			Flags: []string{"-proxy-id", "test-proxy"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster:       "test-proxy",
+				ProxyID:            "test-proxy",
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusBackendPort: "",
+				PrometheusScrapePath:  "/metrics",
+			},
+			ProxyDefaults: api.ProxyConfigEntry{
+				AccessLogs: &api.AccessLogsConfig{
+					Enabled: true,
+				},
+			},
+		},
+		{
+			Name:  "access-logs-enabled-custom",
+			Flags: []string{"-proxy-id", "test-proxy"},
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster:       "test-proxy",
+				ProxyID:            "test-proxy",
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502",
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusBackendPort: "",
+				PrometheusScrapePath:  "/metrics",
+			},
+			ProxyDefaults: api.ProxyConfigEntry{
+				AccessLogs: &api.AccessLogsConfig{
+					Enabled:             true,
+					DisableListenerLogs: true, // Should have no effect here
+					Type:                api.FileLogSinkType,
+					Path:                "/var/log/consul.log",
+					TextFormat:          "MY START TIME %START_TIME%",
+				},
+			},
+		},
+		{
+			Name:       "acl-enabled-but-no-token",
+			Flags:      []string{"-proxy-id", "test-proxy"},
+			ACLEnabled: true,
+			WantWarn:   "No ACL token was provided to Envoy.",
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502", // Note this is the gRPC port
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusBackendPort: "",
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+		{
+			Name:       "acl-enabled-and-token",
+			Flags:      []string{"-proxy-id", "test-proxy", "-token", "foo"},
+			ACLEnabled: true,
+			WantArgs: BootstrapTplArgs{
+				ProxyCluster: "test-proxy",
+				ProxyID:      "test-proxy",
+				// We don't know this til after the lookup so it will be empty in the
+				// initial args call we are testing here.
+				ProxySourceService: "",
+				GRPC: GRPC{
+					AgentAddress: "127.0.0.1",
+					AgentPort:    "8502", // Note this is the gRPC port
+				},
+				AdminAccessLogPath:    "/dev/null",
+				AdminBindAddress:      "127.0.0.1",
+				AdminBindPort:         "19000",
+				Token:                 "foo",
+				LocalAgentClusterName: xds.LocalAgentClusterName,
+				PrometheusBackendPort: "",
+				PrometheusScrapePath:  "/metrics",
+			},
+		},
+	}
+
+	cases = append(cases, enterpriseGenerateConfigTestCases()...)
+
+	copyAndReplaceAll := func(s []string, old, new string) []string {
+		out := make([]string, len(s))
+		for i, v := range s {
+			out[i] = strings.ReplaceAll(v, old, new)
+		}
+		return out
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.Name, func(t *testing.T) {
+
+			testDir := testutil.TempDir(t, "envoytest")
+
+			if len(tc.Files) > 0 {
+				for fn, fv := range tc.Files {
+					fullname := filepath.Join(testDir, fn)
+					require.NoError(t, os.WriteFile(fullname, []byte(fv), 0600))
+				}
+			}
+
+			// Default the ports
+			if tc.XDSPorts.TLS == 0 && tc.XDSPorts.Plaintext == 0 {
+				tc.XDSPorts.Plaintext = 8502
+			}
+
+			// Run a mock agent API that just always returns the proxy config in the
+			// test.
+			var srv *httptest.Server
+			if tc.TLSServer {
+				srv = httptest.NewTLSServer(testMockAgent(tc))
+			} else {
+				srv = httptest.NewServer(testMockAgent(tc))
+			}
+			defer srv.Close()
+
+			testDirPrefix := testDir + string(filepath.Separator)
+			myEnv := copyAndReplaceAll(tc.Env, "@@TEMPDIR@@", testDirPrefix)
+			defer testSetAndResetEnv(t, myEnv)()
+
+			client, err := api.NewClient(&api.Config{Address: srv.URL, TLSConfig: api.TLSConfig{InsecureSkipVerify: true}})
+			require.NoError(t, err)
+
+			ui := cli.NewMockUi()
+			c := New(ui)
+			// explicitly set the client to one which can connect to the httptest.Server
+			c.client = client
+
+			c.dialFunc = func(_, _ string) (net.Conn, error) {
+				return nil, nil
+			}
+
+			c.checkDualStack = func() (bool, error) {
+				return tc.IsDualStack, nil
+			}
+
+			// Run the command
+			myFlags := copyAndReplaceAll(tc.Flags, "@@TEMPDIR@@", testDirPrefix)
+			args := append([]string{"-bootstrap"}, myFlags...)
+
+			require.NoError(t, c.flags.Parse(args))
+			code := c.run(c.flags.Args())
+			if tc.WantErr != "" {
+				require.Equal(t, 1, code, ui.ErrorWriter.String())
+				require.Contains(t, ui.ErrorWriter.String(), tc.WantErr)
+				return
+			} else if tc.WantWarn != "" {
+				require.Equal(t, 0, code, ui.ErrorWriter.String())
+				require.Contains(t, ui.ErrorWriter.String(), tc.WantWarn)
+			} else {
+				require.Equal(t, 0, code, ui.ErrorWriter.String())
+				require.Empty(t, ui.ErrorWriter.String())
+			}
+
+			// Verify we handled the env and flags right first to get correct template
+			// args.
+			got, err := c.templateArgs()
+			require.NoError(t, err) // Error cases should have returned above
+			require.Equal(t, &tc.WantArgs, got)
+
+			actual := ui.OutputWriter.Bytes()
+
+			// If we got the arg handling write, verify output
+			golden := filepath.Join("testdata", tc.Name+".golden")
+			if *update {
+				os.WriteFile(golden, actual, 0644)
+			}
+
+			expected, err := os.ReadFile(golden)
+			require.NoError(t, err)
+			require.Equal(t, string(expected), string(actual))
+		})
+	}
+}
+
+func TestEnvoy_GatewayRegistration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	t.Parallel()
+	a := agent.NewTestAgent(t, ``)
+	defer a.Shutdown()
+	client := a.Client()
+
+	tt := []struct {
+		name    string
+		args    []string
+		kind    api.ServiceKind
+		id      string
+		service string
+	}{
+		{
+			name: "register gateway with proxy-id and name",
+			args: []string{
+				"-http-addr=" + a.HTTPAddr(),
+				"-grpc-addr=http://127.0.0.1:" + strconv.Itoa(a.Config.GRPCPort),
+				"-register",
+				"-bootstrap",
+				"-gateway", "ingress",
+				"-service", "us-ingress",
+				"-proxy-id", "us-ingress-1",
+			},
+			kind:    api.ServiceKindIngressGateway,
+			id:      "us-ingress-1",
+			service: "us-ingress",
+		},
+		{
+			name: "register gateway without proxy-id with name",
+			args: []string{
+				"-http-addr=" + a.HTTPAddr(),
+				"-grpc-addr=http://127.0.0.1:" + strconv.Itoa(a.Config.GRPCPort),
+				"-register",
+				"-bootstrap",
+				"-gateway", "ingress",
+				"-service", "us-ingress",
+			},
+			kind:    api.ServiceKindIngressGateway,
+			id:      "us-ingress",
+			service: "us-ingress",
+		},
+		{
+			name: "register gateway without proxy-id and without name",
+			args: []string{
+				"-http-addr=" + a.HTTPAddr(),
+				"-grpc-addr=http://127.0.0.1:" + strconv.Itoa(a.Config.GRPCPort),
+				"-register",
+				"-bootstrap",
+				"-gateway", "ingress",
+			},
+			kind:    api.ServiceKindIngressGateway,
+			id:      "ingress-gateway",
+			service: "ingress-gateway",
+		},
+		{
+			name: "register gateway with proxy-id without name",
+			args: []string{
+				"-http-addr=" + a.HTTPAddr(),
+				"-grpc-addr=http://127.0.0.1:" + strconv.Itoa(a.Config.GRPCPort),
+				"-register",
+				"-bootstrap",
+				"-gateway", "ingress",
+				"-proxy-id", "us-ingress",
+			},
+			kind:    api.ServiceKindIngressGateway,
+			id:      "us-ingress",
+			service: "ingress-gateway",
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			ui := cli.NewMockUi()
+			c := New(ui)
+			c.checkDualStack = func() (bool, error) {
+				return false, nil
+			}
+
+			code := c.Run(tc.args)
+			if code != 0 {
+				t.Fatalf("bad exit code: %d. %#v", code, ui.ErrorWriter.String())
+			}
+
+			data, _, err := client.Agent().Service(tc.id, nil)
+			assert.NoError(t, err)
+
+			assert.NotNil(t, data)
+			assert.Equal(t, tc.kind, data.Kind)
+			assert.Equal(t, tc.id, data.ID)
+			assert.Equal(t, tc.service, data.Service)
+			assert.Equal(t, defaultGatewayPort, data.Port)
+		})
+	}
+}
+
+func TestEnvoy_proxyRegistration(t *testing.T) {
+	t.Parallel()
+
+	type args struct {
+		svcForProxy api.AgentService
+		cmdFn       func(*cmd)
+	}
+
+	cases := []struct {
+		name   string
+		args   args
+		testFn func(*testing.T, args, *api.AgentServiceRegistration)
+	}{
+		{
+			"locality is inherited from proxied service if configured and using sidecarFor",
+			args{
+				svcForProxy: api.AgentService{
+					ID: "my-svc",
+					Locality: &api.Locality{
+						Region: "us-east-1",
+						Zone:   "us-east-1a",
+					},
+				},
+				cmdFn: func(c *cmd) {
+					c.sidecarFor = "my-svc"
+				},
+			},
+			func(t *testing.T, args args, r *api.AgentServiceRegistration) {
+				assert.NotNil(t, r.Locality)
+				assert.Equal(t, args.svcForProxy.Locality, r.Locality)
+			},
+		},
+		{
+			"locality is not inherited if not using sidecarFor",
+			args{
+				svcForProxy: api.AgentService{
+					ID: "my-svc",
+					Locality: &api.Locality{
+						Region: "us-east-1",
+						Zone:   "us-east-1a",
+					},
+				},
+			},
+			func(t *testing.T, args args, r *api.AgentServiceRegistration) {
+				assert.Nil(t, r.Locality)
+			},
+		},
+		{
+			"locality is not set if not configured for proxied service",
+			args{
+				svcForProxy: api.AgentService{},
+				cmdFn: func(c *cmd) {
+					c.sidecarFor = "my-svc"
+				},
+			},
+			func(t *testing.T, args args, r *api.AgentServiceRegistration) {
+				assert.Nil(t, r.Locality)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ui := cli.NewMockUi()
+			c := New(ui)
+
+			if tc.args.cmdFn != nil {
+				tc.args.cmdFn(c)
+			}
+
+			result, err := c.proxyRegistration(&tc.args.svcForProxy)
+			assert.NoError(t, err)
+			tc.testFn(t, tc.args, result)
+		})
+	}
+}
+
+// testMockAgent combines testMockAgentProxyConfig and testMockAgentSelf,
+// routing /agent/service/... requests to testMockAgentProxyConfig,
+// routing /catalog/node-services/... requests to testMockCatalogNodeServiceList
+// routing /agent/self requests to testMockAgentSelf.
+func testMockAgent(tc generateConfigTestCase) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/agent/services"):
+			testMockAgentGatewayConfig(tc.NamespacesEnabled)(w, r)
+		case strings.Contains(r.URL.Path, "/agent/service"):
+			testMockAgentProxyConfig(tc.ProxyConfig, tc.NamespacesEnabled)(w, r)
+		case strings.Contains(r.URL.Path, "/agent/self"):
+			testMockAgentSelf(tc.XDSPorts, tc.AgentSelf110, tc.GRPCDisabled)(w, r)
+		case strings.Contains(r.URL.Path, "/catalog/node-services"):
+			testMockCatalogNodeServiceList()(w, r)
+		case strings.Contains(r.URL.Path, "/config/proxy-defaults/global"):
+			testMockConfigProxyDefaults(tc.ProxyDefaults)(w, r)
+		case strings.Contains(r.URL.Path, "/acl/token/self"):
+			testMockTokenReadSelf(tc.ACLEnabled, tc.Flags)(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}
+}
+
+func testMockAgentGatewayConfig(namespacesEnabled bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Parse the proxy-id from the end of the URL (blindly assuming it's correct
+		// format)
+		params := r.URL.Query()
+		filter := params["filter"][0]
+
+		var kind api.ServiceKind
+		switch {
+		case strings.Contains(filter, string(api.ServiceKindTerminatingGateway)):
+			kind = api.ServiceKindTerminatingGateway
+		case strings.Contains(filter, string(api.ServiceKindIngressGateway)):
+			kind = api.ServiceKindIngressGateway
+		}
+
+		svc := map[string]*api.AgentService{
+			string(kind): {
+				Kind:       kind,
+				ID:         string(kind),
+				Service:    string(kind),
+				Datacenter: "dc1",
+			},
+		}
+
+		if namespacesEnabled {
+			svc[string(kind)].Namespace = namespaceFromQuery(r)
+			svc[string(kind)].Partition = partitionFromQuery(r)
+		}
+
+		cfgJSON, err := json.Marshal(svc)
+		if err != nil {
+			w.WriteHeader(500)
+			w.Write([]byte(err.Error()))
+			return
+		}
+		w.Write(cfgJSON)
+	}
+}
+
+func namespaceFromQuery(r *http.Request) string {
+	// Use the namespace in the request if there is one, otherwise
+	// use-default.
+	if queryNamespace := r.URL.Query().Get("namespace"); queryNamespace != "" {
+		return queryNamespace
+	}
+	if queryNs := r.URL.Query().Get("ns"); queryNs != "" {
+		return queryNs
+	}
+	return "default"
+}
+
+func partitionFromQuery(r *http.Request) string {
+	// Use the partition in the request if there is one, otherwise
+	// use-default.
+	if queryPartition := r.URL.Query().Get("partition"); queryPartition != "" {
+		return queryPartition
+	}
+	if queryAp := r.URL.Query().Get("ap"); queryAp != "" {
+		return queryAp
+	}
+	return "default"
+}
+
+func testMockAgentProxyConfig(cfg map[string]interface{}, namespacesEnabled bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Parse the proxy-id from the end of the URL (blindly assuming it's correct
+		// format)
+		proxyID := strings.TrimPrefix(r.URL.Path, "/v1/agent/service/")
+		serviceID := strings.TrimSuffix(proxyID, "-proxy")
+
+		svc := api.AgentService{
+			Kind:    api.ServiceKindConnectProxy,
+			ID:      proxyID,
+			Service: proxyID,
+			Proxy: &api.AgentServiceConnectProxyConfig{
+				DestinationServiceName: serviceID,
+				DestinationServiceID:   serviceID,
+				Config:                 cfg,
+			},
+			Datacenter: "dc1",
+		}
+
+		if namespacesEnabled {
+			svc.Namespace = namespaceFromQuery(r)
+			svc.Partition = partitionFromQuery(r)
+		}
+
+		cfgJSON, err := json.Marshal(svc)
+		if err != nil {
+			w.WriteHeader(500)
+			w.Write([]byte(err.Error()))
+			return
+		}
+		w.Write(cfgJSON)
+	}
+}
+
+func testMockCatalogNodeServiceList() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		quotedProxyID := strings.TrimPrefix(r.URL.Query().Get("filter"), "ID == ")
+		proxyID := quotedProxyID[1 : len(quotedProxyID)-1]
+		serviceID := strings.TrimSuffix(proxyID, "-proxy")
+
+		var svcKind api.ServiceKind
+		if strings.Contains(proxyID, "ingress-gateway") {
+			svcKind = api.ServiceKindIngressGateway
+		} else {
+			svcKind = api.ServiceKindConnectProxy
+		}
+
+		var svcProxy api.AgentServiceConnectProxyConfig
+		if svcKind == api.ServiceKindConnectProxy {
+			svcProxy = api.AgentServiceConnectProxyConfig{
+				DestinationServiceName: serviceID,
+				DestinationServiceID:   serviceID,
+			}
+		}
+		svc := api.AgentService{
+			Kind:    svcKind,
+			ID:      proxyID,
+			Service: proxyID,
+			Proxy:   &svcProxy,
+		}
+
+		nodeSvc := api.CatalogNodeServiceList{
+			Node:     &api.Node{Datacenter: "dc1"},
+			Services: []*api.AgentService{&svc},
+		}
+
+		cfgJSON, err := json.Marshal(nodeSvc)
+		if err != nil {
+			w.WriteHeader(500)
+			w.Write([]byte(err.Error()))
+			return
+		}
+		w.Write(cfgJSON)
+	}
+}
+
+func testMockConfigProxyDefaults(entry api.ProxyConfigEntry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cfgJSON, err := json.Marshal(entry)
+		if err != nil {
+			w.WriteHeader(500)
+			w.Write([]byte(err.Error()))
+			return
+		}
+		w.Write(cfgJSON)
+	}
+}
+
+func testMockTokenReadSelf(aclEnabled bool, flags []string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if aclEnabled {
+			for _, f := range flags {
+				if f == "-token" {
+					w.WriteHeader(200)
+					return
+				}
+			}
+			w.WriteHeader(403)
+			w.Write([]byte(acl.ErrNotFound.Error()))
+			return
+		}
+	}
+}
+func TestEnvoyCommand_canBindInternal(t *testing.T) {
+	t.Parallel()
+	type testCheck struct {
+		expected bool
+		addr     string
+	}
+
+	type testCase struct {
+		ifAddrs []net.Addr
+		checks  map[string]testCheck
+	}
+
+	parseIPNets := func(t *testing.T, in ...string) []net.Addr {
+		var out []net.Addr
+		for _, addr := range in {
+			ip := net.ParseIP(addr)
+			require.NotNil(t, ip)
+			out = append(out, &net.IPNet{IP: ip})
+		}
+		return out
+	}
+
+	parseIPs := func(t *testing.T, in ...string) []net.Addr {
+		var out []net.Addr
+		for _, addr := range in {
+			ip := net.ParseIP(addr)
+			require.NotNil(t, ip)
+			out = append(out, &net.IPAddr{IP: ip})
+		}
+		return out
+	}
+
+	cases := map[string]testCase{
+		"IPNet": {
+			parseIPNets(t, "10.3.0.2", "198.18.0.1", "2001:db8:a0b:12f0::1"),
+			map[string]testCheck{
+				"ipv4": {
+					true,
+					"10.3.0.2",
+				},
+				"secondary ipv4": {
+					true,
+					"198.18.0.1",
+				},
+				"ipv6": {
+					true,
+					"2001:db8:a0b:12f0::1",
+				},
+				"ipv4 not found": {
+					false,
+					"1.2.3.4",
+				},
+				"ipv6 not found": {
+					false,
+					"::ffff:192.168.0.1",
+				},
+			},
+		},
+		"IPAddr": {
+			parseIPs(t, "10.3.0.2", "198.18.0.1", "2001:db8:a0b:12f0::1"),
+			map[string]testCheck{
+				"ipv4": {
+					true,
+					"10.3.0.2",
+				},
+				"secondary ipv4": {
+					true,
+					"198.18.0.1",
+				},
+				"ipv6": {
+					true,
+					"2001:db8:a0b:12f0::1",
+				},
+				"ipv4 not found": {
+					false,
+					"1.2.3.4",
+				},
+				"ipv6 not found": {
+					false,
+					"::ffff:192.168.0.1",
+				},
+			},
+		},
+	}
+
+	for name, tcase := range cases {
+		t.Run(name, func(t *testing.T) {
+			for checkName, check := range tcase.checks {
+				t.Run(checkName, func(t *testing.T) {
+					require.Equal(t, check.expected, canBindInternal(check.addr, tcase.ifAddrs))
+				})
+			}
+		})
+	}
+}
+
+// testMockAgentSelf returns an empty /v1/agent/self response except GRPC
+// port is filled in to match the given wantXDSPort argument.
+func testMockAgentSelf(
+	wantXDSPorts agent.GRPCPorts,
+	agentSelf110 bool,
+	grpcDisabled bool,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		resp := agent.Self{
+			Config: map[string]interface{}{
+				"Datacenter": "dc1",
+			},
+		}
+
+		if agentSelf110 {
+			resp.DebugConfig = map[string]interface{}{
+				"GRPCPort": wantXDSPorts.Plaintext,
+			}
+		} else if grpcDisabled {
+			resp.DebugConfig = map[string]interface{}{
+				"GRPCPort": -1,
+			}
+			// the real agent does not populate XDS if grpc or
+			// grpc-tls ports are < 0
+		} else {
+			resp.XDS = &agent.XDSSelf{
+				// The deprecated Port field should default to TLS if it's available.
+				Port:  wantXDSPorts.TLS,
+				Ports: wantXDSPorts,
+			}
+			if wantXDSPorts.TLS <= 0 {
+				resp.XDS.Port = wantXDSPorts.Plaintext
+			}
+		}
+
+		selfJSON, err := json.Marshal(resp)
+		if err != nil {
+			w.WriteHeader(500)
+			w.Write([]byte(err.Error()))
+			return
+		}
+		w.Write(selfJSON)
+	}
+}
+
+func TestCheckEnvoyVersionCompatibility(t *testing.T) {
+	tests := []struct {
+		name            string
+		envoyVersion    string
+		unsupportedList []string
+		expectedCompat  envoyCompat
+		isErrorExpected bool
+	}{
+		{
+			name:            "supported-using-proxy-support-defined",
+			envoyVersion:    xdscommon.EnvoyVersions[1],
+			unsupportedList: xdscommon.UnsupportedEnvoyVersions,
+			expectedCompat: envoyCompat{
+				isCompatible: true,
+			},
+		},
+		{
+			name:            "supported-at-max",
+			envoyVersion:    xdscommon.GetMaxEnvoyMajorVersion(),
+			unsupportedList: xdscommon.UnsupportedEnvoyVersions,
+			expectedCompat: envoyCompat{
+				isCompatible: true,
+			},
+		},
+		{
+			name:            "supported-patch-higher",
+			envoyVersion:    addNPatchVersion(xdscommon.EnvoyVersions[0], 1),
+			unsupportedList: xdscommon.UnsupportedEnvoyVersions,
+			expectedCompat: envoyCompat{
+				isCompatible: true,
+			},
+		},
+		{
+			name:            "not-supported-minor-higher",
+			envoyVersion:    addNMinorVersion(xdscommon.EnvoyVersions[0], 1),
+			unsupportedList: xdscommon.UnsupportedEnvoyVersions,
+			expectedCompat: envoyCompat{
+				isCompatible:        false,
+				versionIncompatible: replacePatchVersionWithX(addNMinorVersion(xdscommon.EnvoyVersions[0], 1)),
+			},
+		},
+		{
+			name:            "not-supported-minor-lower",
+			envoyVersion:    addNMinorVersion(xdscommon.EnvoyVersions[len(xdscommon.EnvoyVersions)-1], -1),
+			unsupportedList: xdscommon.UnsupportedEnvoyVersions,
+			expectedCompat: envoyCompat{
+				isCompatible:        false,
+				versionIncompatible: replacePatchVersionWithX(addNMinorVersion(xdscommon.EnvoyVersions[len(xdscommon.EnvoyVersions)-1], -1)),
+			},
+		},
+		{
+			name:            "not-supported-explicitly-unsupported-version",
+			envoyVersion:    addNPatchVersion(xdscommon.EnvoyVersions[0], 1),
+			unsupportedList: []string{"1.23.1", addNPatchVersion(xdscommon.EnvoyVersions[0], 1)},
+			expectedCompat: envoyCompat{
+				isCompatible:        false,
+				versionIncompatible: addNPatchVersion(xdscommon.EnvoyVersions[0], 1),
+			},
+		},
+		{
+			name:            "error-bad-input",
+			envoyVersion:    "1.abc.3",
+			unsupportedList: xdscommon.UnsupportedEnvoyVersions,
+			expectedCompat:  envoyCompat{},
+			isErrorExpected: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			actual, err := checkEnvoyVersionCompatibility(tc.envoyVersion, tc.unsupportedList)
+			if tc.isErrorExpected {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tc.expectedCompat, actual)
+		})
+	}
+}
+
+func addNPatchVersion(s string, n int) string {
+	splitS := strings.Split(s, ".")
+	minor, _ := strconv.Atoi(splitS[2])
+	minor += n
+	return fmt.Sprintf("%s.%s.%d", splitS[0], splitS[1], minor)
+}
+
+func addNMinorVersion(s string, n int) string {
+	splitS := strings.Split(s, ".")
+	major, _ := strconv.Atoi(splitS[1])
+	major += n
+	return fmt.Sprintf("%s.%d.%s", splitS[0], major, splitS[2])
+}

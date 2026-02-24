@@ -1,0 +1,195 @@
+diff --git a/pkg/commands/executor.go b/pkg/commands/executor.go
+index d241f565..a6e08a48 100644
+--- a/pkg/commands/executor.go
++++ b/pkg/commands/executor.go
+@@ -116,7 +116,18 @@ func NewExecutor(buildInfo BuildInfo) *Executor {
+ 		e.log.Fatalf("Can't read config: %s", err)
+ 	}
+ 
+-	if (commandLineCfg == nil || commandLineCfg.Run.Go == "") && e.cfg != nil && e.cfg.Run.Go == "" {
++	if commandLineCfg != nil && commandLineCfg.Run.Go != "" {
++		// This hack allow to have the right Run information at least for the Go version (because the default value of the "go" flag is empty).
++		// If you put a log for `m.cfg.Run.Go` inside `GetAllSupportedLinterConfigs`,
++		// you will observe that at end (without this hack) the value will have the right value but too late,
++		// the linters are already running with the previous uncompleted configuration.
++		// TODO(ldez) there is a major problem with the executor:
++		//  the parsing of the configuration and the timing to load the configuration and linters are creating unmanageable situations.
++		//  There is no simple solution because it's spaghetti code.
++		//  I need to completely rewrite the command line system and the executor because it's extremely time consuming to debug,
++		//  so it's unmaintainable.
++		e.cfg.Run.Go = commandLineCfg.Run.Go
++	} else if e.cfg.Run.Go == "" {
+ 		e.cfg.Run.Go = config.DetectGoVersion()
+ 	}
+ 
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index a5483a20..2eb82938 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -41,18 +41,18 @@ type Version struct {
+ 	Debug  bool   `mapstructure:"debug"`
+ }
+ 
+-func IsGreaterThanOrEqualGo122(v string) bool {
+-	v1, err := hcversion.NewVersion(strings.TrimPrefix(v, "go"))
++func IsGoGreaterThanOrEqual(current, limit string) bool {
++	v1, err := hcversion.NewVersion(strings.TrimPrefix(current, "go"))
+ 	if err != nil {
+ 		return false
+ 	}
+ 
+-	limit, err := hcversion.NewVersion("1.22")
++	l, err := hcversion.NewVersion(limit)
+ 	if err != nil {
+ 		return false
+ 	}
+ 
+-	return v1.GreaterThanOrEqual(limit)
++	return v1.GreaterThanOrEqual(l)
+ }
+ 
+ func DetectGoVersion() string {
+diff --git a/pkg/golinters/govet.go b/pkg/golinters/govet.go
+index e2c7d2df..066f7e68 100644
+--- a/pkg/golinters/govet.go
++++ b/pkg/golinters/govet.go
+@@ -173,7 +173,7 @@ func analyzersFromConfig(settings *config.GovetSettings) []*analysis.Analyzer {
+ 
+ func isAnalyzerEnabled(name string, cfg *config.GovetSettings, defaultAnalyzers []*analysis.Analyzer) bool {
+ 	// TODO(ldez) remove loopclosure when go1.23
+-	if name == loopclosure.Analyzer.Name && config.IsGreaterThanOrEqualGo122(cfg.Go) {
++	if name == loopclosure.Analyzer.Name && config.IsGoGreaterThanOrEqual(cfg.Go, "1.22") {
+ 		return false
+ 	}
+ 
+diff --git a/pkg/golinters/paralleltest.go b/pkg/golinters/paralleltest.go
+index 5a99830b..8215619c 100644
+--- a/pkg/golinters/paralleltest.go
++++ b/pkg/golinters/paralleltest.go
+@@ -18,7 +18,7 @@ func NewParallelTest(settings *config.ParallelTestSettings) *goanalysis.Linter {
+ 			"ignoremissingsubtests": settings.IgnoreMissingSubtests,
+ 		}
+ 
+-		if config.IsGreaterThanOrEqualGo122(settings.Go) {
++		if config.IsGoGreaterThanOrEqual(settings.Go, "1.22") {
+ 			d["ignoreloopVar"] = true
+ 		}
+ 
+diff --git a/pkg/lint/linter/config.go b/pkg/lint/linter/config.go
+index ed5e5508..8e57d6bd 100644
+--- a/pkg/lint/linter/config.go
++++ b/pkg/lint/linter/config.go
+@@ -1,7 +1,8 @@
+ package linter
+ 
+ import (
+-	"golang.org/x/tools/go/analysis"
++	"fmt"
++
+ 	"golang.org/x/tools/go/packages"
+ 
+ 	"github.com/golangci/golangci-lint/pkg/config"
+@@ -133,23 +134,27 @@ func (lc *Config) Name() string {
+ 	return lc.Linter.Name()
+ }
+ 
+-func (lc *Config) WithNoopFallback(cfg *config.Config) *Config {
+-	if cfg != nil && config.IsGreaterThanOrEqualGo122(cfg.Run.Go) {
+-		lc.Linter = &Noop{
+-			name: lc.Linter.Name(),
+-			desc: lc.Linter.Desc(),
+-			run: func(_ *analysis.Pass) (any, error) {
+-				return nil, nil
+-			},
+-		}
+-
++func (lc *Config) WithNoopFallback(cfg *config.Config, cond func(cfg *config.Config) error) *Config {
++	if err := cond(cfg); err != nil {
++		lc.Linter = NewNoop(lc.Linter, err.Error())
+ 		lc.LoadMode = 0
++
+ 		return lc.WithLoadFiles()
+ 	}
+ 
+ 	return lc
+ }
+ 
++func IsGoLowerThanGo122() func(cfg *config.Config) error {
++	return func(cfg *config.Config) error {
++		if cfg == nil || config.IsGoGreaterThanOrEqual(cfg.Run.Go, "1.22") {
++			return nil
++		}
++
++		return fmt.Errorf("this linter is disabled because the Go version (%s) of your project is lower than Go 1.22", cfg.Run.Go)
++	}
++}
++
+ func NewConfig(linter Linter) *Config {
+ 	lc := &Config{
+ 		Linter: linter,
+diff --git a/pkg/lint/linter/linter.go b/pkg/lint/linter/linter.go
+index a65d6b92..e086bbe5 100644
+--- a/pkg/lint/linter/linter.go
++++ b/pkg/lint/linter/linter.go
+@@ -3,8 +3,6 @@ package linter
+ import (
+ 	"context"
+ 
+-	"golang.org/x/tools/go/analysis"
+-
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+@@ -15,14 +13,23 @@ type Linter interface {
+ }
+ 
+ type Noop struct {
+-	name string
+-	desc string
+-	run  func(pass *analysis.Pass) (any, error)
++	name   string
++	desc   string
++	reason string
++}
++
++func NewNoop(l Linter, reason string) Noop {
++	return Noop{
++		name:   l.Name(),
++		desc:   l.Desc(),
++		reason: reason,
++	}
+ }
+ 
+ func (n Noop) Run(_ context.Context, lintCtx *Context) ([]result.Issue, error) {
+-	lintCtx.Log.Warnf("%s is disabled because of generics."+
+-		" You can track the evolution of the generics support by following the https://github.com/golangci/golangci-lint/issues/2649.", n.name)
++	if n.reason != "" {
++		lintCtx.Log.Warnf("%s: %s", n.name, n.reason)
++	}
+ 	return nil, nil
+ }
+ 
+diff --git a/pkg/lint/lintersdb/manager.go b/pkg/lint/lintersdb/manager.go
+index 977ef0d1..e6a171f1 100644
+--- a/pkg/lint/lintersdb/manager.go
++++ b/pkg/lint/lintersdb/manager.go
+@@ -303,7 +303,8 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
+ 		linter.NewConfig(golinters.NewCopyLoopVar()).
+ 			WithSince("v1.57.0").
+ 			WithPresets(linter.PresetStyle).
+-			WithURL("https://github.com/karamaru-alpha/copyloopvar"),
++			WithURL("https://github.com/karamaru-alpha/copyloopvar").
++			WithNoopFallback(m.cfg, linter.IsGoLowerThanGo122()),
+ 
+ 		linter.NewConfig(golinters.NewCyclop(cyclopCfg)).
+ 			WithSince("v1.37.0").
+@@ -617,7 +618,8 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
+ 
+ 		linter.NewConfig(golinters.NewIntrange()).
+ 			WithSince("v1.57.0").
+-			WithURL("https://github.com/ckaznocha/intrange"),
++			WithURL("https://github.com/ckaznocha/intrange").
++			WithNoopFallback(m.cfg, linter.IsGoLowerThanGo122()),
+ 
+ 		linter.NewConfig(golinters.NewIreturn(ireturnCfg)).
+ 			WithSince("v1.43.0").

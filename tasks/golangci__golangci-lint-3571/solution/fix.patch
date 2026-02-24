@@ -1,0 +1,389 @@
+diff --git a/.golangci.reference.yml b/.golangci.reference.yml
+index 241fb7fe..6cf0efe9 100644
+--- a/.golangci.reference.yml
++++ b/.golangci.reference.yml
+@@ -27,7 +27,8 @@ run:
+     - mytag
+ 
+   # Which dirs to skip: issues from them won't be reported.
+-  # Can use regexp here: `generated.*`, regexp is applied on full path.
++  # Can use regexp here: `generated.*`, regexp is applied on full path,
++  # including the path prefix if one is set.
+   # Default value is empty list,
+   # but default dirs are skipped independently of this option's value (see skip-dirs-use-default).
+   # "/" will be replaced by current OS file path separator to properly work on Windows.
+diff --git a/docs/src/docs/usage/false-positives.mdx b/docs/src/docs/usage/false-positives.mdx
+index 354aee9f..fe94197a 100644
+--- a/docs/src/docs/usage/false-positives.mdx
++++ b/docs/src/docs/usage/false-positives.mdx
+@@ -66,6 +66,10 @@ issues:
+ 
+ Exclude issues in path by `run.skip-dirs`, `run.skip-files` or `issues.exclude-rules` config options.
+ 
++Beware that the paths that get matched here are relative to the current working directory.
++When the configuration contains path patterns that check for specific directories,
++the `--path-prefix` parameter can be used to extend the paths before matching.
++
+ In the following example, all the reports from the linters (`linters`) that concerns the path (`path`) are excluded:
+ 
+ ```yml
+diff --git a/pkg/fsutils/files.go b/pkg/fsutils/files.go
+new file mode 100644
+index 00000000..4398ab9f
+--- /dev/null
++++ b/pkg/fsutils/files.go
+@@ -0,0 +1,33 @@
++package fsutils
++
++import "path/filepath"
++
++// Files combines different operations related to handling file paths and content.
++type Files struct {
++	*LineCache
++	pathPrefix string
++}
++
++func NewFiles(lc *LineCache, pathPrefix string) *Files {
++	return &Files{
++		LineCache:  lc,
++		pathPrefix: pathPrefix,
++	}
++}
++
++// WithPathPrefix takes a path that is relative to the current directory (as used in issues)
++// and adds the configured path prefix, if there is one.
++// The resulting path then can be shown to the user or compared against paths specified in the configuration.
++func (f *Files) WithPathPrefix(relativePath string) string {
++	return WithPathPrefix(f.pathPrefix, relativePath)
++}
++
++// WithPathPrefix takes a path that is relative to the current directory (as used in issues)
++// and adds the configured path prefix, if there is one.
++// The resulting path then can be shown to the user or compared against paths specified in the configuration.
++func WithPathPrefix(pathPrefix, relativePath string) string {
++	if pathPrefix == "" {
++		return relativePath
++	}
++	return filepath.Join(pathPrefix, relativePath)
++}
+diff --git a/pkg/lint/runner.go b/pkg/lint/runner.go
+index 21cce1c6..1d527711 100644
+--- a/pkg/lint/runner.go
++++ b/pkg/lint/runner.go
+@@ -29,7 +29,12 @@ type Runner struct {
+ 
+ func NewRunner(cfg *config.Config, log logutils.Log, goenv *goutil.Env, es *lintersdb.EnabledSet,
+ 	lineCache *fsutils.LineCache, dbManager *lintersdb.Manager, pkgs []*gopackages.Package) (*Runner, error) {
+-	skipFilesProcessor, err := processors.NewSkipFiles(cfg.Run.SkipFiles)
++	// Beware that some processors need to add the path prefix when working with paths
++	// because they get invoked before the path prefixer (exclude and severity rules)
++	// or process other paths (skip files).
++	files := fsutils.NewFiles(lineCache, cfg.Output.PathPrefix)
++
++	skipFilesProcessor, err := processors.NewSkipFiles(cfg.Run.SkipFiles, cfg.Output.PathPrefix)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -38,7 +43,7 @@ func NewRunner(cfg *config.Config, log logutils.Log, goenv *goutil.Env, es *lint
+ 	if cfg.Run.UseDefaultSkipDirs {
+ 		skipDirs = append(skipDirs, packages.StdExcludeDirRegexps...)
+ 	}
+-	skipDirsProcessor, err := processors.NewSkipDirs(skipDirs, log.Child(logutils.DebugKeySkipDirs), cfg.Run.Args)
++	skipDirsProcessor, err := processors.NewSkipDirs(skipDirs, log.Child(logutils.DebugKeySkipDirs), cfg.Run.Args, cfg.Output.PathPrefix)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -82,7 +87,7 @@ func NewRunner(cfg *config.Config, log logutils.Log, goenv *goutil.Env, es *lint
+ 			processors.NewIdentifierMarker(),
+ 
+ 			getExcludeProcessor(&cfg.Issues),
+-			getExcludeRulesProcessor(&cfg.Issues, log, lineCache),
++			getExcludeRulesProcessor(&cfg.Issues, log, files),
+ 			processors.NewNolint(log.Child(logutils.DebugKeyNolint), dbManager, enabledLinters),
+ 
+ 			processors.NewUniqByLine(cfg),
+@@ -92,7 +97,7 @@ func NewRunner(cfg *config.Config, log logutils.Log, goenv *goutil.Env, es *lint
+ 			processors.NewMaxFromLinter(cfg.Issues.MaxIssuesPerLinter, log.Child(logutils.DebugKeyMaxFromLinter), cfg),
+ 			processors.NewSourceCode(lineCache, log.Child(logutils.DebugKeySourceCode)),
+ 			processors.NewPathShortener(),
+-			getSeverityRulesProcessor(&cfg.Severity, log, lineCache),
++			getSeverityRulesProcessor(&cfg.Severity, log, files),
+ 			processors.NewPathPrefixer(cfg.Output.PathPrefix),
+ 			processors.NewSortResults(cfg),
+ 		},
+@@ -259,7 +264,7 @@ func getExcludeProcessor(cfg *config.Issues) processors.Processor {
+ 	return excludeProcessor
+ }
+ 
+-func getExcludeRulesProcessor(cfg *config.Issues, log logutils.Log, lineCache *fsutils.LineCache) processors.Processor {
++func getExcludeRulesProcessor(cfg *config.Issues, log logutils.Log, files *fsutils.Files) processors.Processor {
+ 	var excludeRules []processors.ExcludeRule
+ 	for _, r := range cfg.ExcludeRules {
+ 		excludeRules = append(excludeRules, processors.ExcludeRule{
+@@ -287,13 +292,13 @@ func getExcludeRulesProcessor(cfg *config.Issues, log logutils.Log, lineCache *f
+ 	if cfg.ExcludeCaseSensitive {
+ 		excludeRulesProcessor = processors.NewExcludeRulesCaseSensitive(
+ 			excludeRules,
+-			lineCache,
++			files,
+ 			log.Child(logutils.DebugKeyExcludeRules),
+ 		)
+ 	} else {
+ 		excludeRulesProcessor = processors.NewExcludeRules(
+ 			excludeRules,
+-			lineCache,
++			files,
+ 			log.Child(logutils.DebugKeyExcludeRules),
+ 		)
+ 	}
+@@ -301,7 +306,7 @@ func getExcludeRulesProcessor(cfg *config.Issues, log logutils.Log, lineCache *f
+ 	return excludeRulesProcessor
+ }
+ 
+-func getSeverityRulesProcessor(cfg *config.Severity, log logutils.Log, lineCache *fsutils.LineCache) processors.Processor {
++func getSeverityRulesProcessor(cfg *config.Severity, log logutils.Log, files *fsutils.Files) processors.Processor {
+ 	var severityRules []processors.SeverityRule
+ 	for _, r := range cfg.Rules {
+ 		severityRules = append(severityRules, processors.SeverityRule{
+@@ -320,14 +325,14 @@ func getSeverityRulesProcessor(cfg *config.Severity, log logutils.Log, lineCache
+ 		severityRulesProcessor = processors.NewSeverityRulesCaseSensitive(
+ 			cfg.Default,
+ 			severityRules,
+-			lineCache,
++			files,
+ 			log.Child(logutils.DebugKeySeverityRules),
+ 		)
+ 	} else {
+ 		severityRulesProcessor = processors.NewSeverityRules(
+ 			cfg.Default,
+ 			severityRules,
+-			lineCache,
++			files,
+ 			log.Child(logutils.DebugKeySeverityRules),
+ 		)
+ 	}
+diff --git a/pkg/result/processors/base_rule.go b/pkg/result/processors/base_rule.go
+index 6958b9f2..eaed829a 100644
+--- a/pkg/result/processors/base_rule.go
++++ b/pkg/result/processors/base_rule.go
+@@ -26,14 +26,14 @@ func (r *baseRule) isEmpty() bool {
+ 	return r.text == nil && r.source == nil && r.path == nil && len(r.linters) == 0
+ }
+ 
+-func (r *baseRule) match(issue *result.Issue, lineCache *fsutils.LineCache, log logutils.Log) bool {
++func (r *baseRule) match(issue *result.Issue, files *fsutils.Files, log logutils.Log) bool {
+ 	if r.isEmpty() {
+ 		return false
+ 	}
+ 	if r.text != nil && !r.text.MatchString(issue.Text) {
+ 		return false
+ 	}
+-	if r.path != nil && !r.path.MatchString(issue.FilePath()) {
++	if r.path != nil && !r.path.MatchString(files.WithPathPrefix(issue.FilePath())) {
+ 		return false
+ 	}
+ 	if len(r.linters) != 0 && !r.matchLinter(issue) {
+@@ -41,7 +41,7 @@ func (r *baseRule) match(issue *result.Issue, lineCache *fsutils.LineCache, log
+ 	}
+ 
+ 	// the most heavyweight checking last
+-	if r.source != nil && !r.matchSource(issue, lineCache, log) {
++	if r.source != nil && !r.matchSource(issue, files.LineCache, log) {
+ 		return false
+ 	}
+ 
+diff --git a/pkg/result/processors/exclude_rules.go b/pkg/result/processors/exclude_rules.go
+index 62533b81..42a24f64 100644
+--- a/pkg/result/processors/exclude_rules.go
++++ b/pkg/result/processors/exclude_rules.go
+@@ -17,15 +17,15 @@ type ExcludeRule struct {
+ }
+ 
+ type ExcludeRules struct {
+-	rules     []excludeRule
+-	lineCache *fsutils.LineCache
+-	log       logutils.Log
++	rules []excludeRule
++	files *fsutils.Files
++	log   logutils.Log
+ }
+ 
+-func NewExcludeRules(rules []ExcludeRule, lineCache *fsutils.LineCache, log logutils.Log) *ExcludeRules {
++func NewExcludeRules(rules []ExcludeRule, files *fsutils.Files, log logutils.Log) *ExcludeRules {
+ 	r := &ExcludeRules{
+-		lineCache: lineCache,
+-		log:       log,
++		files: files,
++		log:   log,
+ 	}
+ 	r.rules = createRules(rules, "(?i)")
+ 
+@@ -59,7 +59,7 @@ func (p ExcludeRules) Process(issues []result.Issue) ([]result.Issue, error) {
+ 	return filterIssues(issues, func(i *result.Issue) bool {
+ 		for _, rule := range p.rules {
+ 			rule := rule
+-			if rule.match(i, p.lineCache, p.log) {
++			if rule.match(i, p.files, p.log) {
+ 				return false
+ 			}
+ 		}
+@@ -76,10 +76,10 @@ type ExcludeRulesCaseSensitive struct {
+ 	*ExcludeRules
+ }
+ 
+-func NewExcludeRulesCaseSensitive(rules []ExcludeRule, lineCache *fsutils.LineCache, log logutils.Log) *ExcludeRulesCaseSensitive {
++func NewExcludeRulesCaseSensitive(rules []ExcludeRule, files *fsutils.Files, log logutils.Log) *ExcludeRulesCaseSensitive {
+ 	r := &ExcludeRules{
+-		lineCache: lineCache,
+-		log:       log,
++		files: files,
++		log:   log,
+ 	}
+ 	r.rules = createRules(rules, "")
+ 
+diff --git a/pkg/result/processors/path_prefixer.go b/pkg/result/processors/path_prefixer.go
+index 04ed8312..f6b88501 100644
+--- a/pkg/result/processors/path_prefixer.go
++++ b/pkg/result/processors/path_prefixer.go
+@@ -1,8 +1,7 @@
+ package processors
+ 
+ import (
+-	"path/filepath"
+-
++	"github.com/golangci/golangci-lint/pkg/fsutils"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+@@ -27,7 +26,7 @@ func (*PathPrefixer) Name() string {
+ func (p *PathPrefixer) Process(issues []result.Issue) ([]result.Issue, error) {
+ 	if p.prefix != "" {
+ 		for i := range issues {
+-			issues[i].Pos.Filename = filepath.Join(p.prefix, issues[i].Pos.Filename)
++			issues[i].Pos.Filename = fsutils.WithPathPrefix(p.prefix, issues[i].Pos.Filename)
+ 		}
+ 	}
+ 	return issues, nil
+diff --git a/pkg/result/processors/severity_rules.go b/pkg/result/processors/severity_rules.go
+index 85c1866a..8174ae8c 100644
+--- a/pkg/result/processors/severity_rules.go
++++ b/pkg/result/processors/severity_rules.go
+@@ -21,13 +21,13 @@ type SeverityRule struct {
+ type SeverityRules struct {
+ 	defaultSeverity string
+ 	rules           []severityRule
+-	lineCache       *fsutils.LineCache
++	files           *fsutils.Files
+ 	log             logutils.Log
+ }
+ 
+-func NewSeverityRules(defaultSeverity string, rules []SeverityRule, lineCache *fsutils.LineCache, log logutils.Log) *SeverityRules {
++func NewSeverityRules(defaultSeverity string, rules []SeverityRule, files *fsutils.Files, log logutils.Log) *SeverityRules {
+ 	r := &SeverityRules{
+-		lineCache:       lineCache,
++		files:           files,
+ 		log:             log,
+ 		defaultSeverity: defaultSeverity,
+ 	}
+@@ -70,7 +70,7 @@ func (p SeverityRules) Process(issues []result.Issue) ([]result.Issue, error) {
+ 				ruleSeverity = rule.severity
+ 			}
+ 
+-			if rule.match(i, p.lineCache, p.log) {
++			if rule.match(i, p.files, p.log) {
+ 				i.Severity = ruleSeverity
+ 				return i
+ 			}
+@@ -90,9 +90,9 @@ type SeverityRulesCaseSensitive struct {
+ }
+ 
+ func NewSeverityRulesCaseSensitive(defaultSeverity string, rules []SeverityRule,
+-	lineCache *fsutils.LineCache, log logutils.Log) *SeverityRulesCaseSensitive {
++	files *fsutils.Files, log logutils.Log) *SeverityRulesCaseSensitive {
+ 	r := &SeverityRules{
+-		lineCache:       lineCache,
++		files:           files,
+ 		log:             log,
+ 		defaultSeverity: defaultSeverity,
+ 	}
+diff --git a/pkg/result/processors/skip_dirs.go b/pkg/result/processors/skip_dirs.go
+index 54aeb990..e71495fd 100644
+--- a/pkg/result/processors/skip_dirs.go
++++ b/pkg/result/processors/skip_dirs.go
+@@ -22,13 +22,14 @@ type SkipDirs struct {
+ 	skippedDirs      map[string]*skipStat
+ 	absArgsDirs      []string
+ 	skippedDirsCache map[string]bool
++	pathPrefix       string
+ }
+ 
+ var _ Processor = (*SkipDirs)(nil)
+ 
+ const goFileSuffix = ".go"
+ 
+-func NewSkipDirs(patterns []string, log logutils.Log, runArgs []string) (*SkipDirs, error) {
++func NewSkipDirs(patterns []string, log logutils.Log, runArgs []string, pathPrefix string) (*SkipDirs, error) {
+ 	var patternsRe []*regexp.Regexp
+ 	for _, p := range patterns {
+ 		p = fsutils.NormalizePathInRegex(p)
+@@ -62,6 +63,7 @@ func NewSkipDirs(patterns []string, log logutils.Log, runArgs []string) (*SkipDi
+ 		skippedDirs:      map[string]*skipStat{},
+ 		absArgsDirs:      absArgsDirs,
+ 		skippedDirsCache: map[string]bool{},
++		pathPrefix:       pathPrefix,
+ 	}, nil
+ }
+ 
+@@ -120,8 +122,9 @@ func (p *SkipDirs) shouldPassIssueDirs(issueRelDir, issueAbsDir string) bool {
+ 	// The alternative solution is to find relative to args path, but it has
+ 	// disadvantages (https://github.com/golangci/golangci-lint/pull/313).
+ 
++	path := fsutils.WithPathPrefix(p.pathPrefix, issueRelDir)
+ 	for _, pattern := range p.patterns {
+-		if pattern.MatchString(issueRelDir) {
++		if pattern.MatchString(path) {
+ 			ps := pattern.String()
+ 			if p.skippedDirs[issueRelDir] == nil {
+ 				p.skippedDirs[issueRelDir] = &skipStat{
+diff --git a/pkg/result/processors/skip_files.go b/pkg/result/processors/skip_files.go
+index b7b86bed..9579bee8 100644
+--- a/pkg/result/processors/skip_files.go
++++ b/pkg/result/processors/skip_files.go
+@@ -9,12 +9,13 @@ import (
+ )
+ 
+ type SkipFiles struct {
+-	patterns []*regexp.Regexp
++	patterns   []*regexp.Regexp
++	pathPrefix string
+ }
+ 
+ var _ Processor = (*SkipFiles)(nil)
+ 
+-func NewSkipFiles(patterns []string) (*SkipFiles, error) {
++func NewSkipFiles(patterns []string, pathPrefix string) (*SkipFiles, error) {
+ 	var patternsRe []*regexp.Regexp
+ 	for _, p := range patterns {
+ 		p = fsutils.NormalizePathInRegex(p)
+@@ -26,7 +27,8 @@ func NewSkipFiles(patterns []string) (*SkipFiles, error) {
+ 	}
+ 
+ 	return &SkipFiles{
+-		patterns: patternsRe,
++		patterns:   patternsRe,
++		pathPrefix: pathPrefix,
+ 	}, nil
+ }
+ 
+@@ -40,8 +42,9 @@ func (p SkipFiles) Process(issues []result.Issue) ([]result.Issue, error) {
+ 	}
+ 
+ 	return filterIssues(issues, func(i *result.Issue) bool {
+-		for _, p := range p.patterns {
+-			if p.MatchString(i.FilePath()) {
++		path := fsutils.WithPathPrefix(p.pathPrefix, i.FilePath())
++		for _, pattern := range p.patterns {
++			if pattern.MatchString(path) {
+ 				return false
+ 			}
+ 		}

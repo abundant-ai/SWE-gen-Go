@@ -1,0 +1,325 @@
+diff --git a/LICENSE b/License
+similarity index 100%
+rename from LICENSE
+rename to License
+diff --git a/errors.go b/errors.go
+index cd76f1f..57e3fc5 100644
+--- a/errors.go
++++ b/errors.go
+@@ -47,6 +47,4 @@ var (
+ 	ErrPreloadNotAllowed = errors.New("preload is not allowed when count is used")
+ 	// ErrDuplicatedKey occurs when there is a unique key constraint violation
+ 	ErrDuplicatedKey = errors.New("duplicated key not allowed")
+-	// ErrForeignKeyViolated occurs when there is a foreign key constraint violation
+-	ErrForeignKeyViolated = errors.New("violates foreign key constraint")
+ )
+diff --git a/finisher_api.go b/finisher_api.go
+index f80aa6c..ad14e29 100644
+--- a/finisher_api.go
++++ b/finisher_api.go
+@@ -6,6 +6,8 @@ import (
+ 	"fmt"
+ 	"reflect"
+ 	"strings"
++	"sync"
++	"sync/atomic"
+ 
+ 	"gorm.io/gorm/clause"
+ 	"gorm.io/gorm/logger"
+@@ -105,7 +107,7 @@ func (db *DB) Save(value interface{}) (tx *DB) {
+ 		updateTx := tx.callbacks.Update().Execute(tx.Session(&Session{Initialized: true}))
+ 
+ 		if updateTx.Error == nil && updateTx.RowsAffected == 0 && !updateTx.DryRun && !selectedUpdate {
+-			return tx.Session(&Session{SkipHooks: true}).Clauses(clause.OnConflict{UpdateAll: true}).Create(value)
++			return tx.Clauses(clause.OnConflict{UpdateAll: true}).Create(value)
+ 		}
+ 
+ 		return updateTx
+@@ -610,6 +612,15 @@ func (db *DB) Connection(fc func(tx *DB) error) (err error) {
+ 	return fc(tx)
+ }
+ 
++var (
++	savepointIdx      int64
++	savepointNamePool = &sync.Pool{
++		New: func() interface{} {
++			return fmt.Sprintf("gorm_%d", atomic.AddInt64(&savepointIdx, 1))
++		},
++	}
++)
++
+ // Transaction start a transaction as a block, return error will rollback, otherwise to commit. Transaction executes an
+ // arbitrary number of commands in fc within a transaction. On success the changes are committed; if an error occurs
+ // they are rolled back.
+@@ -619,14 +630,17 @@ func (db *DB) Transaction(fc func(tx *DB) error, opts ...*sql.TxOptions) (err er
+ 	if committer, ok := db.Statement.ConnPool.(TxCommitter); ok && committer != nil {
+ 		// nested transaction
+ 		if !db.DisableNestedTransaction {
+-			err = db.SavePoint(fmt.Sprintf("sp%p", fc)).Error
++			poolName := savepointNamePool.Get()
++			defer savepointNamePool.Put(poolName)
++			err = db.SavePoint(poolName.(string)).Error
+ 			if err != nil {
+ 				return
+ 			}
++
+ 			defer func() {
+ 				// Make sure to rollback when panic, Block error or Commit error
+ 				if panicked || err != nil {
+-					db.RollbackTo(fmt.Sprintf("sp%p", fc))
++					db.RollbackTo(poolName.(string))
+ 				}
+ 			}()
+ 		}
+@@ -707,21 +721,7 @@ func (db *DB) Rollback() *DB {
+ 
+ func (db *DB) SavePoint(name string) *DB {
+ 	if savePointer, ok := db.Dialector.(SavePointerDialectorInterface); ok {
+-		// close prepared statement, because SavePoint not support prepared statement.
+-		// e.g. mysql8.0 doc: https://dev.mysql.com/doc/refman/8.0/en/sql-prepared-statements.html
+-		var (
+-			preparedStmtTx   *PreparedStmtTX
+-			isPreparedStmtTx bool
+-		)
+-		// close prepared statement, because SavePoint not support prepared statement.
+-		if preparedStmtTx, isPreparedStmtTx = db.Statement.ConnPool.(*PreparedStmtTX); isPreparedStmtTx {
+-			db.Statement.ConnPool = preparedStmtTx.Tx
+-		}
+ 		db.AddError(savePointer.SavePoint(db, name))
+-		// restore prepared statement
+-		if isPreparedStmtTx {
+-			db.Statement.ConnPool = preparedStmtTx
+-		}
+ 	} else {
+ 		db.AddError(ErrUnsupportedDriver)
+ 	}
+@@ -730,21 +730,7 @@ func (db *DB) SavePoint(name string) *DB {
+ 
+ func (db *DB) RollbackTo(name string) *DB {
+ 	if savePointer, ok := db.Dialector.(SavePointerDialectorInterface); ok {
+-		// close prepared statement, because RollbackTo not support prepared statement.
+-		// e.g. mysql8.0 doc: https://dev.mysql.com/doc/refman/8.0/en/sql-prepared-statements.html
+-		var (
+-			preparedStmtTx   *PreparedStmtTX
+-			isPreparedStmtTx bool
+-		)
+-		// close prepared statement, because SavePoint not support prepared statement.
+-		if preparedStmtTx, isPreparedStmtTx = db.Statement.ConnPool.(*PreparedStmtTX); isPreparedStmtTx {
+-			db.Statement.ConnPool = preparedStmtTx.Tx
+-		}
+ 		db.AddError(savePointer.RollbackTo(db, name))
+-		// restore prepared statement
+-		if isPreparedStmtTx {
+-			db.Statement.ConnPool = preparedStmtTx
+-		}
+ 	} else {
+ 		db.AddError(ErrUnsupportedDriver)
+ 	}
+diff --git a/gorm.go b/gorm.go
+index 84d4b43..07a913f 100644
+--- a/gorm.go
++++ b/gorm.go
+@@ -146,7 +146,7 @@ func Open(dialector Dialector, opts ...Option) (db *DB, err error) {
+ 	}
+ 
+ 	if config.NamingStrategy == nil {
+-		config.NamingStrategy = schema.NamingStrategy{IdentifierMaxLength: 64} // Default Identifier length is 64
++		config.NamingStrategy = schema.NamingStrategy{}
+ 	}
+ 
+ 	if config.Logger == nil {
+diff --git a/schema/naming.go b/schema/naming.go
+index a2a0150..a258bee 100644
+--- a/schema/naming.go
++++ b/schema/naming.go
+@@ -28,11 +28,10 @@ type Replacer interface {
+ 
+ // NamingStrategy tables, columns naming strategy
+ type NamingStrategy struct {
+-	TablePrefix         string
+-	SingularTable       bool
+-	NameReplacer        Replacer
+-	NoLowerCase         bool
+-	IdentifierMaxLength int
++	TablePrefix   string
++	SingularTable bool
++	NameReplacer  Replacer
++	NoLowerCase   bool
+ }
+ 
+ // TableName convert string to table name
+@@ -90,16 +89,12 @@ func (ns NamingStrategy) formatName(prefix, table, name string) string {
+ 		prefix, table, name,
+ 	}, "_"), ".", "_")
+ 
+-	if ns.IdentifierMaxLength == 0 {
+-		ns.IdentifierMaxLength = 64
+-	}
+-
+-	if utf8.RuneCountInString(formattedName) > ns.IdentifierMaxLength {
++	if utf8.RuneCountInString(formattedName) > 64 {
+ 		h := sha1.New()
+ 		h.Write([]byte(formattedName))
+ 		bs := h.Sum(nil)
+ 
+-		formattedName = formattedName[0:ns.IdentifierMaxLength-8] + hex.EncodeToString(bs)[:8]
++		formattedName = formattedName[0:56] + hex.EncodeToString(bs)[:8]
+ 	}
+ 	return formattedName
+ }
+diff --git a/schema/naming_test.go b/schema/naming_test.go
+index ab7a5e3..3f598c3 100644
+--- a/schema/naming_test.go
++++ b/schema/naming_test.go
+@@ -189,17 +189,8 @@ func TestCustomReplacerWithNoLowerCase(t *testing.T) {
+ 	}
+ }
+ 
+-func TestFormatNameWithStringLongerThan63Characters(t *testing.T) {
+-	ns := NamingStrategy{IdentifierMaxLength: 63}
+-
+-	formattedName := ns.formatName("prefix", "table", "thisIsAVeryVeryVeryVeryVeryVeryVeryVeryVeryLongString")
+-	if formattedName != "prefix_table_thisIsAVeryVeryVeryVeryVeryVeryVeryVeryVer180f2c67" {
+-		t.Errorf("invalid formatted name generated, got %v", formattedName)
+-	}
+-}
+-
+ func TestFormatNameWithStringLongerThan64Characters(t *testing.T) {
+-	ns := NamingStrategy{IdentifierMaxLength: 64}
++	ns := NamingStrategy{}
+ 
+ 	formattedName := ns.formatName("prefix", "table", "thisIsAVeryVeryVeryVeryVeryVeryVeryVeryVeryLongString")
+ 	if formattedName != "prefix_table_thisIsAVeryVeryVeryVeryVeryVeryVeryVeryVery180f2c67" {
+diff --git a/schema/relationship_test.go b/schema/relationship_test.go
+index 1eb66bb..732f6f7 100644
+--- a/schema/relationship_test.go
++++ b/schema/relationship_test.go
+@@ -768,7 +768,7 @@ func TestParseConstraintNameWithSchemaQualifiedLongTableName(t *testing.T) {
+ 	s, err := schema.Parse(
+ 		&Book{},
+ 		&sync.Map{},
+-		schema.NamingStrategy{IdentifierMaxLength: 64},
++		schema.NamingStrategy{},
+ 	)
+ 	if err != nil {
+ 		t.Fatalf("Failed to parse schema")
+diff --git a/tests/error_translator_test.go b/tests/error_translator_test.go
+index ca985a0..ead26fc 100644
+--- a/tests/error_translator_test.go
++++ b/tests/error_translator_test.go
+@@ -15,8 +15,8 @@ func TestDialectorWithErrorTranslatorSupport(t *testing.T) {
+ 	db, _ := gorm.Open(tests.DummyDialector{TranslatedErr: translatedErr})
+ 
+ 	err := db.AddError(untranslatedErr)
+-	if !errors.Is(err, untranslatedErr) {
+-		t.Fatalf("expected err: %v got err: %v", untranslatedErr, err)
++	if errors.Is(err, translatedErr) {
++		t.Fatalf("expected err: %v got err: %v", translatedErr, err)
+ 	}
+ 
+ 	// it should translate error when the TranslateError flag is true
+diff --git a/tests/transaction_test.go b/tests/transaction_test.go
+index bfbd869..5872da9 100644
+--- a/tests/transaction_test.go
++++ b/tests/transaction_test.go
+@@ -57,19 +57,6 @@ func TestTransaction(t *testing.T) {
+ 	if err := DB.First(&User{}, "name = ?", "transaction-2").Error; err != nil {
+ 		t.Fatalf("Should be able to find committed record, but got %v", err)
+ 	}
+-
+-	t.Run("this is test nested transaction and prepareStmt coexist case", func(t *testing.T) {
+-		// enable prepare statement
+-		tx3 := DB.Session(&gorm.Session{PrepareStmt: true})
+-		if err := tx3.Transaction(func(tx4 *gorm.DB) error {
+-			// nested transaction
+-			return tx4.Transaction(func(tx5 *gorm.DB) error {
+-				return tx5.First(&User{}, "name = ?", "transaction-2").Error
+-			})
+-		}); err != nil {
+-			t.Fatalf("prepare statement and nested transcation coexist" + err.Error())
+-		}
+-	})
+ }
+ 
+ func TestCancelTransaction(t *testing.T) {
+diff --git a/tests/update_test.go b/tests/update_test.go
+index c03d2d4..f7c36d7 100644
+--- a/tests/update_test.go
++++ b/tests/update_test.go
+@@ -809,76 +809,3 @@ func TestUpdateWithDiffSchema(t *testing.T) {
+ 	AssertEqual(t, err, nil)
+ 	AssertEqual(t, "update-diff-schema-2", user.Name)
+ }
+-
+-type TokenOwner struct {
+-	ID    int
+-	Name  string
+-	Token Token `gorm:"foreignKey:UserID"`
+-}
+-
+-func (t *TokenOwner) BeforeSave(tx *gorm.DB) error {
+-	t.Name += "_name"
+-	return nil
+-}
+-
+-type Token struct {
+-	UserID  int    `gorm:"primary_key"`
+-	Content string `gorm:"type:varchar(100)"`
+-}
+-
+-func (t *Token) BeforeSave(tx *gorm.DB) error {
+-	t.Content += "_encrypted"
+-	return nil
+-}
+-
+-func TestSaveWithHooks(t *testing.T) {
+-	DB.Migrator().DropTable(&Token{}, &TokenOwner{})
+-	DB.AutoMigrate(&Token{}, &TokenOwner{})
+-
+-	saveTokenOwner := func(owner *TokenOwner) (*TokenOwner, error) {
+-		var newOwner TokenOwner
+-		if err := DB.Transaction(func(tx *gorm.DB) error {
+-			if err := tx.Debug().Session(&gorm.Session{FullSaveAssociations: true}).Save(owner).Error; err != nil {
+-				return err
+-			}
+-			if err := tx.Preload("Token").First(&newOwner, owner.ID).Error; err != nil {
+-				return err
+-			}
+-			return nil
+-		}); err != nil {
+-			return nil, err
+-		}
+-		return &newOwner, nil
+-	}
+-
+-	owner := TokenOwner{
+-		Name:  "user",
+-		Token: Token{Content: "token"},
+-	}
+-	o1, err := saveTokenOwner(&owner)
+-	if err != nil {
+-		t.Errorf("failed to save token owner, got error: %v", err)
+-	}
+-	if o1.Name != "user_name" {
+-		t.Errorf(`owner name should be "user_name", but got: "%s"`, o1.Name)
+-	}
+-	if o1.Token.Content != "token_encrypted" {
+-		t.Errorf(`token content should be "token_encrypted", but got: "%s"`, o1.Token.Content)
+-	}
+-
+-	owner = TokenOwner{
+-		ID:    owner.ID,
+-		Name:  "user",
+-		Token: Token{Content: "token2"},
+-	}
+-	o2, err := saveTokenOwner(&owner)
+-	if err != nil {
+-		t.Errorf("failed to save token owner, got error: %v", err)
+-	}
+-	if o2.Name != "user_name" {
+-		t.Errorf(`owner name should be "user_name", but got: "%s"`, o2.Name)
+-	}
+-	if o2.Token.Content != "token2_encrypted" {
+-		t.Errorf(`token content should be "token2_encrypted", but got: "%s"`, o2.Token.Content)
+-	}
+-}

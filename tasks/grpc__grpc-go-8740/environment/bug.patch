@@ -1,0 +1,244 @@
+diff --git a/internal/xds/balancer/clusterimpl/picker.go b/internal/xds/balancer/clusterimpl/picker.go
+index d766a09a..0c033261 100644
+--- a/internal/xds/balancer/clusterimpl/picker.go
++++ b/internal/xds/balancer/clusterimpl/picker.go
+@@ -194,25 +194,3 @@ func (d *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+ 
+ 	return pr, err
+ }
+-
+-// autoHostRewriteKey is the context key used to store the value of
+-// route's autoHostRewrite in the RPC context.
+-type autoHostRewriteKey struct{}
+-
+-// autoHostRewrite retrieves the autoHostRewrite value from the provided context.
+-func autoHostRewrite(ctx context.Context) bool {
+-	v, _ := ctx.Value(autoHostRewriteKey{}).(bool)
+-	return v
+-}
+-
+-// AutoHostRewriteForTesting returns the value of autoHostRewrite field;
+-// to be used for testing only.
+-func AutoHostRewriteForTesting(ctx context.Context) bool {
+-	return autoHostRewrite(ctx)
+-}
+-
+-// SetAutoHostRewrite adds the autoHostRewrite value to the context for
+-// the xds_cluster_impl LB policy to pick.
+-func SetAutoHostRewrite(ctx context.Context, autohostRewrite bool) context.Context {
+-	return context.WithValue(ctx, autoHostRewriteKey{}, autohostRewrite)
+-}
+diff --git a/internal/xds/resolver/serviceconfig.go b/internal/xds/resolver/serviceconfig.go
+index e0416366..3754b14d 100644
+--- a/internal/xds/resolver/serviceconfig.go
++++ b/internal/xds/resolver/serviceconfig.go
+@@ -35,7 +35,6 @@ import (
+ 	iringhash "google.golang.org/grpc/internal/ringhash"
+ 	"google.golang.org/grpc/internal/serviceconfig"
+ 	"google.golang.org/grpc/internal/wrr"
+-	"google.golang.org/grpc/internal/xds/balancer/clusterimpl"
+ 	"google.golang.org/grpc/internal/xds/balancer/clustermanager"
+ 	"google.golang.org/grpc/internal/xds/httpfilter"
+ 	"google.golang.org/grpc/internal/xds/xdsclient/xdsresource"
+@@ -115,7 +114,6 @@ type route struct {
+ 	maxStreamDuration time.Duration
+ 	retryConfig       *xdsresource.RetryConfig
+ 	hashPolicies      []*xdsresource.HashPolicy
+-	autoHostRewrite   bool
+ }
+ 
+ func (r route) String() string {
+@@ -199,7 +197,6 @@ func (cs *configSelector) SelectConfig(rpcInfo iresolver.RPCInfo) (*iresolver.RP
+ 
+ 	lbCtx := clustermanager.SetPickedCluster(rpcInfo.Context, cluster.name)
+ 	lbCtx = iringhash.SetXDSRequestHash(lbCtx, cs.generateHash(rpcInfo, rt.hashPolicies))
+-	lbCtx = clusterimpl.SetAutoHostRewrite(lbCtx, rt.autoHostRewrite)
+ 
+ 	config := &iresolver.RPCConfig{
+ 		// Communicate to the LB policy the chosen cluster and request hash, if Ring Hash LB policy.
+diff --git a/internal/xds/resolver/xds_resolver.go b/internal/xds/resolver/xds_resolver.go
+index 44b7dd4b..d877d427 100644
+--- a/internal/xds/resolver/xds_resolver.go
++++ b/internal/xds/resolver/xds_resolver.go
+@@ -392,7 +392,6 @@ func (r *xdsResolver) newConfigSelector() (*configSelector, error) {
+ 
+ 		cs.routes[i].retryConfig = rt.RetryConfig
+ 		cs.routes[i].hashPolicies = rt.HashPolicies
+-		cs.routes[i].autoHostRewrite = rt.AutoHostRewrite
+ 	}
+ 
+ 	// Account for this config selector's clusters.  Do this after no further
+diff --git a/internal/xds/resolver/xds_resolver_test.go b/internal/xds/resolver/xds_resolver_test.go
+index 16d6fd76..70db68d3 100644
+--- a/internal/xds/resolver/xds_resolver_test.go
++++ b/internal/xds/resolver/xds_resolver_test.go
+@@ -35,15 +35,12 @@ import (
+ 	"google.golang.org/grpc/codes"
+ 	estats "google.golang.org/grpc/experimental/stats"
+ 	"google.golang.org/grpc/internal"
+-	"google.golang.org/grpc/internal/envconfig"
+ 	iresolver "google.golang.org/grpc/internal/resolver"
+ 	iringhash "google.golang.org/grpc/internal/ringhash"
+ 	"google.golang.org/grpc/internal/testutils"
+ 	"google.golang.org/grpc/internal/testutils/xds/e2e"
+-	"google.golang.org/grpc/internal/xds/balancer/clusterimpl"
+ 	"google.golang.org/grpc/internal/xds/balancer/clustermanager"
+ 	"google.golang.org/grpc/internal/xds/bootstrap"
+-	serverFeature "google.golang.org/grpc/internal/xds/clients/xdsclient"
+ 	rinternal "google.golang.org/grpc/internal/xds/resolver/internal"
+ 	"google.golang.org/grpc/internal/xds/xdsclient"
+ 	"google.golang.org/grpc/internal/xds/xdsclient/xdsresource/version"
+@@ -1300,153 +1297,3 @@ func (s) TestConfigSelector_FailureCases(t *testing.T) {
+ func newDurationP(d time.Duration) *time.Duration {
+ 	return &d
+ }
+-
+-// TestResolver_AutoHostRewrite verifies the propagation of the AutoHostRewrite
+-// field from the xDS resolver.
+-//
+-// Per gRFC A81, this feature should only be active if two conditions met:
+-// 1. The environment variable (XDSAuthorityRewrite) is enabled.
+-// 2. The xDS server is marked as "trusted_xds_server" in the bootstrap config.
+-func (s) TestResolver_AutoHostRewrite(t *testing.T) {
+-	for _, tt := range []struct {
+-		name                string
+-		autoHostRewrite     bool
+-		envconfig           bool
+-		serverfeature       serverFeature.ServerFeature
+-		wantAutoHostRewrite bool
+-	}{
+-		{
+-			name:                "EnvVarDisabled_NonTrustedServer_AutoHostRewriteOff",
+-			autoHostRewrite:     false,
+-			envconfig:           false,
+-			wantAutoHostRewrite: false,
+-		},
+-		{
+-			name:                "EnvVarDisabled_NonTrustedServer_AutoHostRewriteOn",
+-			autoHostRewrite:     true,
+-			envconfig:           false,
+-			wantAutoHostRewrite: false,
+-		},
+-		{
+-			name:                "EnvVarDisabled_TrustedServer_AutoHostRewriteOff",
+-			autoHostRewrite:     false,
+-			envconfig:           false,
+-			serverfeature:       serverFeature.ServerFeatureTrustedXDSServer,
+-			wantAutoHostRewrite: false,
+-		},
+-		{
+-			name:                "EnvVarDisabled_TrustedServer_AutoHostRewriteOn",
+-			autoHostRewrite:     true,
+-			envconfig:           false,
+-			serverfeature:       serverFeature.ServerFeatureTrustedXDSServer,
+-			wantAutoHostRewrite: false,
+-		},
+-		{
+-			name:                "EnvVarEnabled_NonTrustedServer_AutoHostRewriteOff",
+-			autoHostRewrite:     false,
+-			envconfig:           true,
+-			wantAutoHostRewrite: false,
+-		},
+-		{
+-			name:                "EnvVarEnabled_NonTrustedServer_AutoHostRewriteOn",
+-			autoHostRewrite:     true,
+-			envconfig:           true,
+-			wantAutoHostRewrite: false,
+-		},
+-		{
+-			name:                "EnvVarEnabled_TrustedServer_AutoHostRewriteOff",
+-			autoHostRewrite:     false,
+-			envconfig:           true,
+-			serverfeature:       serverFeature.ServerFeatureTrustedXDSServer,
+-			wantAutoHostRewrite: false,
+-		},
+-		{
+-			name:                "EnvVarEnabled_TrustedServer_AutoHostRewriteOn",
+-			autoHostRewrite:     true,
+-			envconfig:           true,
+-			serverfeature:       serverFeature.ServerFeatureTrustedXDSServer,
+-			wantAutoHostRewrite: true,
+-		},
+-	} {
+-		t.Run(tt.name, func(t *testing.T) {
+-			testutils.SetEnvConfig(t, &envconfig.XDSAuthorityRewrite, tt.envconfig)
+-
+-			// Spin up an xDS management server for the test.
+-			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+-			defer cancel()
+-			nodeID := uuid.New().String()
+-			mgmtServer := e2e.StartManagementServer(t, e2e.ManagementServerOptions{AllowResourceSubset: true})
+-			defer mgmtServer.Stop()
+-
+-			// Configure the management server with a good listener resource and a
+-			// route configuration resource, as specified by the test case.
+-			resources := e2e.UpdateOptions{
+-				NodeID:    nodeID,
+-				Listeners: []*v3listenerpb.Listener{e2e.DefaultClientListener(defaultTestServiceName, defaultTestRouteConfigName)},
+-				Routes: []*v3routepb.RouteConfiguration{{
+-					Name: defaultTestRouteConfigName,
+-					VirtualHosts: []*v3routepb.VirtualHost{{
+-						Domains: []string{defaultTestServiceName},
+-						Routes: []*v3routepb.Route{{
+-							Match: &v3routepb.RouteMatch{PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"}},
+-							Action: &v3routepb.Route_Route{Route: &v3routepb.RouteAction{
+-								ClusterSpecifier: &v3routepb.RouteAction_WeightedClusters{WeightedClusters: &v3routepb.WeightedCluster{
+-									Clusters: []*v3routepb.WeightedCluster_ClusterWeight{
+-										{
+-											Name:   defaultTestClusterName,
+-											Weight: &wrapperspb.UInt32Value{Value: 100},
+-										},
+-									},
+-								}},
+-								HostRewriteSpecifier: &v3routepb.RouteAction_AutoHostRewrite{
+-									AutoHostRewrite: &wrapperspb.BoolValue{Value: tt.autoHostRewrite},
+-								},
+-							}},
+-						}},
+-					}},
+-				}},
+-				SkipValidation: true,
+-			}
+-
+-			if err := mgmtServer.Update(ctx, resources); err != nil {
+-				t.Fatal(err)
+-			}
+-
+-			trustedXdsServer := "[]"
+-			if tt.serverfeature == serverFeature.ServerFeatureTrustedXDSServer {
+-				trustedXdsServer = `["trusted_xds_server"]`
+-			}
+-
+-			opts := bootstrap.ConfigOptionsForTesting{
+-				Servers: []byte(fmt.Sprintf(`[{
+-					"server_uri": %q,
+-					"channel_creds": [{"type": "insecure"}],
+-					"server_features": %s
+-				}]`, mgmtServer.Address, trustedXdsServer)),
+-				Node: []byte(fmt.Sprintf(`{"id": "%s"}`, nodeID)),
+-			}
+-
+-			contents, err := bootstrap.NewContentsForTesting(opts)
+-			if err != nil {
+-				t.Fatalf("Failed to create bootstrap configuration: %v", err)
+-			}
+-
+-			// Build the resolver and read the config selector out of it.
+-			stateCh, _, _ := buildResolverForTarget(t, resolver.Target{URL: *testutils.MustParseURL("xds:///" + defaultTestServiceName)}, contents)
+-			cs := verifyUpdateFromResolver(ctx, t, stateCh, "")
+-
+-			res, err := cs.SelectConfig(iresolver.RPCInfo{
+-				Context: ctx,
+-				Method:  "/service/method",
+-			})
+-			if err != nil {
+-				t.Fatalf("cs.SelectConfig(): %v", err)
+-			}
+-
+-			gotAutoHostRewrite := clusterimpl.AutoHostRewriteForTesting(res.Context)
+-			if gotAutoHostRewrite != tt.wantAutoHostRewrite {
+-				t.Fatalf("Got autoHostRewrite: %v, want: %v", gotAutoHostRewrite, tt.wantAutoHostRewrite)
+-			}
+-		})
+-	}
+-}

@@ -1,0 +1,1012 @@
+diff --git a/internal/pool/export_test.go b/internal/pool/export_test.go
+index cafeb974..b723a073 100644
+--- a/internal/pool/export_test.go
++++ b/internal/pool/export_test.go
+@@ -23,10 +23,6 @@ func (p *ConnPool) QueueLen() int {
+ 	return int(p.semaphore.Len())
+ }
+ 
+-func (p *ConnPool) DialsQueueLen() int {
+-	return p.dialsQueue.len()
+-}
+-
+ var NoExpiration = noExpiration
+ 
+ func (p *ConnPool) CalcConnExpiresAt() time.Time {
+diff --git a/internal/pool/pool.go b/internal/pool/pool.go
+index 30e34f16..ed589781 100644
+--- a/internal/pool/pool.go
++++ b/internal/pool/pool.go
+@@ -33,9 +33,6 @@ var (
+ 	// errConnNotPooled is returned when trying to return a non-pooled connection to the pool.
+ 	errConnNotPooled = errors.New("connection not pooled")
+ 
+-	// errPanicInDial is returned when a panic occurs in the dial function.
+-	errPanicInQueuedNewConn = errors.New("panic in queuedNewConn")
+-
+ 	// popAttempts is the maximum number of attempts to find a usable connection
+ 	// when popping from the idle connection pool. This handles cases where connections
+ 	// are temporarily marked as unusable (e.g., during maintenanceNotifications upgrades or network issues).
+@@ -599,15 +596,12 @@ func (p *ConnPool) queuedNewConn(ctx context.Context) (*Conn, error) {
+ 		}
+ 	}()
+ 
+-	p.dialsQueue.discardDoneAtFront()
+ 	p.dialsQueue.enqueue(w)
+ 
+ 	go func(w *wantConn) {
+ 		var freeTurnCalled bool
+ 		defer func() {
+ 			if err := recover(); err != nil {
+-				w.tryDeliver(nil, errPanicInQueuedNewConn)
+-				p.dialsQueue.discardDoneAtFront()
+ 				if !freeTurnCalled {
+ 					p.freeTurn()
+ 				}
+@@ -622,14 +616,12 @@ func (p *ConnPool) queuedNewConn(ctx context.Context) (*Conn, error) {
+ 		cn, cnErr := p.newConn(dialCtx, true)
+ 		if cnErr != nil {
+ 			w.tryDeliver(nil, cnErr) // deliver error to caller, notify connection creation failed
+-			p.dialsQueue.discardDoneAtFront()
+ 			p.freeTurn()
+ 			freeTurnCalled = true
+ 			return
+ 		}
+ 
+ 		delivered := w.tryDeliver(cn, cnErr)
+-		p.dialsQueue.discardDoneAtFront()
+ 		if !delivered && p.putIdleConn(dialCtx, cn) {
+ 			p.freeTurn()
+ 			freeTurnCalled = true
+diff --git a/internal/pool/pool_test.go b/internal/pool/pool_test.go
+index de90b5c7..bdb593e9 100644
+--- a/internal/pool/pool_test.go
++++ b/internal/pool/pool_test.go
+@@ -657,12 +657,6 @@ var _ = Describe("queuedNewConn", func() {
+ 			return testPool.QueueLen()
+ 		}, "1s", "50ms").Should(Equal(1), "Only conn1's turn should be held")
+ 
+-		// Verify dialsQueue is empty
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "1s", "50ms").Should(Equal(0),
+-			"dialsQueue should be empty - cancelled request should be cleaned up")
+-
+ 		// Clean up - release the first connection
+ 		testPool.Put(ctx, conn1)
+ 
+@@ -670,11 +664,6 @@ var _ = Describe("queuedNewConn", func() {
+ 		Eventually(func() int {
+ 			return testPool.QueueLen()
+ 		}, "1s", "50ms").Should(Equal(0), "All turns should be released after cleanup")
+-
+-		// Verify dialsQueue is empty
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "1s", "50ms").Should(Equal(0))
+ 	})
+ 
+ 	It("should handle dial failures gracefully", func() {
+@@ -700,18 +689,6 @@ var _ = Describe("queuedNewConn", func() {
+ 		Eventually(func() int {
+ 			return testPool.QueueLen()
+ 		}, "1s", "50ms").Should(Equal(0), "Turn should be released after dial failure")
+-
+-		// Verify dialsQueue is empty
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "1s", "50ms").Should(Equal(0),
+-			"dialsQueue should be empty after dial failure")
+-
+-		// Verify connection counts are correct
+-		stats := testPool.Stats()
+-		Expect(stats.TotalConns).To(Equal(uint32(0)),
+-			"No connections should exist after dial failure")
+-		Expect(stats.IdleConns).To(Equal(uint32(0)))
+ 	})
+ 
+ 	It("should handle connection creation success with normal delivery", func() {
+@@ -777,10 +754,9 @@ var _ = Describe("queuedNewConn", func() {
+ 		// But due to MaxConcurrentDials=1, only one concurrent dial is allowed
+ 		done := make(chan struct{})
+ 		var err4 error
+-		var conn4 *pool.Conn
+ 		go func() {
+ 			defer GinkgoRecover()
+-			conn4, err4 = testPool.Get(ctx)
++			_, err4 = testPool.Get(ctx)
+ 			close(done)
+ 		}()
+ 
+@@ -791,30 +767,10 @@ var _ = Describe("queuedNewConn", func() {
+ 		<-done
+ 		Expect(err4).NotTo(HaveOccurred())
+ 
+-		if conn4 != nil {
+-			testPool.Put(ctx, conn4)
+-		}
+-
+ 		// Clean up remaining connections
+ 		for i := 1; i < len(conns); i++ {
+ 			testPool.Put(ctx, conns[i])
+ 		}
+-
+-		// Verify dialsQueue is empty
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "1s", "50ms").Should(Equal(0),
+-			"dialsQueue should be empty after all operations complete")
+-
+-		// Verify queue is empty
+-		Eventually(func() int {
+-			return testPool.QueueLen()
+-		}, "1s", "50ms").Should(Equal(0))
+-
+-		// Verify connection counts are correct
+-		stats := testPool.Stats()
+-		Expect(stats.IdleConns).To(Equal(uint32(3)),
+-			"All connections should be idle")
+ 	})
+ 
+ 	It("should reuse connections created in background after request timeout", func() {
+@@ -887,23 +843,6 @@ var _ = Describe("queuedNewConn", func() {
+ 		Expect(duration).To(BeNumerically("<", 50*time.Millisecond))
+ 
+ 		testPool.Put(ctx, conn3)
+-
+-		// Verify dialsQueue is empty
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "1s", "50ms").Should(Equal(0))
+-
+-		// Verify queue is empty
+-		Eventually(func() int {
+-			return testPool.QueueLen()
+-		}, "1s", "50ms").Should(Equal(0))
+-
+-		// Verify connection counts are correct
+-		stats := testPool.Stats()
+-		Expect(stats.TotalConns).To(Equal(uint32(1)),
+-			"Should have 1 total connection")
+-		Expect(stats.IdleConns).To(Equal(uint32(1)),
+-			"Connection should be idle")
+ 	})
+ 
+ 	It("recover queuedNewConn panic", func() {
+@@ -935,14 +874,11 @@ var _ = Describe("queuedNewConn", func() {
+ 		// Verify state after panic recovery:
+ 		// - turn should be properly released (QueueLen() == 0)
+ 		// - connection counts should be correct (TotalConns == 0, IdleConns == 0)
+-		// - dialsQueue should be empty
+ 		Eventually(func() bool {
+ 			stats := testPool.Stats()
+ 			queueLen := testPool.QueueLen()
+-			dialsQueueLen := testPool.DialsQueueLen()
+-			return stats.TotalConns == 0 && stats.IdleConns == 0 && queueLen == 0 && dialsQueueLen == 0
+-		}, "3s", "50ms").Should(BeTrue(),
+-			"After panic recovery, all resources should be cleaned up")
++			return stats.TotalConns == 0 && stats.IdleConns == 0 && queueLen == 0
++		}, "3s", "50ms").Should(BeTrue())
+ 	})
+ 
+ 	It("should handle connection creation success but delivery failure (putIdleConn path)", func() {
+@@ -1001,18 +937,6 @@ var _ = Describe("queuedNewConn", func() {
+ 			return testPool.QueueLen()
+ 		}, "1s", "50ms").Should(Equal(0),
+ 			"Turn should be released after putIdleConn path completes")
+-
+-		// Verify dialsQueue is empty
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "1s", "50ms").Should(Equal(0),
+-			"dialsQueue should be empty - timed out request should be dequeued")
+-
+-		// Verify connection counts are correct
+-		stats := testPool.Stats()
+-		Expect(stats.IdleConns).To(Equal(uint32(1)),
+-			"Connection should be in idle pool for reuse")
+-		Expect(stats.TotalConns).To(Equal(uint32(1)))
+ 	})
+ 
+ 	It("should not leak turn when delivering connection via putIdleConn", func() {
+@@ -1096,12 +1020,6 @@ var _ = Describe("queuedNewConn", func() {
+ 		Expect(reqBErr).NotTo(HaveOccurred(), "Request B should receive Request A's connection")
+ 		Expect(reqBConn).NotTo(BeNil())
+ 
+-		// Verify dialsQueue is empty
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "500ms", "50ms").Should(BeNumerically("<=", 1),
+-			"Request A's wantConn should be dequeued after delivery to Request B")
+-
+ 		// FIRST CRITICAL CHECK: Turn state after connection delivery
+ 		// After Request B receives connection from putIdleConn:
+ 		// - Request A's turn is held by Request B (connection delivered)
+@@ -1115,12 +1033,6 @@ var _ = Describe("queuedNewConn", func() {
+ 		time.Sleep(300 * time.Millisecond) // ~600ms total
+ 		Expect(testPool.QueueLen()).To(Equal(1))
+ 
+-		// Verify dialsQueue is empty
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "1s", "50ms").Should(Equal(0),
+-			"All wantConn should be dequeued after connections are delivered")
+-
+ 		// Cleanup and verify turn is released
+ 		testPool.Put(ctx, reqBConn)
+ 		Eventually(func() int { return testPool.QueueLen() }, "600ms").Should(Equal(0))
+@@ -1182,219 +1094,6 @@ var _ = Describe("queuedNewConn", func() {
+ 
+ 		// We should have at least some timeouts due to the short timeout
+ 		Expect(timeoutCount).To(BeNumerically(">", 0))
+-
+-		// Verify all asynchronous operations are completed
+-		time.Sleep(200 * time.Millisecond)
+-
+-		// Verify no resources are leaked
+-		Eventually(func() int {
+-			return testPool.QueueLen()
+-		}, "2s", "50ms").Should(Equal(0),
+-			"All turns should be released after race condition test")
+-
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "2s", "50ms").Should(Equal(0),
+-			"dialsQueue should be empty - no zombie wantConn")
+-
+-		// Verify connection counts are correct
+-		stats := testPool.Stats()
+-		Expect(stats.TotalConns).To(BeNumerically(">=", 0))
+-		Eventually(func() uint32 {
+-			return testPool.Stats().IdleConns + testPool.Stats().StaleConns
+-		}, "2s", "50ms").Should(Equal(stats.TotalConns),
+-			"All connections should be accounted for")
+-	})
+-
+-	It("should cleanup dialsQueue under high concurrency with continuous dial failures", func() {
+-		alwaysFailDialer := func(ctx context.Context) (net.Conn, error) {
+-			return nil, fmt.Errorf("network unreachable")
+-		}
+-
+-		testPool := pool.NewConnPool(&pool.Options{
+-			Dialer:             alwaysFailDialer,
+-			PoolSize:           100,
+-			MaxConcurrentDials: 100,
+-			DialTimeout:        50 * time.Millisecond,
+-			PoolTimeout:        30 * time.Millisecond,
+-		})
+-		defer testPool.Close()
+-
+-		// Make many concurrent requests
+-		const totalRequests = 1000
+-		var wg sync.WaitGroup
+-
+-		for i := 0; i < totalRequests; i++ {
+-			wg.Add(1)
+-			go func() {
+-				defer wg.Done()
+-				_, _ = testPool.Get(context.Background())
+-			}()
+-		}
+-
+-		wg.Wait()
+-
+-		// Verify dialsQueue is empty
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "2s", "100ms").Should(Equal(0),
+-			"dialsQueue should be empty after all failed requests complete")
+-
+-		// Verify turn is released
+-		Eventually(func() int {
+-			return testPool.QueueLen()
+-		}, "1s", "50ms").Should(Equal(0))
+-
+-		// Verify connection counts are correct
+-		stats := testPool.Stats()
+-		Expect(stats.TotalConns).To(Equal(uint32(0)),
+-			"No connections should exist after all failures")
+-	})
+-
+-	It("should cleanup zombie wantConn when request times out and dial fails", func() {
+-		// Delayed failed dialer
+-		slowFailDialer := func(ctx context.Context) (net.Conn, error) {
+-			time.Sleep(100 * time.Millisecond) // Exceed request timeout
+-			return nil, fmt.Errorf("dial failed")
+-		}
+-
+-		testPool := pool.NewConnPool(&pool.Options{
+-			Dialer:             slowFailDialer,
+-			PoolSize:           10,
+-			MaxConcurrentDials: 10,
+-			DialTimeout:        200 * time.Millisecond,
+-			PoolTimeout:        50 * time.Millisecond, // Request timeout quickly
+-		})
+-		defer testPool.Close()
+-
+-		// Make many requests with quick timeout
+-		const numRequests = 100
+-		var wg sync.WaitGroup
+-
+-		for i := 0; i < numRequests; i++ {
+-			wg.Add(1)
+-			go func() {
+-				defer wg.Done()
+-				shortCtx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+-				defer cancel()
+-				_, _ = testPool.Get(shortCtx)
+-			}()
+-		}
+-
+-		wg.Wait()
+-
+-		// Wait for asynchronous connection creation to complete
+-		time.Sleep(200 * time.Millisecond)
+-
+-		// Verify dialsQueue is empty
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "2s", "100ms").Should(Equal(0),
+-			"dialsQueue should be empty even when requests timeout and dials fail")
+-
+-		// Verify turn is released
+-		Eventually(func() int {
+-			return testPool.QueueLen()
+-		}, "1s", "50ms").Should(Equal(0))
+-	})
+-
+-	It("should handle intermittent dial failures without queue accumulation", func() {
+-		callCount := int64(0)
+-
+-		intermittentDialer := func(ctx context.Context) (net.Conn, error) {
+-			count := atomic.AddInt64(&callCount, 1)
+-			if count%2 == 0 {
+-				return nil, fmt.Errorf("network timeout")
+-			}
+-			return newDummyConn(), nil
+-		}
+-
+-		testPool := pool.NewConnPool(&pool.Options{
+-			Dialer:             intermittentDialer,
+-			PoolSize:           50,
+-			MaxConcurrentDials: 50,
+-			DialTimeout:        100 * time.Millisecond,
+-			PoolTimeout:        50 * time.Millisecond,
+-		})
+-		defer testPool.Close()
+-
+-		// Send requests continuously for 5 seconds
+-		const duration = 5 * time.Second
+-		start := time.Now()
+-		var wg sync.WaitGroup
+-
+-		for time.Since(start) < duration {
+-			wg.Add(1)
+-			go func() {
+-				defer wg.Done()
+-				_, _ = testPool.Get(context.Background())
+-			}()
+-			time.Sleep(10 * time.Millisecond) // Control request rate
+-		}
+-
+-		wg.Wait()
+-
+-		// Verify dialsQueue does not accumulate indefinitely
+-		maxExpectedQueueLen := int(testPool.Size()) * 2
+-		queueLen := testPool.DialsQueueLen()
+-		Expect(queueLen).To(BeNumerically("<=", maxExpectedQueueLen),
+-			fmt.Sprintf("dialsQueue length (%d) should not exceed reasonable limit (%d)",
+-				queueLen, maxExpectedQueueLen))
+-
+-		// Wait for final cleanup
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "2s", "100ms").Should(Equal(0),
+-			"dialsQueue should eventually be cleaned up")
+-	})
+-
+-	It("should enforce dialsQueue upper bound", func() {
+-		alwaysFailDialer := func(ctx context.Context) (net.Conn, error) {
+-			return nil, fmt.Errorf("dial failed")
+-		}
+-
+-		testPool := pool.NewConnPool(&pool.Options{
+-			Dialer:             alwaysFailDialer,
+-			PoolSize:           100,
+-			MaxConcurrentDials: 100,
+-			DialTimeout:        50 * time.Millisecond,
+-			PoolTimeout:        30 * time.Millisecond,
+-		})
+-		defer testPool.Close()
+-
+-		const numRequests = 1000
+-		maxExpectedQueueLen := int(testPool.Size()) * 2 // Reasonable upper bound
+-
+-		var wg sync.WaitGroup
+-		maxObservedQueueLen := int32(0)
+-
+-		// Send many failed requests concurrently
+-		for i := 0; i < numRequests; i++ {
+-			wg.Add(1)
+-			go func() {
+-				defer wg.Done()
+-				_, _ = testPool.Get(context.Background())
+-			}()
+-
+-			// Check queue length periodically
+-			if i%50 == 0 {
+-				queueLen := testPool.DialsQueueLen()
+-				if queueLen > int(atomic.LoadInt32(&maxObservedQueueLen)) {
+-					atomic.StoreInt32(&maxObservedQueueLen, int32(queueLen))
+-				}
+-				Expect(queueLen).To(BeNumerically("<=", maxExpectedQueueLen),
+-					fmt.Sprintf("Queue length (%d) should not exceed limit (%d)",
+-						queueLen, maxExpectedQueueLen))
+-			}
+-		}
+-
+-		wg.Wait()
+-
+-		// Verify final cleanup
+-		Eventually(func() int {
+-			return testPool.DialsQueueLen()
+-		}, "2s", "100ms").Should(Equal(0),
+-			"dialsQueue should be empty after all requests complete")
+ 	})
+ 
+ 	Describe("calcConnExpiresAt", func() {
+diff --git a/internal/pool/want_conn.go b/internal/pool/want_conn.go
+index 78f86813..6f9e4bfa 100644
+--- a/internal/pool/want_conn.go
++++ b/internal/pool/want_conn.go
+@@ -6,7 +6,7 @@ import (
+ )
+ 
+ type wantConn struct {
+-	mu        sync.RWMutex    // protects ctx, done and sending of the result
++	mu        sync.Mutex      // protects ctx, done and sending of the result
+ 	ctx       context.Context // context for dial, cleared after delivered or canceled
+ 	cancelCtx context.CancelFunc
+ 	done      bool                // true after delivered or canceled
+@@ -15,8 +15,8 @@ type wantConn struct {
+ 
+ // getCtxForDial returns context for dial or nil if connection was delivered or canceled.
+ func (w *wantConn) getCtxForDial() context.Context {
+-	w.mu.RLock()
+-	defer w.mu.RUnlock()
++	w.mu.Lock()
++	defer w.mu.Unlock()
+ 
+ 	return w.ctx
+ }
+@@ -57,12 +57,6 @@ func (w *wantConn) cancel() *Conn {
+ 	return cn
+ }
+ 
+-func (w *wantConn) isOngoing() bool {
+-	w.mu.RLock()
+-	defer w.mu.RUnlock()
+-	return !w.done
+-}
+-
+ type wantConnResult struct {
+ 	cn  *Conn
+ 	err error
+@@ -97,19 +91,3 @@ func (q *wantConnQueue) dequeue() (*wantConn, bool) {
+ 	q.items = q.items[1:]
+ 	return item, true
+ }
+-
+-func (q *wantConnQueue) discardDoneAtFront() int {
+-	q.mu.Lock()
+-	defer q.mu.Unlock()
+-	count := 0
+-	for len(q.items) > 0 {
+-		if q.items[0].isOngoing() {
+-			break
+-		}
+-
+-		q.items = q.items[1:]
+-		count++
+-	}
+-
+-	return count
+-}
+diff --git a/internal/pool/want_conn_test.go b/internal/pool/want_conn_test.go
+index 2eda0831..09e8627b 100644
+--- a/internal/pool/want_conn_test.go
++++ b/internal/pool/want_conn_test.go
+@@ -8,12 +8,6 @@ import (
+ 	"time"
+ )
+ 
+-func (q *wantConnQueue) len() int {
+-	q.mu.RLock()
+-	defer q.mu.RUnlock()
+-	return len(q.items)
+-}
+-
+ func TestWantConn_getCtxForDial(t *testing.T) {
+ 	ctx := context.Background()
+ 	w := &wantConn{
+@@ -28,10 +22,8 @@ func TestWantConn_getCtxForDial(t *testing.T) {
+ 	}
+ 
+ 	// Test getting context when done
+-	w.mu.Lock()
+ 	w.done = true
+ 	w.ctx = nil
+-	w.mu.Unlock()
+ 	gotCtx = w.getCtxForDial()
+ 	if gotCtx != nil {
+ 		t.Errorf("getCtxForDial() after done = %v, want nil", gotCtx)
+@@ -54,12 +46,12 @@ func TestWantConn_tryDeliver_Success(t *testing.T) {
+ 	}
+ 
+ 	// Check that wantConn is marked as done
+-	if w.isOngoing() {
++	if !w.done {
+ 		t.Error("wantConn.done = false, want true after delivery")
+ 	}
+ 
+ 	// Check that context is cleared
+-	if w.getCtxForDial() != nil {
++	if w.ctx != nil {
+ 		t.Error("wantConn.ctx should be nil after delivery")
+ 	}
+ 
+@@ -142,12 +134,12 @@ func TestWantConn_cancel_NotDone(t *testing.T) {
+ 	}
+ 
+ 	// Check that wantConn is marked as done
+-	if w.isOngoing() {
++	if !w.done {
+ 		t.Error("wantConn.done = false, want true after cancel")
+ 	}
+ 
+ 	// Check that context is cleared
+-	if w.getCtxForDial() != nil {
++	if w.ctx != nil {
+ 		t.Error("wantConn.ctx should be nil after cancel")
+ 	}
+ 
+@@ -182,12 +174,12 @@ func TestWantConn_cancel_AlreadyDone(t *testing.T) {
+ 	}
+ 
+ 	// Check that wantConn remains done
+-	if w.isOngoing() {
++	if !w.done {
+ 		t.Error("wantConn.done = false, want true")
+ 	}
+ 
+ 	// Check that context is cleared
+-	if w.getCtxForDial() != nil {
++	if w.ctx != nil {
+ 		t.Error("wantConn.ctx should be nil after cancel")
+ 	}
+ }
+@@ -496,422 +488,10 @@ func TestWantConn_RaceConditionNilContext(t *testing.T) {
+ 	wg.Wait()
+ 
+ 	// Verify the wantConn state
+-	if w.isOngoing() {
++	if !w.done {
+ 		t.Error("wantConn should be marked as done after cancel")
+ 	}
+-	if w.getCtxForDial() != nil {
++	if w.ctx != nil {
+ 		t.Error("wantConn.ctx should be nil after cancel")
+ 	}
+ }
+-
+-// TestWantConnQueue_dropFrontDone_EmptyQueue tests dropFrontDone on an empty queue.
+-func TestWantConnQueue_dropFrontDone_EmptyQueue(t *testing.T) {
+-	q := newWantConnQueue()
+-
+-	// Call dropFrontDone on empty queue
+-	count := q.discardDoneAtFront()
+-
+-	// Verify no elements were removed
+-	if count != 0 {
+-		t.Errorf("dropFrontDone() on empty queue = %d, want 0", count)
+-	}
+-
+-	// Verify queue is still empty
+-	if q.len() != 0 {
+-		t.Errorf("queue length after dropFrontDone = %d, want 0", q.len())
+-	}
+-}
+-
+-// TestWantConnQueue_dropFrontDone_AllDone tests dropFrontDone when all elements are done.
+-func TestWantConnQueue_dropFrontDone_AllDone(t *testing.T) {
+-	q := newWantConnQueue()
+-
+-	// Create 3 wantConn items, all marked as done
+-	for i := 0; i < 3; i++ {
+-		w := &wantConn{
+-			ctx:    context.Background(),
+-			done:   true, // Mark as done
+-			result: make(chan wantConnResult, 1),
+-		}
+-		q.enqueue(w)
+-	}
+-
+-	// Verify initial queue length
+-	if q.len() != 3 {
+-		t.Errorf("initial queue length = %d, want 3", q.len())
+-	}
+-
+-	// Call dropFrontDone
+-	count := q.discardDoneAtFront()
+-
+-	// Verify all 3 elements were removed
+-	if count != 3 {
+-		t.Errorf("dropFrontDone() = %d, want 3", count)
+-	}
+-
+-	// Verify queue is now empty
+-	if q.len() != 0 {
+-		t.Errorf("queue length after dropFrontDone = %d, want 0", q.len())
+-	}
+-}
+-
+-// TestWantConnQueue_dropFrontDone_NoneDone tests dropFrontDone when no elements are done.
+-func TestWantConnQueue_dropFrontDone_NoneDone(t *testing.T) {
+-	q := newWantConnQueue()
+-
+-	// Create 3 wantConn items, none marked as done
+-	for i := 0; i < 3; i++ {
+-		w := &wantConn{
+-			ctx:    context.Background(),
+-			done:   false, // Not done
+-			result: make(chan wantConnResult, 1),
+-		}
+-		q.enqueue(w)
+-	}
+-
+-	// Verify initial queue length
+-	if q.len() != 3 {
+-		t.Errorf("initial queue length = %d, want 3", q.len())
+-	}
+-
+-	// Call dropFrontDone
+-	count := q.discardDoneAtFront()
+-
+-	// Verify no elements were removed
+-	if count != 0 {
+-		t.Errorf("dropFrontDone() = %d, want 0", count)
+-	}
+-
+-	// Verify queue length unchanged
+-	if q.len() != 3 {
+-		t.Errorf("queue length after dropFrontDone = %d, want 3", q.len())
+-	}
+-}
+-
+-// TestWantConnQueue_dropFrontDone_PartialDone tests dropFrontDone with mixed done/not-done elements.
+-// This is the core test case that verifies dropFrontDone stops at the first not-done element.
+-func TestWantConnQueue_dropFrontDone_PartialDone(t *testing.T) {
+-	q := newWantConnQueue()
+-
+-	// Create pattern: [done, done, not-done, done, not-done]
+-	states := []bool{true, true, false, true, false}
+-	var items []*wantConn
+-
+-	for _, done := range states {
+-		w := &wantConn{
+-			ctx:    context.Background(),
+-			done:   done,
+-			result: make(chan wantConnResult, 1),
+-		}
+-		q.enqueue(w)
+-		items = append(items, w)
+-	}
+-
+-	// Verify initial queue length
+-	if q.len() != 5 {
+-		t.Errorf("initial queue length = %d, want 5", q.len())
+-	}
+-
+-	// Call dropFrontDone
+-	count := q.discardDoneAtFront()
+-
+-	// Verify only first 2 elements were removed (stopped at first not-done)
+-	if count != 2 {
+-		t.Errorf("dropFrontDone() = %d, want 2", count)
+-	}
+-
+-	// Verify queue length is now 3
+-	if q.len() != 3 {
+-		t.Errorf("queue length after dropFrontDone = %d, want 3", q.len())
+-	}
+-
+-	// Verify the front element is the third item (first not-done)
+-	front, ok := q.dequeue()
+-	if !ok {
+-		t.Fatal("expected to dequeue an item")
+-	}
+-	if front != items[2] {
+-		t.Error("front element should be the third item (first not-done)")
+-	}
+-
+-	// Verify remaining elements are items[3] and items[4]
+-	next, ok := q.dequeue()
+-	if !ok || next != items[3] {
+-		t.Error("second element should be items[3]")
+-	}
+-	next, ok = q.dequeue()
+-	if !ok || next != items[4] {
+-		t.Error("third element should be items[4]")
+-	}
+-
+-	// Queue should now be empty
+-	if q.len() != 0 {
+-		t.Errorf("queue should be empty, got length %d", q.len())
+-	}
+-}
+-
+-// TestWantConnQueue_dropFrontDone_SingleElement tests dropFrontDone with single element.
+-func TestWantConnQueue_dropFrontDone_SingleElement(t *testing.T) {
+-	// Test 1: Single done element
+-	q1 := newWantConnQueue()
+-	w1 := &wantConn{
+-		ctx:    context.Background(),
+-		done:   true,
+-		result: make(chan wantConnResult, 1),
+-	}
+-	q1.enqueue(w1)
+-
+-	count := q1.discardDoneAtFront()
+-	if count != 1 {
+-		t.Errorf("dropFrontDone() with single done element = %d, want 1", count)
+-	}
+-	if q1.len() != 0 {
+-		t.Errorf("queue should be empty after dropping single done element")
+-	}
+-
+-	// Test 2: Single not-done element
+-	q2 := newWantConnQueue()
+-	w2 := &wantConn{
+-		ctx:    context.Background(),
+-		done:   false,
+-		result: make(chan wantConnResult, 1),
+-	}
+-	q2.enqueue(w2)
+-
+-	count = q2.discardDoneAtFront()
+-	if count != 0 {
+-		t.Errorf("dropFrontDone() with single not-done element = %d, want 0", count)
+-	}
+-	if q2.len() != 1 {
+-		t.Errorf("queue length should remain 1 after dropFrontDone")
+-	}
+-}
+-
+-// TestWantConnQueue_dropFrontDone_MultipleCalls tests consecutive calls to dropFrontDone.
+-func TestWantConnQueue_dropFrontDone_MultipleCalls(t *testing.T) {
+-	q := newWantConnQueue()
+-
+-	// Add initial elements: [done, done, not-done]
+-	w1 := &wantConn{ctx: context.Background(), done: true, result: make(chan wantConnResult, 1)}
+-	w2 := &wantConn{ctx: context.Background(), done: true, result: make(chan wantConnResult, 1)}
+-	w3 := &wantConn{ctx: context.Background(), done: false, result: make(chan wantConnResult, 1)}
+-	q.enqueue(w1)
+-	q.enqueue(w2)
+-	q.enqueue(w3)
+-
+-	// First call: should remove 2 done elements
+-	count1 := q.discardDoneAtFront()
+-	if count1 != 2 {
+-		t.Errorf("first dropFrontDone() = %d, want 2", count1)
+-	}
+-	if q.len() != 1 {
+-		t.Errorf("queue length after first drop = %d, want 1", q.len())
+-	}
+-
+-	// Mark w3 as done and add more elements
+-	w3.mu.Lock()
+-	w3.done = true
+-	w3.mu.Unlock()
+-	w4 := &wantConn{ctx: context.Background(), done: true, result: make(chan wantConnResult, 1)}
+-	w5 := &wantConn{ctx: context.Background(), done: false, result: make(chan wantConnResult, 1)}
+-	q.enqueue(w4)
+-	q.enqueue(w5)
+-
+-	// Second call: should remove w3 and w4 (now both done)
+-	count2 := q.discardDoneAtFront()
+-	if count2 != 2 {
+-		t.Errorf("second dropFrontDone() = %d, want 2", count2)
+-	}
+-	if q.len() != 1 {
+-		t.Errorf("queue length after second drop = %d, want 1", q.len())
+-	}
+-
+-	// Verify remaining element is w5
+-	remaining, ok := q.dequeue()
+-	if !ok || remaining != w5 {
+-		t.Error("remaining element should be w5")
+-	}
+-}
+-
+-// TestWantConnQueue_dropFrontDone_ConcurrentWithEnqueue tests concurrent dropFrontDone and enqueue.
+-func TestWantConnQueue_dropFrontDone_ConcurrentWithEnqueue(t *testing.T) {
+-	q := newWantConnQueue()
+-	const numOperations = 1000
+-
+-	var wg sync.WaitGroup
+-	done := make(chan struct{})
+-
+-	// Goroutine 1: Continuously enqueue elements
+-	wg.Add(1)
+-	go func() {
+-		defer wg.Done()
+-		for i := 0; i < numOperations; i++ {
+-			w := &wantConn{
+-				ctx:    context.Background(),
+-				done:   i%2 == 0, // Alternate between done and not-done
+-				result: make(chan wantConnResult, 1),
+-			}
+-			q.enqueue(w)
+-			time.Sleep(time.Microsecond)
+-		}
+-		close(done)
+-	}()
+-
+-	// Goroutine 2: Continuously call dropFrontDone
+-	wg.Add(1)
+-	go func() {
+-		defer wg.Done()
+-		totalDropped := 0
+-		for {
+-			select {
+-			case <-done:
+-				// Final cleanup
+-				totalDropped += q.discardDoneAtFront()
+-				t.Logf("Total elements dropped: %d", totalDropped)
+-				return
+-			default:
+-				dropped := q.discardDoneAtFront()
+-				totalDropped += dropped
+-				time.Sleep(time.Microsecond)
+-			}
+-		}
+-	}()
+-
+-	wg.Wait()
+-
+-	// No panic or race condition is success
+-	t.Logf("Final queue length: %d", q.len())
+-}
+-
+-// TestWantConnQueue_dropFrontDone_ConcurrentWithDequeue tests concurrent operations.
+-func TestWantConnQueue_dropFrontDone_ConcurrentWithDequeue(t *testing.T) {
+-	q := newWantConnQueue()
+-	const numOperations = 500
+-
+-	var wg sync.WaitGroup
+-
+-	// Pre-populate queue
+-	for i := 0; i < 100; i++ {
+-		w := &wantConn{
+-			ctx:    context.Background(),
+-			done:   i%3 == 0,
+-			result: make(chan wantConnResult, 1),
+-		}
+-		q.enqueue(w)
+-	}
+-
+-	// Goroutine 1: enqueue
+-	wg.Add(1)
+-	go func() {
+-		defer wg.Done()
+-		for i := 0; i < numOperations; i++ {
+-			w := &wantConn{
+-				ctx:    context.Background(),
+-				done:   i%2 == 0,
+-				result: make(chan wantConnResult, 1),
+-			}
+-			q.enqueue(w)
+-		}
+-	}()
+-
+-	// Goroutine 2: dequeue
+-	wg.Add(1)
+-	go func() {
+-		defer wg.Done()
+-		for i := 0; i < numOperations/2; i++ {
+-			q.dequeue()
+-			time.Sleep(time.Microsecond)
+-		}
+-	}()
+-
+-	// Goroutine 3: dropFrontDone
+-	wg.Add(1)
+-	go func() {
+-		defer wg.Done()
+-		for i := 0; i < numOperations/4; i++ {
+-			q.discardDoneAtFront()
+-			time.Sleep(time.Microsecond)
+-		}
+-	}()
+-
+-	wg.Wait()
+-
+-	// No panic or race condition is success
+-	t.Logf("Final queue length: %d", q.len())
+-}
+-
+-// TestWantConnQueue_len tests the len() method.
+-func TestWantConnQueue_len(t *testing.T) {
+-	q := newWantConnQueue()
+-
+-	// Test empty queue
+-	if length := q.len(); length != 0 {
+-		t.Errorf("empty queue len() = %d, want 0", length)
+-	}
+-
+-	// Add elements and verify length
+-	for i := 1; i <= 5; i++ {
+-		w := &wantConn{
+-			ctx:    context.Background(),
+-			result: make(chan wantConnResult, 1),
+-		}
+-		q.enqueue(w)
+-
+-		if length := q.len(); length != i {
+-			t.Errorf("queue len() after %d enqueues = %d, want %d", i, length, i)
+-		}
+-	}
+-
+-	// Remove elements and verify length
+-	for i := 4; i >= 0; i-- {
+-		q.dequeue()
+-		if length := q.len(); length != i {
+-			t.Errorf("queue len() after dequeue = %d, want %d", length, i)
+-		}
+-	}
+-}
+-
+-// TestWantConnQueue_len_Concurrent tests len() thread safety.
+-func TestWantConnQueue_len_Concurrent(t *testing.T) {
+-	q := newWantConnQueue()
+-	const numReaders = 10
+-	const numWriters = 5
+-	const operations = 100
+-
+-	var wg sync.WaitGroup
+-
+-	// Multiple readers calling len()
+-	for i := 0; i < numReaders; i++ {
+-		wg.Add(1)
+-		go func() {
+-			defer wg.Done()
+-			for j := 0; j < operations; j++ {
+-				_ = q.len() // Just read, don't care about value
+-				time.Sleep(time.Microsecond)
+-			}
+-		}()
+-	}
+-
+-	// Writers enqueueing
+-	for i := 0; i < numWriters; i++ {
+-		wg.Add(1)
+-		go func() {
+-			defer wg.Done()
+-			for j := 0; j < operations; j++ {
+-				w := &wantConn{
+-					ctx:    context.Background(),
+-					result: make(chan wantConnResult, 1),
+-				}
+-				q.enqueue(w)
+-			}
+-		}()
+-	}
+-
+-	wg.Wait()
+-
+-	// Verify final length is correct
+-	expectedLength := numWriters * operations
+-	if length := q.len(); length != expectedLength {
+-		t.Errorf("final queue len() = %d, want %d", length, expectedLength)
+-	}
+-}

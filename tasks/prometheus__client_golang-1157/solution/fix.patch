@@ -1,0 +1,110 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index faccd3d..14ae670 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,11 @@
+ ## Unreleased
+ 
++## 1.13.1 / 2022-11-01
++
++* [BUGFIX] Fix race condition with Exemplar in Counter. #1146
++* [BUGFIX] Fix `CumulativeCount` value of `+Inf` bucket created from exemplar. #1148
++* [BUGFIX] Fix double-counting bug in `promhttp.InstrumentRoundTripperCounter`. #1118
++
+ ## 1.13.0 / 2022-08-05
+ 
+ * [CHANGE] Minimum required Go version is now 1.17 (we also test client_golang against new 1.19 version).
+diff --git a/README.md b/README.md
+index 40c6146..ab2653d 100644
+--- a/README.md
++++ b/README.md
+@@ -69,3 +69,24 @@ See the [contributing guidelines](CONTRIBUTING.md) and the
+ [Community section](http://prometheus.io/community/) of the homepage.
+ 
+ `clint_golang` community is also present on the CNCF Slack `#prometheus-client_golang`.
++
++### For Maintainers: Release Process
++
++To cut a minor version:
++
++1. Create a new branch `release-<major>.<minor>` on top of the `main` commit you want to cut the version from and push it.
++2. Create a new branch on top of the release branch, e.g. `<yourname>/cut-<major>.<minor>.<patch>`,
++3. Change the `VERSION` file.
++4. Update `CHANGELOG` (only user-impacting changes to mention).
++5. Create PR, and get it reviewed.
++6. Once merged, create a release with the `release-<major>.<minor>` tag on GitHub with the `<version> / <date>` title.
++7. Announce on the prometheus-announce mailing list, slack and Twitter.
++8. Merge the release branch back to the `main` using the "merge without squashing" approach (!).
++
++> NOTE: In case of merge conflicts, you can checkout the release branch in a new branch, e.g. <yourname>/resolve-conflicts`, fix the merge problems there, and then do a PR into main from the new branch. In that way, you still get all the commits in the release branch back into `main`, but leave the release branch alone.
++
++To cut the patch version:
++
++1. Create a branch on top of the release branch you want to use.
++2. Cherry-pick the fixes from the `main` branch (or add new commits) to fix critical bugs for that patch release.
++3. Follow steps 3-8 as above.
+diff --git a/VERSION b/VERSION
+index feaae22..b50dd27 100644
+--- a/VERSION
++++ b/VERSION
+@@ -1 +1 @@
+-1.13.0
++1.13.1
+diff --git a/prometheus/counter.go b/prometheus/counter.go
+index de30de6..3668a16 100644
+--- a/prometheus/counter.go
++++ b/prometheus/counter.go
+@@ -140,12 +140,13 @@ func (c *counter) get() float64 {
+ }
+ 
+ func (c *counter) Write(out *dto.Metric) error {
+-	val := c.get()
+-
++	// Read the Exemplar first and the value second. This is to avoid a race condition
++	// where users see an exemplar for a not-yet-existing observation.
+ 	var exemplar *dto.Exemplar
+ 	if e := c.exemplar.Load(); e != nil {
+ 		exemplar = e.(*dto.Exemplar)
+ 	}
++	val := c.get()
+ 
+ 	return populateMetric(CounterValue, val, c.labelPairs, exemplar, out)
+ }
+diff --git a/prometheus/histogram.go b/prometheus/histogram.go
+index 0d47fec..73e814a 100644
+--- a/prometheus/histogram.go
++++ b/prometheus/histogram.go
+@@ -613,7 +613,7 @@ func (h *constHistogram) Write(out *dto.Metric) error {
+ // to send it to Prometheus in the Collect method.
+ //
+ // buckets is a map of upper bounds to cumulative counts, excluding the +Inf
+-// bucket.
++// bucket. The +Inf bucket is implicit, and its value is equal to the provided count.
+ //
+ // NewConstHistogram returns an error if the length of labelValues is not
+ // consistent with the variable labels in Desc or if Desc is invalid.
+diff --git a/prometheus/metric.go b/prometheus/metric.go
+index f0941f6..b5119c5 100644
+--- a/prometheus/metric.go
++++ b/prometheus/metric.go
+@@ -187,7 +187,7 @@ func (m *withExemplarsMetric) Write(pb *dto.Metric) error {
+ 			} else {
+ 				// The +Inf bucket should be explicitly added if there is an exemplar for it, similar to non-const histogram logic in https://github.com/prometheus/client_golang/blob/main/prometheus/histogram.go#L357-L365.
+ 				b := &dto.Bucket{
+-					CumulativeCount: proto.Uint64(pb.Histogram.Bucket[len(pb.Histogram.GetBucket())-1].GetCumulativeCount()),
++					CumulativeCount: proto.Uint64(pb.Histogram.GetSampleCount()),
+ 					UpperBound:      proto.Float64(math.Inf(1)),
+ 					Exemplar:        e,
+ 				}
+diff --git a/prometheus/promhttp/instrument_client.go b/prometheus/promhttp/instrument_client.go
+index 097aff2..57bb5f9 100644
+--- a/prometheus/promhttp/instrument_client.go
++++ b/prometheus/promhttp/instrument_client.go
+@@ -78,7 +78,6 @@ func InstrumentRoundTripperCounter(counter *prometheus.CounterVec, next http.Rou
+ 				1,
+ 				rtOpts.getExemplarFn(r.Context()),
+ 			)
+-			counter.With(labels(code, method, r.Method, resp.StatusCode, rtOpts.extraMethods...)).Inc()
+ 		}
+ 		return resp, err
+ 	}

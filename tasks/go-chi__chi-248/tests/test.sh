@@ -1,0 +1,28 @@
+#!/bin/bash
+
+cd /app/src/github.com/go-chi/chi
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+mkdir -p "middleware"
+cp "/tests/middleware/get_head_test.go" "middleware/get_head_test.go"
+mkdir -p "middleware"
+cp "/tests/middleware/middleware_test.go" "middleware/middleware_test.go"
+mkdir -p "middleware"
+cp "/tests/middleware/strip_test.go" "middleware/strip_test.go"
+mkdir -p "."
+cp "/tests/mux_test.go" "mux_test.go"
+mkdir -p "."
+cp "/tests/tree_test.go" "tree_test.go"
+
+# Run tests for the specific files from this PR
+# Run all tests - both in main package and middleware package
+# The test files we copied will be tested
+go test -v ./...
+test_status=$?
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+exit "$test_status"

@@ -1,0 +1,176 @@
+diff --git a/agent/config/builder.go b/agent/config/builder.go
+index 1d8643c4bb..63b73e9d64 100644
+--- a/agent/config/builder.go
++++ b/agent/config/builder.go
+@@ -1020,6 +1020,7 @@ func (b *builder) build() (rt RuntimeConfig, err error) {
+ 		EnableAgentTLSForChecks:    boolVal(c.EnableAgentTLSForChecks),
+ 		EnableCentralServiceConfig: boolVal(c.EnableCentralServiceConfig),
+ 		EnableDebug:                boolVal(c.EnableDebug),
++		DisableKVKeyValidation:     boolVal(c.DisableKVKeyValidation),
+ 		EnableRemoteScriptChecks:   enableRemoteScriptChecks,
+ 		EnableLocalScriptChecks:    enableLocalScriptChecks,
+ 		EncryptKey:                 stringVal(c.EncryptKey),
+diff --git a/agent/config/config.go b/agent/config/config.go
+index d2443d9902..b46c01450c 100644
+--- a/agent/config/config.go
++++ b/agent/config/config.go
+@@ -181,6 +181,7 @@ type Config struct {
+ 	EnableDebug                      *bool               `mapstructure:"enable_debug" json:"enable_debug,omitempty"`
+ 	EnableScriptChecks               *bool               `mapstructure:"enable_script_checks" json:"enable_script_checks,omitempty"`
+ 	EnableLocalScriptChecks          *bool               `mapstructure:"enable_local_script_checks" json:"enable_local_script_checks,omitempty"`
++	DisableKVKeyValidation           *bool               `mapstructure:"disable_kv_key_validation" json:"disable_kv_key_validation,omitempty"`
+ 	EnableSyslog                     *bool               `mapstructure:"enable_syslog" json:"enable_syslog,omitempty"`
+ 	EncryptKey                       *string             `mapstructure:"encrypt" json:"encrypt,omitempty"`
+ 	EncryptVerifyIncoming            *bool               `mapstructure:"encrypt_verify_incoming" json:"encrypt_verify_incoming,omitempty"`
+diff --git a/agent/config/runtime.go b/agent/config/runtime.go
+index 5b8ea76dc0..fb5728af34 100644
+--- a/agent/config/runtime.go
++++ b/agent/config/runtime.go
+@@ -670,6 +670,14 @@ type RuntimeConfig struct {
+ 	// flag: -enable-script-checks, -enable-local-script-checks
+ 	EnableLocalScriptChecks bool
+ 
++	// DisableKVKeyValidation controls whether KV key validation is disabled.
++	// When set to true, it disables validation that prevents path traversal and other
++	// security issues in KV key names. This can introduce security risks if not used carefully.
++	// We recommend keeping validation enabled (false) unless you have a specific reason to disable it.
++	//
++	// hcl: disable_kv_key_validation = (true|false)
++	DisableKVKeyValidation bool
++
+ 	// EnableRemoeScriptChecks controls whether health checks declared from the http API
+ 	// which execute scripts are enabled. This includes regular script checks and Docker
+ 	// checks.
+diff --git a/agent/config/testdata/TestRuntimeConfig_Sanitize.golden b/agent/config/testdata/TestRuntimeConfig_Sanitize.golden
+index fc2ac6d7f7..04006cf36b 100644
+--- a/agent/config/testdata/TestRuntimeConfig_Sanitize.golden
++++ b/agent/config/testdata/TestRuntimeConfig_Sanitize.golden
+@@ -202,6 +202,7 @@
+     "EnableCentralServiceConfig": false,
+     "EnableDebug": false,
+     "EnableLocalScriptChecks": false,
++    "DisableKVKeyValidation": false,
+     "EnableRemoteScriptChecks": false,
+     "EncryptKey": "hidden",
+     "EnterpriseRuntimeConfig": {},
+diff --git a/agent/config/testdata/full-config.hcl b/agent/config/testdata/full-config.hcl
+index 6b0c908d81..53c072191f 100644
+--- a/agent/config/testdata/full-config.hcl
++++ b/agent/config/testdata/full-config.hcl
+@@ -281,6 +281,7 @@ enable_central_service_config = false
+ enable_debug = true
+ enable_script_checks = true
+ enable_local_script_checks = true
++disable_kv_key_validation = false
+ enable_syslog = true
+ encrypt = "A4wELWqH"
+ encrypt_verify_incoming = true
+diff --git a/agent/config/testdata/full-config.json b/agent/config/testdata/full-config.json
+index 48d845a824..90f6fb1647 100644
+--- a/agent/config/testdata/full-config.json
++++ b/agent/config/testdata/full-config.json
+@@ -323,6 +323,7 @@
+   "enable_debug": true,
+   "enable_script_checks": true,
+   "enable_local_script_checks": true,
++  "disable_kv_key_validation": false,
+   "enable_syslog": true,
+   "encrypt": "A4wELWqH",
+   "encrypt_verify_incoming": true,
+diff --git a/agent/kvs_endpoint.go b/agent/kvs_endpoint.go
+index 69ddeadc28..616d0e7cd4 100644
+--- a/agent/kvs_endpoint.go
++++ b/agent/kvs_endpoint.go
+@@ -8,8 +8,8 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"net/url"
+ 	"path"
+-	"regexp"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -40,15 +40,19 @@ func (s *HTTPHandlers) KVSEndpoint(resp http.ResponseWriter, req *http.Request)
+ 	}
+ 	args.Key = cleanedKey
+ 
+-	// Validate key format unless unprintable character filter is disabled
+-	// The DisableHTTPUnprintableCharFilter flag allows access to keys with
+-	// unprintable characters for cleanup purposes
+-	if !s.agent.config.DisableHTTPUnprintableCharFilter && args.Key != "" {
+-		// Allowed key pattern: a-zA-Z0-9 ,-_./
+-		// https://developer.hashicorp.com/consul/docs/automate/kv#using-consul-kv
+-		kvKeyPattern := `^[a-zA-Z0-9,_./\-?&=+*%ç]+$`
+-		if err := validateKVKey(args.Key, kvKeyPattern); err != nil {
+-			return nil, fmt.Errorf("invalid key name, keys should respect the %q format", kvKeyPattern)
++	// The DisableKVKeyValidation configuration option controls whether
++	// we validate the key name to prevent path traversal or leading/trailing spaces.
++	// We strongly recommend leaving this validation enabled (false) unless you have a specific reason
++	// to disable it for legacy compatibility.
++	if args.Key != "" {
++		if err := validateKVKey(args.Key); err != nil {
++			if s.agent.config.DisableKVKeyValidation {
++				// When validation is disabled, log a warning
++				s.agent.logger.Warn("KV key validation is disabled but key would fail validation",
++					"key", args.Key, "validation_error", err.Error())
++			} else {
++				return nil, err
++			}
+ 		}
+ 	}
+ 
+@@ -330,20 +334,31 @@ func conflictingFlags(resp http.ResponseWriter, req *http.Request, flags ...stri
+ 	return false
+ }
+ 
+-func validateKVKey(key string, pattern string) error {
++func validateKVKey(key string) error {
+ 	if len(key) == 0 {
+-		return fmt.Errorf("invalid key name, keys should respect the %q format", pattern)
++		return fmt.Errorf("empty key name is not allowed")
+ 	}
+ 
+-	matched, err := regexp.MatchString(pattern, key)
+-	if err != nil {
+-		return fmt.Errorf("failed to validate key: %w", err)
++	if strings.HasPrefix(key, " ") || strings.HasSuffix(key, " ") {
++		return fmt.Errorf("invalid key name, leading/trailing spaces are not allowed")
+ 	}
+-	if !matched {
+-		return fmt.Errorf("invalid key name, keys should respect the %q format", pattern)
++
++	parts := strings.Split(key, "/")
++	for _, p := range parts {
++		if p == ".." {
++			return fmt.Errorf("invalid key name, path traversal is not allowed")
++		}
+ 	}
+-	if strings.Contains(key, "..") {
+-		return fmt.Errorf("invalid key name, path traversal is not allowed")
++
++	decoded, err := url.PathUnescape(key)
++	if err == nil && decoded != key {
++		if strings.Contains(decoded, "..") {
++			return fmt.Errorf("invalid key name, path traversal is not allowed")
++		}
++		if strings.Contains(decoded, " ") {
++			return fmt.Errorf("invalid key name, leading/trailing spaces are not allowed")
++		}
+ 	}
++
+ 	return nil
+ }
+diff --git a/website/content/docs/reference/agent/configuration-file/general.mdx b/website/content/docs/reference/agent/configuration-file/general.mdx
+index 77c2559d5d..250fb0aa54 100644
+--- a/website/content/docs/reference/agent/configuration-file/general.mdx
++++ b/website/content/docs/reference/agent/configuration-file/general.mdx
+@@ -151,6 +151,8 @@ The page provides reference information for general parameters in a Consul agent
+ 
+ - `enable_debug` (boolean, default is `false`): When set to `true`, enables Consul to report additional debugging information, including runtime profiling (`pprof`) data. This setting is only required for clusters without ACL [enabled](/consul/docs/reference/agent/configuration-file/acl#acl_enabled). If you change this setting, you must restart the agent for the change to take effect.
+ 
++- `disable_kv_key_validation` (boolean, default is `false`): When set to `true`, it disables KV key validation that prevents path traversal attacks and other security issues. We strongly recommend keeping validation enabled (false) for security reasons unless you have a specific legacy compatibility requirement.
++
+ - `enable_script_checks` ((#\_enable_script_checks)) This parameter controls whether
+   [health checks that execute scripts](/consul/docs/register/health-check/vm) are enabled on this
+   agent, and defaults to `false` so operators must opt-in to allowing these.

@@ -1,0 +1,255 @@
+diff --git a/doc.go b/doc.go
+index 442baba..9a5e381 100644
+--- a/doc.go
++++ b/doc.go
+@@ -172,13 +172,6 @@ conform to the corresponding patterns. These requirements guarantee that a
+ generated URL will always match a registered route -- the only exception is
+ for explicitly defined "build-only" routes which never match.
+ 
+-Regex support also exists for matching Headers within a route. For example, we could do:
+-
+-	r.HeadersRegexp("Content-Type", "application/(text|json)")
+-
+-...and the route will match both requests with a Content-Type of `application/json` as well as
+-`application/text`
+-
+ There's also a way to build only the URL host or path for a route:
+ use the methods URLHost() or URLPath() instead. For the previous route,
+ we would do:
+diff --git a/mux.go b/mux.go
+index 2304c91..af31d23 100644
+--- a/mux.go
++++ b/mux.go
+@@ -8,7 +8,6 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"path"
+-	"regexp"
+ 
+ 	"github.com/gorilla/context"
+ )
+@@ -314,21 +313,13 @@ func uniqueVars(s1, s2 []string) error {
+ 	return nil
+ }
+ 
+-func checkPairs(pairs ...string) (int, error) {
++// mapFromPairs converts variadic string parameters to a string map.
++func mapFromPairs(pairs ...string) (map[string]string, error) {
+ 	length := len(pairs)
+ 	if length%2 != 0 {
+-		return length, fmt.Errorf(
++		return nil, fmt.Errorf(
+ 			"mux: number of parameters must be multiple of 2, got %v", pairs)
+ 	}
+-	return length, nil
+-}
+-
+-// mapFromPairs converts variadic string parameters to a string map.
+-func mapFromPairsToString(pairs ...string) (map[string]string, error) {
+-	length, err := checkPairs(pairs...)
+-	if err != nil {
+-		return nil, err
+-	}
+ 	m := make(map[string]string, length/2)
+ 	for i := 0; i < length; i += 2 {
+ 		m[pairs[i]] = pairs[i+1]
+@@ -336,22 +327,6 @@ func mapFromPairsToString(pairs ...string) (map[string]string, error) {
+ 	return m, nil
+ }
+ 
+-func mapFromPairsToRegex(pairs ...string) (map[string]*regexp.Regexp, error) {
+-	length, err := checkPairs(pairs...)
+-	if err != nil {
+-		return nil, err
+-	}
+-	m := make(map[string]*regexp.Regexp, length/2)
+-	for i := 0; i < length; i += 2 {
+-		regex, err := regexp.Compile(pairs[i+1])
+-		if err != nil {
+-			return nil, err
+-		}
+-		m[pairs[i]] = regex
+-	}
+-	return m, nil
+-}
+-
+ // matchInArray returns true if the given string value is in the array.
+ func matchInArray(arr []string, value string) bool {
+ 	for _, v := range arr {
+@@ -362,8 +337,9 @@ func matchInArray(arr []string, value string) bool {
+ 	return false
+ }
+ 
+-// matchMapWithString returns true if the given key/value pairs exist in a given map.
+-func matchMapWithString(toCheck map[string]string, toMatch map[string][]string, canonicalKey bool) bool {
++// matchMap returns true if the given key/value pairs exist in a given map.
++func matchMap(toCheck map[string]string, toMatch map[string][]string,
++	canonicalKey bool) bool {
+ 	for k, v := range toCheck {
+ 		// Check if key exists.
+ 		if canonicalKey {
+@@ -388,31 +364,3 @@ func matchMapWithString(toCheck map[string]string, toMatch map[string][]string,
+ 	}
+ 	return true
+ }
+-
+-// matchMapWithRegex returns true if the given key/value pairs exist in a given map compiled against
+-// the given regex
+-func matchMapWithRegex(toCheck map[string]*regexp.Regexp, toMatch map[string][]string, canonicalKey bool) bool {
+-	for k, v := range toCheck {
+-		// Check if key exists.
+-		if canonicalKey {
+-			k = http.CanonicalHeaderKey(k)
+-		}
+-		if values := toMatch[k]; values == nil {
+-			return false
+-		} else if v != nil {
+-			// If value was defined as an empty string we only check that the
+-			// key exists. Otherwise we also check for equality.
+-			valueExists := false
+-			for _, value := range values {
+-				if v.MatchString(value) {
+-					valueExists = true
+-					break
+-				}
+-			}
+-			if !valueExists {
+-				return false
+-			}
+-		}
+-	}
+-	return true
+-}
+diff --git a/mux_test.go b/mux_test.go
+index 67f13e4..6b2c1d2 100644
+--- a/mux_test.go
++++ b/mux_test.go
+@@ -434,24 +434,6 @@ func TestHeaders(t *testing.T) {
+ 			path:        "",
+ 			shouldMatch: false,
+ 		},
+-		{
+-			title:       "Headers route, regex header values to match",
+-			route:       new(Route).Headers("foo", "ba[zr]"),
+-			request:     newRequestHeaders("GET", "http://localhost", map[string]string{"foo": "bar"}),
+-			vars:        map[string]string{},
+-			host:        "",
+-			path:        "",
+-			shouldMatch: false,
+-		},
+-		{
+-			title:       "Headers route, regex header values to match",
+-			route:       new(Route).HeadersRegexp("foo", "ba[zr]"),
+-			request:     newRequestHeaders("GET", "http://localhost", map[string]string{"foo": "baz"}),
+-			vars:        map[string]string{},
+-			host:        "",
+-			path:        "",
+-			shouldMatch: true,
+-		},
+ 	}
+ 
+ 	for _, test := range tests {
+diff --git a/route.go b/route.go
+index e81723e..d4f0146 100644
+--- a/route.go
++++ b/route.go
+@@ -9,7 +9,6 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
+-	"regexp"
+ 	"strings"
+ )
+ 
+@@ -189,7 +188,7 @@ func (r *Route) addRegexpMatcher(tpl string, matchHost, matchPrefix, matchQuery
+ type headerMatcher map[string]string
+ 
+ func (m headerMatcher) Match(r *http.Request, match *RouteMatch) bool {
+-	return matchMapWithString(m, r.Header, true)
++	return matchMap(m, r.Header, true)
+ }
+ 
+ // Headers adds a matcher for request header values.
+@@ -200,53 +199,22 @@ func (m headerMatcher) Match(r *http.Request, match *RouteMatch) bool {
+ //               "X-Requested-With", "XMLHttpRequest")
+ //
+ // The above route will only match if both request header values match.
+-// Alternatively, you can provide a regular expression and match the header as follows:
+-//
+-//     r.Headers("Content-Type", "application/(text|json)",
+-//               "X-Requested-With", "XMLHttpRequest")
+-//
+-// The above route will the same as the previous example, with the addition of matching
+-// application/text as well.
+ //
+ // It the value is an empty string, it will match any value if the key is set.
+ func (r *Route) Headers(pairs ...string) *Route {
+ 	if r.err == nil {
+ 		var headers map[string]string
+-		headers, r.err = mapFromPairsToString(pairs...)
++		headers, r.err = mapFromPairs(pairs...)
+ 		return r.addMatcher(headerMatcher(headers))
+ 	}
+ 	return r
+ }
+ 
+-// headerRegexMatcher matches the request against the route given a regex for the header
+-type headerRegexMatcher map[string]*regexp.Regexp
+-
+-func (m headerRegexMatcher) Match(r *http.Request, match *RouteMatch) bool {
+-	return matchMapWithRegex(m, r.Header, true)
+-}
+-
+-// Regular expressions can be used with headers as well.
+-// It accepts a sequence of key/value pairs, where the value has regex support. For example
+-//     r := mux.NewRouter()
+-//     r.HeadersRegexp("Content-Type", "application/(text|json)",
+-//               "X-Requested-With", "XMLHttpRequest")
+-//
+-// The above route will only match if both the request header matches both regular expressions.
+-// It the value is an empty string, it will match any value if the key is set.
+-func (r *Route) HeadersRegexp(pairs ...string) *Route {
+-	if r.err == nil {
+-		var headers map[string]*regexp.Regexp
+-		headers, r.err = mapFromPairsToRegex(pairs...)
+-		return r.addMatcher(headerRegexMatcher(headers))
+-	}
+-	return r
+-}
+-
+ // Host -----------------------------------------------------------------------
+ 
+ // Host adds a matcher for the URL host.
+ // It accepts a template with zero or more URL variables enclosed by {}.
+-// Variables can define an optional regexp pattern to be matched:
++// Variables can define an optional regexp pattern to me matched:
+ //
+ // - {name} matches anything until the next dot.
+ //
+@@ -304,7 +272,7 @@ func (r *Route) Methods(methods ...string) *Route {
+ // Path adds a matcher for the URL path.
+ // It accepts a template with zero or more URL variables enclosed by {}. The
+ // template must start with a "/".
+-// Variables can define an optional regexp pattern to be matched:
++// Variables can define an optional regexp pattern to me matched:
+ //
+ // - {name} matches anything until the next slash.
+ //
+@@ -355,7 +323,7 @@ func (r *Route) PathPrefix(tpl string) *Route {
+ //
+ // It the value is an empty string, it will match any value if the key is set.
+ //
+-// Variables can define an optional regexp pattern to be matched:
++// Variables can define an optional regexp pattern to me matched:
+ //
+ // - {name} matches anything until the next slash.
+ //
+@@ -543,7 +511,7 @@ func (r *Route) URLPath(pairs ...string) (*url.URL, error) {
+ // prepareVars converts the route variable pairs into a map. If the route has a
+ // BuildVarsFunc, it is invoked.
+ func (r *Route) prepareVars(pairs ...string) (map[string]string, error) {
+-	m, err := mapFromPairsToString(pairs...)
++	m, err := mapFromPairs(pairs...)
+ 	if err != nil {
+ 		return nil, err
+ 	}

@@ -1,0 +1,144 @@
+diff --git a/docs/doc.md b/docs/doc.md
+index b76011f..303da64 100644
+--- a/docs/doc.md
++++ b/docs/doc.md
+@@ -1341,13 +1341,19 @@ func main() {
+ 
+ ### HTML rendering
+ 
+-Using LoadHTMLGlob() or LoadHTMLFiles()
++Using LoadHTMLGlob() or LoadHTMLFiles() or LoadHTMLFS()
+ 
+ ```go
++//go:embed templates/*
++var templates embed.FS
++
+ func main() {
+   router := gin.Default()
+   router.LoadHTMLGlob("templates/*")
+   //router.LoadHTMLFiles("templates/template1.html", "templates/template2.html")
++  //router.LoadHTMLFS(http.Dir("templates"), "template1.html", "template2.html")
++  //or
++  //router.LoadHTMLFS(http.FS(templates), "templates/template1.html", "templates/template2.html")
+   router.GET("/index", func(c *gin.Context) {
+     c.HTML(http.StatusOK, "index.tmpl", gin.H{
+       "title": "Main website",
+diff --git a/gin.go b/gin.go
+index 48cc15c..10b6ed9 100644
+--- a/gin.go
++++ b/gin.go
+@@ -16,6 +16,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/gin-gonic/gin/internal/bytesconv"
++	filesystem "github.com/gin-gonic/gin/internal/fs"
+ 	"github.com/gin-gonic/gin/render"
+ 
+ 	"github.com/quic-go/quic-go/http3"
+@@ -285,6 +286,19 @@ func (engine *Engine) LoadHTMLFiles(files ...string) {
+ 	engine.SetHTMLTemplate(templ)
+ }
+ 
++// LoadHTMLFS loads an http.FileSystem and a slice of patterns
++// and associates the result with HTML renderer.
++func (engine *Engine) LoadHTMLFS(fs http.FileSystem, patterns ...string) {
++	if IsDebugging() {
++		engine.HTMLRender = render.HTMLDebug{FileSystem: fs, Patterns: patterns, FuncMap: engine.FuncMap, Delims: engine.delims}
++		return
++	}
++
++	templ := template.Must(template.New("").Delims(engine.delims.Left, engine.delims.Right).Funcs(engine.FuncMap).ParseFS(
++		filesystem.FileSystem{FileSystem: fs}, patterns...))
++	engine.SetHTMLTemplate(templ)
++}
++
+ // SetHTMLTemplate associate a template with HTML renderer.
+ func (engine *Engine) SetHTMLTemplate(templ *template.Template) {
+ 	if len(engine.trees) > 0 {
+diff --git a/ginS/gins.go b/ginS/gins.go
+index ea38c61..a7d6e92 100644
+--- a/ginS/gins.go
++++ b/ginS/gins.go
+@@ -32,6 +32,11 @@ func LoadHTMLFiles(files ...string) {
+ 	engine().LoadHTMLFiles(files...)
+ }
+ 
++// LoadHTMLFS is a wrapper for Engine.LoadHTMLFS.
++func LoadHTMLFS(fs http.FileSystem, patterns ...string) {
++	engine().LoadHTMLFS(fs, patterns...)
++}
++
+ // SetHTMLTemplate is a wrapper for Engine.SetHTMLTemplate.
+ func SetHTMLTemplate(templ *template.Template) {
+ 	engine().SetHTMLTemplate(templ)
+diff --git a/internal/fs/fs.go b/internal/fs/fs.go
+new file mode 100644
+index 0000000..524ac08
+--- /dev/null
++++ b/internal/fs/fs.go
+@@ -0,0 +1,22 @@
++package fs
++
++import (
++	"io/fs"
++	"net/http"
++)
++
++// FileSystem implements an [fs.FS].
++type FileSystem struct {
++	http.FileSystem
++}
++
++// Open passes `Open` to the upstream implementation and return an [fs.File].
++func (o FileSystem) Open(name string) (fs.File, error) {
++	f, err := o.FileSystem.Open(name)
++
++	if err != nil {
++		return nil, err
++	}
++
++	return fs.File(f), nil
++}
+diff --git a/render/html.go b/render/html.go
+index c308408..f5e7455 100644
+--- a/render/html.go
++++ b/render/html.go
+@@ -7,6 +7,8 @@ package render
+ import (
+ 	"html/template"
+ 	"net/http"
++
++	"github.com/gin-gonic/gin/internal/fs"
+ )
+ 
+ // Delims represents a set of Left and Right delimiters for HTML template rendering.
+@@ -31,10 +33,12 @@ type HTMLProduction struct {
+ 
+ // HTMLDebug contains template delims and pattern and function with file list.
+ type HTMLDebug struct {
+-	Files   []string
+-	Glob    string
+-	Delims  Delims
+-	FuncMap template.FuncMap
++	Files      []string
++	Glob       string
++	FileSystem http.FileSystem
++	Patterns   []string
++	Delims     Delims
++	FuncMap    template.FuncMap
+ }
+ 
+ // HTML contains template reference and its name with given interface object.
+@@ -73,7 +77,11 @@ func (r HTMLDebug) loadTemplate() *template.Template {
+ 	if r.Glob != "" {
+ 		return template.Must(template.New("").Delims(r.Delims.Left, r.Delims.Right).Funcs(r.FuncMap).ParseGlob(r.Glob))
+ 	}
+-	panic("the HTML debug render was created without files or glob pattern")
++	if r.FileSystem != nil && len(r.Patterns) > 0 {
++		return template.Must(template.New("").Delims(r.Delims.Left, r.Delims.Right).Funcs(r.FuncMap).ParseFS(
++			fs.FileSystem{FileSystem: r.FileSystem}, r.Patterns...))
++	}
++	panic("the HTML debug render was created without files or glob pattern or file system with patterns")
+ }
+ 
+ // Render (HTML) executes template and writes its result with custom ContentType for response.

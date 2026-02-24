@@ -1,0 +1,1902 @@
+diff --git a/.github/workflows/doctests.yaml b/.github/workflows/doctests.yaml
+index bd95c58d..1afd0d80 100644
+--- a/.github/workflows/doctests.yaml
++++ b/.github/workflows/doctests.yaml
+@@ -16,7 +16,7 @@ jobs:
+ 
+     services:
+       redis-stack:
+-        image: redislabs/client-libs-test:8.4-RC1-pre.2
++        image: redislabs/client-libs-test:8.0.2
+         env:
+           TLS_ENABLED: no
+           REDIS_CLUSTER: no
+diff --git a/command.go b/command.go
+index b99f1312..1623ab97 100644
+--- a/command.go
++++ b/command.go
+@@ -698,68 +698,6 @@ func (cmd *IntCmd) readReply(rd *proto.Reader) (err error) {
+ 
+ //------------------------------------------------------------------------------
+ 
+-// DigestCmd is a command that returns a uint64 xxh3 hash digest.
+-//
+-// This command is specifically designed for the Redis DIGEST command,
+-// which returns the xxh3 hash of a key's value as a hex string.
+-// The hex string is automatically parsed to a uint64 value.
+-//
+-// The digest can be used for optimistic locking with SetIFDEQ, SetIFDNE,
+-// and DelExArgs commands.
+-//
+-// For examples of client-side digest generation and usage patterns, see:
+-// example/digest-optimistic-locking/
+-//
+-// Redis 8.4+. See https://redis.io/commands/digest/
+-type DigestCmd struct {
+-	baseCmd
+-
+-	val uint64
+-}
+-
+-var _ Cmder = (*DigestCmd)(nil)
+-
+-func NewDigestCmd(ctx context.Context, args ...interface{}) *DigestCmd {
+-	return &DigestCmd{
+-		baseCmd: baseCmd{
+-			ctx:  ctx,
+-			args: args,
+-		},
+-	}
+-}
+-
+-func (cmd *DigestCmd) SetVal(val uint64) {
+-	cmd.val = val
+-}
+-
+-func (cmd *DigestCmd) Val() uint64 {
+-	return cmd.val
+-}
+-
+-func (cmd *DigestCmd) Result() (uint64, error) {
+-	return cmd.val, cmd.err
+-}
+-
+-func (cmd *DigestCmd) String() string {
+-	return cmdString(cmd, cmd.val)
+-}
+-
+-func (cmd *DigestCmd) readReply(rd *proto.Reader) (err error) {
+-	// Redis DIGEST command returns a hex string (e.g., "a1b2c3d4e5f67890")
+-	// We parse it as a uint64 xxh3 hash value
+-	var hexStr string
+-	hexStr, err = rd.ReadString()
+-	if err != nil {
+-		return err
+-	}
+-
+-	// Parse hex string to uint64
+-	cmd.val, err = strconv.ParseUint(hexStr, 16, 64)
+-	return err
+-}
+-
+-//------------------------------------------------------------------------------
+-
+ type IntSliceCmd struct {
+ 	baseCmd
+ 
+diff --git a/command_digest_test.go b/command_digest_test.go
+deleted file mode 100644
+index 6b65b3eb..00000000
+--- a/command_digest_test.go
++++ /dev/null
+@@ -1,118 +0,0 @@
+-package redis
+-
+-import (
+-	"context"
+-	"fmt"
+-	"testing"
+-
+-	"github.com/redis/go-redis/v9/internal/proto"
+-)
+-
+-func TestDigestCmd(t *testing.T) {
+-	tests := []struct {
+-		name     string
+-		hexStr   string
+-		expected uint64
+-		wantErr  bool
+-	}{
+-		{
+-			name:     "zero value",
+-			hexStr:   "0",
+-			expected: 0,
+-			wantErr:  false,
+-		},
+-		{
+-			name:     "small value",
+-			hexStr:   "ff",
+-			expected: 255,
+-			wantErr:  false,
+-		},
+-		{
+-			name:     "medium value",
+-			hexStr:   "1234abcd",
+-			expected: 0x1234abcd,
+-			wantErr:  false,
+-		},
+-		{
+-			name:     "large value",
+-			hexStr:   "ffffffffffffffff",
+-			expected: 0xffffffffffffffff,
+-			wantErr:  false,
+-		},
+-		{
+-			name:     "uppercase hex",
+-			hexStr:   "DEADBEEF",
+-			expected: 0xdeadbeef,
+-			wantErr:  false,
+-		},
+-		{
+-			name:     "mixed case hex",
+-			hexStr:   "DeAdBeEf",
+-			expected: 0xdeadbeef,
+-			wantErr:  false,
+-		},
+-		{
+-			name:     "typical xxh3 hash",
+-			hexStr:   "a1b2c3d4e5f67890",
+-			expected: 0xa1b2c3d4e5f67890,
+-			wantErr:  false,
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			// Create a mock reader that returns the hex string in RESP format
+-			// Format: $<length>\r\n<data>\r\n
+-			respData := []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(tt.hexStr), tt.hexStr))
+-
+-			rd := proto.NewReader(newMockConn(respData))
+-
+-			cmd := NewDigestCmd(context.Background(), "digest", "key")
+-			err := cmd.readReply(rd)
+-
+-			if (err != nil) != tt.wantErr {
+-				t.Errorf("DigestCmd.readReply() error = %v, wantErr %v", err, tt.wantErr)
+-				return
+-			}
+-
+-			if !tt.wantErr && cmd.Val() != tt.expected {
+-				t.Errorf("DigestCmd.Val() = %d (0x%x), want %d (0x%x)", cmd.Val(), cmd.Val(), tt.expected, tt.expected)
+-			}
+-		})
+-	}
+-}
+-
+-func TestDigestCmdResult(t *testing.T) {
+-	cmd := NewDigestCmd(context.Background(), "digest", "key")
+-	expected := uint64(0xdeadbeefcafebabe)
+-	cmd.SetVal(expected)
+-
+-	val, err := cmd.Result()
+-	if err != nil {
+-		t.Errorf("DigestCmd.Result() error = %v", err)
+-	}
+-
+-	if val != expected {
+-		t.Errorf("DigestCmd.Result() = %d (0x%x), want %d (0x%x)", val, val, expected, expected)
+-	}
+-}
+-
+-// mockConn is a simple mock connection for testing
+-type mockConn struct {
+-	data []byte
+-	pos  int
+-}
+-
+-func newMockConn(data []byte) *mockConn {
+-	return &mockConn{data: data}
+-}
+-
+-func (c *mockConn) Read(p []byte) (n int, err error) {
+-	if c.pos >= len(c.data) {
+-		return 0, nil
+-	}
+-	n = copy(p, c.data[c.pos:])
+-	c.pos += n
+-	return n, nil
+-}
+-
+diff --git a/commands_test.go b/commands_test.go
+index edbae4e7..80acf09d 100644
+--- a/commands_test.go
++++ b/commands_test.go
+@@ -1796,200 +1796,6 @@ var _ = Describe("Commands", func() {
+ 			Expect(get.Err()).To(Equal(redis.Nil))
+ 		})
+ 
+-		It("should DelExArgs when value matches", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "lock", "token-123", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Delete only if value matches
+-			deleted := client.DelExArgs(ctx, "lock", redis.DelExArgs{
+-				Mode:       "IFEQ",
+-				MatchValue: "token-123",
+-			})
+-			Expect(deleted.Err()).NotTo(HaveOccurred())
+-			Expect(deleted.Val()).To(Equal(int64(1)))
+-
+-			// Verify key was deleted
+-			get := client.Get(ctx, "lock")
+-			Expect(get.Err()).To(Equal(redis.Nil))
+-		})
+-
+-		It("should DelExArgs fail when value does not match", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "lock", "token-123", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Try to delete with wrong value
+-			deleted := client.DelExArgs(ctx, "lock", redis.DelExArgs{
+-				Mode:       "IFEQ",
+-				MatchValue: "wrong-token",
+-			})
+-			Expect(deleted.Err()).NotTo(HaveOccurred())
+-			Expect(deleted.Val()).To(Equal(int64(0)))
+-
+-			// Verify key was NOT deleted
+-			val, err := client.Get(ctx, "lock").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("token-123"))
+-		})
+-
+-		It("should DelExArgs on non-existent key", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Try to delete non-existent key
+-			deleted := client.DelExArgs(ctx, "nonexistent", redis.DelExArgs{
+-				Mode:       "IFEQ",
+-				MatchValue: "any-value",
+-			})
+-			Expect(deleted.Err()).NotTo(HaveOccurred())
+-			Expect(deleted.Val()).To(Equal(int64(0)))
+-		})
+-
+-		It("should DelExArgs with IFEQ", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "temp-key", "temp-value", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Delete with IFEQ
+-			args := redis.DelExArgs{
+-				Mode:       "IFEQ",
+-				MatchValue: "temp-value",
+-			}
+-			deleted := client.DelExArgs(ctx, "temp-key", args)
+-			Expect(deleted.Err()).NotTo(HaveOccurred())
+-			Expect(deleted.Val()).To(Equal(int64(1)))
+-
+-			// Verify key was deleted
+-			get := client.Get(ctx, "temp-key")
+-			Expect(get.Err()).To(Equal(redis.Nil))
+-		})
+-
+-		It("should DelExArgs with IFNE", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "temporary", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Delete only if value is NOT "permanent"
+-			args := redis.DelExArgs{
+-				Mode:       "IFNE",
+-				MatchValue: "permanent",
+-			}
+-			deleted := client.DelExArgs(ctx, "key", args)
+-			Expect(deleted.Err()).NotTo(HaveOccurred())
+-			Expect(deleted.Val()).To(Equal(int64(1)))
+-
+-			// Verify key was deleted
+-			get := client.Get(ctx, "key")
+-			Expect(get.Err()).To(Equal(redis.Nil))
+-		})
+-
+-		It("should DelExArgs with IFNE fail when value matches", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "permanent", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Try to delete but value matches (should fail)
+-			args := redis.DelExArgs{
+-				Mode:       "IFNE",
+-				MatchValue: "permanent",
+-			}
+-			deleted := client.DelExArgs(ctx, "key", args)
+-			Expect(deleted.Err()).NotTo(HaveOccurred())
+-			Expect(deleted.Val()).To(Equal(int64(0)))
+-
+-			// Verify key was NOT deleted
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("permanent"))
+-		})
+-
+-		It("should Digest", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set a value
+-			err := client.Set(ctx, "my-key", "my-value", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Get digest (returns uint64)
+-			digest := client.Digest(ctx, "my-key")
+-			Expect(digest.Err()).NotTo(HaveOccurred())
+-			Expect(digest.Val()).NotTo(BeZero())
+-
+-			// Digest should be consistent
+-			digest2 := client.Digest(ctx, "my-key")
+-			Expect(digest2.Err()).NotTo(HaveOccurred())
+-			Expect(digest2.Val()).To(Equal(digest.Val()))
+-		})
+-
+-		It("should Digest on non-existent key", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Get digest of non-existent key
+-			digest := client.Digest(ctx, "nonexistent")
+-			Expect(digest.Err()).To(Equal(redis.Nil))
+-		})
+-
+-		It("should use Digest with SetArgs IFDEQ", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "value1", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Get digest
+-			digest := client.Digest(ctx, "key")
+-			Expect(digest.Err()).NotTo(HaveOccurred())
+-
+-			// Update using digest
+-			args := redis.SetArgs{
+-				Mode:        "IFDEQ",
+-				MatchDigest: digest.Val(),
+-			}
+-			result := client.SetArgs(ctx, "key", "value2", args)
+-			Expect(result.Err()).NotTo(HaveOccurred())
+-			Expect(result.Val()).To(Equal("OK"))
+-
+-			// Verify value was updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("value2"))
+-		})
+-
+-		It("should use Digest with DelExArgs IFDEQ", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "value", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Get digest
+-			digest := client.Digest(ctx, "key")
+-			Expect(digest.Err()).NotTo(HaveOccurred())
+-
+-			// Delete using digest
+-			args := redis.DelExArgs{
+-				Mode:        "IFDEQ",
+-				MatchDigest: digest.Val(),
+-			}
+-			deleted := client.DelExArgs(ctx, "key", args)
+-			Expect(deleted.Err()).NotTo(HaveOccurred())
+-			Expect(deleted.Val()).To(Equal(int64(1)))
+-
+-			// Verify key was deleted
+-			get := client.Get(ctx, "key")
+-			Expect(get.Err()).To(Equal(redis.Nil))
+-		})
+-
+ 		It("should Incr", func() {
+ 			set := client.Set(ctx, "key", "10", 0)
+ 			Expect(set.Err()).NotTo(HaveOccurred())
+@@ -2668,320 +2474,6 @@ var _ = Describe("Commands", func() {
+ 			Expect(ttl).NotTo(Equal(-1))
+ 		})
+ 
+-		It("should SetIFEQ when value matches", func() {
+-			if RedisVersion < 8.4 {
+-				Skip("CAS/CAD commands require Redis >= 8.4")
+-			}
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "old-value", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Update only if current value is "old-value"
+-			result := client.SetIFEQ(ctx, "key", "new-value", "old-value", 0)
+-			Expect(result.Err()).NotTo(HaveOccurred())
+-			Expect(result.Val()).To(Equal("OK"))
+-
+-			// Verify value was updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("new-value"))
+-		})
+-
+-		It("should SetIFEQ fail when value does not match", func() {
+-			if RedisVersion < 8.4 {
+-				Skip("CAS/CAD commands require Redis >= 8.4")
+-			}
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "current-value", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Try to update with wrong match value
+-			result := client.SetIFEQ(ctx, "key", "new-value", "wrong-value", 0)
+-			Expect(result.Err()).To(Equal(redis.Nil))
+-
+-			// Verify value was NOT updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("current-value"))
+-		})
+-
+-		It("should SetIFEQ with expiration", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "token-123", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Update with expiration
+-			result := client.SetIFEQ(ctx, "key", "token-456", "token-123", 500*time.Millisecond)
+-			Expect(result.Err()).NotTo(HaveOccurred())
+-			Expect(result.Val()).To(Equal("OK"))
+-
+-			// Verify value was updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("token-456"))
+-
+-			// Wait for expiration
+-			Eventually(func() error {
+-				return client.Get(ctx, "key").Err()
+-			}, "1s", "100ms").Should(Equal(redis.Nil))
+-		})
+-
+-		It("should SetIFNE when value does not match", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "pending", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Update only if current value is NOT "completed"
+-			result := client.SetIFNE(ctx, "key", "processing", "completed", 0)
+-			Expect(result.Err()).NotTo(HaveOccurred())
+-			Expect(result.Val()).To(Equal("OK"))
+-
+-			// Verify value was updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("processing"))
+-		})
+-
+-		It("should SetIFNE fail when value matches", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "completed", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Try to update but value matches (should fail)
+-			result := client.SetIFNE(ctx, "key", "processing", "completed", 0)
+-			Expect(result.Err()).To(Equal(redis.Nil))
+-
+-			// Verify value was NOT updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("completed"))
+-		})
+-
+-		It("should SetArgs with IFEQ", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "counter", "100", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Update with IFEQ
+-			args := redis.SetArgs{
+-				Mode:       "IFEQ",
+-				MatchValue: "100",
+-				TTL:        1 * time.Hour,
+-			}
+-			result := client.SetArgs(ctx, "counter", "200", args)
+-			Expect(result.Err()).NotTo(HaveOccurred())
+-			Expect(result.Val()).To(Equal("OK"))
+-
+-			// Verify value was updated
+-			val, err := client.Get(ctx, "counter").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("200"))
+-		})
+-
+-		It("should SetArgs with IFEQ and GET", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "old", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Update with IFEQ and GET old value
+-			args := redis.SetArgs{
+-				Mode:       "IFEQ",
+-				MatchValue: "old",
+-				Get:        true,
+-			}
+-			result := client.SetArgs(ctx, "key", "new", args)
+-			Expect(result.Err()).NotTo(HaveOccurred())
+-			Expect(result.Val()).To(Equal("old"))
+-
+-			// Verify value was updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("new"))
+-		})
+-
+-		It("should SetArgs with IFNE", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "status", "pending", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Update with IFNE
+-			args := redis.SetArgs{
+-				Mode:       "IFNE",
+-				MatchValue: "completed",
+-				TTL:        30 * time.Minute,
+-			}
+-			result := client.SetArgs(ctx, "status", "processing", args)
+-			Expect(result.Err()).NotTo(HaveOccurred())
+-			Expect(result.Val()).To(Equal("OK"))
+-
+-			// Verify value was updated
+-			val, err := client.Get(ctx, "status").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("processing"))
+-		})
+-
+-		It("should SetIFEQGet return previous value", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "old-value", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Update and get previous value
+-			result := client.SetIFEQGet(ctx, "key", "new-value", "old-value", 0)
+-			Expect(result.Err()).NotTo(HaveOccurred())
+-			Expect(result.Val()).To(Equal("old-value"))
+-
+-			// Verify value was updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("new-value"))
+-		})
+-
+-		It("should SetIFNEGet return previous value", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "pending", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Update and get previous value
+-			result := client.SetIFNEGet(ctx, "key", "processing", "completed", 0)
+-			Expect(result.Err()).NotTo(HaveOccurred())
+-			Expect(result.Val()).To(Equal("pending"))
+-
+-			// Verify value was updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("processing"))
+-		})
+-
+-		It("should SetIFDEQ when digest matches", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "value1", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Get digest
+-			digest := client.Digest(ctx, "key")
+-			Expect(digest.Err()).NotTo(HaveOccurred())
+-
+-			// Update using digest
+-			result := client.SetIFDEQ(ctx, "key", "value2", digest.Val(), 0)
+-			Expect(result.Err()).NotTo(HaveOccurred())
+-			Expect(result.Val()).To(Equal("OK"))
+-
+-			// Verify value was updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("value2"))
+-		})
+-
+-		It("should SetIFDEQ fail when digest does not match", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "value1", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Get digest of a different value to use as wrong digest
+-			err = client.Set(ctx, "temp-key", "different-value", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-			wrongDigest := client.Digest(ctx, "temp-key")
+-			Expect(wrongDigest.Err()).NotTo(HaveOccurred())
+-
+-			// Try to update with wrong digest
+-			result := client.SetIFDEQ(ctx, "key", "value2", wrongDigest.Val(), 0)
+-			Expect(result.Err()).To(Equal(redis.Nil))
+-
+-			// Verify value was NOT updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("value1"))
+-		})
+-
+-		It("should SetIFDEQGet return previous value", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "value1", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Get digest
+-			digest := client.Digest(ctx, "key")
+-			Expect(digest.Err()).NotTo(HaveOccurred())
+-
+-			// Update using digest and get previous value
+-			result := client.SetIFDEQGet(ctx, "key", "value2", digest.Val(), 0)
+-			Expect(result.Err()).NotTo(HaveOccurred())
+-			Expect(result.Val()).To(Equal("value1"))
+-
+-			// Verify value was updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("value2"))
+-		})
+-
+-		It("should SetIFDNE when digest does not match", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "value1", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Get digest of a different value
+-			err = client.Set(ctx, "temp-key", "different-value", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-			differentDigest := client.Digest(ctx, "temp-key")
+-			Expect(differentDigest.Err()).NotTo(HaveOccurred())
+-
+-			// Update with different digest (should succeed because digest doesn't match)
+-			result := client.SetIFDNE(ctx, "key", "value2", differentDigest.Val(), 0)
+-			Expect(result.Err()).NotTo(HaveOccurred())
+-			Expect(result.Val()).To(Equal("OK"))
+-
+-			// Verify value was updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("value2"))
+-		})
+-
+-		It("should SetIFDNE fail when digest matches", func() {
+-			SkipBeforeRedisVersion(8.4, "CAS/CAD commands require Redis >= 8.4")
+-
+-			// Set initial value
+-			err := client.Set(ctx, "key", "value1", 0).Err()
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			// Get digest
+-			digest := client.Digest(ctx, "key")
+-			Expect(digest.Err()).NotTo(HaveOccurred())
+-
+-			// Try to update but digest matches (should fail)
+-			result := client.SetIFDNE(ctx, "key", "value2", digest.Val(), 0)
+-			Expect(result.Err()).To(Equal(redis.Nil))
+-
+-			// Verify value was NOT updated
+-			val, err := client.Get(ctx, "key").Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).To(Equal("value1"))
+-		})
+-
+ 		It("should SetRange", func() {
+ 			set := client.Set(ctx, "key", "Hello World", 0)
+ 			Expect(set.Err()).NotTo(HaveOccurred())
+diff --git a/digest_test.go b/digest_test.go
+deleted file mode 100644
+index b9d91979..00000000
+--- a/digest_test.go
++++ /dev/null
+@@ -1,265 +0,0 @@
+-package redis_test
+-
+-import (
+-	"context"
+-	"os"
+-	"strconv"
+-	"strings"
+-	"testing"
+-
+-	"github.com/redis/go-redis/v9"
+-)
+-
+-func init() {
+-	// Initialize RedisVersion from environment variable for regular Go tests
+-	// (Ginkgo tests initialize this in BeforeSuite)
+-	if version := os.Getenv("REDIS_VERSION"); version != "" {
+-		if v, err := strconv.ParseFloat(strings.Trim(version, "\""), 64); err == nil && v > 0 {
+-			RedisVersion = v
+-		}
+-	}
+-}
+-
+-// skipIfRedisBelow84 checks if Redis version is below 8.4 and skips the test if so
+-func skipIfRedisBelow84(t *testing.T) {
+-	if RedisVersion < 8.4 {
+-		t.Skipf("Skipping test: Redis version %.1f < 8.4 (DIGEST command requires Redis 8.4+)", RedisVersion)
+-	}
+-}
+-
+-// TestDigestBasic validates that the Digest command returns a uint64 value
+-func TestDigestBasic(t *testing.T) {
+-	skipIfRedisBelow84(t)
+-
+-	ctx := context.Background()
+-	client := redis.NewClient(&redis.Options{
+-		Addr: "localhost:6379",
+-	})
+-	defer client.Close()
+-
+-	if err := client.Ping(ctx).Err(); err != nil {
+-		t.Skipf("Redis not available: %v", err)
+-	}
+-
+-	client.Del(ctx, "digest-test-key")
+-
+-	// Set a value
+-	err := client.Set(ctx, "digest-test-key", "testvalue", 0).Err()
+-	if err != nil {
+-		t.Fatalf("Failed to set value: %v", err)
+-	}
+-
+-	// Get digest
+-	digestCmd := client.Digest(ctx, "digest-test-key")
+-	if err := digestCmd.Err(); err != nil {
+-		t.Fatalf("Failed to get digest: %v", err)
+-	}
+-
+-	digest := digestCmd.Val()
+-	if digest == 0 {
+-		t.Error("Digest should not be zero for non-empty value")
+-	}
+-
+-	t.Logf("Digest for 'testvalue': %d (0x%016x)", digest, digest)
+-
+-	// Verify same value produces same digest
+-	digest2 := client.Digest(ctx, "digest-test-key").Val()
+-	if digest != digest2 {
+-		t.Errorf("Same value should produce same digest: %d != %d", digest, digest2)
+-	}
+-
+-	client.Del(ctx, "digest-test-key")
+-}
+-
+-// TestSetIFDEQWithDigest validates the SetIFDEQ command works with digests
+-func TestSetIFDEQWithDigest(t *testing.T) {
+-	skipIfRedisBelow84(t)
+-
+-	ctx := context.Background()
+-	client := redis.NewClient(&redis.Options{
+-		Addr: "localhost:6379",
+-	})
+-	defer client.Close()
+-
+-	if err := client.Ping(ctx).Err(); err != nil {
+-		t.Skipf("Redis not available: %v", err)
+-	}
+-
+-	client.Del(ctx, "cas-test-key")
+-
+-	// Set initial value
+-	initialValue := "initial-value"
+-	err := client.Set(ctx, "cas-test-key", initialValue, 0).Err()
+-	if err != nil {
+-		t.Fatalf("Failed to set initial value: %v", err)
+-	}
+-
+-	// Get current digest
+-	correctDigest := client.Digest(ctx, "cas-test-key").Val()
+-	wrongDigest := uint64(12345) // arbitrary wrong digest
+-
+-	// Test 1: SetIFDEQ with correct digest should succeed
+-	result := client.SetIFDEQ(ctx, "cas-test-key", "new-value", correctDigest, 0)
+-	if err := result.Err(); err != nil {
+-		t.Errorf("SetIFDEQ with correct digest failed: %v", err)
+-	} else {
+-		t.Logf("✓ SetIFDEQ with correct digest succeeded")
+-	}
+-
+-	// Verify value was updated
+-	val, err := client.Get(ctx, "cas-test-key").Result()
+-	if err != nil {
+-		t.Fatalf("Failed to get value: %v", err)
+-	}
+-	if val != "new-value" {
+-		t.Errorf("Value not updated: got %q, want %q", val, "new-value")
+-	}
+-
+-	// Test 2: SetIFDEQ with wrong digest should fail
+-	result = client.SetIFDEQ(ctx, "cas-test-key", "another-value", wrongDigest, 0)
+-	if result.Err() != redis.Nil {
+-		t.Errorf("SetIFDEQ with wrong digest should return redis.Nil, got: %v", result.Err())
+-	} else {
+-		t.Logf("✓ SetIFDEQ with wrong digest correctly failed")
+-	}
+-
+-	// Verify value was NOT updated
+-	val, err = client.Get(ctx, "cas-test-key").Result()
+-	if err != nil {
+-		t.Fatalf("Failed to get value: %v", err)
+-	}
+-	if val != "new-value" {
+-		t.Errorf("Value should not have changed: got %q, want %q", val, "new-value")
+-	}
+-
+-	client.Del(ctx, "cas-test-key")
+-}
+-
+-// TestSetIFDNEWithDigest validates the SetIFDNE command works with digests
+-func TestSetIFDNEWithDigest(t *testing.T) {
+-	skipIfRedisBelow84(t)
+-
+-	ctx := context.Background()
+-	client := redis.NewClient(&redis.Options{
+-		Addr: "localhost:6379",
+-	})
+-	defer client.Close()
+-
+-	if err := client.Ping(ctx).Err(); err != nil {
+-		t.Skipf("Redis not available: %v", err)
+-	}
+-
+-	client.Del(ctx, "cad-test-key")
+-
+-	// Set initial value
+-	initialValue := "initial-value"
+-	err := client.Set(ctx, "cad-test-key", initialValue, 0).Err()
+-	if err != nil {
+-		t.Fatalf("Failed to set initial value: %v", err)
+-	}
+-
+-	// Use an arbitrary different digest
+-	wrongDigest := uint64(99999) // arbitrary different digest
+-
+-	// Test 1: SetIFDNE with different digest should succeed
+-	result := client.SetIFDNE(ctx, "cad-test-key", "new-value", wrongDigest, 0)
+-	if err := result.Err(); err != nil {
+-		t.Errorf("SetIFDNE with different digest failed: %v", err)
+-	} else {
+-		t.Logf("✓ SetIFDNE with different digest succeeded")
+-	}
+-
+-	// Verify value was updated
+-	val, err := client.Get(ctx, "cad-test-key").Result()
+-	if err != nil {
+-		t.Fatalf("Failed to get value: %v", err)
+-	}
+-	if val != "new-value" {
+-		t.Errorf("Value not updated: got %q, want %q", val, "new-value")
+-	}
+-
+-	// Test 2: SetIFDNE with matching digest should fail
+-	newDigest := client.Digest(ctx, "cad-test-key").Val()
+-	result = client.SetIFDNE(ctx, "cad-test-key", "another-value", newDigest, 0)
+-	if result.Err() != redis.Nil {
+-		t.Errorf("SetIFDNE with matching digest should return redis.Nil, got: %v", result.Err())
+-	} else {
+-		t.Logf("✓ SetIFDNE with matching digest correctly failed")
+-	}
+-
+-	// Verify value was NOT updated
+-	val, err = client.Get(ctx, "cad-test-key").Result()
+-	if err != nil {
+-		t.Fatalf("Failed to get value: %v", err)
+-	}
+-	if val != "new-value" {
+-		t.Errorf("Value should not have changed: got %q, want %q", val, "new-value")
+-	}
+-
+-	client.Del(ctx, "cad-test-key")
+-}
+-
+-// TestDelExArgsWithDigest validates DelExArgs works with digest matching
+-func TestDelExArgsWithDigest(t *testing.T) {
+-	skipIfRedisBelow84(t)
+-
+-	ctx := context.Background()
+-	client := redis.NewClient(&redis.Options{
+-		Addr: "localhost:6379",
+-	})
+-	defer client.Close()
+-
+-	if err := client.Ping(ctx).Err(); err != nil {
+-		t.Skipf("Redis not available: %v", err)
+-	}
+-
+-	client.Del(ctx, "del-test-key")
+-
+-	// Set a value
+-	value := "delete-me"
+-	err := client.Set(ctx, "del-test-key", value, 0).Err()
+-	if err != nil {
+-		t.Fatalf("Failed to set value: %v", err)
+-	}
+-
+-	// Get correct digest
+-	correctDigest := client.Digest(ctx, "del-test-key").Val()
+-	wrongDigest := uint64(54321)
+-
+-	// Test 1: Delete with wrong digest should fail
+-	deleted := client.DelExArgs(ctx, "del-test-key", redis.DelExArgs{
+-		Mode:        "IFDEQ",
+-		MatchDigest: wrongDigest,
+-	}).Val()
+-
+-	if deleted != 0 {
+-		t.Errorf("Delete with wrong digest should not delete: got %d deletions", deleted)
+-	} else {
+-		t.Logf("✓ DelExArgs with wrong digest correctly refused to delete")
+-	}
+-
+-	// Verify key still exists
+-	exists := client.Exists(ctx, "del-test-key").Val()
+-	if exists != 1 {
+-		t.Errorf("Key should still exist after failed delete")
+-	}
+-
+-	// Test 2: Delete with correct digest should succeed
+-	deleted = client.DelExArgs(ctx, "del-test-key", redis.DelExArgs{
+-		Mode:        "IFDEQ",
+-		MatchDigest: correctDigest,
+-	}).Val()
+-
+-	if deleted != 1 {
+-		t.Errorf("Delete with correct digest should delete: got %d deletions", deleted)
+-	} else {
+-		t.Logf("✓ DelExArgs with correct digest successfully deleted")
+-	}
+-
+-	// Verify key was deleted
+-	exists = client.Exists(ctx, "del-test-key").Val()
+-	if exists != 0 {
+-		t.Errorf("Key should not exist after successful delete")
+-	}
+-}
+-
+diff --git a/example/digest-optimistic-locking/README.md b/example/digest-optimistic-locking/README.md
+deleted file mode 100644
+index 37fa1e8e..00000000
+--- a/example/digest-optimistic-locking/README.md
++++ /dev/null
+@@ -1,200 +0,0 @@
+-# Redis Digest & Optimistic Locking Example
+-
+-This example demonstrates how to use Redis DIGEST command and digest-based optimistic locking with go-redis.
+-
+-## What is Redis DIGEST?
+-
+-The DIGEST command (Redis 8.4+) returns a 64-bit xxh3 hash of a key's value. This hash can be used for:
+-
+-- **Optimistic locking**: Update values only if they haven't changed
+-- **Change detection**: Detect if a value was modified
+-- **Conditional operations**: Delete or update based on expected content
+-
+-## Features Demonstrated
+-
+-1. **Basic Digest Usage**: Get digest from Redis and verify with client-side calculation
+-2. **Optimistic Locking with SetIFDEQ**: Update only if digest matches (value unchanged)
+-3. **Change Detection with SetIFDNE**: Update only if digest differs (value changed)
+-4. **Conditional Delete**: Delete only if digest matches expected value
+-5. **Client-Side Digest Generation**: Calculate digests without fetching from Redis
+-
+-## Requirements
+-
+-- Redis 8.4+ (for DIGEST command support)
+-- Go 1.18+
+-
+-## Installation
+-
+-```bash
+-cd example/digest-optimistic-locking
+-go mod tidy
+-```
+-
+-## Running the Example
+-
+-```bash
+-# Make sure Redis 8.4+ is running on localhost:6379
+-redis-server
+-
+-# In another terminal, run the example
+-go run .
+-```
+-
+-## Expected Output
+-
+-```
+-=== Redis Digest & Optimistic Locking Example ===
+-
+-1. Basic Digest Usage
+----------------------
+-Key: user:1000:name
+-Value: Alice
+-Digest: 7234567890123456789 (0x6478a1b2c3d4e5f6)
+-Client-calculated digest: 7234567890123456789 (0x6478a1b2c3d4e5f6)
+-✓ Digests match!
+-
+-2. Optimistic Locking with SetIFDEQ
+-------------------------------------
+-Initial value: 100
+-Current digest: 0x1234567890abcdef
+-✓ Update successful! New value: 150
+-✓ Correctly rejected update with wrong digest
+-
+-3. Detecting Changes with SetIFDNE
+------------------------------------
+-Initial value: v1.0.0
+-Old digest: 0xabcdef1234567890
+-✓ Value changed! Updated to: v2.0.0
+-✓ Correctly rejected: current value matches the digest
+-
+-4. Conditional Delete with DelExArgs
+--------------------------------------
+-Created session: session:abc123
+-Expected digest: 0x9876543210fedcba
+-✓ Correctly refused to delete (wrong digest)
+-✓ Successfully deleted with correct digest
+-✓ Session deleted
+-
+-5. Client-Side Digest Generation
+----------------------------------
+-Current price: $29.99
+-Expected digest (calculated client-side): 0xfedcba0987654321
+-✓ Price updated successfully to $24.99
+-
+-Binary data example:
+-Binary data digest: 0x1122334455667788
+-✓ Binary digest matches!
+-
+-=== All examples completed successfully! ===
+-```
+-
+-## How It Works
+-
+-### Digest Calculation
+-
+-Redis uses the **xxh3** hashing algorithm. To calculate digests client-side, use `github.com/zeebo/xxh3`:
+-
+-```go
+-import "github.com/zeebo/xxh3"
+-
+-// For strings
+-digest := xxh3.HashString("myvalue")
+-
+-// For binary data
+-digest := xxh3.Hash([]byte{0x01, 0x02, 0x03})
+-```
+-
+-### Optimistic Locking Pattern
+-
+-```go
+-// 1. Read current value and get its digest
+-currentValue := rdb.Get(ctx, "key").Val()
+-currentDigest := rdb.Digest(ctx, "key").Val()
+-
+-// 2. Perform business logic
+-newValue := processValue(currentValue)
+-
+-// 3. Update only if value hasn't changed
+-result := rdb.SetIFDEQ(ctx, "key", newValue, currentDigest, 0)
+-if result.Err() == redis.Nil {
+-    // Value was modified by another client - retry or handle conflict
+-}
+-```
+-
+-### Client-Side Digest (No Extra Round Trip)
+-
+-```go
+-// If you know the expected current value, calculate digest client-side
+-expectedValue := "100"
+-expectedDigest := xxh3.HashString(expectedValue)
+-
+-// Update without fetching digest from Redis first
+-result := rdb.SetIFDEQ(ctx, "counter", "150", expectedDigest, 0)
+-```
+-
+-## Use Cases
+-
+-### 1. Distributed Counter with Conflict Detection
+-
+-```go
+-// Multiple clients can safely update a counter
+-currentValue := rdb.Get(ctx, "counter").Val()
+-currentDigest := rdb.Digest(ctx, "counter").Val()
+-
+-newValue := incrementCounter(currentValue)
+-
+-// Only succeeds if no other client modified it
+-if rdb.SetIFDEQ(ctx, "counter", newValue, currentDigest, 0).Err() == redis.Nil {
+-    // Retry with new value
+-}
+-```
+-
+-### 2. Session Management
+-
+-```go
+-// Delete session only if it contains expected data
+-sessionData := "user:1234:active"
+-expectedDigest := xxh3.HashString(sessionData)
+-
+-deleted := rdb.DelExArgs(ctx, "session:xyz", redis.DelExArgs{
+-    Mode:        "IFDEQ",
+-    MatchDigest: expectedDigest,
+-}).Val()
+-```
+-
+-### 3. Configuration Updates
+-
+-```go
+-// Update config only if it changed
+-oldConfig := loadOldConfig()
+-oldDigest := xxh3.HashString(oldConfig)
+-
+-newConfig := loadNewConfig()
+-
+-// Only update if config actually changed
+-result := rdb.SetIFDNE(ctx, "config", newConfig, oldDigest, 0)
+-if result.Err() != redis.Nil {
+-    fmt.Println("Config updated!")
+-}
+-```
+-
+-## Advantages Over WATCH/MULTI/EXEC
+-
+-- **Simpler**: Single command instead of transaction
+-- **Faster**: No transaction overhead
+-- **Client-side digest**: Can calculate expected digest without fetching from Redis
+-- **Works with any command**: Not limited to transactions
+-
+-## Learn More
+-
+-- [Redis DIGEST command](https://redis.io/commands/digest/)
+-- [Redis SET command with IFDEQ/IFDNE](https://redis.io/commands/set/)
+-- [xxh3 hashing algorithm](https://github.com/Cyan4973/xxHash)
+-- [github.com/zeebo/xxh3](https://github.com/zeebo/xxh3)
+-
+-## Comparison: XXH3 vs XXH64
+-
+-**Note**: Redis uses **XXH3**, not XXH64. If you have `github.com/cespare/xxhash/v2` in your project, it implements XXH64 which produces **different hash values**. You must use `github.com/zeebo/xxh3` for Redis DIGEST operations.
+-
+-See [XXHASH_LIBRARY_COMPARISON.md](../../XXHASH_LIBRARY_COMPARISON.md) for detailed comparison.
+-
+diff --git a/example/digest-optimistic-locking/go.mod b/example/digest-optimistic-locking/go.mod
+deleted file mode 100644
+index d27d9202..00000000
+--- a/example/digest-optimistic-locking/go.mod
++++ /dev/null
+@@ -1,16 +0,0 @@
+-module github.com/redis/go-redis/example/digest-optimistic-locking
+-
+-go 1.18
+-
+-replace github.com/redis/go-redis/v9 => ../..
+-
+-require (
+-	github.com/redis/go-redis/v9 v9.16.0
+-	github.com/zeebo/xxh3 v1.0.2
+-)
+-
+-require (
+-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+-	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
+-	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
+-)
+diff --git a/example/digest-optimistic-locking/go.sum b/example/digest-optimistic-locking/go.sum
+deleted file mode 100644
+index 1efe9a30..00000000
+--- a/example/digest-optimistic-locking/go.sum
++++ /dev/null
+@@ -1,11 +0,0 @@
+-github.com/bsm/ginkgo/v2 v2.12.0 h1:Ny8MWAHyOepLGlLKYmXG4IEkioBysk6GpaRTLC8zwWs=
+-github.com/bsm/gomega v1.27.10 h1:yeMWxP2pV2fG3FgAODIY8EiRE3dy0aeFYt4l7wh6yKA=
+-github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
+-github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
+-github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/rVNCu3HqELle0jiPLLBs70cWOduZpkS1E78=
+-github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
+-github.com/klauspost/cpuid/v2 v2.0.9 h1:lgaqFMSdTdQYdZ04uHyN2d/eKdOMyi2YLSvlQIBFYa4=
+-github.com/klauspost/cpuid/v2 v2.0.9/go.mod h1:FInQzS24/EEf25PyTYn52gqo7WaD8xa0213Md/qVLRg=
+-github.com/zeebo/assert v1.3.0 h1:g7C04CbJuIDKNPFHmsk4hwZDO5O+kntRxzaUoNXj+IQ=
+-github.com/zeebo/xxh3 v1.0.2 h1:xZmwmqxHZA8AI603jOQ0tMqmBr9lPeFwGg6d+xy9DC0=
+-github.com/zeebo/xxh3 v1.0.2/go.mod h1:5NWz9Sef7zIDm2JHfFlcQvNekmcEl9ekUZQQKCYaDcA=
+diff --git a/example/digest-optimistic-locking/main.go b/example/digest-optimistic-locking/main.go
+deleted file mode 100644
+index 2b380fc1..00000000
+--- a/example/digest-optimistic-locking/main.go
++++ /dev/null
+@@ -1,245 +0,0 @@
+-package main
+-
+-import (
+-	"context"
+-	"fmt"
+-	"time"
+-
+-	"github.com/redis/go-redis/v9"
+-	"github.com/zeebo/xxh3"
+-)
+-
+-func main() {
+-	ctx := context.Background()
+-
+-	// Connect to Redis
+-	rdb := redis.NewClient(&redis.Options{
+-		Addr: "localhost:6379",
+-	})
+-	defer rdb.Close()
+-
+-	// Ping to verify connection
+-	if err := rdb.Ping(ctx).Err(); err != nil {
+-		fmt.Printf("Failed to connect to Redis: %v\n", err)
+-		return
+-	}
+-
+-	fmt.Println("=== Redis Digest & Optimistic Locking Example ===")
+-	fmt.Println()
+-
+-	// Example 1: Basic Digest Usage
+-	fmt.Println("1. Basic Digest Usage")
+-	fmt.Println("---------------------")
+-	basicDigestExample(ctx, rdb)
+-	fmt.Println()
+-
+-	// Example 2: Optimistic Locking with SetIFDEQ
+-	fmt.Println("2. Optimistic Locking with SetIFDEQ")
+-	fmt.Println("------------------------------------")
+-	optimisticLockingExample(ctx, rdb)
+-	fmt.Println()
+-
+-	// Example 3: Detecting Changes with SetIFDNE
+-	fmt.Println("3. Detecting Changes with SetIFDNE")
+-	fmt.Println("-----------------------------------")
+-	detectChangesExample(ctx, rdb)
+-	fmt.Println()
+-
+-	// Example 4: Conditional Delete with DelExArgs
+-	fmt.Println("4. Conditional Delete with DelExArgs")
+-	fmt.Println("-------------------------------------")
+-	conditionalDeleteExample(ctx, rdb)
+-	fmt.Println()
+-
+-	// Example 5: Client-Side Digest Generation
+-	fmt.Println("5. Client-Side Digest Generation")
+-	fmt.Println("---------------------------------")
+-	clientSideDigestExample(ctx, rdb)
+-	fmt.Println()
+-
+-	fmt.Println("=== All examples completed successfully! ===")
+-}
+-
+-// basicDigestExample demonstrates getting a digest from Redis
+-func basicDigestExample(ctx context.Context, rdb *redis.Client) {
+-	// Set a value
+-	key := "user:1000:name"
+-	value := "Alice"
+-	rdb.Set(ctx, key, value, 0)
+-
+-	// Get the digest
+-	digest := rdb.Digest(ctx, key).Val()
+-
+-	fmt.Printf("Key: %s\n", key)
+-	fmt.Printf("Value: %s\n", value)
+-	fmt.Printf("Digest: %d (0x%016x)\n", digest, digest)
+-
+-	// Verify with client-side calculation
+-	clientDigest := xxh3.HashString(value)
+-	fmt.Printf("Client-calculated digest: %d (0x%016x)\n", clientDigest, clientDigest)
+-
+-	if digest == clientDigest {
+-		fmt.Println("✓ Digests match!")
+-	}
+-}
+-
+-// optimisticLockingExample demonstrates using SetIFDEQ for optimistic locking
+-func optimisticLockingExample(ctx context.Context, rdb *redis.Client) {
+-	key := "counter"
+-
+-	// Initial value
+-	rdb.Set(ctx, key, "100", 0)
+-	fmt.Printf("Initial value: %s\n", rdb.Get(ctx, key).Val())
+-
+-	// Get current digest
+-	currentDigest := rdb.Digest(ctx, key).Val()
+-	fmt.Printf("Current digest: 0x%016x\n", currentDigest)
+-
+-	// Simulate some processing time
+-	time.Sleep(100 * time.Millisecond)
+-
+-	// Try to update only if value hasn't changed (digest matches)
+-	newValue := "150"
+-	result := rdb.SetIFDEQ(ctx, key, newValue, currentDigest, 0)
+-
+-	if result.Err() == redis.Nil {
+-		fmt.Println("✗ Update failed: value was modified by another client")
+-	} else if result.Err() != nil {
+-		fmt.Printf("✗ Error: %v\n", result.Err())
+-	} else {
+-		fmt.Printf("✓ Update successful! New value: %s\n", rdb.Get(ctx, key).Val())
+-	}
+-
+-	// Try again with wrong digest (simulating concurrent modification)
+-	wrongDigest := uint64(12345)
+-	result = rdb.SetIFDEQ(ctx, key, "200", wrongDigest, 0)
+-
+-	if result.Err() == redis.Nil {
+-		fmt.Println("✓ Correctly rejected update with wrong digest")
+-	}
+-}
+-
+-// detectChangesExample demonstrates using SetIFDNE to detect if a value changed
+-func detectChangesExample(ctx context.Context, rdb *redis.Client) {
+-	key := "config:version"
+-
+-	// Set initial value
+-	oldValue := "v1.0.0"
+-	rdb.Set(ctx, key, oldValue, 0)
+-	fmt.Printf("Initial value: %s\n", oldValue)
+-
+-	// Calculate digest of a DIFFERENT value (what we expect it NOT to be)
+-	unwantedValue := "v0.9.0"
+-	unwantedDigest := xxh3.HashString(unwantedValue)
+-	fmt.Printf("Unwanted value digest: 0x%016x\n", unwantedDigest)
+-
+-	// Update to new value only if current value is NOT the unwanted value
+-	// (i.e., only if digest does NOT match unwantedDigest)
+-	newValue := "v2.0.0"
+-	result := rdb.SetIFDNE(ctx, key, newValue, unwantedDigest, 0)
+-
+-	if result.Err() == redis.Nil {
+-		fmt.Println("✗ Current value matches unwanted value (digest matches)")
+-	} else if result.Err() != nil {
+-		fmt.Printf("✗ Error: %v\n", result.Err())
+-	} else {
+-		fmt.Printf("✓ Current value is different from unwanted value! Updated to: %s\n", rdb.Get(ctx, key).Val())
+-	}
+-
+-	// Try to update again, but this time the digest matches current value (should fail)
+-	currentDigest := rdb.Digest(ctx, key).Val()
+-	result = rdb.SetIFDNE(ctx, key, "v3.0.0", currentDigest, 0)
+-
+-	if result.Err() == redis.Nil {
+-		fmt.Println("✓ Correctly rejected: current value matches the digest (IFDNE failed)")
+-	}
+-}
+-
+-// conditionalDeleteExample demonstrates using DelExArgs with digest
+-func conditionalDeleteExample(ctx context.Context, rdb *redis.Client) {
+-	key := "session:abc123"
+-	value := "user_data_here"
+-
+-	// Set a value
+-	rdb.Set(ctx, key, value, 0)
+-	fmt.Printf("Created session: %s\n", key)
+-
+-	// Calculate expected digest
+-	expectedDigest := xxh3.HashString(value)
+-	fmt.Printf("Expected digest: 0x%016x\n", expectedDigest)
+-
+-	// Try to delete with wrong digest (should fail)
+-	wrongDigest := uint64(99999)
+-	deleted := rdb.DelExArgs(ctx, key, redis.DelExArgs{
+-		Mode:        "IFDEQ",
+-		MatchDigest: wrongDigest,
+-	}).Val()
+-
+-	if deleted == 0 {
+-		fmt.Println("✓ Correctly refused to delete (wrong digest)")
+-	}
+-
+-	// Delete with correct digest (should succeed)
+-	deleted = rdb.DelExArgs(ctx, key, redis.DelExArgs{
+-		Mode:        "IFDEQ",
+-		MatchDigest: expectedDigest,
+-	}).Val()
+-
+-	if deleted == 1 {
+-		fmt.Println("✓ Successfully deleted with correct digest")
+-	}
+-
+-	// Verify deletion
+-	exists := rdb.Exists(ctx, key).Val()
+-	if exists == 0 {
+-		fmt.Println("✓ Session deleted")
+-	}
+-}
+-
+-// clientSideDigestExample demonstrates calculating digests without fetching from Redis
+-func clientSideDigestExample(ctx context.Context, rdb *redis.Client) {
+-	key := "product:1001:price"
+-
+-	// Scenario: We know the expected current value
+-	expectedCurrentValue := "29.99"
+-	newValue := "24.99"
+-
+-	// Set initial value
+-	rdb.Set(ctx, key, expectedCurrentValue, 0)
+-	fmt.Printf("Current price: $%s\n", expectedCurrentValue)
+-
+-	// Calculate digest client-side (no need to fetch from Redis!)
+-	expectedDigest := xxh3.HashString(expectedCurrentValue)
+-	fmt.Printf("Expected digest (calculated client-side): 0x%016x\n", expectedDigest)
+-
+-	// Update price only if it matches our expectation
+-	result := rdb.SetIFDEQ(ctx, key, newValue, expectedDigest, 0)
+-
+-	if result.Err() == redis.Nil {
+-		fmt.Println("✗ Price was already changed by someone else")
+-		actualValue := rdb.Get(ctx, key).Val()
+-		fmt.Printf("  Actual current price: $%s\n", actualValue)
+-	} else if result.Err() != nil {
+-		fmt.Printf("✗ Error: %v\n", result.Err())
+-	} else {
+-		fmt.Printf("✓ Price updated successfully to $%s\n", newValue)
+-	}
+-
+-	// Demonstrate with binary data
+-	fmt.Println("\nBinary data example:")
+-	binaryKey := "image:thumbnail"
+-	binaryData := []byte{0xFF, 0xD8, 0xFF, 0xE0} // JPEG header
+-
+-	rdb.Set(ctx, binaryKey, binaryData, 0)
+-
+-	// Calculate digest for binary data
+-	binaryDigest := xxh3.Hash(binaryData)
+-	fmt.Printf("Binary data digest: 0x%016x\n", binaryDigest)
+-
+-	// Verify it matches Redis
+-	redisDigest := rdb.Digest(ctx, binaryKey).Val()
+-	if binaryDigest == redisDigest {
+-		fmt.Println("✓ Binary digest matches!")
+-	}
+-}
+-
+diff --git a/string_commands.go b/string_commands.go
+index 1b37381e..cc49800d 100644
+--- a/string_commands.go
++++ b/string_commands.go
+@@ -2,7 +2,6 @@ package redis
+ 
+ import (
+ 	"context"
+-	"fmt"
+ 	"time"
+ )
+ 
+@@ -10,8 +9,6 @@ type StringCmdable interface {
+ 	Append(ctx context.Context, key, value string) *IntCmd
+ 	Decr(ctx context.Context, key string) *IntCmd
+ 	DecrBy(ctx context.Context, key string, decrement int64) *IntCmd
+-	DelExArgs(ctx context.Context, key string, a DelExArgs) *IntCmd
+-	Digest(ctx context.Context, key string) *DigestCmd
+ 	Get(ctx context.Context, key string) *StringCmd
+ 	GetRange(ctx context.Context, key string, start, end int64) *StringCmd
+ 	GetSet(ctx context.Context, key string, value interface{}) *StringCmd
+@@ -28,14 +25,6 @@ type StringCmdable interface {
+ 	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) *StatusCmd
+ 	SetArgs(ctx context.Context, key string, value interface{}, a SetArgs) *StatusCmd
+ 	SetEx(ctx context.Context, key string, value interface{}, expiration time.Duration) *StatusCmd
+-	SetIFEQ(ctx context.Context, key string, value interface{}, matchValue interface{}, expiration time.Duration) *StatusCmd
+-	SetIFEQGet(ctx context.Context, key string, value interface{}, matchValue interface{}, expiration time.Duration) *StringCmd
+-	SetIFNE(ctx context.Context, key string, value interface{}, matchValue interface{}, expiration time.Duration) *StatusCmd
+-	SetIFNEGet(ctx context.Context, key string, value interface{}, matchValue interface{}, expiration time.Duration) *StringCmd
+-	SetIFDEQ(ctx context.Context, key string, value interface{}, matchDigest uint64, expiration time.Duration) *StatusCmd
+-	SetIFDEQGet(ctx context.Context, key string, value interface{}, matchDigest uint64, expiration time.Duration) *StringCmd
+-	SetIFDNE(ctx context.Context, key string, value interface{}, matchDigest uint64, expiration time.Duration) *StatusCmd
+-	SetIFDNEGet(ctx context.Context, key string, value interface{}, matchDigest uint64, expiration time.Duration) *StringCmd
+ 	SetNX(ctx context.Context, key string, value interface{}, expiration time.Duration) *BoolCmd
+ 	SetXX(ctx context.Context, key string, value interface{}, expiration time.Duration) *BoolCmd
+ 	SetRange(ctx context.Context, key string, offset int64, value string) *IntCmd
+@@ -60,70 +49,6 @@ func (c cmdable) DecrBy(ctx context.Context, key string, decrement int64) *IntCm
+ 	return cmd
+ }
+ 
+-// DelExArgs provides arguments for the DelExArgs function.
+-type DelExArgs struct {
+-	// Mode can be `IFEQ`, `IFNE`, `IFDEQ`, or `IFDNE`.
+-	Mode string
+-
+-	// MatchValue is used with IFEQ/IFNE modes for compare-and-delete operations.
+-	// - IFEQ: only delete if current value equals MatchValue
+-	// - IFNE: only delete if current value does not equal MatchValue
+-	MatchValue interface{}
+-
+-	// MatchDigest is used with IFDEQ/IFDNE modes for digest-based compare-and-delete.
+-	// - IFDEQ: only delete if current value's digest equals MatchDigest
+-	// - IFDNE: only delete if current value's digest does not equal MatchDigest
+-	//
+-	// The digest is a uint64 xxh3 hash value.
+-	//
+-	// For examples of client-side digest generation, see:
+-	// example/digest-optimistic-locking/
+-	MatchDigest uint64
+-}
+-
+-// DelExArgs Redis `DELEX key [IFEQ|IFNE|IFDEQ|IFDNE] match-value` command.
+-// Compare-and-delete with flexible conditions.
+-//
+-// Returns the number of keys that were removed (0 or 1).
+-func (c cmdable) DelExArgs(ctx context.Context, key string, a DelExArgs) *IntCmd {
+-	args := []interface{}{"delex", key}
+-
+-	if a.Mode != "" {
+-		args = append(args, a.Mode)
+-
+-		// Add match value/digest based on mode
+-		switch a.Mode {
+-		case "ifeq", "IFEQ", "ifne", "IFNE":
+-			if a.MatchValue != nil {
+-				args = append(args, a.MatchValue)
+-			}
+-		case "ifdeq", "IFDEQ", "ifdne", "IFDNE":
+-			if a.MatchDigest != 0 {
+-				args = append(args, fmt.Sprintf("%016x", a.MatchDigest))
+-			}
+-		}
+-	}
+-
+-	cmd := NewIntCmd(ctx, args...)
+-	_ = c(ctx, cmd)
+-	return cmd
+-}
+-
+-// Digest returns the xxh3 hash (uint64) of the specified key's value.
+-//
+-// The digest is a 64-bit xxh3 hash that can be used for optimistic locking
+-// with SetIFDEQ, SetIFDNE, and DelExArgs commands.
+-//
+-// For examples of client-side digest generation and usage patterns, see:
+-// example/digest-optimistic-locking/
+-//
+-// Redis 8.4+. See https://redis.io/commands/digest/
+-func (c cmdable) Digest(ctx context.Context, key string) *DigestCmd {
+-	cmd := NewDigestCmd(ctx, "digest", key)
+-	_ = c(ctx, cmd)
+-	return cmd
+-}
+-
+ // Get Redis `GET key` command. It returns redis.Nil error when key does not exist.
+ func (c cmdable) Get(ctx context.Context, key string) *StringCmd {
+ 	cmd := NewStringCmd(ctx, "get", key)
+@@ -333,24 +258,9 @@ func (c cmdable) Set(ctx context.Context, key string, value interface{}, expirat
+ 
+ // SetArgs provides arguments for the SetArgs function.
+ type SetArgs struct {
+-	// Mode can be `NX`, `XX`, `IFEQ`, `IFNE`, `IFDEQ`, `IFDNE` or empty.
++	// Mode can be `NX` or `XX` or empty.
+ 	Mode string
+ 
+-	// MatchValue is used with IFEQ/IFNE modes for compare-and-set operations.
+-	// - IFEQ: only set if current value equals MatchValue
+-	// - IFNE: only set if current value does not equal MatchValue
+-	MatchValue interface{}
+-
+-	// MatchDigest is used with IFDEQ/IFDNE modes for digest-based compare-and-set.
+-	// - IFDEQ: only set if current value's digest equals MatchDigest
+-	// - IFDNE: only set if current value's digest does not equal MatchDigest
+-	//
+-	// The digest is a uint64 xxh3 hash value.
+-	//
+-	// For examples of client-side digest generation, see:
+-	// example/digest-optimistic-locking/
+-	MatchDigest uint64
+-
+ 	// Zero `TTL` or `Expiration` means that the key has no expiration time.
+ 	TTL      time.Duration
+ 	ExpireAt time.Time
+@@ -386,18 +296,6 @@ func (c cmdable) SetArgs(ctx context.Context, key string, value interface{}, a S
+ 
+ 	if a.Mode != "" {
+ 		args = append(args, a.Mode)
+-
+-		// Add match value/digest for CAS modes
+-		switch a.Mode {
+-		case "ifeq", "IFEQ", "ifne", "IFNE":
+-			if a.MatchValue != nil {
+-				args = append(args, a.MatchValue)
+-			}
+-		case "ifdeq", "IFDEQ", "ifdne", "IFDNE":
+-			if a.MatchDigest != 0 {
+-				args = append(args, fmt.Sprintf("%016x", a.MatchDigest))
+-			}
+-		}
+ 	}
+ 
+ 	if a.Get {
+@@ -465,246 +363,6 @@ func (c cmdable) SetXX(ctx context.Context, key string, value interface{}, expir
+ 	return cmd
+ }
+ 
+-// SetIFEQ Redis `SET key value [expiration] IFEQ match-value` command.
+-// Compare-and-set: only sets the value if the current value equals matchValue.
+-//
+-// Returns "OK" on success.
+-// Returns nil if the operation was aborted due to condition not matching.
+-// Zero expiration means the key has no expiration time.
+-func (c cmdable) SetIFEQ(ctx context.Context, key string, value interface{}, matchValue interface{}, expiration time.Duration) *StatusCmd {
+-	args := []interface{}{"set", key, value}
+-
+-	if expiration > 0 {
+-		if usePrecise(expiration) {
+-			args = append(args, "px", formatMs(ctx, expiration))
+-		} else {
+-			args = append(args, "ex", formatSec(ctx, expiration))
+-		}
+-	} else if expiration == KeepTTL {
+-		args = append(args, "keepttl")
+-	}
+-
+-	args = append(args, "ifeq", matchValue)
+-
+-	cmd := NewStatusCmd(ctx, args...)
+-	_ = c(ctx, cmd)
+-	return cmd
+-}
+-
+-// SetIFEQGet Redis `SET key value [expiration] IFEQ match-value GET` command.
+-// Compare-and-set with GET: only sets the value if the current value equals matchValue,
+-// and returns the previous value.
+-//
+-// Returns the previous value on success.
+-// Returns nil if the operation was aborted due to condition not matching.
+-// Zero expiration means the key has no expiration time.
+-func (c cmdable) SetIFEQGet(ctx context.Context, key string, value interface{}, matchValue interface{}, expiration time.Duration) *StringCmd {
+-	args := []interface{}{"set", key, value}
+-
+-	if expiration > 0 {
+-		if usePrecise(expiration) {
+-			args = append(args, "px", formatMs(ctx, expiration))
+-		} else {
+-			args = append(args, "ex", formatSec(ctx, expiration))
+-		}
+-	} else if expiration == KeepTTL {
+-		args = append(args, "keepttl")
+-	}
+-
+-	args = append(args, "ifeq", matchValue, "get")
+-
+-	cmd := NewStringCmd(ctx, args...)
+-	_ = c(ctx, cmd)
+-	return cmd
+-}
+-
+-// SetIFNE Redis `SET key value [expiration] IFNE match-value` command.
+-// Compare-and-set: only sets the value if the current value does not equal matchValue.
+-//
+-// Returns "OK" on success.
+-// Returns nil if the operation was aborted due to condition not matching.
+-// Zero expiration means the key has no expiration time.
+-func (c cmdable) SetIFNE(ctx context.Context, key string, value interface{}, matchValue interface{}, expiration time.Duration) *StatusCmd {
+-	args := []interface{}{"set", key, value}
+-
+-	if expiration > 0 {
+-		if usePrecise(expiration) {
+-			args = append(args, "px", formatMs(ctx, expiration))
+-		} else {
+-			args = append(args, "ex", formatSec(ctx, expiration))
+-		}
+-	} else if expiration == KeepTTL {
+-		args = append(args, "keepttl")
+-	}
+-
+-	args = append(args, "ifne", matchValue)
+-
+-	cmd := NewStatusCmd(ctx, args...)
+-	_ = c(ctx, cmd)
+-	return cmd
+-}
+-
+-// SetIFNEGet Redis `SET key value [expiration] IFNE match-value GET` command.
+-// Compare-and-set with GET: only sets the value if the current value does not equal matchValue,
+-// and returns the previous value.
+-//
+-// Returns the previous value on success.
+-// Returns nil if the operation was aborted due to condition not matching.
+-// Zero expiration means the key has no expiration time.
+-func (c cmdable) SetIFNEGet(ctx context.Context, key string, value interface{}, matchValue interface{}, expiration time.Duration) *StringCmd {
+-	args := []interface{}{"set", key, value}
+-
+-	if expiration > 0 {
+-		if usePrecise(expiration) {
+-			args = append(args, "px", formatMs(ctx, expiration))
+-		} else {
+-			args = append(args, "ex", formatSec(ctx, expiration))
+-		}
+-	} else if expiration == KeepTTL {
+-		args = append(args, "keepttl")
+-	}
+-
+-	args = append(args, "ifne", matchValue, "get")
+-
+-	cmd := NewStringCmd(ctx, args...)
+-	_ = c(ctx, cmd)
+-	return cmd
+-}
+-
+-// SetIFDEQ sets the value only if the current value's digest equals matchDigest.
+-//
+-// This is a compare-and-set operation using xxh3 digest for optimistic locking.
+-// The matchDigest parameter is a uint64 xxh3 hash value.
+-//
+-// Returns "OK" on success.
+-// Returns redis.Nil if the digest doesn't match (value was modified).
+-// Zero expiration means the key has no expiration time.
+-//
+-// For examples of client-side digest generation and usage patterns, see:
+-// example/digest-optimistic-locking/
+-//
+-// Redis 8.4+. See https://redis.io/commands/set/
+-func (c cmdable) SetIFDEQ(ctx context.Context, key string, value interface{}, matchDigest uint64, expiration time.Duration) *StatusCmd {
+-	args := []interface{}{"set", key, value}
+-
+-	if expiration > 0 {
+-		if usePrecise(expiration) {
+-			args = append(args, "px", formatMs(ctx, expiration))
+-		} else {
+-			args = append(args, "ex", formatSec(ctx, expiration))
+-		}
+-	} else if expiration == KeepTTL {
+-		args = append(args, "keepttl")
+-	}
+-
+-	args = append(args, "ifdeq", fmt.Sprintf("%016x", matchDigest))
+-
+-	cmd := NewStatusCmd(ctx, args...)
+-	_ = c(ctx, cmd)
+-	return cmd
+-}
+-
+-// SetIFDEQGet sets the value only if the current value's digest equals matchDigest,
+-// and returns the previous value.
+-//
+-// This is a compare-and-set operation using xxh3 digest for optimistic locking.
+-// The matchDigest parameter is a uint64 xxh3 hash value.
+-//
+-// Returns the previous value on success.
+-// Returns redis.Nil if the digest doesn't match (value was modified).
+-// Zero expiration means the key has no expiration time.
+-//
+-// For examples of client-side digest generation and usage patterns, see:
+-// example/digest-optimistic-locking/
+-//
+-// Redis 8.4+. See https://redis.io/commands/set/
+-func (c cmdable) SetIFDEQGet(ctx context.Context, key string, value interface{}, matchDigest uint64, expiration time.Duration) *StringCmd {
+-	args := []interface{}{"set", key, value}
+-
+-	if expiration > 0 {
+-		if usePrecise(expiration) {
+-			args = append(args, "px", formatMs(ctx, expiration))
+-		} else {
+-			args = append(args, "ex", formatSec(ctx, expiration))
+-		}
+-	} else if expiration == KeepTTL {
+-		args = append(args, "keepttl")
+-	}
+-
+-	args = append(args, "ifdeq", fmt.Sprintf("%016x", matchDigest), "get")
+-
+-	cmd := NewStringCmd(ctx, args...)
+-	_ = c(ctx, cmd)
+-	return cmd
+-}
+-
+-// SetIFDNE sets the value only if the current value's digest does NOT equal matchDigest.
+-//
+-// This is a compare-and-set operation using xxh3 digest for optimistic locking.
+-// The matchDigest parameter is a uint64 xxh3 hash value.
+-//
+-// Returns "OK" on success (digest didn't match, value was set).
+-// Returns redis.Nil if the digest matches (value was not modified).
+-// Zero expiration means the key has no expiration time.
+-//
+-// For examples of client-side digest generation and usage patterns, see:
+-// example/digest-optimistic-locking/
+-//
+-// Redis 8.4+. See https://redis.io/commands/set/
+-func (c cmdable) SetIFDNE(ctx context.Context, key string, value interface{}, matchDigest uint64, expiration time.Duration) *StatusCmd {
+-	args := []interface{}{"set", key, value}
+-
+-	if expiration > 0 {
+-		if usePrecise(expiration) {
+-			args = append(args, "px", formatMs(ctx, expiration))
+-		} else {
+-			args = append(args, "ex", formatSec(ctx, expiration))
+-		}
+-	} else if expiration == KeepTTL {
+-		args = append(args, "keepttl")
+-	}
+-
+-	args = append(args, "ifdne", fmt.Sprintf("%016x", matchDigest))
+-
+-	cmd := NewStatusCmd(ctx, args...)
+-	_ = c(ctx, cmd)
+-	return cmd
+-}
+-
+-// SetIFDNEGet sets the value only if the current value's digest does NOT equal matchDigest,
+-// and returns the previous value.
+-//
+-// This is a compare-and-set operation using xxh3 digest for optimistic locking.
+-// The matchDigest parameter is a uint64 xxh3 hash value.
+-//
+-// Returns the previous value on success (digest didn't match, value was set).
+-// Returns redis.Nil if the digest matches (value was not modified).
+-// Zero expiration means the key has no expiration time.
+-//
+-// For examples of client-side digest generation and usage patterns, see:
+-// example/digest-optimistic-locking/
+-//
+-// Redis 8.4+. See https://redis.io/commands/set/
+-func (c cmdable) SetIFDNEGet(ctx context.Context, key string, value interface{}, matchDigest uint64, expiration time.Duration) *StringCmd {
+-	args := []interface{}{"set", key, value}
+-
+-	if expiration > 0 {
+-		if usePrecise(expiration) {
+-			args = append(args, "px", formatMs(ctx, expiration))
+-		} else {
+-			args = append(args, "ex", formatSec(ctx, expiration))
+-		}
+-	} else if expiration == KeepTTL {
+-		args = append(args, "keepttl")
+-	}
+-
+-	args = append(args, "ifdne", fmt.Sprintf("%016x", matchDigest), "get")
+-
+-	cmd := NewStringCmd(ctx, args...)
+-	_ = c(ctx, cmd)
+-	return cmd
+-}
+-
+ func (c cmdable) SetRange(ctx context.Context, key string, offset int64, value string) *IntCmd {
+ 	cmd := NewIntCmd(ctx, "setrange", key, offset, value)
+ 	_ = c(ctx, cmd)

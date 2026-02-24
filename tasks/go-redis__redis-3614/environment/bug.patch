@@ -1,0 +1,885 @@
+diff --git a/commands_test.go b/commands_test.go
+index 21f89528..c5fa40e6 100644
+--- a/commands_test.go
++++ b/commands_test.go
+@@ -8922,37 +8922,27 @@ var _ = Describe("Commands", func() {
+ 			const key = "latency-monitor-threshold"
+ 
+ 			old := client.ConfigGet(ctx, key).Val()
+-			// Use a higher threshold (100ms) to avoid capturing normal operations
+-			// that could cause flakiness due to timing variations
+-			client.ConfigSet(ctx, key, "100")
++			client.ConfigSet(ctx, key, "1")
+ 			defer client.ConfigSet(ctx, key, old[key])
+ 
+ 			result, err := client.Latency(ctx).Result()
+ 			Expect(err).NotTo(HaveOccurred())
+ 			Expect(len(result)).Should(Equal(0))
+ 
+-			// Use a longer sleep (150ms) to ensure it exceeds the 100ms threshold
+-			err = client.Do(ctx, "DEBUG", "SLEEP", 0.15).Err()
++			err = client.Do(ctx, "DEBUG", "SLEEP", 0.01).Err()
+ 			Expect(err).NotTo(HaveOccurred())
+ 
+ 			result, err = client.Latency(ctx).Result()
+ 			Expect(err).NotTo(HaveOccurred())
+-			Expect(len(result)).Should(BeNumerically(">=", 1))
++			Expect(len(result)).Should(Equal(1))
+ 
+ 			// reset latency by event name
+-			eventName := result[0].Name
+-			err = client.LatencyReset(ctx, eventName).Err()
++			err = client.LatencyReset(ctx, result[0].Name).Err()
+ 			Expect(err).NotTo(HaveOccurred())
+ 
+-			// Verify the specific event was reset (not that all events are gone)
+-			// This avoids flakiness from other operations triggering latency events
+ 			result, err = client.Latency(ctx).Result()
+ 			Expect(err).NotTo(HaveOccurred())
+-			for _, event := range result {
+-				if event.Name == eventName {
+-					Fail("Event " + eventName + " should have been reset")
+-				}
+-			}
++			Expect(len(result)).Should(Equal(0))
+ 		})
+ 	})
+ })
+diff --git a/osscluster.go b/osscluster.go
+index 19b915c6..6994ae83 100644
+--- a/osscluster.go
++++ b/osscluster.go
+@@ -91,29 +91,13 @@ type ClusterOptions struct {
+ 	MinRetryBackoff time.Duration
+ 	MaxRetryBackoff time.Duration
+ 
+-	DialTimeout  time.Duration
+-	ReadTimeout  time.Duration
+-	WriteTimeout time.Duration
+-
+-	// DialerRetries is the maximum number of retry attempts when dialing fails.
+-	//
+-	// default: 5
+-	DialerRetries int
+-
+-	// DialerRetryTimeout is the backoff duration between retry attempts.
+-	//
+-	// default: 100 milliseconds
+-	DialerRetryTimeout time.Duration
+-
++	DialTimeout           time.Duration
++	ReadTimeout           time.Duration
++	WriteTimeout          time.Duration
+ 	ContextTimeoutEnabled bool
+ 
+-	PoolFIFO bool
+-	PoolSize int // applies per cluster node and not for the whole cluster
+-
+-	// MaxConcurrentDials is the maximum number of concurrent connection creation goroutines.
+-	// If <= 0, defaults to PoolSize. If > PoolSize, it will be capped at PoolSize.
+-	MaxConcurrentDials int
+-
++	PoolFIFO        bool
++	PoolSize        int // applies per cluster node and not for the whole cluster
+ 	PoolTimeout     time.Duration
+ 	MinIdleConns    int
+ 	MaxIdleConns    int
+@@ -173,8 +157,7 @@ type ClusterOptions struct {
+ 	// cluster upgrade notifications gracefully and manage connection/pool state
+ 	// transitions seamlessly. Requires Protocol: 3 (RESP3) for push notifications.
+ 	// If nil, maintnotifications upgrades are in "auto" mode and will be enabled if the server supports it.
+-	// The ClusterClient supports SMIGRATING and SMIGRATED notifications for cluster state management.
+-	// Individual node clients handle other maintenance notifications (MOVING, MIGRATING, etc.).
++	// The ClusterClient does not directly work with maintnotifications, it is up to the clients in the Nodes map to work with maintnotifications.
+ 	MaintNotificationsConfig *maintnotifications.Config
+ 	// ShardPicker is used to pick a shard when the request_policy is
+ 	// ReqDefault and the command has no keys.
+@@ -193,24 +176,9 @@ func (opt *ClusterOptions) init() {
+ 		opt.ReadOnly = true
+ 	}
+ 
+-	if opt.DialTimeout == 0 {
+-		opt.DialTimeout = 5 * time.Second
+-	}
+-	if opt.DialerRetries == 0 {
+-		opt.DialerRetries = 5
+-	}
+-	if opt.DialerRetryTimeout == 0 {
+-		opt.DialerRetryTimeout = 100 * time.Millisecond
+-	}
+-
+ 	if opt.PoolSize == 0 {
+ 		opt.PoolSize = 5 * runtime.GOMAXPROCS(0)
+ 	}
+-	if opt.MaxConcurrentDials <= 0 {
+-		opt.MaxConcurrentDials = opt.PoolSize
+-	} else if opt.MaxConcurrentDials > opt.PoolSize {
+-		opt.MaxConcurrentDials = opt.PoolSize
+-	}
+ 	if opt.ReadBufferSize == 0 {
+ 		opt.ReadBufferSize = proto.DefaultBufferSize
+ 	}
+@@ -352,13 +320,10 @@ func setupClusterQueryParams(u *url.URL, o *ClusterOptions) (*ClusterOptions, er
+ 	o.MinRetryBackoff = q.duration("min_retry_backoff")
+ 	o.MaxRetryBackoff = q.duration("max_retry_backoff")
+ 	o.DialTimeout = q.duration("dial_timeout")
+-	o.DialerRetries = q.int("dialer_retries")
+-	o.DialerRetryTimeout = q.duration("dialer_retry_timeout")
+ 	o.ReadTimeout = q.duration("read_timeout")
+ 	o.WriteTimeout = q.duration("write_timeout")
+ 	o.PoolFIFO = q.bool("pool_fifo")
+ 	o.PoolSize = q.int("pool_size")
+-	o.MaxConcurrentDials = q.int("max_concurrent_dials")
+ 	o.MinIdleConns = q.int("min_idle_conns")
+ 	o.MaxIdleConns = q.int("max_idle_conns")
+ 	o.MaxActiveConns = q.int("max_active_conns")
+@@ -414,25 +379,21 @@ func (opt *ClusterOptions) clientOptions() *Options {
+ 		MinRetryBackoff: opt.MinRetryBackoff,
+ 		MaxRetryBackoff: opt.MaxRetryBackoff,
+ 
+-		DialTimeout:        opt.DialTimeout,
+-		DialerRetries:      opt.DialerRetries,
+-		DialerRetryTimeout: opt.DialerRetryTimeout,
+-		ReadTimeout:        opt.ReadTimeout,
+-		WriteTimeout:       opt.WriteTimeout,
+-
++		DialTimeout:           opt.DialTimeout,
++		ReadTimeout:           opt.ReadTimeout,
++		WriteTimeout:          opt.WriteTimeout,
+ 		ContextTimeoutEnabled: opt.ContextTimeoutEnabled,
+ 
+-		PoolFIFO:           opt.PoolFIFO,
+-		PoolSize:           opt.PoolSize,
+-		MaxConcurrentDials: opt.MaxConcurrentDials,
+-		PoolTimeout:        opt.PoolTimeout,
+-		MinIdleConns:       opt.MinIdleConns,
+-		MaxIdleConns:       opt.MaxIdleConns,
+-		MaxActiveConns:     opt.MaxActiveConns,
+-		ConnMaxIdleTime:    opt.ConnMaxIdleTime,
+-		ConnMaxLifetime:    opt.ConnMaxLifetime,
+-		ReadBufferSize:     opt.ReadBufferSize,
+-		WriteBufferSize:    opt.WriteBufferSize,
++		PoolFIFO:              opt.PoolFIFO,
++		PoolSize:              opt.PoolSize,
++		PoolTimeout:           opt.PoolTimeout,
++		MinIdleConns:          opt.MinIdleConns,
++		MaxIdleConns:          opt.MaxIdleConns,
++		MaxActiveConns:        opt.MaxActiveConns,
++		ConnMaxIdleTime:       opt.ConnMaxIdleTime,
++		ConnMaxLifetime:       opt.ConnMaxLifetime,
++		ReadBufferSize:        opt.ReadBufferSize,
++		WriteBufferSize:       opt.WriteBufferSize,
+ 		DisableIdentity:       opt.DisableIdentity,
+ 		DisableIndentity:      opt.DisableIdentity,
+ 		IdentitySuffix:        opt.IdentitySuffix,
+@@ -1023,11 +984,9 @@ func (c *clusterState) slotNodes(slot int) []*clusterNode {
+ //------------------------------------------------------------------------------
+ 
+ type clusterStateHolder struct {
+-	load func(ctx context.Context) (*clusterState, error)
+-
+-	state         atomic.Value
+-	reloading     uint32 // atomic
+-	reloadPending uint32 // atomic - set to 1 when reload is requested during active reload
++	load      func(ctx context.Context) (*clusterState, error)
++	state     atomic.Value
++	reloading uint32 // atomic
+ }
+ 
+ func newClusterStateHolder(load func(ctx context.Context) (*clusterState, error)) *clusterStateHolder {
+@@ -1046,37 +1005,17 @@ func (c *clusterStateHolder) Reload(ctx context.Context) (*clusterState, error)
+ }
+ 
+ func (c *clusterStateHolder) LazyReload() {
+-	// If already reloading, mark that another reload is pending
+ 	if !atomic.CompareAndSwapUint32(&c.reloading, 0, 1) {
+-		atomic.StoreUint32(&c.reloadPending, 1)
+ 		return
+ 	}
+-
+ 	go func() {
+-		for {
+-			_, err := c.Reload(context.Background())
+-			if err != nil {
+-				atomic.StoreUint32(&c.reloadPending, 0)
+-				atomic.StoreUint32(&c.reloading, 0)
+-				return
+-			}
+-
+-			// Clear pending flag after reload completes, before cooldown
+-			// This captures notifications that arrived during the reload
+-			atomic.StoreUint32(&c.reloadPending, 0)
+-
+-			// Wait cooldown period
+-			time.Sleep(200 * time.Millisecond)
+-
+-			// Check if another reload was requested during cooldown
+-			if atomic.LoadUint32(&c.reloadPending) == 0 {
+-				// No pending reload, we're done
+-				atomic.StoreUint32(&c.reloading, 0)
+-				return
+-			}
++		defer atomic.StoreUint32(&c.reloading, 0)
+ 
+-			// Pending reload requested, loop to reload again
++		_, err := c.Reload(context.Background())
++		if err != nil {
++			return
+ 		}
++		time.Sleep(200 * time.Millisecond)
+ 	}()
+ }
+ 
+@@ -1140,26 +1079,6 @@ func NewClusterClient(opt *ClusterOptions) *ClusterClient {
+ 		txPipeline: c.processTxPipeline,
+ 	})
+ 
+-	// Set up SMIGRATED notification handling for cluster state reload
+-	// When a node client receives a SMIGRATED notification, it should trigger
+-	// cluster state reload on the parent ClusterClient
+-	if opt.MaintNotificationsConfig != nil {
+-		c.nodes.OnNewNode(func(nodeClient *Client) {
+-			manager := nodeClient.GetMaintNotificationsManager()
+-			if manager != nil {
+-				manager.SetClusterStateReloadCallback(func(ctx context.Context, hostPort string, slotRanges []string) {
+-					// Log the migration details for now
+-					if internal.LogLevel.InfoOrAbove() {
+-						internal.Logger.Printf(ctx, "cluster: slots %v migrated to %s, reloading cluster state", slotRanges, hostPort)
+-					}
+-					// Currently we reload the entire cluster state
+-					// In the future, this could be optimized to reload only the specific slots
+-					c.state.LazyReload()
+-				})
+-			}
+-		})
+-	}
+-
+ 	return c
+ }
+ 
+diff --git a/osscluster_lazy_reload_test.go b/osscluster_lazy_reload_test.go
+deleted file mode 100644
+index 994fd40e..00000000
+--- a/osscluster_lazy_reload_test.go
++++ /dev/null
+@@ -1,201 +0,0 @@
+-package redis
+-
+-import (
+-	"context"
+-	"sync/atomic"
+-	"testing"
+-	"time"
+-)
+-
+-// TestLazyReloadQueueBehavior tests that LazyReload properly queues reload requests
+-func TestLazyReloadQueueBehavior(t *testing.T) {
+-	t.Run("SingleReload", func(t *testing.T) {
+-		var reloadCount atomic.Int32
+-
+-		holder := newClusterStateHolder(func(ctx context.Context) (*clusterState, error) {
+-			reloadCount.Add(1)
+-			time.Sleep(50 * time.Millisecond) // Simulate reload work
+-			return &clusterState{}, nil
+-		})
+-
+-		// Trigger one reload
+-		holder.LazyReload()
+-
+-		// Wait for reload to complete
+-		time.Sleep(300 * time.Millisecond)
+-
+-		if count := reloadCount.Load(); count != 1 {
+-			t.Errorf("Expected 1 reload, got %d", count)
+-		}
+-	})
+-
+-	t.Run("ConcurrentReloadsDeduplication", func(t *testing.T) {
+-		var reloadCount atomic.Int32
+-
+-		holder := newClusterStateHolder(func(ctx context.Context) (*clusterState, error) {
+-			reloadCount.Add(1)
+-			time.Sleep(50 * time.Millisecond) // Simulate reload work
+-			return &clusterState{}, nil
+-		})
+-
+-		// Trigger multiple reloads concurrently
+-		for i := 0; i < 10; i++ {
+-			go holder.LazyReload()
+-		}
+-
+-		// Wait for all to complete
+-		time.Sleep(100 * time.Millisecond)
+-
+-		// Should only reload once (all concurrent calls deduplicated)
+-		if count := reloadCount.Load(); count != 1 {
+-			t.Errorf("Expected 1 reload (deduplication), got %d", count)
+-		}
+-	})
+-
+-	t.Run("PendingReloadDuringCooldown", func(t *testing.T) {
+-		var reloadCount atomic.Int32
+-
+-		holder := newClusterStateHolder(func(ctx context.Context) (*clusterState, error) {
+-			reloadCount.Add(1)
+-			time.Sleep(10 * time.Millisecond) // Simulate reload work
+-			return &clusterState{}, nil
+-		})
+-
+-		// Trigger first reload
+-		holder.LazyReload()
+-
+-		// Wait for reload to complete but still in cooldown
+-		time.Sleep(50 * time.Millisecond)
+-
+-		// Trigger second reload during cooldown period
+-		holder.LazyReload()
+-
+-		// Wait for second reload to complete
+-		time.Sleep(300 * time.Millisecond)
+-
+-		// Should have reloaded twice (second request queued and executed)
+-		if count := reloadCount.Load(); count != 2 {
+-			t.Errorf("Expected 2 reloads (queued during cooldown), got %d", count)
+-		}
+-	})
+-
+-	t.Run("MultiplePendingReloadsCollapsed", func(t *testing.T) {
+-		var reloadCount atomic.Int32
+-
+-		holder := newClusterStateHolder(func(ctx context.Context) (*clusterState, error) {
+-			reloadCount.Add(1)
+-			time.Sleep(10 * time.Millisecond) // Simulate reload work
+-			return &clusterState{}, nil
+-		})
+-
+-		// Trigger first reload
+-		holder.LazyReload()
+-
+-		// Wait for reload to start
+-		time.Sleep(5 * time.Millisecond)
+-
+-		// Trigger multiple reloads during active reload + cooldown
+-		for i := 0; i < 10; i++ {
+-			holder.LazyReload()
+-			time.Sleep(5 * time.Millisecond)
+-		}
+-
+-		// Wait for all to complete
+-		time.Sleep(400 * time.Millisecond)
+-
+-		// Should have reloaded exactly twice:
+-		// 1. Initial reload
+-		// 2. One more reload for all the pending requests (collapsed into one)
+-		if count := reloadCount.Load(); count != 2 {
+-			t.Errorf("Expected 2 reloads (initial + collapsed pending), got %d", count)
+-		}
+-	})
+-
+-	t.Run("ReloadAfterCooldownPeriod", func(t *testing.T) {
+-		var reloadCount atomic.Int32
+-
+-		holder := newClusterStateHolder(func(ctx context.Context) (*clusterState, error) {
+-			reloadCount.Add(1)
+-			time.Sleep(10 * time.Millisecond) // Simulate reload work
+-			return &clusterState{}, nil
+-		})
+-
+-		// Trigger first reload
+-		holder.LazyReload()
+-
+-		// Wait for reload + cooldown to complete
+-		time.Sleep(300 * time.Millisecond)
+-
+-		// Trigger second reload after cooldown
+-		holder.LazyReload()
+-
+-		// Wait for second reload to complete
+-		time.Sleep(300 * time.Millisecond)
+-
+-		// Should have reloaded twice (separate reload cycles)
+-		if count := reloadCount.Load(); count != 2 {
+-			t.Errorf("Expected 2 reloads (separate cycles), got %d", count)
+-		}
+-	})
+-
+-	t.Run("ErrorDuringReload", func(t *testing.T) {
+-		var reloadCount atomic.Int32
+-		var shouldFail atomic.Bool
+-		shouldFail.Store(true)
+-
+-		holder := newClusterStateHolder(func(ctx context.Context) (*clusterState, error) {
+-			reloadCount.Add(1)
+-			if shouldFail.Load() {
+-				return nil, context.DeadlineExceeded
+-			}
+-			return &clusterState{}, nil
+-		})
+-
+-		// Trigger reload that will fail
+-		holder.LazyReload()
+-
+-		// Wait for failed reload
+-		time.Sleep(50 * time.Millisecond)
+-
+-		// Trigger another reload (should succeed now)
+-		shouldFail.Store(false)
+-		holder.LazyReload()
+-
+-		// Wait for successful reload
+-		time.Sleep(300 * time.Millisecond)
+-
+-		// Should have attempted reload twice (first failed, second succeeded)
+-		if count := reloadCount.Load(); count != 2 {
+-			t.Errorf("Expected 2 reload attempts, got %d", count)
+-		}
+-	})
+-
+-	t.Run("CascadingSMIGRATEDScenario", func(t *testing.T) {
+-		// Simulate the real-world scenario: multiple SMIGRATED notifications
+-		// arriving in quick succession from different node clients
+-		var reloadCount atomic.Int32
+-
+-		holder := newClusterStateHolder(func(ctx context.Context) (*clusterState, error) {
+-			reloadCount.Add(1)
+-			time.Sleep(20 * time.Millisecond) // Simulate realistic reload time
+-			return &clusterState{}, nil
+-		})
+-
+-		// Simulate 5 SMIGRATED notifications arriving within 100ms
+-		for i := 0; i < 5; i++ {
+-			go holder.LazyReload()
+-			time.Sleep(20 * time.Millisecond)
+-		}
+-
+-		// Wait for all reloads to complete
+-		time.Sleep(500 * time.Millisecond)
+-
+-		// Should reload at most 2 times:
+-		// 1. First notification triggers reload
+-		// 2. Notifications 2-5 collapse into one pending reload
+-		count := reloadCount.Load()
+-		if count < 1 || count > 2 {
+-			t.Errorf("Expected 1-2 reloads for cascading scenario, got %d", count)
+-		}
+-	})
+-}
+diff --git a/sentinel.go b/sentinel.go
+index 8565a31e..663f7b1a 100644
+--- a/sentinel.go
++++ b/sentinel.go
+@@ -89,18 +89,7 @@ type FailoverOptions struct {
+ 	MinRetryBackoff time.Duration
+ 	MaxRetryBackoff time.Duration
+ 
+-	DialTimeout time.Duration
+-
+-	// DialerRetries is the maximum number of retry attempts when dialing fails.
+-	//
+-	// default: 5
+-	DialerRetries int
+-
+-	// DialerRetryTimeout is the backoff duration between retry attempts.
+-	//
+-	// default: 100 milliseconds
+-	DialerRetryTimeout time.Duration
+-
++	DialTimeout           time.Duration
+ 	ReadTimeout           time.Duration
+ 	WriteTimeout          time.Duration
+ 	ContextTimeoutEnabled bool
+@@ -121,12 +110,7 @@ type FailoverOptions struct {
+ 
+ 	PoolFIFO bool
+ 
+-	PoolSize int
+-
+-	// MaxConcurrentDials is the maximum number of concurrent connection creation goroutines.
+-	// If <= 0, defaults to PoolSize. If > PoolSize, it will be capped at PoolSize.
+-	MaxConcurrentDials int
+-
++	PoolSize        int
+ 	PoolTimeout     time.Duration
+ 	MinIdleConns    int
+ 	MaxIdleConns    int
+@@ -157,10 +141,6 @@ type FailoverOptions struct {
+ 
+ 	UnstableResp3 bool
+ 
+-	// PushNotificationProcessor is the processor for handling push notifications.
+-	// If nil, a default processor will be created for RESP3 connections.
+-	PushNotificationProcessor push.NotificationProcessor
+-
+ 	// MaintNotificationsConfig is not supported for FailoverClients at the moment
+ 	// MaintNotificationsConfig provides custom configuration for maintnotifications upgrades.
+ 	// When MaintNotificationsConfig.Mode is not "disabled", the client will handle
+@@ -194,32 +174,27 @@ func (opt *FailoverOptions) clientOptions() *Options {
+ 		ReadBufferSize:  opt.ReadBufferSize,
+ 		WriteBufferSize: opt.WriteBufferSize,
+ 
+-		DialTimeout:        opt.DialTimeout,
+-		DialerRetries:      opt.DialerRetries,
+-		DialerRetryTimeout: opt.DialerRetryTimeout,
+-		ReadTimeout:        opt.ReadTimeout,
+-		WriteTimeout:       opt.WriteTimeout,
+-
++		DialTimeout:           opt.DialTimeout,
++		ReadTimeout:           opt.ReadTimeout,
++		WriteTimeout:          opt.WriteTimeout,
+ 		ContextTimeoutEnabled: opt.ContextTimeoutEnabled,
+ 
+-		PoolFIFO:           opt.PoolFIFO,
+-		PoolSize:           opt.PoolSize,
+-		MaxConcurrentDials: opt.MaxConcurrentDials,
+-		PoolTimeout:        opt.PoolTimeout,
+-		MinIdleConns:       opt.MinIdleConns,
+-		MaxIdleConns:       opt.MaxIdleConns,
+-		MaxActiveConns:     opt.MaxActiveConns,
+-		ConnMaxIdleTime:    opt.ConnMaxIdleTime,
+-		ConnMaxLifetime:    opt.ConnMaxLifetime,
++		PoolFIFO:        opt.PoolFIFO,
++		PoolSize:        opt.PoolSize,
++		PoolTimeout:     opt.PoolTimeout,
++		MinIdleConns:    opt.MinIdleConns,
++		MaxIdleConns:    opt.MaxIdleConns,
++		MaxActiveConns:  opt.MaxActiveConns,
++		ConnMaxIdleTime: opt.ConnMaxIdleTime,
++		ConnMaxLifetime: opt.ConnMaxLifetime,
+ 
+ 		TLSConfig: opt.TLSConfig,
+ 
+ 		DisableIdentity:  opt.DisableIdentity,
+ 		DisableIndentity: opt.DisableIndentity,
+ 
+-		IdentitySuffix:            opt.IdentitySuffix,
+-		UnstableResp3:             opt.UnstableResp3,
+-		PushNotificationProcessor: opt.PushNotificationProcessor,
++		IdentitySuffix: opt.IdentitySuffix,
++		UnstableResp3:  opt.UnstableResp3,
+ 
+ 		MaintNotificationsConfig: &maintnotifications.Config{
+ 			Mode: maintnotifications.ModeDisabled,
+@@ -247,32 +222,27 @@ func (opt *FailoverOptions) sentinelOptions(addr string) *Options {
+ 		ReadBufferSize:  4096,
+ 		WriteBufferSize: 4096,
+ 
+-		DialTimeout:        opt.DialTimeout,
+-		DialerRetries:      opt.DialerRetries,
+-		DialerRetryTimeout: opt.DialerRetryTimeout,
+-		ReadTimeout:        opt.ReadTimeout,
+-		WriteTimeout:       opt.WriteTimeout,
+-
++		DialTimeout:           opt.DialTimeout,
++		ReadTimeout:           opt.ReadTimeout,
++		WriteTimeout:          opt.WriteTimeout,
+ 		ContextTimeoutEnabled: opt.ContextTimeoutEnabled,
+ 
+-		PoolFIFO:           opt.PoolFIFO,
+-		PoolSize:           opt.PoolSize,
+-		MaxConcurrentDials: opt.MaxConcurrentDials,
+-		PoolTimeout:        opt.PoolTimeout,
+-		MinIdleConns:       opt.MinIdleConns,
+-		MaxIdleConns:       opt.MaxIdleConns,
+-		MaxActiveConns:     opt.MaxActiveConns,
+-		ConnMaxIdleTime:    opt.ConnMaxIdleTime,
+-		ConnMaxLifetime:    opt.ConnMaxLifetime,
++		PoolFIFO:        opt.PoolFIFO,
++		PoolSize:        opt.PoolSize,
++		PoolTimeout:     opt.PoolTimeout,
++		MinIdleConns:    opt.MinIdleConns,
++		MaxIdleConns:    opt.MaxIdleConns,
++		MaxActiveConns:  opt.MaxActiveConns,
++		ConnMaxIdleTime: opt.ConnMaxIdleTime,
++		ConnMaxLifetime: opt.ConnMaxLifetime,
+ 
+ 		TLSConfig: opt.TLSConfig,
+ 
+ 		DisableIdentity:  opt.DisableIdentity,
+ 		DisableIndentity: opt.DisableIndentity,
+ 
+-		IdentitySuffix:            opt.IdentitySuffix,
+-		UnstableResp3:             opt.UnstableResp3,
+-		PushNotificationProcessor: opt.PushNotificationProcessor,
++		IdentitySuffix: opt.IdentitySuffix,
++		UnstableResp3:  opt.UnstableResp3,
+ 
+ 		MaintNotificationsConfig: &maintnotifications.Config{
+ 			Mode: maintnotifications.ModeDisabled,
+@@ -306,31 +276,26 @@ func (opt *FailoverOptions) clusterOptions() *ClusterOptions {
+ 		ReadBufferSize:  opt.ReadBufferSize,
+ 		WriteBufferSize: opt.WriteBufferSize,
+ 
+-		DialTimeout:        opt.DialTimeout,
+-		DialerRetries:      opt.DialerRetries,
+-		DialerRetryTimeout: opt.DialerRetryTimeout,
+-		ReadTimeout:        opt.ReadTimeout,
+-		WriteTimeout:       opt.WriteTimeout,
+-
++		DialTimeout:           opt.DialTimeout,
++		ReadTimeout:           opt.ReadTimeout,
++		WriteTimeout:          opt.WriteTimeout,
+ 		ContextTimeoutEnabled: opt.ContextTimeoutEnabled,
+ 
+-		PoolFIFO:           opt.PoolFIFO,
+-		PoolSize:           opt.PoolSize,
+-		MaxConcurrentDials: opt.MaxConcurrentDials,
+-		PoolTimeout:        opt.PoolTimeout,
+-		MinIdleConns:       opt.MinIdleConns,
+-		MaxIdleConns:       opt.MaxIdleConns,
+-		MaxActiveConns:     opt.MaxActiveConns,
+-		ConnMaxIdleTime:    opt.ConnMaxIdleTime,
+-		ConnMaxLifetime:    opt.ConnMaxLifetime,
++		PoolFIFO:        opt.PoolFIFO,
++		PoolSize:        opt.PoolSize,
++		PoolTimeout:     opt.PoolTimeout,
++		MinIdleConns:    opt.MinIdleConns,
++		MaxIdleConns:    opt.MaxIdleConns,
++		MaxActiveConns:  opt.MaxActiveConns,
++		ConnMaxIdleTime: opt.ConnMaxIdleTime,
++		ConnMaxLifetime: opt.ConnMaxLifetime,
+ 
+ 		TLSConfig: opt.TLSConfig,
+ 
+-		DisableIdentity:           opt.DisableIdentity,
+-		DisableIndentity:          opt.DisableIndentity,
+-		IdentitySuffix:            opt.IdentitySuffix,
+-		FailingTimeoutSeconds:     opt.FailingTimeoutSeconds,
+-		PushNotificationProcessor: opt.PushNotificationProcessor,
++		DisableIdentity:       opt.DisableIdentity,
++		DisableIndentity:      opt.DisableIndentity,
++		IdentitySuffix:        opt.IdentitySuffix,
++		FailingTimeoutSeconds: opt.FailingTimeoutSeconds,
+ 
+ 		MaintNotificationsConfig: &maintnotifications.Config{
+ 			Mode: maintnotifications.ModeDisabled,
+@@ -434,14 +399,11 @@ func setupFailoverConnParams(u *url.URL, o *FailoverOptions) (*FailoverOptions,
+ 	o.MinRetryBackoff = q.duration("min_retry_backoff")
+ 	o.MaxRetryBackoff = q.duration("max_retry_backoff")
+ 	o.DialTimeout = q.duration("dial_timeout")
+-	o.DialerRetries = q.int("dialer_retries")
+-	o.DialerRetryTimeout = q.duration("dialer_retry_timeout")
+ 	o.ReadTimeout = q.duration("read_timeout")
+ 	o.WriteTimeout = q.duration("write_timeout")
+ 	o.ContextTimeoutEnabled = q.bool("context_timeout_enabled")
+ 	o.PoolFIFO = q.bool("pool_fifo")
+ 	o.PoolSize = q.int("pool_size")
+-	o.MaxConcurrentDials = q.int("max_concurrent_dials")
+ 	o.MinIdleConns = q.int("min_idle_conns")
+ 	o.MaxIdleConns = q.int("max_idle_conns")
+ 	o.MaxActiveConns = q.int("max_active_conns")
+diff --git a/universal.go b/universal.go
+index 39acdb8e..1dc9764d 100644
+--- a/universal.go
++++ b/universal.go
+@@ -8,7 +8,6 @@ import (
+ 
+ 	"github.com/redis/go-redis/v9/auth"
+ 	"github.com/redis/go-redis/v9/maintnotifications"
+-	"github.com/redis/go-redis/v9/push"
+ )
+ 
+ // UniversalOptions information is required by UniversalClient to establish
+@@ -58,18 +57,7 @@ type UniversalOptions struct {
+ 	MinRetryBackoff time.Duration
+ 	MaxRetryBackoff time.Duration
+ 
+-	DialTimeout time.Duration
+-
+-	// DialerRetries is the maximum number of retry attempts when dialing fails.
+-	//
+-	// default: 5
+-	DialerRetries int
+-
+-	// DialerRetryTimeout is the backoff duration between retry attempts.
+-	//
+-	// default: 100 milliseconds
+-	DialerRetryTimeout time.Duration
+-
++	DialTimeout           time.Duration
+ 	ReadTimeout           time.Duration
+ 	WriteTimeout          time.Duration
+ 	ContextTimeoutEnabled bool
+@@ -91,12 +79,7 @@ type UniversalOptions struct {
+ 	// PoolFIFO uses FIFO mode for each node connection pool GET/PUT (default LIFO).
+ 	PoolFIFO bool
+ 
+-	PoolSize int
+-
+-	// MaxConcurrentDials is the maximum number of concurrent connection creation goroutines.
+-	// If <= 0, defaults to PoolSize. If > PoolSize, it will be capped at PoolSize.
+-	MaxConcurrentDials int
+-
++	PoolSize        int
+ 	PoolTimeout     time.Duration
+ 	MinIdleConns    int
+ 	MaxIdleConns    int
+@@ -138,10 +121,6 @@ type UniversalOptions struct {
+ 
+ 	UnstableResp3 bool
+ 
+-	// PushNotificationProcessor is the processor for handling push notifications.
+-	// If nil, a default processor will be created for RESP3 connections.
+-	PushNotificationProcessor push.NotificationProcessor
+-
+ 	// IsClusterMode can be used when only one Addrs is provided (e.g. Elasticache supports setting up cluster mode with configuration endpoint).
+ 	IsClusterMode bool
+ 
+@@ -177,36 +156,32 @@ func (o *UniversalOptions) Cluster() *ClusterOptions {
+ 		MinRetryBackoff: o.MinRetryBackoff,
+ 		MaxRetryBackoff: o.MaxRetryBackoff,
+ 
+-		DialTimeout:        o.DialTimeout,
+-		DialerRetries:      o.DialerRetries,
+-		DialerRetryTimeout: o.DialerRetryTimeout,
+-		ReadTimeout:        o.ReadTimeout,
+-		WriteTimeout:       o.WriteTimeout,
+-
++		DialTimeout:           o.DialTimeout,
++		ReadTimeout:           o.ReadTimeout,
++		WriteTimeout:          o.WriteTimeout,
+ 		ContextTimeoutEnabled: o.ContextTimeoutEnabled,
+ 
+ 		ReadBufferSize:  o.ReadBufferSize,
+ 		WriteBufferSize: o.WriteBufferSize,
+ 
+-		PoolFIFO:           o.PoolFIFO,
+-		PoolSize:           o.PoolSize,
+-		MaxConcurrentDials: o.MaxConcurrentDials,
+-		PoolTimeout:        o.PoolTimeout,
+-		MinIdleConns:       o.MinIdleConns,
+-		MaxIdleConns:       o.MaxIdleConns,
+-		MaxActiveConns:     o.MaxActiveConns,
+-		ConnMaxIdleTime:    o.ConnMaxIdleTime,
+-		ConnMaxLifetime:    o.ConnMaxLifetime,
++		PoolFIFO: o.PoolFIFO,
++
++		PoolSize:        o.PoolSize,
++		PoolTimeout:     o.PoolTimeout,
++		MinIdleConns:    o.MinIdleConns,
++		MaxIdleConns:    o.MaxIdleConns,
++		MaxActiveConns:  o.MaxActiveConns,
++		ConnMaxIdleTime: o.ConnMaxIdleTime,
++		ConnMaxLifetime: o.ConnMaxLifetime,
+ 
+ 		TLSConfig: o.TLSConfig,
+ 
+-		DisableIdentity:           o.DisableIdentity,
+-		DisableIndentity:          o.DisableIndentity,
+-		IdentitySuffix:            o.IdentitySuffix,
+-		FailingTimeoutSeconds:     o.FailingTimeoutSeconds,
+-		UnstableResp3:             o.UnstableResp3,
+-		PushNotificationProcessor: o.PushNotificationProcessor,
+-		MaintNotificationsConfig:  o.MaintNotificationsConfig,
++		DisableIdentity:          o.DisableIdentity,
++		DisableIndentity:         o.DisableIndentity,
++		IdentitySuffix:           o.IdentitySuffix,
++		FailingTimeoutSeconds:    o.FailingTimeoutSeconds,
++		UnstableResp3:            o.UnstableResp3,
++		MaintNotificationsConfig: o.MaintNotificationsConfig,
+ 	}
+ }
+ 
+@@ -242,36 +217,31 @@ func (o *UniversalOptions) Failover() *FailoverOptions {
+ 		MinRetryBackoff: o.MinRetryBackoff,
+ 		MaxRetryBackoff: o.MaxRetryBackoff,
+ 
+-		DialTimeout:        o.DialTimeout,
+-		DialerRetries:      o.DialerRetries,
+-		DialerRetryTimeout: o.DialerRetryTimeout,
+-		ReadTimeout:        o.ReadTimeout,
+-		WriteTimeout:       o.WriteTimeout,
+-
++		DialTimeout:           o.DialTimeout,
++		ReadTimeout:           o.ReadTimeout,
++		WriteTimeout:          o.WriteTimeout,
+ 		ContextTimeoutEnabled: o.ContextTimeoutEnabled,
+ 
+ 		ReadBufferSize:  o.ReadBufferSize,
+ 		WriteBufferSize: o.WriteBufferSize,
+ 
+-		PoolFIFO:           o.PoolFIFO,
+-		PoolSize:           o.PoolSize,
+-		MaxConcurrentDials: o.MaxConcurrentDials,
+-		PoolTimeout:        o.PoolTimeout,
+-		MinIdleConns:       o.MinIdleConns,
+-		MaxIdleConns:       o.MaxIdleConns,
+-		MaxActiveConns:     o.MaxActiveConns,
+-		ConnMaxIdleTime:    o.ConnMaxIdleTime,
+-		ConnMaxLifetime:    o.ConnMaxLifetime,
++		PoolFIFO:        o.PoolFIFO,
++		PoolSize:        o.PoolSize,
++		PoolTimeout:     o.PoolTimeout,
++		MinIdleConns:    o.MinIdleConns,
++		MaxIdleConns:    o.MaxIdleConns,
++		MaxActiveConns:  o.MaxActiveConns,
++		ConnMaxIdleTime: o.ConnMaxIdleTime,
++		ConnMaxLifetime: o.ConnMaxLifetime,
+ 
+ 		TLSConfig: o.TLSConfig,
+ 
+ 		ReplicaOnly: o.ReadOnly,
+ 
+-		DisableIdentity:           o.DisableIdentity,
+-		DisableIndentity:          o.DisableIndentity,
+-		IdentitySuffix:            o.IdentitySuffix,
+-		UnstableResp3:             o.UnstableResp3,
+-		PushNotificationProcessor: o.PushNotificationProcessor,
++		DisableIdentity:  o.DisableIdentity,
++		DisableIndentity: o.DisableIndentity,
++		IdentitySuffix:   o.IdentitySuffix,
++		UnstableResp3:    o.UnstableResp3,
+ 		// Note: MaintNotificationsConfig not supported for FailoverOptions
+ 	}
+ }
+@@ -301,35 +271,30 @@ func (o *UniversalOptions) Simple() *Options {
+ 		MinRetryBackoff: o.MinRetryBackoff,
+ 		MaxRetryBackoff: o.MaxRetryBackoff,
+ 
+-		DialTimeout:        o.DialTimeout,
+-		DialerRetries:      o.DialerRetries,
+-		DialerRetryTimeout: o.DialerRetryTimeout,
+-		ReadTimeout:        o.ReadTimeout,
+-		WriteTimeout:       o.WriteTimeout,
+-
++		DialTimeout:           o.DialTimeout,
++		ReadTimeout:           o.ReadTimeout,
++		WriteTimeout:          o.WriteTimeout,
+ 		ContextTimeoutEnabled: o.ContextTimeoutEnabled,
+ 
+ 		ReadBufferSize:  o.ReadBufferSize,
+ 		WriteBufferSize: o.WriteBufferSize,
+ 
+-		PoolFIFO:           o.PoolFIFO,
+-		PoolSize:           o.PoolSize,
+-		MaxConcurrentDials: o.MaxConcurrentDials,
+-		PoolTimeout:        o.PoolTimeout,
+-		MinIdleConns:       o.MinIdleConns,
+-		MaxIdleConns:       o.MaxIdleConns,
+-		MaxActiveConns:     o.MaxActiveConns,
+-		ConnMaxIdleTime:    o.ConnMaxIdleTime,
+-		ConnMaxLifetime:    o.ConnMaxLifetime,
++		PoolFIFO:        o.PoolFIFO,
++		PoolSize:        o.PoolSize,
++		PoolTimeout:     o.PoolTimeout,
++		MinIdleConns:    o.MinIdleConns,
++		MaxIdleConns:    o.MaxIdleConns,
++		MaxActiveConns:  o.MaxActiveConns,
++		ConnMaxIdleTime: o.ConnMaxIdleTime,
++		ConnMaxLifetime: o.ConnMaxLifetime,
+ 
+ 		TLSConfig: o.TLSConfig,
+ 
+-		DisableIdentity:           o.DisableIdentity,
+-		DisableIndentity:          o.DisableIndentity,
+-		IdentitySuffix:            o.IdentitySuffix,
+-		UnstableResp3:             o.UnstableResp3,
+-		PushNotificationProcessor: o.PushNotificationProcessor,
+-		MaintNotificationsConfig:  o.MaintNotificationsConfig,
++		DisableIdentity:          o.DisableIdentity,
++		DisableIndentity:         o.DisableIndentity,
++		IdentitySuffix:           o.IdentitySuffix,
++		UnstableResp3:            o.UnstableResp3,
++		MaintNotificationsConfig: o.MaintNotificationsConfig,
+ 	}
+ }
+ 

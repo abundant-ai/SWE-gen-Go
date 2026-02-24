@@ -1,0 +1,318 @@
+diff --git a/context.go b/context.go
+index 91ab6e4..f2421d7 100644
+--- a/context.go
++++ b/context.go
+@@ -210,6 +210,13 @@ type (
+ 	}
+ )
+ 
++const (
++	// ContextKeyHeaderAllow is set by Router for getting value for `Allow` header in later stages of handler call chain.
++	// Allow header is mandatory for status 405 (method not found) and useful for OPTIONS method requests.
++	// It is added to context only when Router does not find matching method handler for request.
++	ContextKeyHeaderAllow = "echo_header_allow"
++)
++
+ const (
+ 	defaultMemory = 32 << 20 // 32 MB
+ 	indexPage     = "index.html"
+diff --git a/echo.go b/echo.go
+index df5d358..7bca8b5 100644
+--- a/echo.go
++++ b/echo.go
+@@ -190,8 +190,12 @@ const (
+ 
+ // Headers
+ const (
+-	HeaderAccept              = "Accept"
+-	HeaderAcceptEncoding      = "Accept-Encoding"
++	HeaderAccept         = "Accept"
++	HeaderAcceptEncoding = "Accept-Encoding"
++	// HeaderAllow is the name of the "Allow" header field used to list the set of methods
++	// advertised as supported by the target resource. Returning an Allow header is mandatory
++	// for status 405 (method not found) and useful for the OPTIONS method in responses.
++	// See RFC 7231: https://datatracker.ietf.org/doc/html/rfc7231#section-7.4.1
+ 	HeaderAllow               = "Allow"
+ 	HeaderAuthorization       = "Authorization"
+ 	HeaderContentDisposition  = "Content-Disposition"
+@@ -301,6 +305,12 @@ var (
+ 	}
+ 
+ 	MethodNotAllowedHandler = func(c Context) error {
++		// See RFC 7231 section 7.4.1: An origin server MUST generate an Allow field in a 405 (Method Not Allowed)
++		// response and MAY do so in any other response. For disabled resources an empty Allow header may be returned
++		routerAllowMethods, ok := c.Get(ContextKeyHeaderAllow).(string)
++		if ok && routerAllowMethods != "" {
++			c.Response().Header().Set(HeaderAllow, routerAllowMethods)
++		}
+ 		return ErrMethodNotAllowed
+ 	}
+ )
+diff --git a/middleware/cors.go b/middleware/cors.go
+index d6ef896..1625951 100644
+--- a/middleware/cors.go
++++ b/middleware/cors.go
+@@ -29,6 +29,8 @@ type (
+ 		// AllowMethods defines a list methods allowed when accessing the resource.
+ 		// This is used in response to a preflight request.
+ 		// Optional. Default value DefaultCORSConfig.AllowMethods.
++		// If `allowMethods` is left empty will fill for preflight request `Access-Control-Allow-Methods` header value
++		// from `Allow` header that echo.Router set into context.
+ 		AllowMethods []string `yaml:"allow_methods"`
+ 
+ 		// AllowHeaders defines a list of request headers that can be used when
+@@ -41,6 +43,8 @@ type (
+ 		// a response to a preflight request, this indicates whether or not the
+ 		// actual request can be made using credentials.
+ 		// Optional. Default value false.
++		// Security: avoid using `AllowCredentials = true` with `AllowOrigins = *`.
++		// See http://blog.portswigger.net/2016/10/exploiting-cors-misconfigurations-for.html
+ 		AllowCredentials bool `yaml:"allow_credentials"`
+ 
+ 		// ExposeHeaders defines a whitelist headers that clients are allowed to
+@@ -80,7 +84,9 @@ func CORSWithConfig(config CORSConfig) echo.MiddlewareFunc {
+ 	if len(config.AllowOrigins) == 0 {
+ 		config.AllowOrigins = DefaultCORSConfig.AllowOrigins
+ 	}
++	hasCustomAllowMethods := true
+ 	if len(config.AllowMethods) == 0 {
++		hasCustomAllowMethods = false
+ 		config.AllowMethods = DefaultCORSConfig.AllowMethods
+ 	}
+ 
+@@ -109,10 +115,28 @@ func CORSWithConfig(config CORSConfig) echo.MiddlewareFunc {
+ 			origin := req.Header.Get(echo.HeaderOrigin)
+ 			allowOrigin := ""
+ 
+-			preflight := req.Method == http.MethodOptions
+ 			res.Header().Add(echo.HeaderVary, echo.HeaderOrigin)
+ 
+-			// No Origin provided
++			// Preflight request is an OPTIONS request, using three HTTP request headers: Access-Control-Request-Method,
++			// Access-Control-Request-Headers, and the Origin header. See: https://developer.mozilla.org/en-US/docs/Glossary/Preflight_request
++			// For simplicity we just consider method type and later `Origin` header.
++			preflight := req.Method == http.MethodOptions
++
++			// Although router adds special handler in case of OPTIONS method we avoid calling next for OPTIONS in this middleware
++			// as CORS requests do not have cookies / authentication headers by default, so we could get stuck in auth
++			// middlewares by calling next(c).
++			// But we still want to send `Allow` header as response in case of Non-CORS OPTIONS request as router default
++			// handler does.
++			routerAllowMethods := ""
++			if preflight {
++				tmpAllowMethods, ok := c.Get(echo.ContextKeyHeaderAllow).(string)
++				if ok && tmpAllowMethods != "" {
++					routerAllowMethods = tmpAllowMethods
++					c.Response().Header().Set(echo.HeaderAllow, routerAllowMethods)
++				}
++			}
++
++			// No Origin provided. This is (probably) not request from actual browser - proceed executing middleware chain
+ 			if origin == "" {
+ 				if !preflight {
+ 					return next(c)
+@@ -145,19 +169,15 @@ func CORSWithConfig(config CORSConfig) echo.MiddlewareFunc {
+ 					}
+ 				}
+ 
+-				// Check allowed origin patterns
+-				for _, re := range allowOriginPatterns {
+-					if allowOrigin == "" {
+-						didx := strings.Index(origin, "://")
+-						if didx == -1 {
+-							continue
+-						}
+-						domAuth := origin[didx+3:]
+-						// to avoid regex cost by invalid long domain
+-						if len(domAuth) > 253 {
+-							break
+-						}
+-
++				checkPatterns := false
++				if allowOrigin == "" {
++					// to avoid regex cost by invalid (long) domains (253 is domain name max limit)
++					if len(origin) <= (253+3+5) && strings.Contains(origin, "://") {
++						checkPatterns = true
++					}
++				}
++				if checkPatterns {
++					for _, re := range allowOriginPatterns {
+ 						if match, _ := regexp.MatchString(re, origin); match {
+ 							allowOrigin = origin
+ 							break
+@@ -174,12 +194,13 @@ func CORSWithConfig(config CORSConfig) echo.MiddlewareFunc {
+ 				return c.NoContent(http.StatusNoContent)
+ 			}
+ 
++			res.Header().Set(echo.HeaderAccessControlAllowOrigin, allowOrigin)
++			if config.AllowCredentials {
++				res.Header().Set(echo.HeaderAccessControlAllowCredentials, "true")
++			}
++
+ 			// Simple request
+ 			if !preflight {
+-				res.Header().Set(echo.HeaderAccessControlAllowOrigin, allowOrigin)
+-				if config.AllowCredentials {
+-					res.Header().Set(echo.HeaderAccessControlAllowCredentials, "true")
+-				}
+ 				if exposeHeaders != "" {
+ 					res.Header().Set(echo.HeaderAccessControlExposeHeaders, exposeHeaders)
+ 				}
+@@ -189,11 +210,13 @@ func CORSWithConfig(config CORSConfig) echo.MiddlewareFunc {
+ 			// Preflight request
+ 			res.Header().Add(echo.HeaderVary, echo.HeaderAccessControlRequestMethod)
+ 			res.Header().Add(echo.HeaderVary, echo.HeaderAccessControlRequestHeaders)
+-			res.Header().Set(echo.HeaderAccessControlAllowOrigin, allowOrigin)
+-			res.Header().Set(echo.HeaderAccessControlAllowMethods, allowMethods)
+-			if config.AllowCredentials {
+-				res.Header().Set(echo.HeaderAccessControlAllowCredentials, "true")
++
++			if !hasCustomAllowMethods && routerAllowMethods != "" {
++				res.Header().Set(echo.HeaderAccessControlAllowMethods, routerAllowMethods)
++			} else {
++				res.Header().Set(echo.HeaderAccessControlAllowMethods, allowMethods)
+ 			}
++
+ 			if allowHeaders != "" {
+ 				res.Header().Set(echo.HeaderAccessControlAllowHeaders, allowHeaders)
+ 			} else {
+diff --git a/router.go b/router.go
+index a8277c8..6134297 100644
+--- a/router.go
++++ b/router.go
+@@ -1,6 +1,7 @@
+ package echo
+ 
+ import (
++	"bytes"
+ 	"net/http"
+ )
+ 
+@@ -31,17 +32,18 @@ type (
+ 	kind          uint8
+ 	children      []*node
+ 	methodHandler struct {
+-		connect  HandlerFunc
+-		delete   HandlerFunc
+-		get      HandlerFunc
+-		head     HandlerFunc
+-		options  HandlerFunc
+-		patch    HandlerFunc
+-		post     HandlerFunc
+-		propfind HandlerFunc
+-		put      HandlerFunc
+-		trace    HandlerFunc
+-		report   HandlerFunc
++		connect     HandlerFunc
++		delete      HandlerFunc
++		get         HandlerFunc
++		head        HandlerFunc
++		options     HandlerFunc
++		patch       HandlerFunc
++		post        HandlerFunc
++		propfind    HandlerFunc
++		put         HandlerFunc
++		trace       HandlerFunc
++		report      HandlerFunc
++		allowHeader string
+ 	}
+ )
+ 
+@@ -68,6 +70,51 @@ func (m *methodHandler) isHandler() bool {
+ 		m.report != nil
+ }
+ 
++func (m *methodHandler) updateAllowHeader() {
++	buf := new(bytes.Buffer)
++	buf.WriteString(http.MethodOptions)
++
++	if m.connect != nil {
++		buf.WriteString(", ")
++		buf.WriteString(http.MethodConnect)
++	}
++	if m.delete != nil {
++		buf.WriteString(", ")
++		buf.WriteString(http.MethodDelete)
++	}
++	if m.get != nil {
++		buf.WriteString(", ")
++		buf.WriteString(http.MethodGet)
++	}
++	if m.head != nil {
++		buf.WriteString(", ")
++		buf.WriteString(http.MethodHead)
++	}
++	if m.patch != nil {
++		buf.WriteString(", ")
++		buf.WriteString(http.MethodPatch)
++	}
++	if m.post != nil {
++		buf.WriteString(", ")
++		buf.WriteString(http.MethodPost)
++	}
++	if m.propfind != nil {
++		buf.WriteString(", PROPFIND")
++	}
++	if m.put != nil {
++		buf.WriteString(", ")
++		buf.WriteString(http.MethodPut)
++	}
++	if m.trace != nil {
++		buf.WriteString(", ")
++		buf.WriteString(http.MethodTrace)
++	}
++	if m.report != nil {
++		buf.WriteString(", REPORT")
++	}
++	m.allowHeader = buf.String()
++}
++
+ // NewRouter returns a new Router instance.
+ func NewRouter(e *Echo) *Router {
+ 	return &Router{
+@@ -323,6 +370,7 @@ func (n *node) addHandler(method string, h HandlerFunc) {
+ 		n.methodHandler.report = h
+ 	}
+ 
++	n.methodHandler.updateAllowHeader()
+ 	if h != nil {
+ 		n.isHandler = true
+ 	} else {
+@@ -359,13 +407,14 @@ func (n *node) findHandler(method string) HandlerFunc {
+ 	}
+ }
+ 
+-func (n *node) checkMethodNotAllowed() HandlerFunc {
+-	for _, m := range methods {
+-		if h := n.findHandler(m); h != nil {
+-			return MethodNotAllowedHandler
+-		}
++func optionsMethodHandler(allowMethods string) func(c Context) error {
++	return func(c Context) error {
++		// Note: we are not handling most of the CORS headers here. CORS is handled by CORS middleware
++		// 'OPTIONS' method RFC: https://httpwg.org/specs/rfc7231.html#OPTIONS
++		// 'Allow' header RFC: https://datatracker.ietf.org/doc/html/rfc7231#section-7.4.1
++		c.Response().Header().Add(HeaderAllow, allowMethods)
++		return c.NoContent(http.StatusNoContent)
+ 	}
+-	return NotFoundHandler
+ }
+ 
+ // Find lookup a handler registered for method and path. It also parses URL for path
+@@ -560,7 +609,15 @@ func (r *Router) Find(method, path string, c Context) {
+ 		// use previous match as basis. although we have no matching handler we have path match.
+ 		// so we can send http.StatusMethodNotAllowed (405) instead of http.StatusNotFound (404)
+ 		currentNode = previousBestMatchNode
+-		ctx.handler = currentNode.checkMethodNotAllowed()
++
++		ctx.handler = NotFoundHandler
++		if currentNode.isHandler {
++			ctx.Set(ContextKeyHeaderAllow, currentNode.methodHandler.allowHeader)
++			ctx.handler = MethodNotAllowedHandler
++			if method == http.MethodOptions {
++				ctx.handler = optionsMethodHandler(currentNode.methodHandler.allowHeader)
++			}
++		}
+ 	}
+ 	ctx.path = currentNode.ppath
+ 	ctx.pnames = currentNode.pnames

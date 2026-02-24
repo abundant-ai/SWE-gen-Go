@@ -1,0 +1,1072 @@
+diff --git a/.github/actions/run-tests/action.yml b/.github/actions/run-tests/action.yml
+deleted file mode 100644
+index 95709b5d..00000000
+--- a/.github/actions/run-tests/action.yml
++++ /dev/null
+@@ -1,62 +0,0 @@
+-name: 'Run go-redis tests'
+-description: 'Runs go-redis tests against different Redis versions and configurations'
+-inputs:
+-  go-version:
+-    description: 'Go version to use for running tests'
+-    default: '1.23'
+-  redis-version:
+-    description: 'Redis version to test against'
+-    required: true
+-runs:
+-  using: "composite"
+-  steps:
+-    - name: Set up ${{ inputs.go-version }}
+-      uses: actions/setup-go@v5
+-      with:
+-        go-version: ${{ inputs.go-version }}
+-
+-    - name: Setup Test environment
+-      env:
+-        REDIS_VERSION: ${{ inputs.redis-version }}
+-        CLIENT_LIBS_TEST_IMAGE: "redislabs/client-libs-test:${{ inputs.redis-version }}"
+-      run: |
+-        set -e
+-        redis_major_version=$(echo "$REDIS_VERSION" | grep -oP '^\d+')
+-        if (( redis_major_version < 8 )); then
+-          echo "Using redis-stack for module tests"
+-        else
+-          echo "Using redis CE for module tests"
+-        fi        
+-        
+-        # Mapping of redis version to redis testing containers
+-        declare -A redis_version_mapping=(
+-          ["8.0-M03"]="8.0-M04-pre"
+-          ["7.4.2"]="rs-7.4.0-v2"
+-          ["7.2.7"]="rs-7.2.0-v14"
+-        )
+-        
+-        if [[ -v redis_version_mapping[$REDIS_VERSION] ]]; then
+-          echo "REDIS_MAJOR_VERSION=${redis_major_version}" >> $GITHUB_ENV
+-          echo "REDIS_IMAGE=redis:${{ inputs.redis-version }}" >> $GITHUB_ENV
+-          echo "CLIENT_LIBS_TEST_IMAGE=redislabs/client-libs-test:${redis_version_mapping[$REDIS_VERSION]}" >> $GITHUB_ENV
+-        else
+-          echo "Version not found in the mapping."
+-          exit 1
+-        fi
+-        sleep 10 # time to settle
+-      shell: bash
+-    - name: Set up Docker Compose environment with redis ${{ inputs.redis-version }}
+-      run: docker compose --profile all up -d
+-      shell: bash
+-    - name: Run tests
+-      env:
+-        RCE_DOCKER: "true"
+-        RE_CLUSTER: "false"
+-      run: |
+-        go test \
+-        --ginkgo.skip-file="ring_test.go" \
+-        --ginkgo.skip-file="sentinel_test.go" \
+-        --ginkgo.skip-file="pubsub_test.go" \
+-        --ginkgo.skip-file="gears_commands_test.go" \
+-        --ginkgo.label-filter="!NonRedisEnterprise"
+-      shell: bash
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 5852fcde..7578e962 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -16,7 +16,15 @@ jobs:
+     strategy:
+       fail-fast: false
+       matrix:
+-        go-version: [1.21.x, 1.22.x, 1.23.x]
++        go-version: [1.19.x, 1.20.x, 1.21.x]
++
++    services:
++      redis:
++        image: redis/redis-stack-server:latest
++        options: >-
++          --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
++        ports:
++          - 6379:6379
+ 
+     steps:
+       - name: Set up ${{ matrix.go-version }}
+@@ -42,22 +50,39 @@ jobs:
+     strategy:
+         fail-fast: false
+         matrix:
+-          redis-version:
+-            - "8.0-M03" # 8.0 milestone 4
+-            - "7.4.2" # should use redis stack 7.4
+-            - "7.2.7" # should redis stack 7.2
++          redis_version:
++            - "8.0-M01"
++            - "7.4.1"
++            - "7.2.6"
++            - "6.2.16"
+           go-version:
+-            - "1.22.x"
+-            - "1.23.x"
++            - "1.19.x"
++            - "1.20.x"
++            - "1.21.x"
+ 
+     steps:
++      - name: Set up ${{ matrix.go-version }}
++        uses: actions/setup-go@v5
++        with:
++          go-version: ${{ matrix.go-version }}
+ 
+       - name: Checkout code
+         uses: actions/checkout@v4
+-
+-      - name: Run tests
+-        uses: ./.github/actions/run-tests
+-        with:
+-          go-version: ${{matrix.go-version}}
+-          redis-version: ${{ matrix.redis-version }}
+       
++      # Set up Docker Compose environment
++      - name: Set up Docker Compose environment
++        run: |
++          docker compose --profile all up -d
++      
++      - name: Run tests
++        env:
++          USE_CONTAINERIZED_REDIS: "true"
++          RE_CLUSTER: "true"
++        run: |
++          go test \
++          --ginkgo.skip-file="ring_test.go" \
++          --ginkgo.skip-file="sentinel_test.go" \
++          --ginkgo.skip-file="osscluster_test.go" \
++          --ginkgo.skip-file="pubsub_test.go" \
++          --ginkgo.skip-file="gears_commands_test.go" \
++          --ginkgo.label-filter='!NonRedisEnterprise'
+diff --git a/.github/workflows/doctests.yaml b/.github/workflows/doctests.yaml
+index b04f3140..6e49e647 100644
+--- a/.github/workflows/doctests.yaml
++++ b/.github/workflows/doctests.yaml
+@@ -25,7 +25,7 @@ jobs:
+     strategy:
+       fail-fast: false
+       matrix:
+-        go-version: [ "1.21", "1.22", "1.23" ]
++        go-version: [ "1.18", "1.19", "1.20", "1.21" ]
+ 
+     steps:
+       - name: Set up ${{ matrix.go-version }}
+diff --git a/.github/workflows/test-redis-enterprise.yml b/.github/workflows/test-redis-enterprise.yml
+index 10c27198..1cb36b8d 100644
+--- a/.github/workflows/test-redis-enterprise.yml
++++ b/.github/workflows/test-redis-enterprise.yml
+@@ -15,7 +15,7 @@ jobs:
+     strategy:
+       fail-fast: false
+       matrix:
+-        go-version: [1.23.x]
++        go-version: [1.21.x]
+         re-build: ["7.4.2-54"]
+ 
+     steps:
+@@ -46,8 +46,8 @@ jobs:
+ 
+       - name: Test
+         env:
+-          RE_CLUSTER: true
+-          REDIS_MAJOR_VERSION: 7
++          RE_CLUSTER: "1"
++          USE_CONTAINERIZED_REDIS: "1"
+         run: |
+           go test \
+           --ginkgo.skip-file="ring_test.go" \
+diff --git a/.gitignore b/.gitignore
+index 63b21b0b..7507584f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,4 @@
++dockers/
+ *.rdb
+ testdata/*
+ .idea/
+diff --git a/Makefile b/Makefile
+index 360505ba..1a6bd178 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,8 +1,6 @@
+ GO_MOD_DIRS := $(shell find . -type f -name 'go.mod' -exec dirname {} \; | sort)
+-export REDIS_MAJOR_VERSION := 7
+ 
+ test: testdeps
+-	docker start go-redis-redis-stack || docker run -d --name go-redis-redis-stack  -p 6379:6379 -e REDIS_ARGS="--enable-debug-command yes --enable-module-command yes" redis/redis-stack-server:latest
+ 	$(eval GO_VERSION := $(shell go version | cut -d " " -f 3 | cut -d. -f2))
+ 	set -e; for dir in $(GO_MOD_DIRS); do \
+ 	  if echo "$${dir}" | grep -q "./example" && [ "$(GO_VERSION)" = "19" ]; then \
+@@ -21,7 +19,6 @@ test: testdeps
+ 	done
+ 	cd internal/customvet && go build .
+ 	go vet -vettool ./internal/customvet/customvet
+-	docker stop go-redis-redis-stack
+ 
+ testdeps: testdata/redis/src/redis-server
+ 
+@@ -35,7 +32,7 @@ build:
+ 
+ testdata/redis:
+ 	mkdir -p $@
+-	wget -qO- https://download.redis.io/releases/redis-7.4.2.tar.gz  | tar xvz --strip-components=1 -C $@
++	wget -qO- https://download.redis.io/releases/redis-7.4-rc2.tar.gz  | tar xvz --strip-components=1 -C $@
+ 
+ testdata/redis/src/redis-server: testdata/redis
+ 	cd $< && make all
+diff --git a/bench_test.go b/bench_test.go
+index bb84c415..8e23303f 100644
+--- a/bench_test.go
++++ b/bench_test.go
+@@ -277,7 +277,7 @@ func BenchmarkXRead(b *testing.B) {
+ 
+ func newClusterScenario() *clusterScenario {
+ 	return &clusterScenario{
+-		ports:     []string{"16600", "16601", "16602", "16603", "16604", "16605"},
++		ports:     []string{"8220", "8221", "8222", "8223", "8224", "8225"},
+ 		nodeIDs:   make([]string, 6),
+ 		processes: make(map[string]*redisProcess, 6),
+ 		clients:   make(map[string]*redis.Client, 6),
+diff --git a/commands_test.go b/commands_test.go
+index 901e96e3..9554bf9a 100644
+--- a/commands_test.go
++++ b/commands_test.go
+@@ -441,6 +441,7 @@ var _ = Describe("Commands", func() {
+ 		It("should Command", Label("NonRedisEnterprise"), func() {
+ 			cmds, err := client.Command(ctx).Result()
+ 			Expect(err).NotTo(HaveOccurred())
++			Expect(len(cmds)).To(BeNumerically("~", 240, 25))
+ 
+ 			cmd := cmds["mget"]
+ 			Expect(cmd.Name).To(Equal("mget"))
+diff --git a/docker-compose.yml b/docker-compose.yml
+index fecd14fe..f5ccb8f4 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,140 +1,21 @@
+ ---
+ 
+ services:
+-  redis:
+-    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:7.4.1}
++
++  redis-stanalone:
++    image: redislabs/client-libs-test:8.0-M02
+     container_name: redis-standalone
+     environment:
+-      - TLS_ENABLED=yes
+       - REDIS_CLUSTER=no
+       - PORT=6379
+       - TLS_PORT=6666
+-    command: ${REDIS_EXTRA_ARGS:---enable-debug-command yes --enable-module-command yes --tls-auth-clients optional --save ""}
++
+     ports:
+       - 6379:6379
++      - 6380:6379
+       - 6666:6666 # TLS port
+     volumes:
+-      - "./dockers/standalone:/redis/work"
++      - "./dockers/redis-standalone:/redis/work"
+     profiles:
+       - standalone
+-      - sentinel
+-      - all-stack
+-      - all
+-
+-  cluster:
+-    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:7.4.1}
+-    container_name: redis-cluster
+-    environment:
+-      - NODES=6
+-      - PORT=16600
+-    command: "--cluster-enabled yes"
+-    ports:
+-      - "16600-16605:16600-16605"
+-    volumes:
+-      - "./dockers/cluster:/redis/work"
+-    profiles:
+-      - cluster
+-      - all-stack
+-      - all
+-
+-  sentinel:
+-    image: ${REDIS_IMAGE:-redis:7.4.1}
+-    container_name: redis-sentinel
+-    depends_on:
+-      - redis
+-    entrypoint: "redis-sentinel /redis.conf --port 26379"
+-    ports:
+-      - 26379:26379
+-    volumes:
+-      - "./dockers/sentinel.conf:/redis.conf"
+-    profiles:
+-      - sentinel
+-      - all-stack
+       - all
+-
+-  sentinel2:
+-    image: ${REDIS_IMAGE:-redis:7.4.1}
+-    container_name: redis-sentinel2
+-    depends_on:
+-      - redis
+-    entrypoint: "redis-sentinel /redis.conf --port 26380"
+-    ports:
+-      - 26380:26380
+-    volumes:
+-      - "./dockers/sentinel.conf:/redis.conf"
+-    profiles:
+-      - sentinel
+-      - all-stack
+-      - all
+-
+-  sentinel3:
+-    image: ${REDIS_IMAGE:-redis:7.4.1}
+-    container_name: redis-sentinel3
+-    depends_on:
+-      - redis
+-    entrypoint: "redis-sentinel /redis.conf --port 26381"
+-    ports:
+-      - 26381:26381
+-    volumes:
+-      - "./dockers/sentinel.conf:/redis.conf"
+-    profiles:
+-      - sentinel
+-      - all-stack
+-      - all
+-
+-  redisRing1:
+-    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:7.4.1}
+-    container_name: redis-ring-1
+-    environment:
+-      - TLS_ENABLED=yes
+-      - REDIS_CLUSTER=no
+-      - PORT=6390
+-    command: ${REDIS_EXTRA_ARGS:---enable-debug-command yes --enable-module-command yes --tls-auth-clients optional --save ""}
+-    ports:
+-      - 6390:6390
+-    volumes:
+-      - "./dockers/ring1:/redis/work"
+-    profiles:
+-      - ring
+-      - cluster
+-      - sentinel
+-      - all-stack
+-      - all
+-
+-  redisRing2:
+-    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:7.4.1}
+-    container_name: redis-ring-2
+-    environment:
+-      - TLS_ENABLED=yes
+-      - REDIS_CLUSTER=no
+-      - PORT=6391
+-    command: ${REDIS_EXTRA_ARGS:---enable-debug-command yes --enable-module-command yes --tls-auth-clients optional --save ""}
+-    ports:
+-      - 6391:6391
+-    volumes:
+-      - "./dockers/ring2:/redis/work"
+-    profiles:
+-      - ring
+-      - cluster
+-      - sentinel
+-      - all-stack
+-      - all
+-
+-  redisRing3:
+-    image: ${CLIENT_LIBS_TEST_IMAGE:-redislabs/client-libs-test:7.4.1}
+-    container_name: redis-ring-3
+-    environment:
+-      - TLS_ENABLED=yes
+-      - REDIS_CLUSTER=no
+-      - PORT=6392
+-    command: ${REDIS_EXTRA_ARGS:---enable-debug-command yes --enable-module-command yes --tls-auth-clients optional --save ""}
+-    ports:
+-      - 6392:6392
+-    volumes:
+-      - "./dockers/ring3:/redis/work"
+-    profiles:
+-      - ring
+-      - cluster
+-      - sentinel
+-      - all-stack
+-      - all
+\ No newline at end of file
+diff --git a/dockers/.gitignore b/dockers/.gitignore
+deleted file mode 100644
+index 355164c1..00000000
+--- a/dockers/.gitignore
++++ /dev/null
+@@ -1 +0,0 @@
+-*/
+diff --git a/dockers/sentinel.conf b/dockers/sentinel.conf
+deleted file mode 100644
+index 7d85e430..00000000
+--- a/dockers/sentinel.conf
++++ /dev/null
+@@ -1,5 +0,0 @@
+-sentinel resolve-hostnames yes
+-sentinel monitor go-redis-test redis 6379 2
+-sentinel down-after-milliseconds go-redis-test 5000
+-sentinel failover-timeout go-redis-test 60000
+-sentinel parallel-syncs go-redis-test 1
+diff --git a/main_test.go b/main_test.go
+index 6b3b563a..9f99b5c9 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -13,6 +13,7 @@ import (
+ 
+ 	. "github.com/bsm/ginkgo/v2"
+ 	. "github.com/bsm/gomega"
++
+ 	"github.com/redis/go-redis/v9"
+ )
+ 
+@@ -27,7 +28,7 @@ const (
+ )
+ 
+ const (
+-	sentinelName       = "go-redis-test"
++	sentinelName       = "mymaster"
+ 	sentinelMasterPort = "9123"
+ 	sentinelSlave1Port = "9124"
+ 	sentinelSlave2Port = "9125"
+@@ -42,8 +43,8 @@ var (
+ )
+ 
+ var (
+-	redisStackPort = "6379"
+-	redisStackAddr = ":" + redisStackPort
++	rediStackPort = "6379"
++	rediStackAddr = ":" + rediStackPort
+ )
+ 
+ var (
+@@ -58,22 +59,14 @@ var (
+ )
+ 
+ var cluster = &clusterScenario{
+-	ports:     []string{"16600", "16601", "16602", "16603", "16604", "16605"},
++	ports:     []string{"8220", "8221", "8222", "8223", "8224", "8225"},
+ 	nodeIDs:   make([]string, 6),
+ 	processes: make(map[string]*redisProcess, 6),
+ 	clients:   make(map[string]*redis.Client, 6),
+ }
+ 
+-// Redis Software Cluster
+ var RECluster = false
+-
+-// Redis Community Edition Docker
+-var RCEDocker = false
+-
+-// Notes the major version of redis we are executing tests.
+-// This can be used before we change the bsm fork of ginkgo for one,
+-// which have support for label sets, so we can filter tests per redis major version.
+-var REDIS_MAJOR_VERSION = 7
++var USE_CONTAINERIZED_REDIS = false
+ 
+ func registerProcess(port string, p *redisProcess) {
+ 	if processes == nil {
+@@ -90,19 +83,8 @@ var _ = BeforeSuite(func() {
+ 	}
+ 	var err error
+ 	RECluster, _ = strconv.ParseBool(os.Getenv("RE_CLUSTER"))
+-	RCEDocker, _ = strconv.ParseBool(os.Getenv("RCE_DOCKER"))
+-
+-	REDIS_MAJOR_VERSION, _ = strconv.Atoi(os.Getenv("REDIS_MAJOR_VERSION"))
+-	if REDIS_MAJOR_VERSION == 0 {
+-		REDIS_MAJOR_VERSION = 7
+-	}
+-	Expect(REDIS_MAJOR_VERSION).To(BeNumerically(">=", 6))
+-	Expect(REDIS_MAJOR_VERSION).To(BeNumerically("<=", 8))
+-
+-	fmt.Printf("RECluster: %v\n", RECluster)
+-	fmt.Printf("RCEDocker: %v\n", RCEDocker)
+-	fmt.Printf("REDIS_MAJOR_VERSION: %v\n", REDIS_MAJOR_VERSION)
+-	if !RECluster && !RCEDocker {
++	USE_CONTAINERIZED_REDIS, _ = strconv.ParseBool(os.Getenv("USE_CONTAINERIZED_REDIS"))
++	if !RECluster || !USE_CONTAINERIZED_REDIS {
+ 
+ 		redisMain, err = startRedis(redisPort)
+ 		Expect(err).NotTo(HaveOccurred())
+@@ -139,24 +121,18 @@ var _ = BeforeSuite(func() {
+ 		err = startCluster(ctx, cluster)
+ 		Expect(err).NotTo(HaveOccurred())
+ 	} else {
+-		redisPort = redisStackPort
+-		redisAddr = redisStackAddr
+-
+-		if !RECluster {
+-			// populate cluster node information
+-			Expect(configureClusterTopology(ctx, cluster)).NotTo(HaveOccurred())
+-		}
++		redisPort = rediStackPort
++		redisAddr = rediStackAddr
+ 	}
+ })
+ 
+ var _ = AfterSuite(func() {
+ 	if !RECluster {
+ 		Expect(cluster.Close()).NotTo(HaveOccurred())
+-	}
+ 
+-	// NOOP if there are no processes registered
+-	for _, p := range processes {
+-		Expect(p.Close()).NotTo(HaveOccurred())
++		for _, p := range processes {
++			Expect(p.Close()).NotTo(HaveOccurred())
++		}
+ 	}
+ 	processes = nil
+ })
+@@ -180,8 +156,8 @@ func redisOptions() *redis.Options {
+ 			ContextTimeoutEnabled: true,
+ 
+ 			MaxRetries: -1,
++			PoolSize:   10,
+ 
+-			PoolSize:        10,
+ 			PoolTimeout:     30 * time.Second,
+ 			ConnMaxIdleTime: time.Minute,
+ 		}
+diff --git a/monitor_test.go b/monitor_test.go
+index ebb78485..96c33bf1 100644
+--- a/monitor_test.go
++++ b/monitor_test.go
+@@ -22,7 +22,7 @@ var _ = Describe("Monitor command", Label("monitor"), func() {
+ 		if os.Getenv("RUN_MONITOR_TEST") != "true" {
+ 			Skip("Skipping Monitor command test. Set RUN_MONITOR_TEST=true to run it.")
+ 		}
+-		client = redis.NewClient(&redis.Options{Addr: redisPort})
++		client = redis.NewClient(&redis.Options{Addr: ":6379"})
+ 		Expect(client.FlushDB(ctx).Err()).NotTo(HaveOccurred())
+ 
+ 	})
+@@ -33,7 +33,7 @@ var _ = Describe("Monitor command", Label("monitor"), func() {
+ 
+ 	It("should monitor", Label("monitor"), func() {
+ 		ress := make(chan string)
+-		client1 := redis.NewClient(&redis.Options{Addr: redisPort})
++		client1 := redis.NewClient(&redis.Options{Addr: rediStackAddr})
+ 		mn := client1.Monitor(ctx, ress)
+ 		mn.Start()
+ 		// Wait for the Redis server to be in monitoring mode.
+@@ -61,7 +61,7 @@ func TestMonitorCommand(t *testing.T) {
+ 	}
+ 
+ 	ctx := context.TODO()
+-	client := redis.NewClient(&redis.Options{Addr: redisPort})
++	client := redis.NewClient(&redis.Options{Addr: ":6379"})
+ 	if err := client.FlushDB(ctx).Err(); err != nil {
+ 		t.Fatalf("FlushDB failed: %v", err)
+ 	}
+@@ -72,8 +72,8 @@ func TestMonitorCommand(t *testing.T) {
+ 		}
+ 	}()
+ 
+-	ress := make(chan string, 10)                               // Buffer to prevent blocking
+-	client1 := redis.NewClient(&redis.Options{Addr: redisPort}) // Adjust the Addr field as necessary
++	ress := make(chan string, 10)                             // Buffer to prevent blocking
++	client1 := redis.NewClient(&redis.Options{Addr: ":6379"}) // Adjust the Addr field as necessary
+ 	mn := client1.Monitor(ctx, ress)
+ 	mn.Start()
+ 	// Wait for the Redis server to be in monitoring mode.
+diff --git a/osscluster_test.go b/osscluster_test.go
+index 93ee464f..9c3eaba3 100644
+--- a/osscluster_test.go
++++ b/osscluster_test.go
+@@ -25,10 +25,6 @@ type clusterScenario struct {
+ 	clients   map[string]*redis.Client
+ }
+ 
+-func (s *clusterScenario) slots() []int {
+-	return []int{0, 5461, 10923, 16384}
+-}
+-
+ func (s *clusterScenario) masters() []*redis.Client {
+ 	result := make([]*redis.Client, 3)
+ 	for pos, port := range s.ports[:3] {
+@@ -87,37 +83,35 @@ func (s *clusterScenario) newClusterClient(
+ }
+ 
+ func (s *clusterScenario) Close() error {
+-	ctx := context.TODO()
+-	for _, master := range s.masters() {
+-		err := master.FlushAll(ctx).Err()
+-		if err != nil {
+-			return err
+-		}
+-
+-		// since 7.2 forget calls should be propagated, calling only master
+-		// nodes should be sufficient.
+-		for _, nID := range s.nodeIDs {
+-			master.ClusterForget(ctx, nID)
+-		}
+-	}
+-
+ 	for _, port := range s.ports {
+ 		if process, ok := processes[port]; ok {
+-			if process != nil {
+-				process.Close()
+-			}
+-
++			process.Close()
+ 			delete(processes, port)
+ 		}
+ 	}
+-
+ 	return nil
+ }
+ 
+-func configureClusterTopology(ctx context.Context, scenario *clusterScenario) error {
+-	err := collectNodeInformation(ctx, scenario)
+-	if err != nil {
+-		return err
++func startCluster(ctx context.Context, scenario *clusterScenario) error {
++	// Start processes and collect node ids
++	for pos, port := range scenario.ports {
++		process, err := startRedis(port, "--cluster-enabled", "yes")
++		if err != nil {
++			return err
++		}
++
++		client := redis.NewClient(&redis.Options{
++			Addr: ":" + port,
++		})
++
++		info, err := client.ClusterNodes(ctx).Result()
++		if err != nil {
++			return err
++		}
++
++		scenario.processes[port] = process
++		scenario.clients[port] = client
++		scenario.nodeIDs[pos] = info[:40]
+ 	}
+ 
+ 	// Meet cluster nodes.
+@@ -128,7 +122,8 @@ func configureClusterTopology(ctx context.Context, scenario *clusterScenario) er
+ 		}
+ 	}
+ 
+-	slots := scenario.slots()
++	// Bootstrap masters.
++	slots := []int{0, 5000, 10000, 16384}
+ 	for pos, master := range scenario.masters() {
+ 		err := master.ClusterAddSlotsRange(ctx, slots[pos], slots[pos+1]-1).Err()
+ 		if err != nil {
+@@ -162,36 +157,35 @@ func configureClusterTopology(ctx context.Context, scenario *clusterScenario) er
+ 	// Wait until all nodes have consistent info.
+ 	wanted := []redis.ClusterSlot{{
+ 		Start: 0,
+-		End:   5460,
++		End:   4999,
+ 		Nodes: []redis.ClusterNode{{
+ 			ID:   "",
+-			Addr: "127.0.0.1:16600",
++			Addr: "127.0.0.1:8220",
+ 		}, {
+ 			ID:   "",
+-			Addr: "127.0.0.1:16603",
++			Addr: "127.0.0.1:8223",
+ 		}},
+ 	}, {
+-		Start: 5461,
+-		End:   10922,
++		Start: 5000,
++		End:   9999,
+ 		Nodes: []redis.ClusterNode{{
+ 			ID:   "",
+-			Addr: "127.0.0.1:16601",
++			Addr: "127.0.0.1:8221",
+ 		}, {
+ 			ID:   "",
+-			Addr: "127.0.0.1:16604",
++			Addr: "127.0.0.1:8224",
+ 		}},
+ 	}, {
+-		Start: 10923,
++		Start: 10000,
+ 		End:   16383,
+ 		Nodes: []redis.ClusterNode{{
+ 			ID:   "",
+-			Addr: "127.0.0.1:16602",
++			Addr: "127.0.0.1:8222",
+ 		}, {
+ 			ID:   "",
+-			Addr: "127.0.0.1:16605",
++			Addr: "127.0.0.1:8225",
+ 		}},
+ 	}}
+-
+ 	for _, client := range scenario.clients {
+ 		err := eventually(func() error {
+ 			res, err := client.ClusterSlots(ctx).Result()
+@@ -199,7 +193,7 @@ func configureClusterTopology(ctx context.Context, scenario *clusterScenario) er
+ 				return err
+ 			}
+ 			return assertSlotsEqual(res, wanted)
+-		}, 60*time.Second)
++		}, 30*time.Second)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -208,37 +202,6 @@ func configureClusterTopology(ctx context.Context, scenario *clusterScenario) er
+ 	return nil
+ }
+ 
+-func collectNodeInformation(ctx context.Context, scenario *clusterScenario) error {
+-	for pos, port := range scenario.ports {
+-		client := redis.NewClient(&redis.Options{
+-			Addr: ":" + port,
+-		})
+-
+-		info, err := client.ClusterNodes(ctx).Result()
+-		if err != nil {
+-			return err
+-		}
+-
+-		scenario.clients[port] = client
+-		scenario.nodeIDs[pos] = info[:40]
+-	}
+-	return nil
+-}
+-
+-// startCluster start a cluster
+-func startCluster(ctx context.Context, scenario *clusterScenario) error {
+-	// Start processes and collect node ids
+-	for _, port := range scenario.ports {
+-		process, err := startRedis(port, "--cluster-enabled", "yes")
+-		if err != nil {
+-			return err
+-		}
+-		scenario.processes[port] = process
+-	}
+-
+-	return configureClusterTopology(ctx, scenario)
+-}
+-
+ func assertSlotsEqual(slots, wanted []redis.ClusterSlot) error {
+ outerLoop:
+ 	for _, s2 := range wanted {
+@@ -338,19 +301,17 @@ var _ = Describe("ClusterClient", func() {
+ 				Expect(err).NotTo(HaveOccurred())
+ 			}
+ 
+-			err := client.ForEachMaster(ctx, func(ctx context.Context, master *redis.Client) error {
++			client.ForEachMaster(ctx, func(ctx context.Context, master *redis.Client) error {
+ 				defer GinkgoRecover()
+ 				Eventually(func() string {
+ 					return master.Info(ctx, "keyspace").Val()
+ 				}, 30*time.Second).Should(Or(
+-					ContainSubstring("keys=32"),
+-					ContainSubstring("keys=36"),
+-					ContainSubstring("keys=32"),
++					ContainSubstring("keys=31"),
++					ContainSubstring("keys=29"),
++					ContainSubstring("keys=40"),
+ 				))
+ 				return nil
+ 			})
+-
+-			Expect(err).NotTo(HaveOccurred())
+ 		})
+ 
+ 		It("distributes keys when using EVAL", func() {
+@@ -366,19 +327,17 @@ var _ = Describe("ClusterClient", func() {
+ 				Expect(err).NotTo(HaveOccurred())
+ 			}
+ 
+-			err := client.ForEachMaster(ctx, func(ctx context.Context, master *redis.Client) error {
++			client.ForEachMaster(ctx, func(ctx context.Context, master *redis.Client) error {
+ 				defer GinkgoRecover()
+ 				Eventually(func() string {
+ 					return master.Info(ctx, "keyspace").Val()
+ 				}, 30*time.Second).Should(Or(
+-					ContainSubstring("keys=32"),
+-					ContainSubstring("keys=36"),
+-					ContainSubstring("keys=32"),
++					ContainSubstring("keys=31"),
++					ContainSubstring("keys=29"),
++					ContainSubstring("keys=40"),
+ 				))
+ 				return nil
+ 			})
+-
+-			Expect(err).NotTo(HaveOccurred())
+ 		})
+ 
+ 		It("distributes scripts when using Script Load", func() {
+@@ -388,14 +347,13 @@ var _ = Describe("ClusterClient", func() {
+ 
+ 			script.Load(ctx, client)
+ 
+-			err := client.ForEachShard(ctx, func(ctx context.Context, shard *redis.Client) error {
++			client.ForEachShard(ctx, func(ctx context.Context, shard *redis.Client) error {
+ 				defer GinkgoRecover()
+ 
+ 				val, _ := script.Exists(ctx, shard).Result()
+ 				Expect(val[0]).To(Equal(true))
+ 				return nil
+ 			})
+-			Expect(err).NotTo(HaveOccurred())
+ 		})
+ 
+ 		It("checks all shards when using Script Exists", func() {
+@@ -769,33 +727,33 @@ var _ = Describe("ClusterClient", func() {
+ 
+ 			wanted := []redis.ClusterSlot{{
+ 				Start: 0,
+-				End:   5460,
++				End:   4999,
+ 				Nodes: []redis.ClusterNode{{
+ 					ID:   "",
+-					Addr: "127.0.0.1:16600",
++					Addr: "127.0.0.1:8220",
+ 				}, {
+ 					ID:   "",
+-					Addr: "127.0.0.1:16603",
++					Addr: "127.0.0.1:8223",
+ 				}},
+ 			}, {
+-				Start: 5461,
+-				End:   10922,
++				Start: 5000,
++				End:   9999,
+ 				Nodes: []redis.ClusterNode{{
+ 					ID:   "",
+-					Addr: "127.0.0.1:16601",
++					Addr: "127.0.0.1:8221",
+ 				}, {
+ 					ID:   "",
+-					Addr: "127.0.0.1:16604",
++					Addr: "127.0.0.1:8224",
+ 				}},
+ 			}, {
+-				Start: 10923,
++				Start: 10000,
+ 				End:   16383,
+ 				Nodes: []redis.ClusterNode{{
+ 					ID:   "",
+-					Addr: "127.0.0.1:16602",
++					Addr: "127.0.0.1:8222",
+ 				}, {
+ 					ID:   "",
+-					Addr: "127.0.0.1:16605",
++					Addr: "127.0.0.1:8225",
+ 				}},
+ 			}}
+ 			Expect(assertSlotsEqual(res, wanted)).NotTo(HaveOccurred())
+@@ -1164,14 +1122,14 @@ var _ = Describe("ClusterClient", func() {
+ 			client, err := client.SlaveForKey(ctx, "test")
+ 			Expect(err).ToNot(HaveOccurred())
+ 			info := client.Info(ctx, "server")
+-			Expect(info.Val()).Should(ContainSubstring("tcp_port:16604"))
++			Expect(info.Val()).Should(ContainSubstring("tcp_port:8224"))
+ 		})
+ 
+ 		It("should return correct master for key", func() {
+ 			client, err := client.MasterForKey(ctx, "test")
+ 			Expect(err).ToNot(HaveOccurred())
+ 			info := client.Info(ctx, "server")
+-			Expect(info.Val()).Should(ContainSubstring("tcp_port:16601"))
++			Expect(info.Val()).Should(ContainSubstring("tcp_port:8221"))
+ 		})
+ 
+ 		assertClusterClient()
+@@ -1218,18 +1176,18 @@ var _ = Describe("ClusterClient", func() {
+ 			opt.ClusterSlots = func(ctx context.Context) ([]redis.ClusterSlot, error) {
+ 				slots := []redis.ClusterSlot{{
+ 					Start: 0,
+-					End:   5460,
++					End:   4999,
+ 					Nodes: []redis.ClusterNode{{
+ 						Addr: ":" + ringShard1Port,
+ 					}},
+ 				}, {
+-					Start: 5461,
+-					End:   10922,
++					Start: 5000,
++					End:   9999,
+ 					Nodes: []redis.ClusterNode{{
+ 						Addr: ":" + ringShard2Port,
+ 					}},
+ 				}, {
+-					Start: 10923,
++					Start: 10000,
+ 					End:   16383,
+ 					Nodes: []redis.ClusterNode{{
+ 						Addr: ":" + ringShard3Port,
+@@ -1272,18 +1230,18 @@ var _ = Describe("ClusterClient", func() {
+ 			opt.ClusterSlots = func(ctx context.Context) ([]redis.ClusterSlot, error) {
+ 				slots := []redis.ClusterSlot{{
+ 					Start: 0,
+-					End:   5460,
++					End:   4999,
+ 					Nodes: []redis.ClusterNode{{
+ 						Addr: ":" + ringShard1Port,
+ 					}},
+ 				}, {
+-					Start: 5461,
+-					End:   10922,
++					Start: 5000,
++					End:   9999,
+ 					Nodes: []redis.ClusterNode{{
+ 						Addr: ":" + ringShard2Port,
+ 					}},
+ 				}, {
+-					Start: 10923,
++					Start: 10000,
+ 					End:   16383,
+ 					Nodes: []redis.ClusterNode{{
+ 						Addr: ":" + ringShard3Port,
+@@ -1326,27 +1284,27 @@ var _ = Describe("ClusterClient", func() {
+ 			opt.ClusterSlots = func(ctx context.Context) ([]redis.ClusterSlot, error) {
+ 				slots := []redis.ClusterSlot{{
+ 					Start: 0,
+-					End:   5460,
++					End:   4999,
+ 					Nodes: []redis.ClusterNode{{
+-						Addr: ":16600",
++						Addr: ":8220",
+ 					}, {
+-						Addr: ":16603",
++						Addr: ":8223",
+ 					}},
+ 				}, {
+-					Start: 5461,
+-					End:   10922,
++					Start: 5000,
++					End:   9999,
+ 					Nodes: []redis.ClusterNode{{
+-						Addr: ":16601",
++						Addr: ":8221",
+ 					}, {
+-						Addr: ":16604",
++						Addr: ":8224",
+ 					}},
+ 				}, {
+-					Start: 10923,
++					Start: 10000,
+ 					End:   16383,
+ 					Nodes: []redis.ClusterNode{{
+-						Addr: ":16602",
++						Addr: ":8222",
+ 					}, {
+-						Addr: ":16605",
++						Addr: ":8225",
+ 					}},
+ 				}}
+ 				return slots, nil
+diff --git a/search_commands.go b/search_commands.go
+index 9e592801..ede084e4 100644
+--- a/search_commands.go
++++ b/search_commands.go
+@@ -282,30 +282,23 @@ type FTSearchSortBy struct {
+ 	Desc      bool
+ }
+ 
+-// FTSearchOptions hold options that can be passed to the FT.SEARCH command.
+-// More information about the options can be found
+-// in the documentation for FT.SEARCH https://redis.io/docs/latest/commands/ft.search/
+ type FTSearchOptions struct {
+-	NoContent    bool
+-	Verbatim     bool
+-	NoStopWords  bool
+-	WithScores   bool
+-	WithPayloads bool
+-	WithSortKeys bool
+-	Filters      []FTSearchFilter
+-	GeoFilter    []FTSearchGeoFilter
+-	InKeys       []interface{}
+-	InFields     []interface{}
+-	Return       []FTSearchReturn
+-	Slop         int
+-	Timeout      int
+-	InOrder      bool
+-	Language     string
+-	Expander     string
+-	// Scorer is used to set scoring function, if not set passed, a default will be used.
+-	// The default scorer depends on the Redis version:
+-	// - `BM25` for Redis >= 8
+-	// - `TFIDF` for Redis < 8
++	NoContent       bool
++	Verbatim        bool
++	NoStopWords     bool
++	WithScores      bool
++	WithPayloads    bool
++	WithSortKeys    bool
++	Filters         []FTSearchFilter
++	GeoFilter       []FTSearchGeoFilter
++	InKeys          []interface{}
++	InFields        []interface{}
++	Return          []FTSearchReturn
++	Slop            int
++	Timeout         int
++	InOrder         bool
++	Language        string
++	Expander        string
+ 	Scorer          string
+ 	ExplainScore    bool
+ 	Payload         string
+diff --git a/search_test.go b/search_test.go
+index a48f45bf..e267c8ae 100644
+--- a/search_test.go
++++ b/search_test.go
+@@ -371,56 +371,7 @@ var _ = Describe("RediSearch commands Resp 2", Label("search"), func() {
+ 		Expect(names).To(ContainElement("John"))
+ 	})
+ 
+-	// up until redis 8 the default scorer was TFIDF, in redis 8 it is BM25
+-	// this test expect redis major version >= 8
+ 	It("should FTSearch WithScores", Label("search", "ftsearch"), func() {
+-		if REDIS_MAJOR_VERSION < 8 {
+-			Skip("(redis major version < 8) default scorer is not BM25")
+-		}
+-		text1 := &redis.FieldSchema{FieldName: "description", FieldType: redis.SearchFieldTypeText}
+-		val, err := client.FTCreate(ctx, "idx1", &redis.FTCreateOptions{}, text1).Result()
+-		Expect(err).NotTo(HaveOccurred())
+-		Expect(val).To(BeEquivalentTo("OK"))
+-		WaitForIndexing(client, "idx1")
+-
+-		client.HSet(ctx, "doc1", "description", "The quick brown fox jumps over the lazy dog")
+-		client.HSet(ctx, "doc2", "description", "Quick alice was beginning to get very tired of sitting by her quick sister on the bank, and of having nothing to do.")
+-
+-		res, err := client.FTSearchWithArgs(ctx, "idx1", "quick", &redis.FTSearchOptions{WithScores: true}).Result()
+-		Expect(err).NotTo(HaveOccurred())
+-		Expect(*res.Docs[0].Score).To(BeNumerically("<=", 0.236))
+-
+-		res, err = client.FTSearchWithArgs(ctx, "idx1", "quick", &redis.FTSearchOptions{WithScores: true, Scorer: "TFIDF"}).Result()
+-		Expect(err).NotTo(HaveOccurred())
+-		Expect(*res.Docs[0].Score).To(BeEquivalentTo(float64(1)))
+-
+-		res, err = client.FTSearchWithArgs(ctx, "idx1", "quick", &redis.FTSearchOptions{WithScores: true, Scorer: "TFIDF.DOCNORM"}).Result()
+-		Expect(err).NotTo(HaveOccurred())
+-		Expect(*res.Docs[0].Score).To(BeEquivalentTo(0.14285714285714285))
+-
+-		res, err = client.FTSearchWithArgs(ctx, "idx1", "quick", &redis.FTSearchOptions{WithScores: true, Scorer: "BM25"}).Result()
+-		Expect(err).NotTo(HaveOccurred())
+-		Expect(*res.Docs[0].Score).To(BeNumerically("<=", 0.22471909420069797))
+-
+-		res, err = client.FTSearchWithArgs(ctx, "idx1", "quick", &redis.FTSearchOptions{WithScores: true, Scorer: "DISMAX"}).Result()
+-		Expect(err).NotTo(HaveOccurred())
+-		Expect(*res.Docs[0].Score).To(BeEquivalentTo(float64(2)))
+-
+-		res, err = client.FTSearchWithArgs(ctx, "idx1", "quick", &redis.FTSearchOptions{WithScores: true, Scorer: "DOCSCORE"}).Result()
+-		Expect(err).NotTo(HaveOccurred())
+-		Expect(*res.Docs[0].Score).To(BeEquivalentTo(float64(1)))
+-
+-		res, err = client.FTSearchWithArgs(ctx, "idx1", "quick", &redis.FTSearchOptions{WithScores: true, Scorer: "HAMMING"}).Result()
+-		Expect(err).NotTo(HaveOccurred())
+-		Expect(*res.Docs[0].Score).To(BeEquivalentTo(float64(0)))
+-	})
+-
+-	// up until redis 8 the default scorer was TFIDF, in redis 8 it is BM25
+-	// this test expect redis major version <=7
+-	It("should FTSearch WithScores", Label("search", "ftsearch"), func() {
+-		if REDIS_MAJOR_VERSION > 7 {
+-			Skip("(redis major version > 7) default scorer is not TFIDF")
+-		}
+ 		text1 := &redis.FieldSchema{FieldName: "description", FieldType: redis.SearchFieldTypeText}
+ 		val, err := client.FTCreate(ctx, "idx1", &redis.FTCreateOptions{}, text1).Result()
+ 		Expect(err).NotTo(HaveOccurred())

@@ -1,0 +1,160 @@
+diff --git a/.changes/v1.14/BUG FIXES-20251209-130050.yaml b/.changes/v1.14/BUG FIXES-20251209-130050.yaml
+deleted file mode 100644
+index 97914871b9..0000000000
+--- a/.changes/v1.14/BUG FIXES-20251209-130050.yaml	
++++ /dev/null
+@@ -1,5 +0,0 @@
+-kind: BUG FIXES
+-body: resource instance apply failures should not cause the resource instance state to be empty.
+-time: 2025-12-09T13:00:50.440436+01:00
+-custom:
+-    Issue: "37981"
+diff --git a/internal/terraform/node_resource_abstract_instance.go b/internal/terraform/node_resource_abstract_instance.go
+index 37321761bc..c5569b5491 100644
+--- a/internal/terraform/node_resource_abstract_instance.go
++++ b/internal/terraform/node_resource_abstract_instance.go
+@@ -2542,13 +2542,13 @@ func (n *NodeAbstractResourceInstance) apply(
+ 
+ 	provider, providerSchema, err := getProvider(ctx, n.ResolvedProvider)
+ 	if err != nil {
+-		return state, diags.Append(err)
++		return nil, diags.Append(err)
+ 	}
+ 	schema := providerSchema.SchemaForResourceType(n.Addr.Resource.Resource.Mode, n.Addr.Resource.Resource.Type)
+ 	if schema.Body == nil {
+ 		// Should be caught during validation, so we don't bother with a pretty error here
+ 		diags = diags.Append(fmt.Errorf("provider does not support resource type %q", n.Addr.Resource.Resource.Type))
+-		return state, diags
++		return nil, diags
+ 	}
+ 
+ 	log.Printf("[INFO] Starting apply for %s", n.Addr)
+@@ -2559,7 +2559,7 @@ func (n *NodeAbstractResourceInstance) apply(
+ 		configVal, _, configDiags = ctx.EvaluateBlock(applyConfig.Config, schema.Body, nil, keyData)
+ 		diags = diags.Append(configDiags)
+ 		if configDiags.HasErrors() {
+-			return state, diags
++			return nil, diags
+ 		}
+ 	}
+ 
+@@ -2584,13 +2584,13 @@ func (n *NodeAbstractResourceInstance) apply(
+ 				strings.Join(unknownPaths, "\n"),
+ 			),
+ 		))
+-		return state, diags
++		return nil, diags
+ 	}
+ 
+ 	metaConfigVal, metaDiags := n.providerMetas(ctx)
+ 	diags = diags.Append(metaDiags)
+ 	if diags.HasErrors() {
+-		return state, diags
++		return nil, diags
+ 	}
+ 
+ 	log.Printf("[DEBUG] %s: applying the planned %s change", n.Addr, change.Action)
+@@ -2713,7 +2713,7 @@ func (n *NodeAbstractResourceInstance) apply(
+ 		// Bail early in this particular case, because an object that doesn't
+ 		// conform to the schema can't be saved in the state anyway -- the
+ 		// serializer will reject it.
+-		return state, diags
++		return nil, diags
+ 	}
+ 
+ 	// Providers are supposed to return null values for all write-only attributes
+@@ -2731,7 +2731,7 @@ func (n *NodeAbstractResourceInstance) apply(
+ 	diags = diags.Append(writeOnlyDiags)
+ 
+ 	if writeOnlyDiags.HasErrors() {
+-		return state, diags
++		return nil, diags
+ 	}
+ 
+ 	// After this point we have a type-conforming result object and so we
+diff --git a/internal/terraform/node_resource_abstract_instance_test.go b/internal/terraform/node_resource_abstract_instance_test.go
+index 40e4fa480f..79810b81a1 100644
+--- a/internal/terraform/node_resource_abstract_instance_test.go
++++ b/internal/terraform/node_resource_abstract_instance_test.go
+@@ -9,16 +9,12 @@ import (
+ 
+ 	"github.com/zclconf/go-cty/cty"
+ 
+-	"github.com/hashicorp/hcl/v2"
+ 	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/configs"
+ 	"github.com/hashicorp/terraform/internal/configs/configschema"
+-	"github.com/hashicorp/terraform/internal/instances"
+-	"github.com/hashicorp/terraform/internal/plans"
+ 	"github.com/hashicorp/terraform/internal/plans/deferring"
+ 	"github.com/hashicorp/terraform/internal/providers"
+ 	"github.com/hashicorp/terraform/internal/states"
+-	"github.com/hashicorp/terraform/internal/tfdiags"
+ )
+ 
+ func TestNodeAbstractResourceInstanceProvider(t *testing.T) {
+@@ -254,64 +250,3 @@ func TestNodeAbstractResourceInstance_refresh_with_deferred_read(t *testing.T) {
+ 		t.Fatalf("expected deferral to be AbsentPrereq, got %s", deferred.Reason)
+ 	}
+ }
+-
+-func TestNodeAbstractResourceInstance_apply_with_unknown_values(t *testing.T) {
+-	state := states.NewState()
+-	evalCtx := &MockEvalContext{}
+-	evalCtx.StateState = state.SyncWrapper()
+-	evalCtx.Scope = evalContextModuleInstance{Addr: addrs.RootModuleInstance}
+-
+-	mockProvider := mockProviderWithResourceTypeSchema("aws_instance", &configschema.Block{
+-		Attributes: map[string]*configschema.Attribute{
+-			"id": {
+-				Type:     cty.String,
+-				Optional: true,
+-			},
+-		},
+-	})
+-	mockProvider.ConfigureProviderCalled = true
+-
+-	node := &NodeAbstractResourceInstance{
+-		Addr: mustResourceInstanceAddr("aws_instance.foo"),
+-		NodeAbstractResource: NodeAbstractResource{
+-			ResolvedProvider: mustProviderConfig(`provider["registry.terraform.io/hashicorp/aws"]`),
+-		},
+-	}
+-	evalCtx.ProviderProvider = mockProvider
+-	evalCtx.ProviderSchemaSchema = mockProvider.GetProviderSchema()
+-	evalCtx.EvaluateBlockResult = cty.ObjectVal(map[string]cty.Value{
+-		"id": cty.UnknownVal(cty.String),
+-	})
+-	priorState := &states.ResourceInstanceObject{
+-		Value: cty.ObjectVal(map[string]cty.Value{
+-			"id": cty.StringVal("prior"),
+-		}),
+-		Status: states.ObjectReady,
+-	}
+-	change := &plans.ResourceInstanceChange{
+-		Addr: node.Addr,
+-		Change: plans.Change{
+-			Action: plans.Update,
+-			Before: priorState.Value,
+-			After: cty.ObjectVal(map[string]cty.Value{
+-				"id": cty.UnknownVal(cty.String),
+-			}),
+-		},
+-	}
+-
+-	// Not needed for this test
+-	applyConfig := &configs.Resource{}
+-	keyData := instances.RepetitionData{}
+-
+-	newState, diags := node.apply(evalCtx, priorState, change, applyConfig, keyData, false)
+-
+-	tfdiags.AssertDiagnosticsMatch(t, diags, tfdiags.Diagnostics{}.Append(&hcl.Diagnostic{
+-		Severity: hcl.DiagError,
+-		Summary:  "Configuration contains unknown value",
+-		Detail:   "configuration for aws_instance.foo still contains unknown values during apply (this is a bug in Terraform; please report it!)\nThe following paths in the resource configuration are unknown:\n.id",
+-	}))
+-
+-	if !newState.Value.RawEquals(priorState.Value) {
+-		t.Fatalf("expected prior state to be preserved, got %s", newState.Value.GoString())
+-	}
+-}

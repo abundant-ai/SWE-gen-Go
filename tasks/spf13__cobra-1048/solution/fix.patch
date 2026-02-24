@@ -1,0 +1,403 @@
+diff --git a/args.go b/args.go
+index c4d820b..70e9b26 100644
+--- a/args.go
++++ b/args.go
+@@ -2,6 +2,7 @@ package cobra
+ 
+ import (
+ 	"fmt"
++	"strings"
+ )
+ 
+ type PositionalArgs func(cmd *Command, args []string) error
+@@ -34,8 +35,15 @@ func NoArgs(cmd *Command, args []string) error {
+ // OnlyValidArgs returns an error if any args are not in the list of ValidArgs.
+ func OnlyValidArgs(cmd *Command, args []string) error {
+ 	if len(cmd.ValidArgs) > 0 {
++		// Remove any description that may be included in ValidArgs.
++		// A description is following a tab character.
++		var validArgs []string
++		for _, v := range cmd.ValidArgs {
++			validArgs = append(validArgs, strings.Split(v, "\t")[0])
++		}
++
+ 		for _, v := range args {
+-			if !stringInSlice(v, cmd.ValidArgs) {
++			if !stringInSlice(v, validArgs) {
+ 				return fmt.Errorf("invalid argument %q for %q%s", v, cmd.CommandPath(), cmd.findSuggestions(args[0]))
+ 			}
+ 		}
+diff --git a/bash_completions.go b/bash_completions.go
+index b4098f4..1e27188 100644
+--- a/bash_completions.go
++++ b/bash_completions.go
+@@ -344,7 +344,7 @@ __%[1]s_handle_word()
+     __%[1]s_handle_word
+ }
+ 
+-`, name, ShellCompRequestCmd, ShellCompDirectiveError, ShellCompDirectiveNoSpace, ShellCompDirectiveNoFileComp))
++`, name, ShellCompNoDescRequestCmd, ShellCompDirectiveError, ShellCompDirectiveNoSpace, ShellCompDirectiveNoFileComp))
+ }
+ 
+ func writePostscript(buf *bytes.Buffer, name string) {
+@@ -548,6 +548,9 @@ func writeRequiredNouns(buf *bytes.Buffer, cmd *Command) {
+ 	buf.WriteString("    must_have_one_noun=()\n")
+ 	sort.Sort(sort.StringSlice(cmd.ValidArgs))
+ 	for _, value := range cmd.ValidArgs {
++		// Remove any description that may be included following a tab character.
++		// Descriptions are not supported by bash completion.
++		value = strings.Split(value, "\t")[0]
+ 		buf.WriteString(fmt.Sprintf("    must_have_one_noun+=(%q)\n", value))
+ 	}
+ 	if cmd.ValidArgsFunction != nil {
+diff --git a/bash_completions.md b/bash_completions.md
+index e1590e1..e61a3a6 100644
+--- a/bash_completions.md
++++ b/bash_completions.md
+@@ -115,6 +115,8 @@ in this example again instead of the replication controllers.
+ 
+ In some cases it is not possible to provide a list of possible completions in advance.  Instead, the list of completions must be determined at execution-time.  Cobra provides two ways of defining such dynamic completion of nouns. Note that both these methods can be used along-side each other as long as they are not both used for the same command.
+ 
++**Note**: *Custom Completions written in Go* will automatically work for other shell-completion scripts (e.g., Fish shell), while *Custom Completions written in Bash* will only work for Bash shell-completion.  It is therefore recommended to use *Custom Completions written in Go*.
++
+ #### 1. Custom completions of nouns written in Go
+ 
+ In a similar fashion as for static completions, you can use the `ValidArgsFunction` field to provide a Go function that Cobra will execute when it needs the list of completion choices for the nouns of a command.  Note that either `ValidArgs` or `ValidArgsFunction` can be used for a single cobra command, but not both.
+@@ -301,6 +303,8 @@ So while there are many other files in the CWD it only shows me subdirs and thos
+ 
+ As for nouns, Cobra provides two ways of defining dynamic completion of flags.  Note that both these methods can be used along-side each other as long as they are not both used for the same flag.
+ 
++**Note**: *Custom Completions written in Go* will automatically work for other shell-completion scripts (e.g., Fish shell), while *Custom Completions written in Bash* will only work for Bash shell-completion.  It is therefore recommended to use *Custom Completions written in Go*.
++
+ ## 1. Custom completions of flags written in Go
+ 
+ To provide a Go function that Cobra will execute when it needs the list of completion choices for a flag, you must register the function in the following manner:
+diff --git a/custom_completions.go b/custom_completions.go
+index 81f1bc3..ba57327 100644
+--- a/custom_completions.go
++++ b/custom_completions.go
+@@ -9,9 +9,14 @@ import (
+ 	"github.com/spf13/pflag"
+ )
+ 
+-// ShellCompRequestCmd is the name of the hidden command that is used to request
+-// completion results from the program.  It is used by the shell completion script.
+-const ShellCompRequestCmd = "__complete"
++const (
++	// ShellCompRequestCmd is the name of the hidden command that is used to request
++	// completion results from the program.  It is used by the shell completion scripts.
++	ShellCompRequestCmd = "__complete"
++	// ShellCompNoDescRequestCmd is the name of the hidden command that is used to request
++	// completion results without their description.  It is used by the shell completion scripts.
++	ShellCompNoDescRequestCmd = "__completeNoDesc"
++)
+ 
+ // Global map of flag completion functions.
+ var flagCompletionFunctions = map[*pflag.Flag]func(cmd *Command, args []string, toComplete string) ([]string, ShellCompDirective){}
+@@ -77,6 +82,7 @@ func (d ShellCompDirective) string() string {
+ func (c *Command) initCompleteCmd(args []string) {
+ 	completeCmd := &Command{
+ 		Use:                   fmt.Sprintf("%s [command-line]", ShellCompRequestCmd),
++		Aliases:               []string{ShellCompNoDescRequestCmd},
+ 		DisableFlagsInUseLine: true,
+ 		Hidden:                true,
+ 		DisableFlagParsing:    true,
+@@ -93,7 +99,12 @@ func (c *Command) initCompleteCmd(args []string) {
+ 				// 2- Even without completions, we need to print the directive
+ 			}
+ 
++			noDescriptions := (cmd.CalledAs() == ShellCompNoDescRequestCmd)
+ 			for _, comp := range completions {
++				if noDescriptions {
++					// Remove any description that may be included following a tab character.
++					comp = strings.Split(comp, "\t")[0]
++				}
+ 				// Print each possible completion to stdout for the completion script to consume.
+ 				fmt.Fprintln(finalCmd.OutOrStdout(), comp)
+ 			}
+@@ -139,6 +150,27 @@ func (c *Command) getCompletions(args []string) (*Command, []string, ShellCompDi
+ 		return c, completions, ShellCompDirectiveDefault, fmt.Errorf("Unable to find a command for arguments: %v", trimmedArgs)
+ 	}
+ 
++	// When doing completion of a flag name, as soon as an argument starts with
++	// a '-' we know it is a flag.  We cannot use isFlagArg() here as it requires
++	// the flag to be complete
++	if len(toComplete) > 0 && toComplete[0] == '-' && !strings.Contains(toComplete, "=") {
++		// We are completing a flag name
++		finalCmd.NonInheritedFlags().VisitAll(func(flag *pflag.Flag) {
++			completions = append(completions, getFlagNameCompletions(flag, toComplete)...)
++		})
++		finalCmd.InheritedFlags().VisitAll(func(flag *pflag.Flag) {
++			completions = append(completions, getFlagNameCompletions(flag, toComplete)...)
++		})
++
++		directive := ShellCompDirectiveDefault
++		if len(completions) > 0 {
++			if strings.HasSuffix(completions[0], "=") {
++				directive = ShellCompDirectiveNoSpace
++			}
++		}
++		return finalCmd, completions, directive, nil
++	}
++
+ 	var flag *pflag.Flag
+ 	if !finalCmd.DisableFlagParsing {
+ 		// We only do flag completion if we are allowed to parse flags
+@@ -150,6 +182,33 @@ func (c *Command) getCompletions(args []string) (*Command, []string, ShellCompDi
+ 		}
+ 	}
+ 
++	if flag == nil {
++		// Complete subcommand names
++		for _, subCmd := range finalCmd.Commands() {
++			if subCmd.IsAvailableCommand() && strings.HasPrefix(subCmd.Name(), toComplete) {
++				completions = append(completions, fmt.Sprintf("%s\t%s", subCmd.Name(), subCmd.Short))
++			}
++		}
++
++		if len(finalCmd.ValidArgs) > 0 {
++			// Always complete ValidArgs, even if we are completing a subcommand name.
++			// This is for commands that have both subcommands and ValidArgs.
++			for _, validArg := range finalCmd.ValidArgs {
++				if strings.HasPrefix(validArg, toComplete) {
++					completions = append(completions, validArg)
++				}
++			}
++
++			// If there are ValidArgs specified (even if they don't match), we stop completion.
++			// Only one of ValidArgs or ValidArgsFunction can be used for a single command.
++			return finalCmd, completions, ShellCompDirectiveNoFileComp, nil
++		}
++
++		// Always let the logic continue so as to add any ValidArgsFunction completions,
++		// even if we already found sub-commands.
++		// This is for commands that have subcommands but also specify a ValidArgsFunction.
++	}
++
+ 	// Parse the flags and extract the arguments to prepare for calling the completion function
+ 	if err = finalCmd.ParseFlags(finalArgs); err != nil {
+ 		return finalCmd, completions, ShellCompDirectiveDefault, fmt.Errorf("Error while parsing flags from args %v: %s", finalArgs, err.Error())
+@@ -179,6 +238,32 @@ func (c *Command) getCompletions(args []string) (*Command, []string, ShellCompDi
+ 	return finalCmd, completions, directive, nil
+ }
+ 
++func getFlagNameCompletions(flag *pflag.Flag, toComplete string) []string {
++	if nonCompletableFlag(flag) {
++		return []string{}
++	}
++
++	var completions []string
++	flagName := "--" + flag.Name
++	if strings.HasPrefix(flagName, toComplete) {
++		// Flag without the =
++		completions = append(completions, fmt.Sprintf("%s\t%s", flagName, flag.Usage))
++
++		if len(flag.NoOptDefVal) == 0 {
++			// Flag requires a value, so it can be suffixed with =
++			flagName += "="
++			completions = append(completions, fmt.Sprintf("%s\t%s", flagName, flag.Usage))
++		}
++	}
++
++	flagName = "-" + flag.Shorthand
++	if len(flag.Shorthand) > 0 && strings.HasPrefix(flagName, toComplete) {
++		completions = append(completions, fmt.Sprintf("%s\t%s", flagName, flag.Usage))
++	}
++
++	return completions
++}
++
+ func checkIfFlagCompletion(finalCmd *Command, args []string, lastArg string) (*pflag.Flag, []string, string, error) {
+ 	var flagName string
+ 	trimmedArgs := args
+diff --git a/fish_completions.go b/fish_completions.go
+new file mode 100644
+index 0000000..c83609c
+--- /dev/null
++++ b/fish_completions.go
+@@ -0,0 +1,172 @@
++package cobra
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"os"
++)
++
++func genFishComp(buf *bytes.Buffer, name string, includeDesc bool) {
++	compCmd := ShellCompRequestCmd
++	if !includeDesc {
++		compCmd = ShellCompNoDescRequestCmd
++	}
++	buf.WriteString(fmt.Sprintf("# fish completion for %-36s -*- shell-script -*-\n", name))
++	buf.WriteString(fmt.Sprintf(`
++function __%[1]s_debug
++    set file "$BASH_COMP_DEBUG_FILE"
++    if test -n "$file"
++        echo "$argv" >> $file
++    end
++end
++
++function __%[1]s_perform_completion
++    __%[1]s_debug "Starting __%[1]s_perform_completion with: $argv"
++
++    set args (string split -- " " "$argv")
++    set lastArg "$args[-1]"
++
++    __%[1]s_debug "args: $args"
++    __%[1]s_debug "last arg: $lastArg"
++
++    set emptyArg ""
++    if test -z "$lastArg"
++        __%[1]s_debug "Setting emptyArg"
++        set emptyArg \"\"
++    end
++    __%[1]s_debug "emptyArg: $emptyArg"
++
++    set requestComp "$args[1] %[2]s $args[2..-1] $emptyArg"
++    __%[1]s_debug "Calling $requestComp"
++
++    set results (eval $requestComp 2> /dev/null)
++    set comps $results[1..-2]
++    set directiveLine $results[-1]
++
++    # For Fish, when completing a flag with an = (e.g., <program> -n=<TAB>)
++    # completions must be prefixed with the flag
++    set flagPrefix (string match -r -- '-.*=' "$lastArg")
++
++    __%[1]s_debug "Comps: $comps"
++    __%[1]s_debug "DirectiveLine: $directiveLine"
++    __%[1]s_debug "flagPrefix: $flagPrefix"
++
++    for comp in $comps
++        printf "%%s%%s\n" "$flagPrefix" "$comp"
++    end
++
++    printf "%%s\n" "$directiveLine"
++end
++
++# This function does three things:
++# 1- Obtain the completions and store them in the global __%[1]s_comp_results
++# 2- Set the __%[1]s_comp_do_file_comp flag if file completion should be performed
++#    and unset it otherwise
++# 3- Return true if the completion results are not empty
++function __%[1]s_prepare_completions
++    # Start fresh
++    set --erase __%[1]s_comp_do_file_comp
++    set --erase __%[1]s_comp_results
++
++    # Check if the command-line is already provided.  This is useful for testing.
++    if not set --query __%[1]s_comp_commandLine
++        set __%[1]s_comp_commandLine (commandline)
++    end
++    __%[1]s_debug "commandLine is: $__%[1]s_comp_commandLine"
++
++    set results (__%[1]s_perform_completion "$__%[1]s_comp_commandLine")
++    set --erase __%[1]s_comp_commandLine
++    __%[1]s_debug "Completion results: $results"
++
++    if test -z "$results"
++        __%[1]s_debug "No completion, probably due to a failure"
++        # Might as well do file completion, in case it helps
++        set --global __%[1]s_comp_do_file_comp 1
++        return 0
++    end
++
++    set directive (string sub --start 2 $results[-1])
++    set --global __%[1]s_comp_results $results[1..-2]
++
++    __%[1]s_debug "Completions are: $__%[1]s_comp_results"
++    __%[1]s_debug "Directive is: $directive"
++
++    if test -z "$directive"
++        set directive 0
++    end
++
++    set compErr (math (math --scale 0 $directive / %[3]d) %% 2)
++    if test $compErr -eq 1
++        __%[1]s_debug "Received error directive: aborting."
++        # Might as well do file completion, in case it helps
++        set --global __%[1]s_comp_do_file_comp 1
++        return 0
++    end
++
++    set nospace (math (math --scale 0 $directive / %[4]d) %% 2)
++    set nofiles (math (math --scale 0 $directive / %[5]d) %% 2)
++
++    __%[1]s_debug "nospace: $nospace, nofiles: $nofiles"
++
++    # Important not to quote the variable for count to work
++    set numComps (count $__%[1]s_comp_results)
++    __%[1]s_debug "numComps: $numComps"
++
++    if test $numComps -eq 1; and test $nospace -ne 0
++        # To support the "nospace" directive we trick the shell
++        # by outputting an extra, longer completion.
++        __%[1]s_debug "Adding second completion to perform nospace directive"
++        set --append __%[1]s_comp_results $__%[1]s_comp_results[1].
++    end
++
++    if test $numComps -eq 0; and test $nofiles -eq 0
++        __%[1]s_debug "Requesting file completion"
++        set --global __%[1]s_comp_do_file_comp 1
++    end
++
++    # If we don't want file completion, we must return true even if there
++    # are no completions found.  This is because fish will perform the last
++    # completion command, even if its condition is false, if no other
++    # completion command was triggered
++    return (not set --query __%[1]s_comp_do_file_comp)
++end
++
++# Remove any pre-existing completions for the program since we will be handling all of them
++# TODO this cleanup is not sufficient.  Fish completions are only loaded once the user triggers
++# them, so the below deletion will not work as it is run too early.  What else can we do?
++complete -c %[1]s -e
++
++# The order in which the below two lines are defined is very important so that __%[1]s_prepare_completions
++# is called first.  It is __%[1]s_prepare_completions that sets up the __%[1]s_comp_do_file_comp variable.
++#
++# This completion will be run second as complete commands are added FILO.
++# It triggers file completion choices when __%[1]s_comp_do_file_comp is set.
++complete -c %[1]s -n 'set --query __%[1]s_comp_do_file_comp'
++
++# This completion will be run first as complete commands are added FILO.
++# The call to __%[1]s_prepare_completions will setup both __%[1]s_comp_results abd __%[1]s_comp_do_file_comp.
++# It provides the program's completion choices.
++complete -c %[1]s -n '__%[1]s_prepare_completions' -f -a '$__%[1]s_comp_results'
++
++`, name, compCmd, ShellCompDirectiveError, ShellCompDirectiveNoSpace, ShellCompDirectiveNoFileComp))
++}
++
++// GenFishCompletion generates fish completion file and writes to the passed writer.
++func (c *Command) GenFishCompletion(w io.Writer, includeDesc bool) error {
++	buf := new(bytes.Buffer)
++	genFishComp(buf, c.Name(), includeDesc)
++	_, err := buf.WriteTo(w)
++	return err
++}
++
++// GenFishCompletionFile generates fish completion file.
++func (c *Command) GenFishCompletionFile(filename string, includeDesc bool) error {
++	outFile, err := os.Create(filename)
++	if err != nil {
++		return err
++	}
++	defer outFile.Close()
++
++	return c.GenFishCompletion(outFile, includeDesc)
++}
+diff --git a/fish_completions.md b/fish_completions.md
+new file mode 100644
+index 0000000..6bfe5f8
+--- /dev/null
++++ b/fish_completions.md
+@@ -0,0 +1,7 @@
++## Generating Fish Completions for your own cobra.Command
++
++Cobra supports native Fish completions generated from the root `cobra.Command`.  You can use the `command.GenFishCompletion()` or `command.GenFishCompletionFile()` functions. You must provide these functions with a parameter indicating if the completions should be annotated with a description; Cobra will provide the description automatically based on usage information.  You can choose to make this option configurable by your users.
++
++### Limitations
++
++* Custom completions implemented using the `ValidArgsFunction` and `RegisterFlagCompletionFunc()` are supported automatically but the ones implemented in Bash scripting are not.

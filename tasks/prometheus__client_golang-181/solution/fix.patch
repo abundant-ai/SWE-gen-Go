@@ -1,0 +1,269 @@
+diff --git a/prometheus/counter.go b/prometheus/counter.go
+index a2952d1..d2a564b 100644
+--- a/prometheus/counter.go
++++ b/prometheus/counter.go
+@@ -15,7 +15,6 @@ package prometheus
+ 
+ import (
+ 	"errors"
+-	"hash/fnv"
+ )
+ 
+ // Counter is a Metric that represents a single numerical value that only ever
+@@ -97,7 +96,6 @@ func NewCounterVec(opts CounterOpts, labelNames []string) *CounterVec {
+ 		MetricVec: MetricVec{
+ 			children: map[uint64]Metric{},
+ 			desc:     desc,
+-			hash:     fnv.New64a(),
+ 			newMetric: func(lvs ...string) Metric {
+ 				result := &counter{value: value{
+ 					desc:       desc,
+diff --git a/prometheus/fnv.go b/prometheus/fnv.go
+new file mode 100644
+index 0000000..59ecedc
+--- /dev/null
++++ b/prometheus/fnv.go
+@@ -0,0 +1,22 @@
++package prometheus
++
++// Inline and byte-free variant of hash/fnv's fnv64a.
++
++const (
++	offset64 = 14695981039346656037
++	prime64  = 1099511628211
++)
++
++// hashNew initializies a new fnv64a hash value.
++func hashNew() uint64 {
++	return offset64
++}
++
++// hashAdd adds a string to a fnv64a hash value, returning the updated hash.
++func hashAdd(h uint64, s string) uint64 {
++	for i := 0; i < len(s); i++ {
++		h ^= uint64(s[i])
++		h *= prime64
++	}
++	return h
++}
+diff --git a/prometheus/gauge.go b/prometheus/gauge.go
+index ba8a402..390c074 100644
+--- a/prometheus/gauge.go
++++ b/prometheus/gauge.go
+@@ -13,8 +13,6 @@
+ 
+ package prometheus
+ 
+-import "hash/fnv"
+-
+ // Gauge is a Metric that represents a single numerical value that can
+ // arbitrarily go up and down.
+ //
+@@ -77,7 +75,6 @@ func NewGaugeVec(opts GaugeOpts, labelNames []string) *GaugeVec {
+ 		MetricVec: MetricVec{
+ 			children: map[uint64]Metric{},
+ 			desc:     desc,
+-			hash:     fnv.New64a(),
+ 			newMetric: func(lvs ...string) Metric {
+ 				return newValue(desc, GaugeValue, 0, lvs...)
+ 			},
+diff --git a/prometheus/histogram.go b/prometheus/histogram.go
+index f98a41b..7a68910 100644
+--- a/prometheus/histogram.go
++++ b/prometheus/histogram.go
+@@ -15,7 +15,6 @@ package prometheus
+ 
+ import (
+ 	"fmt"
+-	"hash/fnv"
+ 	"math"
+ 	"sort"
+ 	"sync/atomic"
+@@ -305,7 +304,6 @@ func NewHistogramVec(opts HistogramOpts, labelNames []string) *HistogramVec {
+ 		MetricVec: MetricVec{
+ 			children: map[uint64]Metric{},
+ 			desc:     desc,
+-			hash:     fnv.New64a(),
+ 			newMetric: func(lvs ...string) Metric {
+ 				return newHistogram(desc, opts, lvs...)
+ 			},
+diff --git a/prometheus/summary.go b/prometheus/summary.go
+index fe81e00..eb84961 100644
+--- a/prometheus/summary.go
++++ b/prometheus/summary.go
+@@ -15,7 +15,6 @@ package prometheus
+ 
+ import (
+ 	"fmt"
+-	"hash/fnv"
+ 	"math"
+ 	"sort"
+ 	"sync"
+@@ -408,7 +407,6 @@ func NewSummaryVec(opts SummaryOpts, labelNames []string) *SummaryVec {
+ 		MetricVec: MetricVec{
+ 			children: map[uint64]Metric{},
+ 			desc:     desc,
+-			hash:     fnv.New64a(),
+ 			newMetric: func(lvs ...string) Metric {
+ 				return newSummary(desc, opts, lvs...)
+ 			},
+diff --git a/prometheus/untyped.go b/prometheus/untyped.go
+index c65ab1c..89b86ea 100644
+--- a/prometheus/untyped.go
++++ b/prometheus/untyped.go
+@@ -13,8 +13,6 @@
+ 
+ package prometheus
+ 
+-import "hash/fnv"
+-
+ // Untyped is a Metric that represents a single numerical value that can
+ // arbitrarily go up and down.
+ //
+@@ -75,7 +73,6 @@ func NewUntypedVec(opts UntypedOpts, labelNames []string) *UntypedVec {
+ 		MetricVec: MetricVec{
+ 			children: map[uint64]Metric{},
+ 			desc:     desc,
+-			hash:     fnv.New64a(),
+ 			newMetric: func(lvs ...string) Metric {
+ 				return newValue(desc, UntypedValue, 0, lvs...)
+ 			},
+diff --git a/prometheus/vec.go b/prometheus/vec.go
+index a1f3bdf..68f9461 100644
+--- a/prometheus/vec.go
++++ b/prometheus/vec.go
+@@ -14,9 +14,7 @@
+ package prometheus
+ 
+ import (
+-	"bytes"
+ 	"fmt"
+-	"hash"
+ 	"sync"
+ )
+ 
+@@ -26,16 +24,10 @@ import (
+ // type. GaugeVec, CounterVec, SummaryVec, and UntypedVec are examples already
+ // provided in this package.
+ type MetricVec struct {
+-	mtx      sync.RWMutex // Protects not only children, but also hash and buf.
++	mtx      sync.RWMutex // Protects the children.
+ 	children map[uint64]Metric
+ 	desc     *Desc
+ 
+-	// hash is our own hash instance to avoid repeated allocations.
+-	hash hash.Hash64
+-	// buf is used to copy string contents into it for hashing,
+-	// again to avoid allocations.
+-	buf bytes.Buffer
+-
+ 	newMetric func(labelValues ...string) Metric
+ }
+ 
+@@ -80,13 +72,20 @@ func (m *MetricVec) Collect(ch chan<- Metric) {
+ // with a performance overhead (for creating and processing the Labels map).
+ // See also the GaugeVec example.
+ func (m *MetricVec) GetMetricWithLabelValues(lvs ...string) (Metric, error) {
+-	m.mtx.Lock()
+-	defer m.mtx.Unlock()
+-
+ 	h, err := m.hashLabelValues(lvs)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++
++	m.mtx.RLock()
++	metric, ok := m.children[h]
++	m.mtx.RUnlock()
++	if ok {
++		return metric, nil
++	}
++
++	m.mtx.Lock()
++	defer m.mtx.Unlock()
+ 	return m.getOrCreateMetric(h, lvs...), nil
+ }
+ 
+@@ -103,17 +102,24 @@ func (m *MetricVec) GetMetricWithLabelValues(lvs ...string) (Metric, error) {
+ // GetMetricWithLabelValues(...string). See there for pros and cons of the two
+ // methods.
+ func (m *MetricVec) GetMetricWith(labels Labels) (Metric, error) {
+-	m.mtx.Lock()
+-	defer m.mtx.Unlock()
+-
+ 	h, err := m.hashLabels(labels)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++
++	m.mtx.RLock()
++	metric, ok := m.children[h]
++	m.mtx.RUnlock()
++	if ok {
++		return metric, nil
++	}
++
+ 	lvs := make([]string, len(labels))
+ 	for i, label := range m.desc.variableLabels {
+ 		lvs[i] = labels[label]
+ 	}
++	m.mtx.Lock()
++	defer m.mtx.Unlock()
+ 	return m.getOrCreateMetric(h, lvs...), nil
+ }
+ 
+@@ -162,7 +168,7 @@ func (m *MetricVec) DeleteLabelValues(lvs ...string) bool {
+ 	if err != nil {
+ 		return false
+ 	}
+-	if _, has := m.children[h]; !has {
++	if _, ok := m.children[h]; !ok {
+ 		return false
+ 	}
+ 	delete(m.children, h)
+@@ -187,7 +193,7 @@ func (m *MetricVec) Delete(labels Labels) bool {
+ 	if err != nil {
+ 		return false
+ 	}
+-	if _, has := m.children[h]; !has {
++	if _, ok := m.children[h]; !ok {
+ 		return false
+ 	}
+ 	delete(m.children, h)
+@@ -208,30 +214,26 @@ func (m *MetricVec) hashLabelValues(vals []string) (uint64, error) {
+ 	if len(vals) != len(m.desc.variableLabels) {
+ 		return 0, errInconsistentCardinality
+ 	}
+-	m.hash.Reset()
++	h := hashNew()
+ 	for _, val := range vals {
+-		m.buf.Reset()
+-		m.buf.WriteString(val)
+-		m.hash.Write(m.buf.Bytes())
++		h = hashAdd(h, val)
+ 	}
+-	return m.hash.Sum64(), nil
++	return h, nil
+ }
+ 
+ func (m *MetricVec) hashLabels(labels Labels) (uint64, error) {
+ 	if len(labels) != len(m.desc.variableLabels) {
+ 		return 0, errInconsistentCardinality
+ 	}
+-	m.hash.Reset()
++	h := hashNew()
+ 	for _, label := range m.desc.variableLabels {
+ 		val, ok := labels[label]
+ 		if !ok {
+ 			return 0, fmt.Errorf("label name %q missing in label map", label)
+ 		}
+-		m.buf.Reset()
+-		m.buf.WriteString(val)
+-		m.hash.Write(m.buf.Bytes())
++		h = hashAdd(h, val)
+ 	}
+-	return m.hash.Sum64(), nil
++	return h, nil
+ }
+ 
+ func (m *MetricVec) getOrCreateMetric(hash uint64, labelValues ...string) Metric {

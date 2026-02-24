@@ -1,0 +1,404 @@
+diff --git a/prometheus/gen_go_collector_metrics_set.go b/prometheus/gen_go_collector_metrics_set.go
+index e33b397..ac63777 100644
+--- a/prometheus/gen_go_collector_metrics_set.go
++++ b/prometheus/gen_go_collector_metrics_set.go
+@@ -21,9 +21,7 @@ import (
+ 	"fmt"
+ 	"go/format"
+ 	"log"
+-	"math"
+ 	"os"
+-	"runtime"
+ 	"runtime/metrics"
+ 	"strconv"
+ 	"strings"
+@@ -37,10 +35,6 @@ func main() {
+ 	if len(os.Args) != 2 {
+ 		log.Fatal("requires Go version (e.g. go1.17) as an argument")
+ 	}
+-	toolVersion := runtime.Version()
+-	if majorVersion := toolVersion[:strings.LastIndexByte(toolVersion, '.')]; majorVersion != os.Args[1] {
+-		log.Fatalf("using Go version %q but expected Go version %q", majorVersion, os.Args[1])
+-	}
+ 	version, err := parseVersion(os.Args[1])
+ 	if err != nil {
+ 		log.Fatalf("parsing Go version: %v", err)
+@@ -51,11 +45,9 @@ func main() {
+ 	err = testFile.Execute(&buf, struct {
+ 		Descriptions []metrics.Description
+ 		GoVersion    goVersion
+-		Cardinality  int
+ 	}{
+ 		Descriptions: metrics.All(),
+ 		GoVersion:    version,
+-		Cardinality:  rmCardinality(),
+ 	})
+ 	if err != nil {
+ 		log.Fatalf("executing template: %v", err)
+@@ -93,46 +85,6 @@ func parseVersion(s string) (goVersion, error) {
+ 	return goVersion(i), err
+ }
+ 
+-func rmCardinality() int {
+-	cardinality := 0
+-
+-	// Collect all histogram samples so that we can get their buckets.
+-	// The API guarantees that the buckets are always fixed for the lifetime
+-	// of the process.
+-	var histograms []metrics.Sample
+-	for _, d := range metrics.All() {
+-		if d.Kind == metrics.KindFloat64Histogram {
+-			histograms = append(histograms, metrics.Sample{Name: d.Name})
+-		} else {
+-			cardinality++
+-		}
+-	}
+-
+-	// Handle histograms.
+-	metrics.Read(histograms)
+-	for i := range histograms {
+-		name := histograms[i].Name
+-		buckets := internal.RuntimeMetricsBucketsForUnit(
+-			histograms[i].Value.Float64Histogram().Buckets,
+-			name[strings.IndexRune(name, ':')+1:],
+-		)
+-		cardinality += len(buckets) + 3 // Plus total count, sum, and the implicit infinity bucket.
+-		// runtime/metrics bucket boundaries are lower-bound-inclusive, but
+-		// always represents each actual *boundary* so Buckets is always
+-		// 1 longer than Counts, while in Prometheus the mapping is one-to-one,
+-		// as the bottom bucket extends to -Inf, and the top infinity bucket is
+-		// implicit. Therefore, we should have one fewer bucket than is listed
+-		// above.
+-		cardinality--
+-		if buckets[len(buckets)-1] == math.Inf(1) {
+-			// We already counted the infinity bucket separately.
+-			cardinality--
+-		}
+-	}
+-
+-	return cardinality
+-}
+-
+ var testFile = template.Must(template.New("testFile").Funcs(map[string]interface{}{
+ 	"rm2prom": func(d metrics.Description) string {
+ 		ns, ss, n, ok := internal.RuntimeMetricsToProm(&d)
+@@ -160,6 +112,4 @@ var expectedRuntimeMetrics = map[string]string{
+ 	{{- end -}}
+ {{end}}
+ }
+-
+-const expectedRuntimeMetricsCardinality = {{.Cardinality}}
+ `))
+diff --git a/prometheus/go_collector_go117.go b/prometheus/go_collector_go117.go
+index 80ef07f..5046840 100644
+--- a/prometheus/go_collector_go117.go
++++ b/prometheus/go_collector_go117.go
+@@ -20,7 +20,6 @@ import (
+ 	"math"
+ 	"runtime"
+ 	"runtime/metrics"
+-	"strings"
+ 	"sync"
+ 
+ 	//nolint:staticcheck // Ignore SA1019. Need to keep deprecated package for compatibility.
+@@ -54,20 +53,9 @@ type goCollector struct {
+ // Deprecated: Use collectors.NewGoCollector instead.
+ func NewGoCollector() Collector {
+ 	descriptions := metrics.All()
+-
+-	// Collect all histogram samples so that we can get their buckets.
+-	// The API guarantees that the buckets are always fixed for the lifetime
+-	// of the process.
+-	var histograms []metrics.Sample
+-	for _, d := range descriptions {
+-		if d.Kind == metrics.KindFloat64Histogram {
+-			histograms = append(histograms, metrics.Sample{Name: d.Name})
+-		}
+-	}
+-	metrics.Read(histograms)
+-	bucketsMap := make(map[string][]float64)
+-	for i := range histograms {
+-		bucketsMap[histograms[i].Name] = histograms[i].Value.Float64Histogram().Buckets
++	descMap := make(map[string]*metrics.Description)
++	for i := range descriptions {
++		descMap[descriptions[i].Name] = &descriptions[i]
+ 	}
+ 
+ 	// Generate a Desc and ValueType for each runtime/metrics metric.
+@@ -92,7 +80,6 @@ func NewGoCollector() Collector {
+ 		var m collectorMetric
+ 		if d.Kind == metrics.KindFloat64Histogram {
+ 			_, hasSum := rmExactSumMap[d.Name]
+-			unit := d.Name[strings.IndexRune(d.Name, ':')+1:]
+ 			m = newBatchHistogram(
+ 				NewDesc(
+ 					BuildFQName(namespace, subsystem, name),
+@@ -100,7 +87,6 @@ func NewGoCollector() Collector {
+ 					nil,
+ 					nil,
+ 				),
+-				internal.RuntimeMetricsBucketsForUnit(bucketsMap[d.Name], unit),
+ 				hasSum,
+ 			)
+ 		} else if d.Cumulative {
+@@ -312,27 +298,13 @@ type batchHistogram struct {
+ 	// but Write calls may operate concurrently with updates.
+ 	// Contention between these two sources should be rare.
+ 	mu      sync.Mutex
+-	buckets []float64 // Inclusive lower bounds, like runtime/metrics.
++	buckets []float64 // Inclusive lower bounds.
+ 	counts  []uint64
+ 	sum     float64 // Used if hasSum is true.
+ }
+ 
+-// newBatchHistogram creates a new batch histogram value with the given
+-// Desc, buckets, and whether or not it has an exact sum available.
+-//
+-// buckets must always be from the runtime/metrics package, following
+-// the same conventions.
+-func newBatchHistogram(desc *Desc, buckets []float64, hasSum bool) *batchHistogram {
+-	h := &batchHistogram{
+-		desc:    desc,
+-		buckets: buckets,
+-		// Because buckets follows runtime/metrics conventions, there's
+-		// 1 more value in the buckets list than there are buckets represented,
+-		// because in runtime/metrics, the bucket values represent *boundaries*,
+-		// and non-Inf boundaries are inclusive lower bounds for that bucket.
+-		counts: make([]uint64, len(buckets)-1),
+-		hasSum: hasSum,
+-	}
++func newBatchHistogram(desc *Desc, hasSum bool) *batchHistogram {
++	h := &batchHistogram{desc: desc, hasSum: hasSum}
+ 	h.init(h)
+ 	return h
+ }
+@@ -340,25 +312,28 @@ func newBatchHistogram(desc *Desc, buckets []float64, hasSum bool) *batchHistogr
+ // update updates the batchHistogram from a runtime/metrics histogram.
+ //
+ // sum must be provided if the batchHistogram was created to have an exact sum.
+-// h.buckets must be a strict subset of his.Buckets.
+ func (h *batchHistogram) update(his *metrics.Float64Histogram, sum float64) {
+ 	counts, buckets := his.Counts, his.Buckets
++	// Skip a -Inf bucket altogether. It's not clear how to represent that.
++	if math.IsInf(buckets[0], -1) {
++		buckets = buckets[1:]
++		counts = counts[1:]
++	}
+ 
+ 	h.mu.Lock()
+ 	defer h.mu.Unlock()
+ 
+-	// Clear buckets.
+-	for i := range h.counts {
+-		h.counts[i] = 0
+-	}
+-	// Copy and reduce buckets.
+-	var j int
+-	for i, count := range counts {
+-		h.counts[j] += count
+-		if buckets[i+1] == h.buckets[j+1] {
+-			j++
+-		}
++	// Check if we're initialized.
++	if h.buckets == nil {
++		// Make copies of counts and buckets. It's really important
++		// that we don't retain his.Counts or his.Buckets anywhere since
++		// it's going to get reused.
++		h.buckets = make([]float64, len(buckets))
++		copy(h.buckets, buckets)
++
++		h.counts = make([]uint64, len(counts))
+ 	}
++	copy(h.counts, counts)
+ 	if h.hasSum {
+ 		h.sum = sum
+ 	}
+diff --git a/prometheus/go_collector_go117_test.go b/prometheus/go_collector_go117_test.go
+index 734711f..e780bce 100644
+--- a/prometheus/go_collector_go117_test.go
++++ b/prometheus/go_collector_go117_test.go
+@@ -140,13 +140,9 @@ func TestBatchHistogram(t *testing.T) {
+ 	}
+ 	metrics.Read(s)
+ 	rmHist := s[0].Value.Float64Histogram()
+-	wantBuckets := internal.RuntimeMetricsBucketsForUnit(rmHist.Buckets, "bytes")
+-	// runtime/metrics histograms always have a +Inf bucket and are lower
+-	// bound inclusive. In contrast, we have an implicit +Inf bucket and
+-	// are upper bound inclusive, so we can chop off the first bucket
+-	// (since the conversion to upper bound inclusive will shift all buckets
+-	// down one index) and the +Inf for the last bucket.
+-	wantBuckets = wantBuckets[1 : len(wantBuckets)-1]
++	// runtime/metrics histograms always have -Inf and +Inf buckets.
++	// We never handle -Inf and +Inf is implicit.
++	wantBuckets := len(rmHist.Buckets) - 2
+ 
+ 	// Check to make sure the output proto makes sense.
+ 	pb := &dto.Metric{}
+@@ -155,14 +151,14 @@ func TestBatchHistogram(t *testing.T) {
+ 	if math.IsInf(pb.Histogram.Bucket[len(pb.Histogram.Bucket)-1].GetUpperBound(), +1) {
+ 		t.Errorf("found +Inf bucket")
+ 	}
+-	if got := len(pb.Histogram.Bucket); got != len(wantBuckets) {
+-		t.Errorf("got %d buckets in protobuf, want %d", got, len(wantBuckets))
++	if got := len(pb.Histogram.Bucket); got != wantBuckets {
++		t.Errorf("got %d buckets in protobuf, want %d", got, wantBuckets)
+ 	}
+ 	for i, bucket := range pb.Histogram.Bucket {
+ 		// runtime/metrics histograms are lower-bound inclusive, but we're
+ 		// upper-bound inclusive. So just make sure the new inclusive upper
+ 		// bound is somewhere close by (in some cases it's equal).
+-		wantBound := wantBuckets[i]
++		wantBound := rmHist.Buckets[i+1]
+ 		if gotBound := *bucket.UpperBound; (wantBound-gotBound)/wantBound > 0.001 {
+ 			t.Errorf("got bound %f, want within 0.1%% of %f", gotBound, wantBound)
+ 		}
+@@ -248,7 +244,6 @@ func TestExpectedRuntimeMetrics(t *testing.T) {
+ 
+ 	descs := metrics.All()
+ 	rmSet := make(map[string]struct{})
+-	// Iterate over runtime-reported descriptions to find new metrics.
+ 	for i := range descs {
+ 		rmName := descs[i].Name
+ 		rmSet[rmName] = struct{}{}
+@@ -268,8 +263,6 @@ func TestExpectedRuntimeMetrics(t *testing.T) {
+ 			continue
+ 		}
+ 	}
+-	// Now iterate over the expected metrics and look for removals.
+-	cardinality := 0
+ 	for rmName, fqName := range expectedRuntimeMetrics {
+ 		if _, ok := rmSet[rmName]; !ok {
+ 			t.Errorf("runtime/metrics metric %s removed", rmName)
+@@ -279,30 +272,6 @@ func TestExpectedRuntimeMetrics(t *testing.T) {
+ 			t.Errorf("runtime/metrics metric %s not appearing under expected name %s", rmName, fqName)
+ 			continue
+ 		}
+-
+-		// While we're at it, check to make sure expected cardinality lines
+-		// up, but at the point of the protobuf write to get as close to the
+-		// real deal as possible.
+-		//
+-		// Note that we filter out non-runtime/metrics metrics here, because
+-		// those are manually managed.
+-		var m dto.Metric
+-		if err := goMetricSet[fqName].Write(&m); err != nil {
+-			t.Errorf("writing metric %s: %v", fqName, err)
+-			continue
+-		}
+-		// N.B. These are the only fields populated by runtime/metrics metrics specifically.
+-		// Other fields are populated by e.g. GCStats metrics.
+-		switch {
+-		case m.Counter != nil:
+-			fallthrough
+-		case m.Gauge != nil:
+-			cardinality++
+-		case m.Histogram != nil:
+-			cardinality += len(m.Histogram.Bucket) + 3 // + sum, count, and +inf
+-		default:
+-			t.Errorf("unexpected protobuf structure for metric %s", fqName)
+-		}
+ 	}
+ 
+ 	if t.Failed() {
+@@ -310,11 +279,6 @@ func TestExpectedRuntimeMetrics(t *testing.T) {
+ 		t.Log("\tgo run gen_go_collector_metrics_set.go go1.X")
+ 		t.Log("where X is the Go version you are currently using")
+ 	}
+-
+-	expectCardinality := expectedRuntimeMetricsCardinality
+-	if cardinality != expectCardinality {
+-		t.Errorf("unexpected cardinality for runtime/metrics metrics: got %d, want %d", cardinality, expectCardinality)
+-	}
+ }
+ 
+ func TestGoCollectorConcurrency(t *testing.T) {
+diff --git a/prometheus/go_collector_metrics_go117_test.go b/prometheus/go_collector_metrics_go117_test.go
+index 20e98ef..6c0a693 100644
+--- a/prometheus/go_collector_metrics_go117_test.go
++++ b/prometheus/go_collector_metrics_go117_test.go
+@@ -37,5 +37,3 @@ var expectedRuntimeMetrics = map[string]string{
+ 	"/sched/goroutines:goroutines":                "go_sched_goroutines_goroutines",
+ 	"/sched/latencies:seconds":                    "go_sched_latencies_seconds",
+ }
+-
+-const expectedRuntimeMetricsCardinality = 79
+diff --git a/prometheus/internal/go_runtime_metrics.go b/prometheus/internal/go_runtime_metrics.go
+index fe0a521..afc8dff 100644
+--- a/prometheus/internal/go_runtime_metrics.go
++++ b/prometheus/internal/go_runtime_metrics.go
+@@ -17,7 +17,6 @@
+ package internal
+ 
+ import (
+-	"math"
+ 	"path"
+ 	"runtime/metrics"
+ 	"strings"
+@@ -76,67 +75,3 @@ func RuntimeMetricsToProm(d *metrics.Description) (string, string, string, bool)
+ 	}
+ 	return namespace, subsystem, name, valid
+ }
+-
+-// RuntimeMetricsBucketsForUnit takes a set of buckets obtained for a runtime/metrics histogram
+-// type (so, lower-bound inclusive) and a unit from a runtime/metrics name, and produces
+-// a reduced set of buckets. This function always removes any -Inf bucket as it's represented
+-// as the bottom-most upper-bound inclusive bucket in Prometheus.
+-func RuntimeMetricsBucketsForUnit(buckets []float64, unit string) []float64 {
+-	switch unit {
+-	case "bytes":
+-		// Rebucket as powers of 2.
+-		return rebucketExp(buckets, 2)
+-	case "seconds":
+-		// Rebucket as powers of 10 and then merge all buckets greater
+-		// than 1 second into the +Inf bucket.
+-		b := rebucketExp(buckets, 10)
+-		for i := range b {
+-			if b[i] <= 1 {
+-				continue
+-			}
+-			b[i] = math.Inf(1)
+-			b = b[:i+1]
+-			break
+-		}
+-		return b
+-	}
+-	return buckets
+-}
+-
+-// rebucketExp takes a list of bucket boundaries (lower bound inclusive) and
+-// downsamples the buckets to those a multiple of base apart. The end result
+-// is a roughly exponential (in many cases, perfectly exponential) bucketing
+-// scheme.
+-func rebucketExp(buckets []float64, base float64) []float64 {
+-	bucket := buckets[0]
+-	var newBuckets []float64
+-	// We may see a -Inf here, in which case, add it and skip it
+-	// since we risk producing NaNs otherwise.
+-	//
+-	// We need to preserve -Inf values to maintain runtime/metrics
+-	// conventions. We'll strip it out later.
+-	if bucket == math.Inf(-1) {
+-		newBuckets = append(newBuckets, bucket)
+-		buckets = buckets[1:]
+-		bucket = buckets[0]
+-	}
+-	// From now on, bucket should always have a non-Inf value because
+-	// Infs are only ever at the ends of the bucket lists, so
+-	// arithmetic operations on it are non-NaN.
+-	for i := 1; i < len(buckets); i++ {
+-		if bucket >= 0 && buckets[i] < bucket*base {
+-			// The next bucket we want to include is at least bucket*base.
+-			continue
+-		} else if bucket < 0 && buckets[i] < bucket/base {
+-			// In this case the bucket we're targeting is negative, and since
+-			// we're ascending through buckets here, we need to divide to get
+-			// closer to zero exponentially.
+-			continue
+-		}
+-		// The +Inf bucket will always be the last one, and we'll always
+-		// end up including it here because bucket
+-		newBuckets = append(newBuckets, bucket)
+-		bucket = buckets[i]
+-	}
+-	return append(newBuckets, bucket)
+-}

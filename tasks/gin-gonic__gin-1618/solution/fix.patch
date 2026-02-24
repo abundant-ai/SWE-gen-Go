@@ -1,0 +1,250 @@
+diff --git a/README.md b/README.md
+index ba2dd57..96becfc 100644
+--- a/README.md
++++ b/README.md
+@@ -529,7 +529,7 @@ func main() {
+ 
+ ### Model binding and validation
+ 
+-To bind a request body into a type, use model binding. We currently support binding of JSON, XML and standard form values (foo=bar&boo=baz).
++To bind a request body into a type, use model binding. We currently support binding of JSON, XML, YAML and standard form values (foo=bar&boo=baz).
+ 
+ Gin uses [**go-playground/validator.v8**](https://github.com/go-playground/validator) for validation. Check the full docs on tags usage [here](http://godoc.org/gopkg.in/go-playground/validator.v8#hdr-Baked_In_Validators_and_Tags).
+ 
+@@ -537,10 +537,10 @@ Note that you need to set the corresponding binding tag on all fields you want t
+ 
+ Also, Gin provides two sets of methods for binding:
+ - **Type** - Must bind
+-  - **Methods** - `Bind`, `BindJSON`, `BindXML`, `BindQuery`
++  - **Methods** - `Bind`, `BindJSON`, `BindXML`, `BindQuery`, `BindYAML`
+   - **Behavior** - These methods use `MustBindWith` under the hood. If there is a binding error, the request is aborted with `c.AbortWithError(400, err).SetType(ErrorTypeBind)`. This sets the response status code to 400 and the `Content-Type` header is set to `text/plain; charset=utf-8`. Note that if you try to set the response code after this, it will result in a warning `[GIN-debug] [WARNING] Headers were already written. Wanted to override status code 400 with 422`. If you wish to have greater control over the behavior, consider using the `ShouldBind` equivalent method.
+ - **Type** - Should bind
+-  - **Methods** - `ShouldBind`, `ShouldBindJSON`, `ShouldBindXML`, `ShouldBindQuery`
++  - **Methods** - `ShouldBind`, `ShouldBindJSON`, `ShouldBindXML`, `ShouldBindQuery`, `ShouldBindYAML`
+   - **Behavior** - These methods use `ShouldBindWith` under the hood. If there is a binding error, the error is returned and it is the developer's responsibility to handle the request and error appropriately.
+ 
+ When using the Bind-method, Gin tries to infer the binder depending on the Content-Type header. If you are sure what you are binding, you can use `MustBindWith` or `ShouldBindWith`.
+diff --git a/binding/binding.go b/binding/binding.go
+index ecbce2f..2e2a33d 100644
+--- a/binding/binding.go
++++ b/binding/binding.go
+@@ -18,6 +18,7 @@ const (
+ 	MIMEPROTOBUF          = "application/x-protobuf"
+ 	MIMEMSGPACK           = "application/x-msgpack"
+ 	MIMEMSGPACK2          = "application/msgpack"
++	MIMEYAML              = "application/x-yaml"
+ )
+ 
+ // Binding describes the interface which needs to be implemented for binding the
+@@ -68,6 +69,7 @@ var (
+ 	FormMultipart = formMultipartBinding{}
+ 	ProtoBuf      = protobufBinding{}
+ 	MsgPack       = msgpackBinding{}
++	YAML          = yamlBinding{}
+ )
+ 
+ // Default returns the appropriate Binding instance based on the HTTP method
+@@ -86,6 +88,8 @@ func Default(method, contentType string) Binding {
+ 		return ProtoBuf
+ 	case MIMEMSGPACK, MIMEMSGPACK2:
+ 		return MsgPack
++	case MIMEYAML:
++		return YAML
+ 	default: //case MIMEPOSTForm, MIMEMultipartPOSTForm:
+ 		return Form
+ 	}
+diff --git a/binding/binding_body_test.go b/binding/binding_body_test.go
+index dfd761e..901d429 100644
+--- a/binding/binding_body_test.go
++++ b/binding/binding_body_test.go
+@@ -19,12 +19,12 @@ func TestBindingBody(t *testing.T) {
+ 		want    string
+ 	}{
+ 		{
+-			name:    "JSON bidning",
++			name:    "JSON binding",
+ 			binding: JSON,
+ 			body:    `{"foo":"FOO"}`,
+ 		},
+ 		{
+-			name:    "XML bidning",
++			name:    "XML binding",
+ 			binding: XML,
+ 			body: `<?xml version="1.0" encoding="UTF-8"?>
+ <root>
+@@ -36,6 +36,11 @@ func TestBindingBody(t *testing.T) {
+ 			binding: MsgPack,
+ 			body:    msgPackBody(t),
+ 		},
++		{
++			name:    "YAML binding",
++			binding: YAML,
++			body:    `foo: FOO`,
++		},
+ 	} {
+ 		t.Logf("testing: %s", tt.name)
+ 		req := requestWithBody("POST", "/", tt.body)
+diff --git a/binding/binding_test.go b/binding/binding_test.go
+index efe8766..e76cb85 100644
+--- a/binding/binding_test.go
++++ b/binding/binding_test.go
+@@ -190,6 +190,9 @@ func TestBindingDefault(t *testing.T) {
+ 
+ 	assert.Equal(t, MsgPack, Default("POST", MIMEMSGPACK))
+ 	assert.Equal(t, MsgPack, Default("PUT", MIMEMSGPACK2))
++
++	assert.Equal(t, YAML, Default("POST", MIMEYAML))
++	assert.Equal(t, YAML, Default("PUT", MIMEYAML))
+ }
+ 
+ func TestBindingJSON(t *testing.T) {
+@@ -473,6 +476,20 @@ func TestBindingXMLFail(t *testing.T) {
+ 		"<map><foo>bar<foo></map>", "<map><bar>foo</bar></map>")
+ }
+ 
++func TestBindingYAML(t *testing.T) {
++	testBodyBinding(t,
++		YAML, "yaml",
++		"/", "/",
++		`foo: bar`, `bar: foo`)
++}
++
++func TestBindingYAMLFail(t *testing.T) {
++	testBodyBindingFail(t,
++		YAML, "yaml",
++		"/", "/",
++		`foo:\nbar`, `bar: foo`)
++}
++
+ func createFormPostRequest() *http.Request {
+ 	req, _ := http.NewRequest("POST", "/?foo=getfoo&bar=getbar", bytes.NewBufferString("foo=bar&bar=foo"))
+ 	req.Header.Set("Content-Type", MIMEPOSTForm)
+diff --git a/binding/yaml.go b/binding/yaml.go
+new file mode 100644
+index 0000000..a2d36d6
+--- /dev/null
++++ b/binding/yaml.go
+@@ -0,0 +1,35 @@
++// Copyright 2018 Gin Core Team.  All rights reserved.
++// Use of this source code is governed by a MIT style
++// license that can be found in the LICENSE file.
++
++package binding
++
++import (
++	"bytes"
++	"io"
++	"net/http"
++
++	"gopkg.in/yaml.v2"
++)
++
++type yamlBinding struct{}
++
++func (yamlBinding) Name() string {
++	return "yaml"
++}
++
++func (yamlBinding) Bind(req *http.Request, obj interface{}) error {
++	return decodeYAML(req.Body, obj)
++}
++
++func (yamlBinding) BindBody(body []byte, obj interface{}) error {
++	return decodeYAML(bytes.NewReader(body), obj)
++}
++
++func decodeYAML(r io.Reader, obj interface{}) error {
++	decoder := yaml.NewDecoder(r)
++	if err := decoder.Decode(obj); err != nil {
++		return err
++	}
++	return validate(obj)
++}
+diff --git a/context.go b/context.go
+index e5d9180..887e716 100644
+--- a/context.go
++++ b/context.go
+@@ -31,6 +31,7 @@ const (
+ 	MIMEPlain             = binding.MIMEPlain
+ 	MIMEPOSTForm          = binding.MIMEPOSTForm
+ 	MIMEMultipartPOSTForm = binding.MIMEMultipartPOSTForm
++	MIMEYAML              = binding.MIMEYAML
+ 	BodyBytesKey          = "_gin-gonic/gin/bodybyteskey"
+ )
+ 
+@@ -524,6 +525,11 @@ func (c *Context) BindQuery(obj interface{}) error {
+ 	return c.MustBindWith(obj, binding.Query)
+ }
+ 
++// BindYAML is a shortcut for c.MustBindWith(obj, binding.YAML).
++func (c *Context) BindYAML(obj interface{}) error {
++	return c.MustBindWith(obj, binding.YAML)
++}
++
+ // MustBindWith binds the passed struct pointer using the specified binding engine.
+ // It will abort the request with HTTP 400 if any error occurs.
+ // See the binding package.
+@@ -563,6 +569,11 @@ func (c *Context) ShouldBindQuery(obj interface{}) error {
+ 	return c.ShouldBindWith(obj, binding.Query)
+ }
+ 
++// ShouldBindYAML is a shortcut for c.ShouldBindWith(obj, binding.YAML).
++func (c *Context) ShouldBindYAML(obj interface{}) error {
++	return c.ShouldBindWith(obj, binding.YAML)
++}
++
+ // ShouldBindWith binds the passed struct pointer using the specified binding engine.
+ // See the binding package.
+ func (c *Context) ShouldBindWith(obj interface{}, b binding.Binding) error {
+diff --git a/context_test.go b/context_test.go
+index fb492e0..dced73f 100644
+--- a/context_test.go
++++ b/context_test.go
+@@ -1380,6 +1380,23 @@ func TestContextBindWithQuery(t *testing.T) {
+ 	assert.Equal(t, 0, w.Body.Len())
+ }
+ 
++func TestContextBindWithYAML(t *testing.T) {
++	w := httptest.NewRecorder()
++	c, _ := CreateTestContext(w)
++
++	c.Request, _ = http.NewRequest("POST", "/", bytes.NewBufferString("foo: bar\nbar: foo"))
++	c.Request.Header.Add("Content-Type", MIMEXML) // set fake content-type
++
++	var obj struct {
++		Foo string `yaml:"foo"`
++		Bar string `yaml:"bar"`
++	}
++	assert.NoError(t, c.BindYAML(&obj))
++	assert.Equal(t, "foo", obj.Bar)
++	assert.Equal(t, "bar", obj.Foo)
++	assert.Equal(t, 0, w.Body.Len())
++}
++
+ func TestContextBadAutoBind(t *testing.T) {
+ 	w := httptest.NewRecorder()
+ 	c, _ := CreateTestContext(w)
+@@ -1470,6 +1487,23 @@ func TestContextShouldBindWithQuery(t *testing.T) {
+ 	assert.Equal(t, 0, w.Body.Len())
+ }
+ 
++func TestContextShouldBindWithYAML(t *testing.T) {
++	w := httptest.NewRecorder()
++	c, _ := CreateTestContext(w)
++
++	c.Request, _ = http.NewRequest("POST", "/", bytes.NewBufferString("foo: bar\nbar: foo"))
++	c.Request.Header.Add("Content-Type", MIMEXML) // set fake content-type
++
++	var obj struct {
++		Foo string `yaml:"foo"`
++		Bar string `yaml:"bar"`
++	}
++	assert.NoError(t, c.ShouldBindYAML(&obj))
++	assert.Equal(t, "foo", obj.Bar)
++	assert.Equal(t, "bar", obj.Foo)
++	assert.Equal(t, 0, w.Body.Len())
++}
++
+ func TestContextBadAutoShouldBind(t *testing.T) {
+ 	w := httptest.NewRecorder()
+ 	c, _ := CreateTestContext(w)

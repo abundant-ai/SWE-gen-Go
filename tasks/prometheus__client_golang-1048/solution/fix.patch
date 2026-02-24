@@ -1,0 +1,184 @@
+diff --git a/.gitignore b/.gitignore
+index f080929..788dfa1 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,6 +1,7 @@
+ # Examples
+ examples/simple/simple
+ examples/random/random
++examples/gocollector/gocollector
+ 
+ # Typical backup/temporary files of editors
+ *~
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d515e69..7740be2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,7 @@
+ * [CHANGE] Minimum required Go version is now 1.16.
+ * [CHANGE] Added `collectors.WithGoCollections` that allows to choose what collection of Go runtime metrics user wants: Equivalent of [`MemStats` structure](https://pkg.go.dev/runtime#MemStats) configured using `GoRuntimeMemStatsCollection`, new based on dedicated [runtime/metrics](https://pkg.go.dev/runtime/metrics) metrics represented by `GoRuntimeMetricsCollection` option, or both by specifying `GoRuntimeMemStatsCollection | GoRuntimeMetricsCollection` flag.
+ * [CHANGE] :warning: Change in `collectors.NewGoCollector` metrics: Reverting addition of new ~80 runtime metrics by default. You can enable this back with `GoRuntimeMetricsCollection` option or `GoRuntimeMemStatsCollection | GoRuntimeMetricsCollection`  for smooth transition.
++* [BUGFIX] Fix the bug that causes generated histogram metric names to end with `_total`. `go_gc_heap_allocs_by_size_bytes_total` -> `go_gc_heap_allocs_by_size_bytes`, `go_gc_heap_frees_by_size_bytes_total` -> `go_gc_heap_allocs_by_size_bytes` and`go_gc_pauses_seconds_total` -> `go_gc_pauses_seconds`.
+ 
+ ## 1.12.1 / 2022-01-29
+ 
+diff --git a/Dockerfile b/Dockerfile
+index 2627ff4..395a30a 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -21,11 +21,14 @@ WORKDIR /go/src/github.com/prometheus/client_golang/examples/random
+ RUN CGO_ENABLED=0 GOOS=linux go build -a -tags netgo -ldflags '-w'
+ WORKDIR /go/src/github.com/prometheus/client_golang/examples/simple
+ RUN CGO_ENABLED=0 GOOS=linux go build -a -tags netgo -ldflags '-w'
++WORKDIR /go/src/github.com/prometheus/client_golang/examples/gocollector
++RUN CGO_ENABLED=0 GOOS=linux go build -a -tags netgo -ldflags '-w'
+ 
+ # Final image.
+ FROM quay.io/prometheus/busybox:latest
+ LABEL maintainer="The Prometheus Authors <prometheus-developers@googlegroups.com>"
+ COPY --from=builder /go/src/github.com/prometheus/client_golang/examples/random \
+-    /go/src/github.com/prometheus/client_golang/examples/simple ./
++    /go/src/github.com/prometheus/client_golang/examples/simple \
++    /go/src/github.com/prometheus/client_golang/examples/gocollector ./
+ EXPOSE 8080
+-CMD ["echo", "Please run an example. Either /random or /simple"]
++CMD ["echo", "Please run an example. Either /random, /simple or /gocollector"]
+diff --git a/examples/gocollector/main.go b/examples/gocollector/main.go
+new file mode 100644
+index 0000000..93f8c22
+--- /dev/null
++++ b/examples/gocollector/main.go
+@@ -0,0 +1,55 @@
++// Copyright 2022 The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//go:build go1.17
++// +build go1.17
++
++// A minimal example of how to include Prometheus instrumentation.
++package main
++
++import (
++	"flag"
++	"fmt"
++	"log"
++	"net/http"
++
++	"github.com/prometheus/client_golang/prometheus"
++	"github.com/prometheus/client_golang/prometheus/collectors"
++	"github.com/prometheus/client_golang/prometheus/promhttp"
++)
++
++var addr = flag.String("listen-address", ":8080", "The address to listen on for HTTP requests.")
++
++func main() {
++	flag.Parse()
++
++	// Create a new registry.
++	reg := prometheus.NewRegistry()
++
++	// Add Go module build info.
++	reg.MustRegister(collectors.NewBuildInfoCollector())
++	reg.MustRegister(collectors.NewGoCollector(
++		collectors.WithGoCollections(collectors.GoRuntimeMemStatsCollection | collectors.GoRuntimeMetricsCollection),
++	))
++
++	// Expose the registered metrics via HTTP.
++	http.Handle("/metrics", promhttp.HandlerFor(
++		reg,
++		promhttp.HandlerOpts{
++			// Opt into OpenMetrics to support exemplars.
++			EnableOpenMetrics: true,
++		},
++	))
++	fmt.Println("Hello world from new Go Collector!")
++	log.Fatal(http.ListenAndServe(*addr, nil))
++}
+diff --git a/prometheus/collectors/go_collector_latest.go b/prometheus/collectors/go_collector_latest.go
+index 58b0a5b..01790e8 100644
+--- a/prometheus/collectors/go_collector_latest.go
++++ b/prometheus/collectors/go_collector_latest.go
+@@ -72,9 +72,9 @@ const (
+ //
+ // The current default is GoRuntimeMemStatsCollection, so the compatibility mode with
+ // client_golang pre v1.12 (move to runtime/metrics).
+-func WithGoCollections(flags uint32) goOption {
++func WithGoCollections(flags GoCollectionOption) goOption {
+ 	return func(o *goOptions) {
+-		o.EnabledCollections = flags
++		o.EnabledCollections = uint32(flags)
+ 	}
+ }
+ 
+diff --git a/prometheus/gen_go_collector_metrics_set.go b/prometheus/gen_go_collector_metrics_set.go
+index 4bc127c..2f60ea3 100644
+--- a/prometheus/gen_go_collector_metrics_set.go
++++ b/prometheus/gen_go_collector_metrics_set.go
+@@ -39,11 +39,11 @@ func main() {
+ 	}
+ 	toolVersion := runtime.Version()
+ 	mtv := majorVersion(toolVersion)
+-	mv != majorVersion(os.Args[1])
++	mv := majorVersion(os.Args[1])
+ 	if mtv != mv {
+ 		log.Fatalf("using Go version %q but expected Go version %q", mtv, mv)
+ 	}
+-	version, err := parseVersion(os.Args[1])
++	version, err := parseVersion(mv)
+ 	if err != nil {
+ 		log.Fatalf("parsing Go version: %v", err)
+ 	}
+diff --git a/prometheus/internal/go_runtime_metrics.go b/prometheus/internal/go_runtime_metrics.go
+index fe0a521..6cbe063 100644
+--- a/prometheus/internal/go_runtime_metrics.go
++++ b/prometheus/internal/go_runtime_metrics.go
+@@ -62,7 +62,7 @@ func RuntimeMetricsToProm(d *metrics.Description) (string, string, string, bool)
+ 	// other data.
+ 	name = strings.ReplaceAll(name, "-", "_")
+ 	name = name + "_" + unit
+-	if d.Cumulative {
++	if d.Cumulative && d.Kind != metrics.KindFloat64Histogram {
+ 		name = name + "_total"
+ 	}
+ 
+@@ -84,12 +84,12 @@ func RuntimeMetricsToProm(d *metrics.Description) (string, string, string, bool)
+ func RuntimeMetricsBucketsForUnit(buckets []float64, unit string) []float64 {
+ 	switch unit {
+ 	case "bytes":
+-		// Rebucket as powers of 2.
+-		return rebucketExp(buckets, 2)
++		// Re-bucket as powers of 2.
++		return reBucketExp(buckets, 2)
+ 	case "seconds":
+-		// Rebucket as powers of 10 and then merge all buckets greater
++		// Re-bucket as powers of 10 and then merge all buckets greater
+ 		// than 1 second into the +Inf bucket.
+-		b := rebucketExp(buckets, 10)
++		b := reBucketExp(buckets, 10)
+ 		for i := range b {
+ 			if b[i] <= 1 {
+ 				continue
+@@ -103,11 +103,11 @@ func RuntimeMetricsBucketsForUnit(buckets []float64, unit string) []float64 {
+ 	return buckets
+ }
+ 
+-// rebucketExp takes a list of bucket boundaries (lower bound inclusive) and
++// reBucketExp takes a list of bucket boundaries (lower bound inclusive) and
+ // downsamples the buckets to those a multiple of base apart. The end result
+ // is a roughly exponential (in many cases, perfectly exponential) bucketing
+ // scheme.
+-func rebucketExp(buckets []float64, base float64) []float64 {
++func reBucketExp(buckets []float64, base float64) []float64 {
+ 	bucket := buckets[0]
+ 	var newBuckets []float64
+ 	// We may see a -Inf here, in which case, add it and skip it

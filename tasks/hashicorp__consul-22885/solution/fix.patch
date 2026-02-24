@@ -1,0 +1,141 @@
+diff --git a/agent/netutil/network.go b/agent/netutil/network.go
+index 7c9d45d920..8710d941cd 100644
+--- a/agent/netutil/network.go
++++ b/agent/netutil/network.go
+@@ -11,6 +11,13 @@ import (
+ 	"github.com/hashicorp/consul/api"
+ )
+ 
++// IPStackRequestDTO contains either a client or config for making requests
++type IPStackRequestDTO struct {
++	Client *api.Client
++	Config *api.Config
++	Cached bool
++}
++
+ // GetAgentConfigFunc is the function type for getting agent config
+ var GetAgentConfigFunc = GetAgentConfig
+ 
+@@ -73,11 +80,76 @@ func GetAgentBindAddr(config *api.Config, cached bool) (net.IP, error) {
+ 	return cachedBindAddr, nil
+ }
+ 
++func IsDualStack(config *api.Config, cached bool) (bool, error) {
++	req := &IPStackRequestDTO{
++		Config: config,
++		Cached: cached,
++	}
++	return IsDualStackWithDTO(req)
++}
++
++// GetAgentConfigDTO retrieves the agent's configuration using the local Consul agent's API.
++func GetAgentConfigWithDTO(req *IPStackRequestDTO) (map[string]map[string]interface{}, error) {
++	var client *api.Client
++	var err error
++
++	// Use existing client if provided, otherwise create from config
++	if req.Client != nil {
++		client = req.Client
++	} else {
++		config := req.Config
++		if config == nil {
++			config = api.DefaultConfig()
++		}
++		client, err = api.NewClient(config)
++		if err != nil {
++			return nil, err
++		}
++	}
++
++	self, err := client.Agent().Self()
++	if err != nil {
++		return nil, err
++	}
++
++	return self, nil
++}
++
++// GetAgentBindAddrDTO retrieves the bind address from the agent's configuration.
++func GetAgentBindAddrWithDTO(req *IPStackRequestDTO) (net.IP, error) {
++	if cachedBindAddr != nil && req.Cached {
++		return cachedBindAddr, nil
++	}
++	agentConfig, err := GetAgentConfigWithDTO(req)
++	if err != nil {
++		return nil, err
++	}
++
++	bindAddr, ok := agentConfig["Config"]["BindAddr"].(string)
++	if !ok || bindAddr == "" {
++		return nil, nil
++	}
++
++	ip, err := netip.ParseAddr(bindAddr)
++	if err != nil {
++		return nil, err
++	}
++	cachedBindAddr = ip.AsSlice()
++	return cachedBindAddr, nil
++}
++
+ // IsDualStack checks if the agent is configured to use both IPv4 and IPv6 addresses.
+ // It returns true if the agent is running in dual-stack mode, false otherwise.
+ // An error is returned if the agent's bind address cannot be determined.
+-func IsDualStack(config *api.Config, cached bool) (bool, error) {
+-	bindIP, err := GetAgentBindAddrFunc(config, cached)
++func IsDualStackWithDTO(req *IPStackRequestDTO) (bool, error) {
++	var bindIP net.IP
++	var err error
++	if req.Client == nil {
++		//fallback to older DualStack
++		bindIP, err = GetAgentBindAddrFunc(req.Config, req.Cached)
++	} else {
++		bindIP, err = GetAgentBindAddrWithDTO(req)
++	}
+ 	if err != nil {
+ 		return false, err
+ 	}
+diff --git a/command/connect/envoy/envoy.go b/command/connect/envoy/envoy.go
+index 80391853de..5ec13d9b8c 100644
+--- a/command/connect/envoy/envoy.go
++++ b/command/connect/envoy/envoy.go
+@@ -92,7 +92,7 @@ type cmd struct {
+ 	dialFunc func(network string, address string) (net.Conn, error)
+ 
+ 	//checks if the consul agent is configured to use both IPv4 and IPv6 addresses.
+-	checkDualStack  func() (bool, error)
++	checkDualStack  func(dto *netutil.IPStackRequestDTO) (bool, error)
+ 	useIPv6loopback bool
+ }
+ 
+@@ -250,9 +250,7 @@ func (c *cmd) init() {
+ 	c.dialFunc = func(network string, address string) (net.Conn, error) {
+ 		return net.DialTimeout(network, address, 3*time.Second)
+ 	}
+-	c.checkDualStack = func() (bool, error) {
+-		return netutil.IsDualStack(nil, false)
+-	}
++	c.checkDualStack = netutil.IsDualStackWithDTO
+ }
+ 
+ // canBindInternal is here mainly so we can unit test this with a constant net.Addr list
+@@ -400,7 +398,10 @@ func (c *cmd) run(args []string) int {
+ 	}
+ 
+ 	// check dual stack is configured
+-	isDualStack, err := c.checkDualStack()
++
++	isDualStack, err := c.checkDualStack(&netutil.IPStackRequestDTO{
++		Client: c.client,
++	})
+ 	if err != nil {
+ 		if strings.Contains(err.Error(), "Permission denied") {
+ 			// Token did not have agent:read. Suppress and proceed with defaults.
+@@ -410,7 +411,6 @@ func (c *cmd) run(args []string) int {
+ 			return 1
+ 		}
+ 	}
+-
+ 	c.logger.Debug("Received", "isDualStack", strconv.FormatBool(isDualStack))
+ 	if isDualStack {
+ 		c.logger.Debug("using dual-stack configuration: default localhost to IPv6 loopback")

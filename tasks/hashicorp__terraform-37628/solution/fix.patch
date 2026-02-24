@@ -1,0 +1,241 @@
+diff --git a/internal/command/meta.go b/internal/command/meta.go
+index 0dc89ecdd0..1626109fbf 100644
+--- a/internal/command/meta.go
++++ b/internal/command/meta.go
+@@ -272,6 +272,9 @@ type Meta struct {
+ 	// Used with commands which write state to allow users to write remote
+ 	// state even if the remote and local Terraform versions don't match.
+ 	ignoreRemoteVersion bool
++
++	// set to true if query files should be parsed
++	includeQueryFiles bool
+ }
+ 
+ type testingOverrides struct {
+diff --git a/internal/command/meta_config.go b/internal/command/meta_config.go
+index 3887d77db4..6485a43479 100644
+--- a/internal/command/meta_config.go
++++ b/internal/command/meta_config.go
+@@ -38,7 +38,7 @@ func (m *Meta) normalizePath(path string) string {
+ // loadConfig reads a configuration from the given directory, which should
+ // contain a root module and have already have any required descendant modules
+ // installed.
+-func (m *Meta) loadConfig(rootDir string, parserOpts ...configs.Option) (*configs.Config, tfdiags.Diagnostics) {
++func (m *Meta) loadConfig(rootDir string) (*configs.Config, tfdiags.Diagnostics) {
+ 	var diags tfdiags.Diagnostics
+ 	rootDir = m.normalizePath(rootDir)
+ 
+@@ -48,7 +48,7 @@ func (m *Meta) loadConfig(rootDir string, parserOpts ...configs.Option) (*config
+ 		return nil, diags
+ 	}
+ 
+-	config, hclDiags := loader.LoadConfig(rootDir, parserOpts...)
++	config, hclDiags := loader.LoadConfig(rootDir)
+ 	diags = diags.Append(hclDiags)
+ 	return config, diags
+ }
+@@ -353,8 +353,9 @@ func (m *Meta) registerSynthConfigSource(filename string, src []byte) {
+ func (m *Meta) initConfigLoader() (*configload.Loader, error) {
+ 	if m.configLoader == nil {
+ 		loader, err := configload.NewLoader(&configload.Config{
+-			ModulesDir: m.modulesDir(),
+-			Services:   m.Services,
++			ModulesDir:        m.modulesDir(),
++			Services:          m.Services,
++			IncludeQueryFiles: m.includeQueryFiles,
+ 		})
+ 		if err != nil {
+ 			return nil, err
+diff --git a/internal/command/query.go b/internal/command/query.go
+index 6e1d00d730..5faf2f0616 100644
+--- a/internal/command/query.go
++++ b/internal/command/query.go
+@@ -75,6 +75,7 @@ func (c *QueryCommand) Run(rawArgs []string) int {
+ 	// migrated to views.
+ 	c.Meta.color = !common.NoColor
+ 	c.Meta.Color = c.Meta.color
++	c.Meta.includeQueryFiles = true
+ 
+ 	// Parse and validate flags
+ 	args, diags := arguments.ParseQuery(rawArgs)
+diff --git a/internal/configs/configload/loader.go b/internal/configs/configload/loader.go
+index 07d68b30dd..07dfff0db6 100644
+--- a/internal/configs/configload/loader.go
++++ b/internal/configs/configload/loader.go
+@@ -27,6 +27,8 @@ type Loader struct {
+ 	// modules is used to install and locate descendant modules that are
+ 	// referenced (directly or indirectly) from the root module.
+ 	modules moduleMgr
++
++	parserOpts []configs.Option
+ }
+ 
+ // Config is used with NewLoader to specify configuration arguments for the
+@@ -43,6 +45,10 @@ type Config struct {
+ 	// not supported, which should be true only in specialized circumstances
+ 	// such as in tests.
+ 	Services *disco.Disco
++
++	// IncludeQueryFiles is set to true if query files should be parsed
++	// when running query commands.
++	IncludeQueryFiles bool
+ }
+ 
+ // NewLoader creates and returns a loader that reads configuration from the
+@@ -65,6 +71,7 @@ func NewLoader(config *Config) (*Loader, error) {
+ 			Services:   config.Services,
+ 			Registry:   reg,
+ 		},
++		parserOpts: make([]configs.Option, 0),
+ 	}
+ 
+ 	err := ret.modules.readModuleManifestSnapshot()
+@@ -72,6 +79,10 @@ func NewLoader(config *Config) (*Loader, error) {
+ 		return nil, fmt.Errorf("failed to read module manifest: %s", err)
+ 	}
+ 
++	if config.IncludeQueryFiles {
++		ret.parserOpts = append(ret.parserOpts, configs.MatchQueryFiles())
++	}
++
+ 	return ret, nil
+ }
+ 
+@@ -122,7 +133,7 @@ func (l *Loader) Sources() map[string][]byte {
+ // least one Terraform configuration file. This is a wrapper around calling
+ // the same method name on the loader's parser.
+ func (l *Loader) IsConfigDir(path string) bool {
+-	return l.parser.IsConfigDir(path)
++	return l.parser.IsConfigDir(path, l.parserOpts...)
+ }
+ 
+ // ImportSources writes into the receiver's source code map the given source
+diff --git a/internal/configs/configload/loader_load.go b/internal/configs/configload/loader_load.go
+index f7b776b860..3b9407a32b 100644
+--- a/internal/configs/configload/loader_load.go
++++ b/internal/configs/configload/loader_load.go
+@@ -22,14 +22,14 @@ import (
+ //
+ // LoadConfig performs the basic syntax and uniqueness validations that are
+ // required to process the individual modules
+-func (l *Loader) LoadConfig(rootDir string, parserOpts ...configs.Option) (*configs.Config, hcl.Diagnostics) {
+-	return l.loadConfig(l.parser.LoadConfigDir(rootDir, parserOpts...))
++func (l *Loader) LoadConfig(rootDir string) (*configs.Config, hcl.Diagnostics) {
++	return l.loadConfig(l.parser.LoadConfigDir(rootDir, l.parserOpts...))
+ }
+ 
+ // LoadConfigWithTests matches LoadConfig, except the configs.Config contains
+ // any relevant .tftest.hcl files.
+ func (l *Loader) LoadConfigWithTests(rootDir string, testDir string) (*configs.Config, hcl.Diagnostics) {
+-	return l.loadConfig(l.parser.LoadConfigDirWithTests(rootDir, testDir))
++	return l.loadConfig(l.parser.LoadConfigDir(rootDir, append(l.parserOpts, configs.MatchTestFiles(testDir))...))
+ }
+ 
+ func (l *Loader) loadConfig(rootMod *configs.Module, diags hcl.Diagnostics) (*configs.Config, hcl.Diagnostics) {
+diff --git a/internal/configs/configload/loader_snapshot.go b/internal/configs/configload/loader_snapshot.go
+index d8260cddd7..46efab362c 100644
+--- a/internal/configs/configload/loader_snapshot.go
++++ b/internal/configs/configload/loader_snapshot.go
+@@ -24,7 +24,7 @@ import (
+ // creates an in-memory snapshot of the configuration files used, which can
+ // be later used to create a loader that may read only from this snapshot.
+ func (l *Loader) LoadConfigWithSnapshot(rootDir string) (*configs.Config, *Snapshot, hcl.Diagnostics) {
+-	rootMod, diags := l.parser.LoadConfigDir(rootDir)
++	rootMod, diags := l.parser.LoadConfigDir(rootDir, l.parserOpts...)
+ 	if rootMod == nil {
+ 		return nil, nil, diags
+ 	}
+diff --git a/internal/configs/configload/testing.go b/internal/configs/configload/testing.go
+index bc90b2ef3c..537e86ac2c 100644
+--- a/internal/configs/configload/testing.go
++++ b/internal/configs/configload/testing.go
+@@ -4,9 +4,10 @@
+ package configload
+ 
+ import (
+-	"io/ioutil"
+ 	"os"
+ 	"testing"
++
++	"github.com/hashicorp/terraform/internal/configs"
+ )
+ 
+ // NewLoaderForTests is a variant of NewLoader that is intended to be more
+@@ -20,10 +21,10 @@ import (
+ // In the case of any errors, t.Fatal (or similar) will be called to halt
+ // execution of the test, so the calling test does not need to handle errors
+ // itself.
+-func NewLoaderForTests(t testing.TB) (*Loader, func()) {
++func NewLoaderForTests(t testing.TB, parserOpts ...configs.Option) (*Loader, func()) {
+ 	t.Helper()
+ 
+-	modulesDir, err := ioutil.TempDir("", "tf-configs")
++	modulesDir, err := os.MkdirTemp("", "tf-configs")
+ 	if err != nil {
+ 		t.Fatalf("failed to create temporary modules dir: %s", err)
+ 		return nil, func() {}
+@@ -36,6 +37,7 @@ func NewLoaderForTests(t testing.TB) (*Loader, func()) {
+ 	loader, err := NewLoader(&Config{
+ 		ModulesDir: modulesDir,
+ 	})
++	loader.parserOpts = append(loader.parserOpts, parserOpts...)
+ 	if err != nil {
+ 		cleanup()
+ 		t.Fatalf("failed to create config loader: %s", err)
+diff --git a/internal/configs/parser_config_dir.go b/internal/configs/parser_config_dir.go
+index 9c296bc013..a4c220febc 100644
+--- a/internal/configs/parser_config_dir.go
++++ b/internal/configs/parser_config_dir.go
+@@ -153,8 +153,8 @@ func (p Parser) ConfigDirFiles(dir string, opts ...Option) (primary, override []
+ // exists and contains at least one Terraform config file (with a .tf or
+ // .tf.json extension.). Note, we explicitely exclude checking for tests here
+ // as tests must live alongside actual .tf config files. Same goes for query files.
+-func (p *Parser) IsConfigDir(path string) bool {
+-	pathSet, _ := p.dirFileSet(path)
++func (p *Parser) IsConfigDir(path string, opts ...Option) bool {
++	pathSet, _ := p.dirFileSet(path, opts...)
+ 	return (len(pathSet.Primary) + len(pathSet.Override)) > 0
+ }
+ 
+diff --git a/internal/configs/parser_file_matcher.go b/internal/configs/parser_file_matcher.go
+index 92d26fb4aa..6644b421ee 100644
+--- a/internal/configs/parser_file_matcher.go
++++ b/internal/configs/parser_file_matcher.go
+@@ -59,8 +59,8 @@ func (p *Parser) dirFileSet(dir string, opts ...Option) (ConfigFileSet, hcl.Diag
+ 
+ 	// Set up the parser configuration
+ 	cfg := &parserConfig{
+-		// We always match .tf files and .tfquery.hcl files
+-		matchers:      []FileMatcher{&moduleFiles{}, &queryFiles{}},
++		// We always match .tf files
++		matchers:      []FileMatcher{&moduleFiles{}},
+ 		testDirectory: DefaultTestDirectory,
+ 		fs:            p.fs,
+ 	}
+@@ -139,6 +139,13 @@ func MatchTestFiles(dir string) Option {
+ 	}
+ }
+ 
++// MatchQueryFiles adds a matcher for Terraform query files (.tfquery.hcl and .tfquery.json)
++func MatchQueryFiles() Option {
++	return func(o *parserConfig) {
++		o.matchers = append(o.matchers, &queryFiles{})
++	}
++}
++
+ // moduleFiles matches regular Terraform configuration files (.tf and .tf.json)
+ type moduleFiles struct{}
+ 
+diff --git a/internal/initwd/testing.go b/internal/initwd/testing.go
+index 8c99778e1c..4331529131 100644
+--- a/internal/initwd/testing.go
++++ b/internal/initwd/testing.go
+@@ -53,7 +53,7 @@ func LoadConfigForTests(t *testing.T, rootDir string, testsDir string) (*configs
+ 		t.Fatalf("failed to refresh modules after installation: %s", err)
+ 	}
+ 
+-	config, hclDiags := loader.LoadConfig(rootDir, configs.MatchTestFiles(testsDir))
++	config, hclDiags := loader.LoadConfigWithTests(rootDir, testsDir)
+ 	diags = diags.Append(hclDiags)
+ 	return config, loader, cleanup, diags
+ }

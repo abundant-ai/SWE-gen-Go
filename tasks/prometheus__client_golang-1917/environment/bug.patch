@@ -1,0 +1,167 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5b029c6..f542539 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,10 +2,6 @@
+ 
+ * [FEATURE] HTTP handlers created by `promhttp` package now support metrics filtering by providing one or more `name[]` query parameters. The default behavior when none are provided remains the same, returning all metrics. #1925
+ 
+-## Unreleased `exp` module
+-
+-* [BUGFIX] exp/api: Reject malformed snappy payloads declaring huge decoded sizes. Enforce a 32MB decoded-size limit to prevent OOM from oversized remote-write requests. #1917.
+-
+ ## 1.23.2 / 2025-09-05
+ 
+ This release is made to upgrade to prometheus/common v0.66.1, which drops the dependencies github.com/grafana/regexp and go.uber.org/atomic and replaces gopkg.in/yaml.v2 with go.yaml.in/yaml/v2 (a drop-in replacement).
+diff --git a/exp/api/remote/remote_api.go b/exp/api/remote/remote_api.go
+index 219a104..10996b0 100644
+--- a/exp/api/remote/remote_api.go
++++ b/exp/api/remote/remote_api.go
+@@ -448,12 +448,6 @@ func WithWriteHandlerMiddlewares(middlewares ...func(http.Handler) http.Handler)
+ 	}
+ }
+ 
+-// maxDecodedSize limits the maximum allowed bytes of decompressed snappy payloads.
+-// This protects against maliciously crafted payloads that could cause excessive memory
+-// allocation and potentially lead to out-of-memory (OOM) conditions.
+-// All usual payloads should be much smaller than this limit and pass without any problems.
+-const maxDecodedSize = 32 * 1024 * 1024
+-
+ // SnappyDecodeMiddleware returns a middleware that checks if the request body is snappy-encoded and decompresses it.
+ // If the request body is not snappy-encoded, it returns an error.
+ // Used by default in NewHandler.
+@@ -485,18 +479,6 @@ func SnappyDecodeMiddleware(logger *slog.Logger) func(http.Handler) http.Handler
+ 				return
+ 			}
+ 
+-			decodedSize, err := snappy.DecodedLen(bodyBytes)
+-			if err != nil {
+-				logger.Error("Error snappy decoding request body length", "err", err)
+-				http.Error(w, err.Error(), http.StatusBadRequest)
+-				return
+-			}
+-			if decodedSize > maxDecodedSize {
+-				logger.Error("Snappy decoded size exceeds the limit", "sizeBytes", decodedSize, "limitBytes", maxDecodedSize)
+-				http.Error(w, fmt.Sprintf("decoded size exceeds the %v bytes limit", maxDecodedSize), http.StatusBadRequest)
+-				return
+-			}
+-
+ 			decompressed, err := snappy.Decode(nil, bodyBytes)
+ 			if err != nil {
+ 				// TODO(bwplotka): Add more context to responded error?
+diff --git a/exp/api/remote/remote_api_test.go b/exp/api/remote/remote_api_test.go
+index 6217ab5..8445b1e 100644
+--- a/exp/api/remote/remote_api_test.go
++++ b/exp/api/remote/remote_api_test.go
+@@ -14,9 +14,7 @@
+ package remote
+ 
+ import (
+-	"bytes"
+ 	"context"
+-	"encoding/binary"
+ 	"errors"
+ 	"io"
+ 	"log/slog"
+@@ -28,7 +26,6 @@ import (
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/google/go-cmp/cmp/cmpopts"
+-	"github.com/klauspost/compress/snappy"
+ 	"github.com/prometheus/common/model"
+ 	"google.golang.org/protobuf/proto"
+ 	"google.golang.org/protobuf/testing/protocmp"
+@@ -298,93 +295,3 @@ func TestRemoteAPI_Write_WithHandler(t *testing.T) {
+ 		}
+ 	})
+ }
+-
+-func TestSnappyDecodeMiddleware(t *testing.T) {
+-	tLogger := slog.Default()
+-
+-	var gotRequest *writev2.Request
+-	successHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		b, err := io.ReadAll(r.Body)
+-		if err != nil {
+-			t.Fatalf("failed to read body: %v", err)
+-		}
+-		gotRequest = &writev2.Request{}
+-		if err := proto.Unmarshal(b, gotRequest); err != nil {
+-			t.Fatalf("failed to unmarshal request: %v", err)
+-		}
+-
+-		w.WriteHeader(http.StatusOK)
+-	})
+-
+-	mw := SnappyDecodeMiddleware(tLogger)(successHandler)
+-
+-	t.Run("success", func(t *testing.T) {
+-		// populated by successHandler handler
+-		gotRequest = nil
+-		expReq := testV2()
+-
+-		serializedExpReq, err := proto.Marshal(expReq)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		compressedExpReq := snappy.Encode(nil, serializedExpReq)
+-
+-		// Create HTTP request
+-		r := httptest.NewRequest("POST", "/api/v1/write", bytes.NewReader(compressedExpReq))
+-		r.Header.Set("Content-Encoding", "snappy")
+-		rw := httptest.NewRecorder()
+-
+-		mw.ServeHTTP(rw, r)
+-
+-		if rw.Code != http.StatusOK {
+-			t.Fatalf("expected status 200, got %d: %s", rw.Code, rw.Body.String())
+-		}
+-		if diff := cmp.Diff(expReq, gotRequest, protocmp.Transform()); diff != "" {
+-			t.Fatalf("unexpected request after decoding: %s", diff)
+-		}
+-	})
+-
+-	t.Run("crafted_decode_len", func(t *testing.T) {
+-		// Snappy format: varint(decoded_len) + compressed_data
+-		// For a claimed size of 33MB (exceeds 32MB limit), we need varint encoding
+-		dst := make([]byte, binary.MaxVarintLen64)
+-		binary.PutUvarint(dst, uint64(33*1024*1024))
+-		// Add some dummy compressed data. Doesn't need to be valid.
+-		dst = append(dst, []byte{0x00, 0x01, 0x02}...)
+-
+-		r := httptest.NewRequest("POST", "/api/v1/write", bytes.NewReader(dst))
+-		r.Header.Set("Content-Encoding", "snappy")
+-		rw := httptest.NewRecorder()
+-
+-		mw.ServeHTTP(rw, r)
+-
+-		if rw.Code != http.StatusBadRequest {
+-			t.Fatalf("expected status 400, got %d", rw.Code)
+-		}
+-
+-		body := rw.Body.String()
+-		if !strings.Contains(body, "decoded size exceeds the") {
+-			t.Fatalf("expected decoded size exceeds error, got: %s", body)
+-		}
+-	})
+-
+-	t.Run("invalid", func(t *testing.T) {
+-		// Completely invalid snappy data
+-		invalidData := []byte{0xff, 0xff, 0xff, 0xff}
+-
+-		r := httptest.NewRequest("POST", "/api/v1/write", bytes.NewReader(invalidData))
+-		r.Header.Set("Content-Encoding", "snappy")
+-		rw := httptest.NewRecorder()
+-
+-		mw.ServeHTTP(rw, r)
+-
+-		if rw.Code != http.StatusBadRequest {
+-			t.Fatalf("expected status 400, got %d", rw.Code)
+-		}
+-
+-		body := rw.Body.String()
+-		if !strings.Contains(body, "corrupt input") {
+-			t.Fatalf("expected error message about corrupt input, got: %s", body)
+-		}
+-	})
+-}

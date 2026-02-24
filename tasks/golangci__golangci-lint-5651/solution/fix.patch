@@ -1,0 +1,187 @@
+diff --git a/.golangci.next.reference.yml b/.golangci.next.reference.yml
+index 2667c443..c5a2e480 100644
+--- a/.golangci.next.reference.yml
++++ b/.golangci.next.reference.yml
+@@ -4149,9 +4149,16 @@ output:
+       path: ./path/to/output.json
+ 
+   # Add a prefix to the output file references.
++  # This option is ignored when using `output.path-mode: abs` mode.
+   # Default: ""
+   path-prefix: ""
+ 
++  # By default, the report are related to the path obtained by `run.relative-path-mode`.
++  # The mode `abs` allows to show absolute file paths instead of relative file paths.
++  # The option `output.path-prefix` is ignored when using `abs` mode.
++  # Default: ""
++  path-mode: "abs"
++
+   # Order to use when sorting results.
+   # Possible values: `file`, `linter`, and `severity`.
+   #
+diff --git a/jsonschema/golangci.next.jsonschema.json b/jsonschema/golangci.next.jsonschema.json
+index e775096e..48d68df5 100644
+--- a/jsonschema/golangci.next.jsonschema.json
++++ b/jsonschema/golangci.next.jsonschema.json
+@@ -4222,6 +4222,11 @@
+             }
+           }
+         },
++        "path-mode": {
++          "type": "string",
++          "default": "",
++          "examples": ["abs"]
++        },
+         "path-prefix": {
+           "description": "Add a prefix to the output file references.",
+           "type": "string",
+diff --git a/pkg/commands/flagsets.go b/pkg/commands/flagsets.go
+index 2ef16585..cc4b0043 100644
+--- a/pkg/commands/flagsets.go
++++ b/pkg/commands/flagsets.go
+@@ -62,6 +62,8 @@ func setupRunFlagSet(v *viper.Viper, fs *pflag.FlagSet) {
+ func setupOutputFlagSet(v *viper.Viper, fs *pflag.FlagSet) {
+ 	internal.AddFlagAndBind(v, fs, fs.String, "path-prefix", "output.path-prefix", "",
+ 		color.GreenString("Path prefix to add to output"))
++	internal.AddFlagAndBind(v, fs, fs.String, "path-mode", "output.path-mode", "",
++		color.GreenString("Path mode to use (empty, or 'abs')"))
+ 	internal.AddFlagAndBind(v, fs, fs.Bool, "show-stats", "output.show-stats", true, color.GreenString("Show statistics per linter"))
+ 
+ 	setupOutputFormatsFlagSet(v, fs)
+diff --git a/pkg/config/output.go b/pkg/config/output.go
+index 43dce390..803dc3ac 100644
+--- a/pkg/config/output.go
++++ b/pkg/config/output.go
+@@ -4,16 +4,34 @@ import (
+ 	"fmt"
+ 	"slices"
+ 	"strings"
++
++	"github.com/golangci/golangci-lint/v2/pkg/fsutils"
+ )
+ 
+ type Output struct {
+ 	Formats    Formats  `mapstructure:"formats"`
+ 	SortOrder  []string `mapstructure:"sort-order"`
+-	PathPrefix string   `mapstructure:"path-prefix"`
+ 	ShowStats  bool     `mapstructure:"show-stats"`
++	PathPrefix string   `mapstructure:"path-prefix"`
++	PathMode   string   `mapstructure:"path-mode"`
+ }
+ 
+ func (o *Output) Validate() error {
++	validators := []func() error{
++		o.validateSortOrder,
++		o.validatePathMode,
++	}
++
++	for _, v := range validators {
++		if err := v(); err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func (o *Output) validateSortOrder() error {
+ 	validOrders := []string{"linter", "file", "severity"}
+ 
+ 	all := strings.Join(o.SortOrder, " ")
+@@ -30,3 +48,15 @@ func (o *Output) Validate() error {
+ 
+ 	return nil
+ }
++
++func (o *Output) validatePathMode() error {
++	switch o.PathMode {
++	case "", fsutils.OutputPathModeAbsolute:
++		// Valid
++
++	default:
++		return fmt.Errorf("unsupported output path mode %q", o.PathMode)
++	}
++
++	return nil
++}
+diff --git a/pkg/fsutils/basepath.go b/pkg/fsutils/basepath.go
+index f0f4bc76..3761fa0e 100644
+--- a/pkg/fsutils/basepath.go
++++ b/pkg/fsutils/basepath.go
+@@ -19,6 +19,9 @@ const (
+ 	RelativePathModeWd      = "wd"
+ )
+ 
++// OutputPathModeAbsolute path mode used to show absolute paths in output reports (user-facing).
++const OutputPathModeAbsolute = "abs"
++
+ func AllRelativePathModes() []string {
+ 	return []string{RelativePathModeGoMod, RelativePathModeGitRoot, RelativePathModeCfg, RelativePathModeWd}
+ }
+diff --git a/pkg/lint/runner.go b/pkg/lint/runner.go
+index ebb35a0d..5ede9b24 100644
+--- a/pkg/lint/runner.go
++++ b/pkg/lint/runner.go
+@@ -110,7 +110,7 @@ func NewRunner(log logutils.Log, cfg *config.Config, goenv *goutil.Env,
+ 			processors.NewSourceCode(lineCache, log.Child(logutils.DebugKeySourceCode)),
+ 			processors.NewPathShortener(),
+ 			processors.NewSeverity(log.Child(logutils.DebugKeySeverityRules), lineCache, &cfg.Severity),
+-			processors.NewPathPrettifier(log, cfg.Output.PathPrefix),
++			processors.NewPathPrettifier(log, &cfg.Output),
+ 			processors.NewSortResults(&cfg.Output),
+ 		},
+ 		lintCtx: lintCtx,
+diff --git a/pkg/result/processors/path_prettifier.go b/pkg/result/processors/path_prettifier.go
+index 31270044..cb6ef8eb 100644
+--- a/pkg/result/processors/path_prettifier.go
++++ b/pkg/result/processors/path_prettifier.go
+@@ -3,6 +3,8 @@ package processors
+ import (
+ 	"path/filepath"
+ 
++	"github.com/golangci/golangci-lint/v2/pkg/config"
++	"github.com/golangci/golangci-lint/v2/pkg/fsutils"
+ 	"github.com/golangci/golangci-lint/v2/pkg/logutils"
+ 	"github.com/golangci/golangci-lint/v2/pkg/result"
+ )
+@@ -12,14 +14,15 @@ var _ Processor = (*PathPrettifier)(nil)
+ // PathPrettifier modifies report file path to be relative to the base path.
+ // Also handles the `output.path-prefix` option.
+ type PathPrettifier struct {
+-	prefix string
+-	log    logutils.Log
++	cfg *config.Output
++
++	log logutils.Log
+ }
+ 
+-func NewPathPrettifier(log logutils.Log, prefix string) *PathPrettifier {
++func NewPathPrettifier(log logutils.Log, cfg *config.Output) *PathPrettifier {
+ 	return &PathPrettifier{
+-		prefix: prefix,
+-		log:    log.Child(logutils.DebugKeyPathPrettifier),
++		cfg: cfg,
++		log: log.Child(logutils.DebugKeyPathPrettifier),
+ 	}
+ }
+ 
+@@ -28,13 +31,17 @@ func (*PathPrettifier) Name() string {
+ }
+ 
+ func (p *PathPrettifier) Process(issues []result.Issue) ([]result.Issue, error) {
++	if p.cfg.PathMode == fsutils.OutputPathModeAbsolute {
++		return issues, nil
++	}
++
+ 	return transformIssues(issues, func(issue *result.Issue) *result.Issue {
+ 		newIssue := issue
+ 
+-		if p.prefix == "" {
++		if p.cfg.PathPrefix == "" {
+ 			newIssue.Pos.Filename = issue.RelativePath
+ 		} else {
+-			newIssue.Pos.Filename = filepath.Join(p.prefix, issue.RelativePath)
++			newIssue.Pos.Filename = filepath.Join(p.cfg.PathPrefix, issue.RelativePath)
+ 		}
+ 
+ 		return newIssue

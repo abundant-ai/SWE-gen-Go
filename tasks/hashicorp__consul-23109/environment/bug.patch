@@ -1,0 +1,1753 @@
+diff --git a/.changelog/23109.txt b/.changelog/23109.txt
+deleted file mode 100644
+index c36b258e11..0000000000
+--- a/.changelog/23109.txt
++++ /dev/null
+@@ -1,4 +0,0 @@
+-```release-note:improvement
+-connect: Migrate to aws-sdk-go-v2 from aws-sdk-go (v1). Also updated consul-awsauth and go-secure-stdlib/awsutil dependencies to their v2 versions..
+-cli: Added `--aws-iam-endpoint` flag to `consul login` command for AWS IAM auth method to support custom IAM endpoint configuration.
+-```
+\ No newline at end of file
+diff --git a/agent/connect/ca/provider_aws.go b/agent/connect/ca/provider_aws.go
+index 2771664a7d..3a09d3e4fe 100644
+--- a/agent/connect/ca/provider_aws.go
++++ b/agent/connect/ca/provider_aws.go
+@@ -5,19 +5,16 @@ package ca
+ 
+ import (
+ 	"bytes"
+-	"context"
+ 	"crypto/x509"
+ 	"encoding/pem"
+-	"errors"
+ 	"fmt"
+ 	"sync/atomic"
+ 	"time"
+ 
+-	"github.com/aws/aws-sdk-go-v2/aws"
+-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+-	"github.com/aws/aws-sdk-go-v2/service/acmpca"
+-	"github.com/aws/aws-sdk-go-v2/service/acmpca/types"
+-	"github.com/aws/smithy-go"
++	"github.com/aws/aws-sdk-go/aws"
++	"github.com/aws/aws-sdk-go/aws/awserr"
++	"github.com/aws/aws-sdk-go/aws/session"
++	"github.com/aws/aws-sdk-go/service/acmpca"
+ 
+ 	"github.com/go-viper/mapstructure/v2"
+ 	"github.com/hashicorp/go-hclog"
+@@ -68,8 +65,8 @@ type AWSProvider struct {
+ 	stopCh  chan struct{}
+ 
+ 	config          *structs.AWSCAProviderConfig
+-	awsConfig       *aws.Config
+-	client          *acmpca.Client
++	session         *session.Session
++	client          *acmpca.ACMPCA
+ 	isPrimary       bool
+ 	datacenter      string
+ 	clusterID       string
+@@ -102,19 +99,19 @@ func (a *AWSProvider) Configure(cfg ProviderConfig) error {
+ 	// another place or sending them via API call and persisting them in state
+ 	// store in a new place on disk. One of the existing standard solutions seems
+ 	// better in all cases.
+-	awsConfig, err := awsconfig.LoadDefaultConfig(context.Background(),
+-		awsconfig.WithSharedConfigProfile(""),
+-	)
++	awsSession, err := session.NewSessionWithOptions(session.Options{
++		SharedConfigState: session.SharedConfigEnable,
++	})
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+ 	a.config = config
+-	a.awsConfig = &awsConfig
++	a.session = awsSession
+ 	a.isPrimary = cfg.IsPrimary
+ 	a.clusterID = cfg.ClusterID
+ 	a.datacenter = cfg.Datacenter
+-	a.client = acmpca.NewFromConfig(awsConfig)
++	a.client = acmpca.New(awsSession)
+ 	a.stopCh = make(chan struct{})
+ 
+ 	// Load the ARN from config or previous state.
+@@ -174,14 +171,14 @@ func (a *AWSProvider) ensureCA() error {
+ 		input := &acmpca.DescribeCertificateAuthorityInput{
+ 			CertificateAuthorityArn: aws.String(a.arn),
+ 		}
+-		output, err := a.client.DescribeCertificateAuthority(context.Background(), input)
++		output, err := a.client.DescribeCertificateAuthority(input)
+ 		if err != nil {
+ 			return err
+ 		}
+ 		// Allow it to be active or pending a certificate (leadership might have
+ 		// changed during a secondary initialization for example).
+-		if output.CertificateAuthority.Status != types.CertificateAuthorityStatusActive &&
+-			output.CertificateAuthority.Status != types.CertificateAuthorityStatusPendingCertificate {
++		if *output.CertificateAuthority.Status != acmpca.CertificateAuthorityStatusActive &&
++			*output.CertificateAuthority.Status != acmpca.CertificateAuthorityStatusPendingCertificate {
+ 			verb := "configured"
+ 			if a.caCreated {
+ 				verb = "created"
+@@ -192,7 +189,7 @@ func (a *AWSProvider) ensureCA() error {
+ 			// but this is simpler and less surprising default behavior if user
+ 			// disabled a CA due to a security concern and we just work around it.
+ 			return fmt.Errorf("the %s PCA is not active: status is %s", verb,
+-				output.CertificateAuthority.Status)
++				*output.CertificateAuthority.Status)
+ 		}
+ 
+ 		// Load the certs
+@@ -236,7 +233,7 @@ func (a *AWSProvider) ensureCA() error {
+ 	}
+ 
+ 	a.logger.Debug("uploading certificate for ARN", "arn", a.arn)
+-	_, err = a.client.ImportCertificateAuthorityCertificate(context.Background(), &input)
++	_, err = a.client.ImportCertificateAuthorityCertificate(&input)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -250,9 +247,9 @@ func keyTypeToAlgos(keyType string, keyBits int) (string, string, error) {
+ 	case "rsa":
+ 		switch keyBits {
+ 		case 2048:
+-			return string(types.KeyAlgorithmRsa2048), string(types.SigningAlgorithmSha256withrsa), nil
++			return acmpca.KeyAlgorithmRsa2048, acmpca.SigningAlgorithmSha256withrsa, nil
+ 		case 4096:
+-			return string(types.KeyAlgorithmRsa4096), string(types.SigningAlgorithmSha256withrsa), nil
++			return acmpca.KeyAlgorithmRsa4096, acmpca.SigningAlgorithmSha256withrsa, nil
+ 		default:
+ 			return "", "", fmt.Errorf("AWS PCA only supports RSA key lengths 2048"+
+ 				" and 4096, PrivateKeyBits of %d configured", keyBits)
+@@ -261,7 +258,7 @@ func keyTypeToAlgos(keyType string, keyBits int) (string, string, error) {
+ 		if keyBits != 256 {
+ 			return "", "", fmt.Errorf("AWS PCA only supports P256 EC curve, keyBits of %d configured", keyBits)
+ 		}
+-		return string(types.KeyAlgorithmEcPrime256v1), string(types.SigningAlgorithmSha256withecdsa), nil
++		return acmpca.KeyAlgorithmEcPrime256v1, acmpca.SigningAlgorithmSha256withecdsa, nil
+ 	default:
+ 		return "", "", fmt.Errorf("AWS PCA only supports P256 EC curve, or RSA"+
+ 			" 2048/4096. %s, %d configured", keyType, keyBits)
+@@ -271,7 +268,7 @@ func keyTypeToAlgos(keyType string, keyBits int) (string, string, error) {
+ func (a *AWSProvider) createPCA() error {
+ 	pcaType := "ROOT" // For some reason there is no constant for this in the SDK
+ 	if !a.isPrimary {
+-		pcaType = string(types.CertificateAuthorityTypeSubordinate)
++		pcaType = acmpca.CertificateAuthorityTypeSubordinate
+ 	}
+ 
+ 	keyAlg, signAlg, err := keyTypeToAlgos(a.config.PrivateKeyType, a.config.PrivateKeyBits)
+@@ -286,32 +283,32 @@ func (a *AWSProvider) createPCA() error {
+ 	commonName := connect.CACN("aws", uid, a.clusterID, a.isPrimary)
+ 
+ 	createInput := acmpca.CreateCertificateAuthorityInput{
+-		CertificateAuthorityType: types.CertificateAuthorityType(pcaType),
+-		CertificateAuthorityConfiguration: &types.CertificateAuthorityConfiguration{
+-			Subject: &types.ASN1Subject{
++		CertificateAuthorityType: aws.String(pcaType),
++		CertificateAuthorityConfiguration: &acmpca.CertificateAuthorityConfiguration{
++			Subject: &acmpca.ASN1Subject{
+ 				CommonName: aws.String(commonName),
+ 			},
+-			KeyAlgorithm:     types.KeyAlgorithm(keyAlg),
+-			SigningAlgorithm: types.SigningAlgorithm(signAlg),
++			KeyAlgorithm:     aws.String(keyAlg),
++			SigningAlgorithm: aws.String(signAlg),
+ 		},
+-		RevocationConfiguration: &types.RevocationConfiguration{
++		RevocationConfiguration: &acmpca.RevocationConfiguration{
+ 			// TODO support CRL in future when we manage revocation in Connect more
+ 			// generally.
+-			CrlConfiguration: &types.CrlConfiguration{
++			CrlConfiguration: &acmpca.CrlConfiguration{
+ 				Enabled: aws.Bool(false),
+ 			},
+ 		},
+ 		// uid is unique to each PCA we create so use it as an idempotency string. We
+ 		// don't actually retry on failure yet but might as well!
+ 		IdempotencyToken: aws.String(uid),
+-		Tags: []types.Tag{
++		Tags: []*acmpca.Tag{
+ 			{Key: aws.String("consul_cluster_id"), Value: aws.String(a.clusterID)},
+ 			{Key: aws.String("consul_datacenter"), Value: aws.String(a.datacenter)},
+ 		},
+ 	}
+ 
+ 	a.logger.Debug("creating new PCA", "common_name", commonName)
+-	createOutput, err := a.client.CreateCertificateAuthority(context.Background(), &createInput)
++	createOutput, err := a.client.CreateCertificateAuthority(&createInput)
+ 	if err != nil {
+ 		a.logger.Error("failed to create new PCA", "common_name", commonName, "error", err)
+ 		return err
+@@ -323,14 +320,13 @@ func (a *AWSProvider) createPCA() error {
+ 		CertificateAuthorityArn: aws.String(newARN),
+ 	}
+ 	_, err = a.pollLoop("Private CA", AWSCreateTimeout, func() (bool, string, error) {
+-		describeOutput, err := a.client.DescribeCertificateAuthority(context.Background(), &describeInput)
++		describeOutput, err := a.client.DescribeCertificateAuthority(&describeInput)
+ 		if err != nil {
+-			var apiErr smithy.APIError
+-			if errors.As(err, &apiErr) && apiErr.ErrorCode() != "RequestInProgressException" {
++			if err.(awserr.Error).Code() != acmpca.ErrCodeRequestInProgressException {
+ 				return true, "", fmt.Errorf("error waiting for PCA to be created: %s", err)
+ 			}
+ 		}
+-		if describeOutput.CertificateAuthority.Status == types.CertificateAuthorityStatusPendingCertificate {
++		if *describeOutput.CertificateAuthority.Status == acmpca.CertificateAuthorityStatusPendingCertificate {
+ 			a.logger.Debug("new PCA is ready to accept a certificate", "pca", newARN)
+ 			a.arn = newARN
+ 			// We don't need to reload this ARN since we just created it and know what
+@@ -349,7 +345,7 @@ func (a *AWSProvider) getCACSR() (string, error) {
+ 		CertificateAuthorityArn: aws.String(a.arn),
+ 	}
+ 	a.logger.Debug("retrieving CSR for PCA", "pca", a.arn)
+-	output, err := a.client.GetCertificateAuthorityCsr(context.Background(), input)
++	output, err := a.client.GetCertificateAuthorityCsr(input)
+ 	if err != nil {
+ 		return "", err
+ 	}
+@@ -366,7 +362,7 @@ func (a *AWSProvider) loadCACerts() error {
+ 	input := &acmpca.GetCertificateAuthorityCertificateInput{
+ 		CertificateAuthorityArn: aws.String(a.arn),
+ 	}
+-	output, err := a.client.GetCertificateAuthorityCertificate(context.Background(), input)
++	output, err := a.client.GetCertificateAuthorityCertificate(input)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -462,23 +458,24 @@ func (a *AWSProvider) signCSR(csrPEM string, templateARN string, ttl time.Durati
+ 	issueInput := acmpca.IssueCertificateInput{
+ 		CertificateAuthorityArn: aws.String(a.arn),
+ 		Csr:                     []byte(csrPEM),
+-		SigningAlgorithm:        types.SigningAlgorithm(signAlg),
++		SigningAlgorithm:        aws.String(signAlg),
+ 		TemplateArn:             aws.String(templateARN),
+-		Validity: &types.Validity{
++		Validity: &acmpca.Validity{
+ 			Value: aws.Int64(int64(ttl / day)),
+-			Type:  types.ValidityPeriodTypeDays,
++			Type:  aws.String(acmpca.ValidityPeriodTypeDays),
+ 		},
+ 	}
+ 
+-	issueOutput, err := a.client.IssueCertificate(context.Background(), &issueInput)
++	issueOutput, err := a.client.IssueCertificate(&issueInput)
+ 	// ErrCodeLimitExceededException is used for both hard and soft limits in AWS
+ 	// SDK :(. In this specific context though (issuing a certificate) there is no
+ 	// hard limit on number of certs so a limit exceeded here is a rate limit.
+-	if err != nil {
+-		var apiErr smithy.APIError
+-		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "LimitExceededException" {
++	if aerr, ok := err.(awserr.Error); ok && err != nil {
++		if aerr.Code() == acmpca.ErrCodeLimitExceededException {
+ 			return "", ErrRateLimited
+ 		}
++	}
++	if err != nil {
+ 		return "", fmt.Errorf("error issuing certificate from PCA: %s", err)
+ 	}
+ 
+@@ -490,10 +487,9 @@ func (a *AWSProvider) signCSR(csrPEM string, templateARN string, ttl time.Durati
+ 	return a.pollLoop(fmt.Sprintf("certificate %s", *issueOutput.CertificateArn),
+ 		AWSSignTimeout,
+ 		func() (bool, string, error) {
+-			certOutput, err := a.client.GetCertificate(context.Background(), &certInput)
++			certOutput, err := a.client.GetCertificate(&certInput)
+ 			if err != nil {
+-				var apiErr smithy.APIError
+-				if errors.As(err, &apiErr) && apiErr.ErrorCode() != "RequestInProgressException" {
++				if err.(awserr.Error).Code() != acmpca.ErrCodeRequestInProgressException {
+ 					return true, "", fmt.Errorf("error retrieving certificate from PCA: %s", err)
+ 				}
+ 			}
+@@ -537,7 +533,7 @@ func (a *AWSProvider) SetIntermediate(intermediatePEM string, rootPEM string, _
+ 		CertificateChain:        []byte(rootPEM),
+ 	}
+ 	a.logger.Debug("uploading certificate for PCA", "pca", a.arn)
+-	_, err = a.client.ImportCertificateAuthorityCertificate(context.Background(), &input)
++	_, err = a.client.ImportCertificateAuthorityCertificate(&input)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -615,10 +611,10 @@ func (a *AWSProvider) disablePCA() error {
+ 	}
+ 	input := acmpca.UpdateCertificateAuthorityInput{
+ 		CertificateAuthorityArn: aws.String(a.arn),
+-		Status:                  types.CertificateAuthorityStatusDisabled,
++		Status:                  aws.String(acmpca.CertificateAuthorityStatusDisabled),
+ 	}
+ 	a.logger.Info("disabling PCA", "pca", a.arn)
+-	_, err := a.client.UpdateCertificateAuthority(context.Background(), &input)
++	_, err := a.client.UpdateCertificateAuthority(&input)
+ 	return err
+ }
+ 
+@@ -630,10 +626,10 @@ func (a *AWSProvider) deletePCA() error {
+ 		CertificateAuthorityArn: aws.String(a.arn),
+ 		// We only ever use this to clean up after tests so delete as quickly as
+ 		// possible (7 days).
+-		PermanentDeletionTimeInDays: aws.Int32(7),
++		PermanentDeletionTimeInDays: aws.Int64(7),
+ 	}
+ 	a.logger.Info("deleting PCA", "pca", a.arn)
+-	_, err := a.client.DeleteCertificateAuthority(context.Background(), &input)
++	_, err := a.client.DeleteCertificateAuthority(&input)
+ 	return err
+ }
+ 
+diff --git a/agent/connect/ca/provider_aws_test.go b/agent/connect/ca/provider_aws_test.go
+index 9ba893fd32..eb7e113b85 100644
+--- a/agent/connect/ca/provider_aws_test.go
++++ b/agent/connect/ca/provider_aws_test.go
+@@ -4,20 +4,17 @@
+ package ca
+ 
+ import (
+-	"context"
+ 	"os"
+ 	"strconv"
+ 	"strings"
+ 	"testing"
+ 	"time"
+ 
+-	"github.com/aws/aws-sdk-go-v2/aws"
+-	"github.com/aws/aws-sdk-go-v2/service/acmpca"
+-	"github.com/aws/aws-sdk-go-v2/service/acmpca/types"
++	"github.com/aws/aws-sdk-go/aws"
++	"github.com/aws/aws-sdk-go/service/acmpca"
+ 	"github.com/stretchr/testify/require"
+ 
+ 	"github.com/hashicorp/consul/agent/connect"
+-	"github.com/hashicorp/consul/agent/structs"
+ 	"github.com/hashicorp/consul/sdk/testutil"
+ )
+ 
+@@ -26,7 +23,7 @@ import (
+ // These tests are not run in CI.  If you are making changes to the AWS provider
+ // you probably want to run these tests locally. The tests will run using any
+ // credentials available to the AWS SDK. See
+-// https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide
++// https://docs.aws.amazon.com/sdk-for-go/v1/developer-guide/configuring-sdk.html#specifying-credentials
+ // for a list of options.
+ func skipIfAWSNotConfigured(t *testing.T) {
+ 	enabled := os.Getenv("ENABLE_AWS_PCA_TESTS")
+@@ -296,13 +293,14 @@ func TestAWSProvider_Cleanup(t *testing.T) {
+ 		input := &acmpca.DescribeCertificateAuthorityInput{
+ 			CertificateAuthorityArn: aws.String(state[AWSStateCAARNKey]),
+ 		}
+-		output, err := provider.client.DescribeCertificateAuthority(context.Background(), input)
++		output, err := provider.client.DescribeCertificateAuthority(input)
+ 		if err != nil {
+ 			return false, err
+ 		}
+ 		require.NotNil(t, output)
+ 		require.NotNil(t, output.CertificateAuthority)
+-		return output.CertificateAuthority.Status == types.CertificateAuthorityStatusDeleted, nil
++		require.NotNil(t, output.CertificateAuthority.Status)
++		return *output.CertificateAuthority.Status == acmpca.CertificateAuthorityStatusDeleted, nil
+ 	}
+ 
+ 	requirePCADeleted := func(t *testing.T, provider *AWSProvider) {
+@@ -445,426 +443,3 @@ func testProviderConfigSecondary(cfg map[string]interface{}) ProviderConfig {
+ 	c.Datacenter = "dc2"
+ 	return c
+ }
+-
+-func TestNewAWSProvider(t *testing.T) {
+-	logger := testutil.Logger(t)
+-	provider := NewAWSProvider(logger)
+-
+-	require.NotNil(t, provider)
+-	require.Equal(t, logger, provider.logger)
+-	require.Equal(t, uint32(0), provider.stopped)
+-}
+-
+-func TestAWSProvider_State(t *testing.T) {
+-	tests := []struct {
+-		name     string
+-		arn      string
+-		expected map[string]string
+-	}{
+-		{
+-			name:     "no ARN returns nil",
+-			arn:      "",
+-			expected: nil,
+-		},
+-		{
+-			name: "ARN set returns state with ARN",
+-			arn:  "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/abc123",
+-			expected: map[string]string{
+-				AWSStateCAARNKey: "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/abc123",
+-			},
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			provider := &AWSProvider{
+-				arn: tt.arn,
+-			}
+-
+-			state, err := provider.State()
+-			require.NoError(t, err)
+-			require.Equal(t, tt.expected, state)
+-		})
+-	}
+-}
+-
+-func TestAWSProvider_SupportsCrossSigning(t *testing.T) {
+-	provider := &AWSProvider{}
+-
+-	supported, err := provider.SupportsCrossSigning()
+-	require.NoError(t, err)
+-	require.False(t, supported, "AWS PCA provider should not support cross-signing")
+-}
+-
+-func TestAWSProvider_CrossSignCA(t *testing.T) {
+-	provider := &AWSProvider{}
+-
+-	// Create a test certificate
+-	ca := connect.TestCA(t, nil)
+-	caCert, err := connect.ParseCert(ca.RootCert)
+-	require.NoError(t, err)
+-
+-	// CrossSignCA should always return an error
+-	_, err = provider.CrossSignCA(caCert)
+-	require.Error(t, err)
+-	require.Contains(t, err.Error(), "not implemented")
+-}
+-
+-func TestAWSProvider_GenerateCAChain_NotPrimary(t *testing.T) {
+-	provider := &AWSProvider{
+-		isPrimary: false,
+-	}
+-
+-	// Should return error when called on non-primary
+-	_, err := provider.GenerateCAChain()
+-	require.Error(t, err)
+-	require.Contains(t, err.Error(), "provider is not the root certificate authority")
+-}
+-
+-func TestAWSProvider_GenerateIntermediateCSR_IsPrimary(t *testing.T) {
+-	provider := &AWSProvider{
+-		isPrimary: true,
+-	}
+-
+-	// Should return error when called on primary
+-	_, _, err := provider.GenerateIntermediateCSR()
+-	require.Error(t, err)
+-	require.Contains(t, err.Error(), "provider is the root certificate authority")
+-}
+-
+-func TestKeyTypeToAlgos(t *testing.T) {
+-	tests := []struct {
+-		name         string
+-		keyType      string
+-		keyBits      int
+-		wantKeyAlgo  string
+-		wantSignAlgo string
+-		wantErr      bool
+-		errContains  string
+-	}{
+-		{
+-			name:         "RSA 2048",
+-			keyType:      "rsa",
+-			keyBits:      2048,
+-			wantKeyAlgo:  string(types.KeyAlgorithmRsa2048),
+-			wantSignAlgo: string(types.SigningAlgorithmSha256withrsa),
+-		},
+-		{
+-			name:         "RSA 4096",
+-			keyType:      "rsa",
+-			keyBits:      4096,
+-			wantKeyAlgo:  string(types.KeyAlgorithmRsa4096),
+-			wantSignAlgo: string(types.SigningAlgorithmSha256withrsa),
+-		},
+-		{
+-			name:         "EC 256",
+-			keyType:      "ec",
+-			keyBits:      256,
+-			wantKeyAlgo:  string(types.KeyAlgorithmEcPrime256v1),
+-			wantSignAlgo: string(types.SigningAlgorithmSha256withecdsa),
+-		},
+-		{
+-			name:        "RSA invalid key bits 1024",
+-			keyType:     "rsa",
+-			keyBits:     1024,
+-			wantErr:     true,
+-			errContains: "AWS PCA only supports RSA key lengths 2048 and 4096",
+-		},
+-		{
+-			name:        "RSA invalid key bits 8192",
+-			keyType:     "rsa",
+-			keyBits:     8192,
+-			wantErr:     true,
+-			errContains: "AWS PCA only supports RSA key lengths 2048 and 4096",
+-		},
+-		{
+-			name:        "EC invalid key bits 384",
+-			keyType:     "ec",
+-			keyBits:     384,
+-			wantErr:     true,
+-			errContains: "AWS PCA only supports P256 EC curve",
+-		},
+-		{
+-			name:        "EC invalid key bits 521",
+-			keyType:     "ec",
+-			keyBits:     521,
+-			wantErr:     true,
+-			errContains: "AWS PCA only supports P256 EC curve",
+-		},
+-		{
+-			name:        "unsupported key type ed25519",
+-			keyType:     "ed25519",
+-			keyBits:     256,
+-			wantErr:     true,
+-			errContains: "AWS PCA only supports P256 EC curve, or RSA 2048/4096",
+-		},
+-		{
+-			name:        "unsupported key type dsa",
+-			keyType:     "dsa",
+-			keyBits:     2048,
+-			wantErr:     true,
+-			errContains: "AWS PCA only supports P256 EC curve, or RSA 2048/4096",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			keyAlgo, signAlgo, err := keyTypeToAlgos(tt.keyType, tt.keyBits)
+-			if tt.wantErr {
+-				require.Error(t, err)
+-				require.Contains(t, err.Error(), tt.errContains)
+-				return
+-			}
+-			require.NoError(t, err)
+-			require.Equal(t, tt.wantKeyAlgo, keyAlgo)
+-			require.Equal(t, tt.wantSignAlgo, signAlgo)
+-		})
+-	}
+-}
+-
+-func TestPollWait(t *testing.T) {
+-	tests := []struct {
+-		name         string
+-		attemptsMade int
+-		expected     time.Duration
+-	}{
+-		{
+-			name:         "first attempt",
+-			attemptsMade: 0,
+-			expected:     100 * time.Millisecond,
+-		},
+-		{
+-			name:         "second attempt",
+-			attemptsMade: 1,
+-			expected:     200 * time.Millisecond,
+-		},
+-		{
+-			name:         "third attempt",
+-			attemptsMade: 2,
+-			expected:     500 * time.Millisecond,
+-		},
+-		{
+-			name:         "fourth attempt",
+-			attemptsMade: 3,
+-			expected:     1 * time.Second,
+-		},
+-		{
+-			name:         "fifth attempt",
+-			attemptsMade: 4,
+-			expected:     3 * time.Second,
+-		},
+-		{
+-			name:         "sixth attempt",
+-			attemptsMade: 5,
+-			expected:     5 * time.Second,
+-		},
+-		{
+-			name:         "many attempts caps at max",
+-			attemptsMade: 10,
+-			expected:     5 * time.Second,
+-		},
+-		{
+-			name:         "excessive attempts still caps at max",
+-			attemptsMade: 100,
+-			expected:     5 * time.Second,
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			result := pollWait(tt.attemptsMade)
+-			require.Equal(t, tt.expected, result)
+-		})
+-	}
+-}
+-
+-func TestParseAWSCAConfig(t *testing.T) {
+-	tests := []struct {
+-		name        string
+-		raw         map[string]interface{}
+-		wantErr     bool
+-		errContains string
+-		validate    func(t *testing.T, cfg *structs.AWSCAProviderConfig)
+-	}{
+-		{
+-			name: "valid minimal config uses defaults",
+-			raw:  map[string]interface{}{},
+-			validate: func(t *testing.T, cfg *structs.AWSCAProviderConfig) {
+-				require.NotNil(t, cfg)
+-				require.Equal(t, "ec", cfg.PrivateKeyType)
+-				require.Equal(t, 256, cfg.PrivateKeyBits)
+-				require.False(t, cfg.DeleteOnExit)
+-			},
+-		},
+-		{
+-			name: "valid config with ExistingARN",
+-			raw: map[string]interface{}{
+-				"ExistingARN": "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/abc123",
+-			},
+-			validate: func(t *testing.T, cfg *structs.AWSCAProviderConfig) {
+-				require.Equal(t, "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/abc123", cfg.ExistingARN)
+-			},
+-		},
+-		{
+-			name: "valid config with DeleteOnExit true",
+-			raw: map[string]interface{}{
+-				"DeleteOnExit": true,
+-			},
+-			validate: func(t *testing.T, cfg *structs.AWSCAProviderConfig) {
+-				require.True(t, cfg.DeleteOnExit)
+-			},
+-		},
+-		{
+-			name: "valid config with DeleteOnExit false",
+-			raw: map[string]interface{}{
+-				"DeleteOnExit": false,
+-			},
+-			validate: func(t *testing.T, cfg *structs.AWSCAProviderConfig) {
+-				require.False(t, cfg.DeleteOnExit)
+-			},
+-		},
+-		{
+-			name: "valid RSA 2048",
+-			raw: map[string]interface{}{
+-				"PrivateKeyType": "rsa",
+-				"PrivateKeyBits": 2048,
+-			},
+-			validate: func(t *testing.T, cfg *structs.AWSCAProviderConfig) {
+-				require.Equal(t, "rsa", cfg.PrivateKeyType)
+-				require.Equal(t, 2048, cfg.PrivateKeyBits)
+-			},
+-		},
+-		{
+-			name: "valid RSA 4096",
+-			raw: map[string]interface{}{
+-				"PrivateKeyType": "rsa",
+-				"PrivateKeyBits": 4096,
+-			},
+-			validate: func(t *testing.T, cfg *structs.AWSCAProviderConfig) {
+-				require.Equal(t, "rsa", cfg.PrivateKeyType)
+-				require.Equal(t, 4096, cfg.PrivateKeyBits)
+-			},
+-		},
+-		{
+-			name: "valid EC 256",
+-			raw: map[string]interface{}{
+-				"PrivateKeyType": "ec",
+-				"PrivateKeyBits": 256,
+-			},
+-			validate: func(t *testing.T, cfg *structs.AWSCAProviderConfig) {
+-				require.Equal(t, "ec", cfg.PrivateKeyType)
+-				require.Equal(t, 256, cfg.PrivateKeyBits)
+-			},
+-		},
+-		{
+-			name: "invalid RSA key bits",
+-			raw: map[string]interface{}{
+-				"PrivateKeyType": "rsa",
+-				"PrivateKeyBits": 1024,
+-			},
+-			wantErr:     true,
+-			errContains: "RSA key length must be 2048 or 4096 bits",
+-		},
+-		{
+-			name: "invalid EC key bits",
+-			raw: map[string]interface{}{
+-				"PrivateKeyType": "ec",
+-				"PrivateKeyBits": 384,
+-			},
+-			wantErr:     true,
+-			errContains: "AWS PCA only supports P256 EC curve",
+-		},
+-		{
+-			name: "unsupported key type",
+-			raw: map[string]interface{}{
+-				"PrivateKeyType": "ed25519",
+-				"PrivateKeyBits": 256,
+-			},
+-			wantErr:     true,
+-			errContains: "private key type must be either 'ec' or 'rsa'",
+-		},
+-		{
+-			name: "LeafCertTTL less than 24 hours",
+-			raw: map[string]interface{}{
+-				"LeafCertTTL": "12h",
+-			},
+-			wantErr:     true,
+-			errContains: "AWS PCA doesn't support certificates that are valid for less than 24 hours",
+-		},
+-		{
+-			name: "LeafCertTTL exactly 24 hours is valid",
+-			raw: map[string]interface{}{
+-				"LeafCertTTL": "24h",
+-			},
+-			validate: func(t *testing.T, cfg *structs.AWSCAProviderConfig) {
+-				require.Equal(t, 24*time.Hour, cfg.LeafCertTTL)
+-			},
+-		},
+-		{
+-			name: "LeafCertTTL more than 24 hours is valid",
+-			raw: map[string]interface{}{
+-				"LeafCertTTL": "72h",
+-			},
+-			validate: func(t *testing.T, cfg *structs.AWSCAProviderConfig) {
+-				require.Equal(t, 72*time.Hour, cfg.LeafCertTTL)
+-			},
+-		},
+-		{
+-			name: "RootCertTTL can be specified",
+-			raw: map[string]interface{}{
+-				"RootCertTTL": "87600h",
+-			},
+-			validate: func(t *testing.T, cfg *structs.AWSCAProviderConfig) {
+-				require.Equal(t, 87600*time.Hour, cfg.RootCertTTL)
+-			},
+-		},
+-		{
+-			name: "IntermediateCertTTL can be specified",
+-			raw: map[string]interface{}{
+-				"IntermediateCertTTL": "43800h",
+-			},
+-			validate: func(t *testing.T, cfg *structs.AWSCAProviderConfig) {
+-				require.Equal(t, 43800*time.Hour, cfg.IntermediateCertTTL)
+-			},
+-		},
+-		{
+-			name: "all valid options together",
+-			raw: map[string]interface{}{
+-				"ExistingARN":         "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/test",
+-				"DeleteOnExit":        true,
+-				"PrivateKeyType":      "rsa",
+-				"PrivateKeyBits":      4096,
+-				"LeafCertTTL":         "72h",
+-				"RootCertTTL":         "87600h",
+-				"IntermediateCertTTL": "43800h",
+-			},
+-			validate: func(t *testing.T, cfg *structs.AWSCAProviderConfig) {
+-				require.Equal(t, "arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/test", cfg.ExistingARN)
+-				require.True(t, cfg.DeleteOnExit)
+-				require.Equal(t, "rsa", cfg.PrivateKeyType)
+-				require.Equal(t, 4096, cfg.PrivateKeyBits)
+-				require.Equal(t, 72*time.Hour, cfg.LeafCertTTL)
+-				require.Equal(t, 87600*time.Hour, cfg.RootCertTTL)
+-				require.Equal(t, 43800*time.Hour, cfg.IntermediateCertTTL)
+-			},
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			cfg, err := ParseAWSCAConfig(tt.raw)
+-			if tt.wantErr {
+-				require.Error(t, err)
+-				if tt.errContains != "" {
+-					require.Contains(t, err.Error(), tt.errContains)
+-				}
+-				return
+-			}
+-			require.NoError(t, err)
+-			require.NotNil(t, cfg)
+-			if tt.validate != nil {
+-				tt.validate(t, cfg)
+-			}
+-		})
+-	}
+-}
+diff --git a/agent/connect/ca/provider_vault_auth_aws.go b/agent/connect/ca/provider_vault_auth_aws.go
+index 726fd6c0c0..61762b36fd 100644
+--- a/agent/connect/ca/provider_vault_auth_aws.go
++++ b/agent/connect/ca/provider_vault_auth_aws.go
+@@ -4,16 +4,14 @@
+ package ca
+ 
+ import (
+-	"context"
+ 	"fmt"
+ 	"os"
+ 	"strconv"
+ 
+-	"github.com/aws/aws-sdk-go-v2/aws"
+-	iamauth "github.com/hashicorp/consul-awsauth"
++	"github.com/aws/aws-sdk-go/aws/credentials"
+ 	"github.com/hashicorp/go-cleanhttp"
+ 	"github.com/hashicorp/go-hclog"
+-	"github.com/hashicorp/go-secure-stdlib/awsutil/v2"
++	"github.com/hashicorp/go-secure-stdlib/awsutil"
+ 
+ 	"github.com/hashicorp/consul/agent/structs"
+ )
+@@ -45,60 +43,32 @@ func NewAWSAuthClient(authMethod *structs.VaultAuthMethod) *VaultAuthClient {
+ 
+ // AWSLoginDataGenerator is a LoginDataGenerator for AWS authentication.
+ type AWSLoginDataGenerator struct {
+-	// awsConfig supports explicitly setting the AWS config to use for authenticating with AWS.
++	// credentials supports explicitly setting the AWS credentials to use for authenticating with AWS.
+ 	// It is un-exported and intended for testing purposes only.
+-	awsConfig *aws.Config
++	credentials *credentials.Credentials
+ }
+ 
+ // GenerateLoginData derives the login data for the Vault AWS auth login request from the CA
+ // provider auth method config.
+ func (g *AWSLoginDataGenerator) GenerateLoginData(authMethod *structs.VaultAuthMethod) (map[string]interface{}, error) {
+-	ctx := context.Background()
+-
+ 	// Create the credential configuration from the parameters.
+ 	credsConfig, headerValue, err := newAWSCredentialsConfig(authMethod.Params)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("aws auth failed to create credential configuration: %w", err)
+ 	}
+ 
+-	// Use the provided AWS config if present, otherwise generate one
+-	awsConfig := g.awsConfig
+-	if awsConfig == nil {
+-		// Generate the AWS config with credentials
+-		awsConfig, err = credsConfig.GenerateCredentialChain(ctx)
++	// Use the provided credentials if they are present.
++	creds := g.credentials
++	if creds == nil {
++		// Generate the credential chain
++		creds, err = credsConfig.GenerateCredentialChain()
+ 		if err != nil {
+ 			return nil, fmt.Errorf("aws auth failed to generate credential chain: %w", err)
+ 		}
+ 	}
+ 
+-	// Extract STS endpoint from params if provided
+-	// This is needed because consul-awsauth creates its own STS client
+-	stsEndpoint := ""
+-	if ep, ok := authMethod.Params["sts_endpoint"].(string); ok {
+-		stsEndpoint = ep
+-	}
+-
+-	// Extract IAM endpoint from params if provided
+-	// This is needed because consul-awsauth creates its own IAM client internally
+-	iamEndpoint := ""
+-	if ep, ok := authMethod.Params["iam_endpoint"].(string); ok {
+-		iamEndpoint = ep
+-	}
+-
+-	// Use consul-awsauth's GenerateLoginData which works with AWS SDK v2
+-	// Note: IncludeIAMEntity is set to false for Vault authentication because:
+-	// 1. Vault's AWS auth method doesn't use the entity headers that consul-awsauth requires
+-	// 2. The entity headers (GetEntityMethodHeader, etc.) are specific to Consul's auth method
+-	// 3. Vault validates AWS identity differently and doesn't need IAM entity details in the request
+-	loginData, err := iamauth.GenerateLoginData(&iamauth.LoginInput{
+-		Creds:               awsConfig.Credentials,
+-		IncludeIAMEntity:    false, // Always false for Vault auth (entity headers not applicable)
+-		STSRegion:           awsConfig.Region,
+-		STSEndpoint:         stsEndpoint, // Pass custom STS endpoint if specified
+-		IAMEndpoint:         iamEndpoint, // Pass custom IAM endpoint if specified
+-		ServerIDHeaderValue: headerValue,
+-		Logger:              hclog.NewNullLogger(),
+-	})
++	// Derive the login data
++	loginData, err := awsutil.GenerateLoginData(creds, headerValue, credsConfig.Region, hclog.NewNullLogger())
+ 	if err != nil {
+ 		return nil, fmt.Errorf("aws auth failed to generate login data: %w", err)
+ 	}
+@@ -113,104 +83,43 @@ func (g *AWSLoginDataGenerator) GenerateLoginData(authMethod *structs.VaultAuthM
+ }
+ 
+ // newAWSCredentialsConfig creates an awsutil.CredentialsConfig from the given set of parameters.
++// It is mostly copied from the awsutil package because that package does not currently provide
++// an easy way to configure all the available options.
+ func newAWSCredentialsConfig(config map[string]interface{}) (*awsutil.CredentialsConfig, string, error) {
+-	// Filter out non-credential parameters before passing to awsutil
+-	// These parameters (endpoints, role) are handled separately in the auth flow
+-	filteredConfig := make(map[string]interface{})
+-	for k, v := range config {
+-		// Skip parameters that aren't credentials-related
+-		if k == "sts_endpoint" || k == "iam_endpoint" || k == "role" {
+-			continue
+-		}
+-		filteredConfig[k] = v
+-	}
+-
+-	params, err := toMapStringString(filteredConfig)
++	params, err := toMapStringString(config)
+ 	if err != nil {
+ 		return nil, "", fmt.Errorf("misconfiguration of AWS auth parameters: %w", err)
+ 	}
+ 
+-	// Build options for awsutil.NewCredentialsConfig
+-	var opts []awsutil.Option
+-
+-	// Add basic credentials if provided
+-	if accessKey := params["access_key"]; accessKey != "" {
+-		opts = append(opts, awsutil.WithAccessKey(accessKey))
+-	}
+-	if secretKey := params["secret_key"]; secretKey != "" {
+-		opts = append(opts, awsutil.WithSecretKey(secretKey))
+-	}
+-
+-	// Add region
+-	region := params["region"]
+-	if region == "" {
+-		region = os.Getenv("AWS_REGION")
+-		if region == "" {
+-			region = os.Getenv("AWS_DEFAULT_REGION")
+-			if region == "" {
+-				region = "us-east-1"
++	// Populate the AWS credentials configuration. Empty strings will use the defaults.
++	c := &awsutil.CredentialsConfig{
++		AccessKey:            params["access_key"],
++		SecretKey:            params["secret_key"],
++		SessionToken:         params["session_token"],
++		IAMEndpoint:          params["iam_endpoint"],
++		STSEndpoint:          params["sts_endpoint"],
++		Region:               params["region"],
++		Filename:             params["filename"],
++		Profile:              params["profile"],
++		RoleARN:              params["role_arn"],
++		RoleSessionName:      params["role_session_name"],
++		WebIdentityTokenFile: params["web_identity_token_file"],
++		HTTPClient:           cleanhttp.DefaultClient(),
++	}
++
++	if maxRetries, err := strconv.Atoi(params["max_retries"]); err == nil {
++		c.MaxRetries = &maxRetries
++	}
++
++	if c.Region == "" {
++		c.Region = os.Getenv("AWS_REGION")
++		if c.Region == "" {
++			c.Region = os.Getenv("AWS_DEFAULT_REGION")
++			if c.Region == "" {
++				c.Region = "us-east-1"
+ 			}
+ 		}
+ 	}
+-	opts = append(opts, awsutil.WithRegion(region))
+-
+-	// Add optional parameters
+-	if roleArn := params["role_arn"]; roleArn != "" {
+-		opts = append(opts, awsutil.WithRoleArn(roleArn))
+-	}
+-	if roleSessionName := params["role_session_name"]; roleSessionName != "" {
+-		opts = append(opts, awsutil.WithRoleSessionName(roleSessionName))
+-	}
+-	if roleExternalId := params["role_external_id"]; roleExternalId != "" {
+-		opts = append(opts, awsutil.WithRoleExternalId(roleExternalId))
+-	}
+-	if webIdentityTokenFile := params["web_identity_token_file"]; webIdentityTokenFile != "" {
+-		opts = append(opts, awsutil.WithWebIdentityTokenFile(webIdentityTokenFile))
+-	}
+-	if webIdentityToken := params["web_identity_token"]; webIdentityToken != "" {
+-		opts = append(opts, awsutil.WithWebIdentityToken(webIdentityToken))
+-	}
+-
+-	// Add HTTP client
+-	opts = append(opts, awsutil.WithHttpClient(cleanhttp.DefaultClient()))
+-
+-	// Add max retries if specified
+-	if maxRetriesStr := params["max_retries"]; maxRetriesStr != "" {
+-		if maxRetries, err := strconv.Atoi(maxRetriesStr); err == nil {
+-			opts = append(opts, awsutil.WithMaxRetries(&maxRetries))
+-		}
+-	}
+-
+-	// Note: IAM and STS endpoint configuration is NOT added to awsutil config here
+-	// because consul-awsauth creates its own STS/IAM clients and doesn't use the
+-	// awsutil-provided config. Instead, we extract the endpoint strings from params
+-	// and pass them directly to consul-awsauth.GenerateLoginData()
+-
+-	// Create the credentials config
+-	c, err := awsutil.NewCredentialsConfig(opts...)
+-	if err != nil {
+-		return nil, "", fmt.Errorf("failed to create AWS credentials config: %w", err)
+-	}
+-
+-	// Set session token directly on the config struct if provided in auth method params.
+-	// The session_token parameter comes from the Vault CA provider's auth_method configuration
+-	// awsutil.NewCredentialsConfig() doesn't provide
+-	// a WithSessionToken option, we set it directly on the returned config struct.
+-	if sessionToken := params["session_token"]; sessionToken != "" {
+-		c.SessionToken = sessionToken
+-	}
+-
+-	// Set filename (custom credential file path) if provided
+-	// This allows using a custom AWS credentials file instead of the default ~/.aws/credentials
+-	if filename := params["filename"]; filename != "" {
+-		c.Filename = filename
+-	}
+-
+-	// Set profile (AWS profile selection) if provided
+-	// This allows selecting a specific profile from the AWS credentials/config files
+-	if profile := params["profile"]; profile != "" {
+-		c.Profile = profile
+-	}
+ 
+ 	return c, params["header_value"], nil
+ }
+diff --git a/agent/connect/ca/provider_vault_auth_test.go b/agent/connect/ca/provider_vault_auth_test.go
+index 7b06490ef1..361d89400e 100644
+--- a/agent/connect/ca/provider_vault_auth_test.go
++++ b/agent/connect/ca/provider_vault_auth_test.go
+@@ -4,7 +4,6 @@
+ package ca
+ 
+ import (
+-	"context"
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"fmt"
+@@ -12,10 +11,12 @@ import (
+ 	"net/http/httptest"
+ 	"net/url"
+ 	"os"
++	"strconv"
+ 	"testing"
+ 
+-	"github.com/aws/aws-sdk-go-v2/aws"
++	"github.com/aws/aws-sdk-go/aws/credentials"
+ 	"github.com/hashicorp/consul/agent/structs"
++	"github.com/hashicorp/go-secure-stdlib/awsutil"
+ 	"github.com/hashicorp/vault/api/auth/gcp"
+ 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
+ 	"github.com/stretchr/testify/require"
+@@ -162,34 +163,55 @@ func TestVaultCAProvider_AWSCredentialsConfig(t *testing.T) {
+ 	cases := map[string]struct {
+ 		params    map[string]interface{}
+ 		envVars   map[string]string
+-		expRegion string
++		expCreds  *awsutil.CredentialsConfig
+ 		expErr    error
++		expRegion string
+ 	}{
+ 		"valid config": {
+ 			params: map[string]interface{}{
+ 				"access_key":              "access key",
+ 				"secret_key":              "secret key",
+-				"region":                  "custom-region",
++				"session_token":           "session token",
++				"iam_endpoint":            "iam endpoint",
++				"sts_endpoint":            "sts endpoint",
++				"region":                  "region",
++				"filename":                "filename",
++				"profile":                 "profile",
+ 				"role_arn":                "role arn",
+ 				"role_session_name":       "role session name",
+ 				"web_identity_token_file": "web identity token file",
+ 				"header_value":            "header value",
+ 				"max_retries":             "13",
+ 			},
+-			expRegion: "custom-region",
++			expCreds: &awsutil.CredentialsConfig{
++				AccessKey:            "access key",
++				SecretKey:            "secret key",
++				SessionToken:         "session token",
++				IAMEndpoint:          "iam endpoint",
++				STSEndpoint:          "sts endpoint",
++				Region:               "region",
++				Filename:             "filename",
++				Profile:              "profile",
++				RoleARN:              "role arn",
++				RoleSessionName:      "role session name",
++				WebIdentityTokenFile: "web identity token file",
++			},
+ 		},
+ 		"default region": {
+ 			params:    map[string]interface{}{},
++			expCreds:  &awsutil.CredentialsConfig{},
+ 			expRegion: "us-east-1",
+ 		},
+ 		"env AWS_REGION": {
+ 			params:    map[string]interface{}{},
+ 			envVars:   map[string]string{"AWS_REGION": "us-west-1"},
++			expCreds:  &awsutil.CredentialsConfig{},
+ 			expRegion: "us-west-1",
+ 		},
+ 		"env AWS_DEFAULT_REGION": {
+ 			params:    map[string]interface{}{},
+ 			envVars:   map[string]string{"AWS_DEFAULT_REGION": "us-west-2"},
++			expCreds:  &awsutil.CredentialsConfig{},
+ 			expRegion: "us-west-2",
+ 		},
+ 		"both AWS_REGION and AWS_DEFAULT_REGION": {
+@@ -198,27 +220,9 @@ func TestVaultCAProvider_AWSCredentialsConfig(t *testing.T) {
+ 				"AWS_REGION":         "us-west-1",
+ 				"AWS_DEFAULT_REGION": "us-west-2",
+ 			},
++			expCreds:  &awsutil.CredentialsConfig{},
+ 			expRegion: "us-west-1",
+ 		},
+-		"with role_external_id": {
+-			params: map[string]interface{}{
+-				"access_key":       "access key",
+-				"secret_key":       "secret key",
+-				"region":           "eu-west-1",
+-				"role_arn":         "arn:aws:iam::123456789012:role/test-role",
+-				"role_external_id": "external-id-12345",
+-			},
+-			expRegion: "eu-west-1",
+-		},
+-		"with web_identity_token": {
+-			params: map[string]interface{}{
+-				"region":             "ap-southeast-1",
+-				"role_arn":           "arn:aws:iam::123456789012:role/web-identity-role",
+-				"web_identity_token": "mock-web-identity-token",
+-				"role_session_name":  "test-session",
+-			},
+-			expRegion: "ap-southeast-1",
+-		},
+ 		"invalid config": {
+ 			params: map[string]interface{}{
+ 				"invalid": true,
+@@ -246,8 +250,6 @@ func TestVaultCAProvider_AWSCredentialsConfig(t *testing.T) {
+ 				return
+ 			}
+ 
+-			require.NoError(t, err)
+-
+ 			// If a header value was provided in the params then make sure it was returned.
+ 			if val, ok := c.params["header_value"]; ok {
+ 				require.Equal(t, val, headerValue)
+@@ -255,22 +257,29 @@ func TestVaultCAProvider_AWSCredentialsConfig(t *testing.T) {
+ 				require.Empty(t, headerValue)
+ 			}
+ 
+-			// Verify the credentials config was created successfully by generating a config
+-			ctx := context.Background()
+-			awsConfig, err := creds.GenerateCredentialChain(ctx)
+-			require.NoError(t, err)
+-			require.NotNil(t, awsConfig)
+-			require.Equal(t, c.expRegion, awsConfig.Region)
++			if val, ok := c.params["max_retries"]; ok {
++				mr, err := strconv.Atoi(val.(string))
++				require.NoError(t, err)
++				c.expCreds.MaxRetries = &mr
++			} else {
++				creds.MaxRetries = nil
++			}
++
++			require.NotNil(t, creds.HTTPClient)
++			creds.HTTPClient = nil
++
++			if c.expRegion != "" {
++				c.expCreds.Region = c.expRegion
++			}
++			require.Equal(t, *c.expCreds, *creds)
+ 		})
+ 	}
+ }
+ 
+ func TestVaultCAProvider_AWSLoginDataGenerator(t *testing.T) {
+ 	cases := map[string]struct {
+-		expErr        error
+-		authMethod    structs.VaultAuthMethod
+-		useNilConfig  bool
+-		expectHeaders bool
++		expErr     error
++		authMethod structs.VaultAuthMethod
+ 	}{
+ 		"valid login data": {
+ 			authMethod: structs.VaultAuthMethod{},
+@@ -279,65 +288,11 @@ func TestVaultCAProvider_AWSLoginDataGenerator(t *testing.T) {
+ 			expErr:     nil,
+ 			authMethod: structs.VaultAuthMethod{Type: "aws", MountPath: "", Params: map[string]interface{}{"role": "test-role"}},
+ 		},
+-		"with header_value": {
+-			authMethod: structs.VaultAuthMethod{
+-				Type:      "aws",
+-				MountPath: "",
+-				Params: map[string]interface{}{
+-					"access_key":   "AKIAIOSFODNN7EXAMPLE",
+-					"secret_key":   "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+-					"region":       "us-west-2",
+-					"header_value": "vault.example.com",
+-				},
+-			},
+-			useNilConfig:  true,
+-			expectHeaders: true,
+-		},
+-		"nil awsConfig generates credentials": {
+-			authMethod: structs.VaultAuthMethod{
+-				Type:      "aws",
+-				MountPath: "",
+-				Params: map[string]interface{}{
+-					"access_key": "AKIAIOSFODNN7EXAMPLE",
+-					"secret_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+-					"region":     "eu-central-1",
+-				},
+-			},
+-			useNilConfig: true,
+-		},
+-		"error on invalid config": {
+-			authMethod: structs.VaultAuthMethod{
+-				Type:      "aws",
+-				MountPath: "",
+-				Params: map[string]interface{}{
+-					"invalid": true,
+-				},
+-			},
+-			expErr: fmt.Errorf("aws auth failed to create credential configuration"),
+-		},
+ 	}
+ 
+ 	for name, c := range cases {
+ 		t.Run(name, func(t *testing.T) {
+-			var ldg *AWSLoginDataGenerator
+-
+-			if c.useNilConfig {
+-				// Test the path where awsConfig is nil and needs to be generated
+-				ldg = &AWSLoginDataGenerator{awsConfig: nil}
+-			} else {
+-				// Create a mock AWS config with anonymous credentials for testing
+-				mockConfig := &aws.Config{
+-					Region: "us-east-1",
+-					Credentials: aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+-						return aws.Credentials{
+-							AccessKeyID:     "AKIAIOSFODNN7EXAMPLE",
+-							SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+-						}, nil
+-					}),
+-				}
+-				ldg = &AWSLoginDataGenerator{awsConfig: mockConfig}
+-			}
+-
++			ldg := &AWSLoginDataGenerator{credentials: credentials.AnonymousCredentials}
+ 			loginData, err := ldg.GenerateLoginData(&c.authMethod)
+ 			if c.expErr != nil {
+ 				require.Error(t, err)
+@@ -367,133 +322,6 @@ func TestVaultCAProvider_AWSLoginDataGenerator(t *testing.T) {
+ 	}
+ }
+ 
+-// TestVaultCAProvider_AWSEndpointConfiguration tests that custom IAM and STS endpoints
+-// are properly extracted from auth method params and passed to consul-awsauth.
+-func TestVaultCAProvider_AWSEndpointConfiguration(t *testing.T) {
+-	cases := map[string]struct {
+-		params              map[string]interface{}
+-		expectLoginDataKeys []string
+-		expectRole          string
+-	}{
+-		"with custom iam_endpoint": {
+-			params: map[string]interface{}{
+-				"access_key":   "AKIAIOSFODNN7EXAMPLE",
+-				"secret_key":   "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+-				"region":       "us-east-1",
+-				"iam_endpoint": "https://iam.custom-endpoint.example.com",
+-			},
+-			expectLoginDataKeys: []string{
+-				"iam_http_request_method",
+-				"iam_request_url",
+-				"iam_request_headers",
+-				"iam_request_body",
+-			},
+-		},
+-		"with custom sts_endpoint": {
+-			params: map[string]interface{}{
+-				"access_key":   "AKIAIOSFODNN7EXAMPLE",
+-				"secret_key":   "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+-				"region":       "us-west-2",
+-				"sts_endpoint": "https://sts.custom-endpoint.example.com",
+-			},
+-			expectLoginDataKeys: []string{
+-				"iam_http_request_method",
+-				"iam_request_url",
+-				"iam_request_headers",
+-				"iam_request_body",
+-			},
+-		},
+-		"with both iam_endpoint and sts_endpoint": {
+-			params: map[string]interface{}{
+-				"access_key":   "AKIAIOSFODNN7EXAMPLE",
+-				"secret_key":   "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+-				"region":       "eu-west-1",
+-				"iam_endpoint": "https://iam.custom.example.com",
+-				"sts_endpoint": "https://sts.custom.example.com",
+-			},
+-			expectLoginDataKeys: []string{
+-				"iam_http_request_method",
+-				"iam_request_url",
+-				"iam_request_headers",
+-				"iam_request_body",
+-			},
+-		},
+-		"without custom endpoints (default behavior)": {
+-			params: map[string]interface{}{
+-				"access_key": "AKIAIOSFODNN7EXAMPLE",
+-				"secret_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+-				"region":     "ap-southeast-1",
+-			},
+-			expectLoginDataKeys: []string{
+-				"iam_http_request_method",
+-				"iam_request_url",
+-				"iam_request_headers",
+-				"iam_request_body",
+-			},
+-		},
+-		"with role and custom endpoints": {
+-			params: map[string]interface{}{
+-				"access_key":   "AKIAIOSFODNN7EXAMPLE",
+-				"secret_key":   "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+-				"region":       "us-east-1",
+-				"role":         "test-vault-role",
+-				"iam_endpoint": "https://iam-fips.us-gov-west-1.amazonaws.com",
+-				"sts_endpoint": "https://sts-fips.us-gov-west-1.amazonaws.com",
+-			},
+-			expectLoginDataKeys: []string{
+-				"iam_http_request_method",
+-				"iam_request_url",
+-				"iam_request_headers",
+-				"iam_request_body",
+-			},
+-			expectRole: "test-vault-role",
+-		},
+-	}
+-
+-	for name, c := range cases {
+-		t.Run(name, func(t *testing.T) {
+-			// Create auth method with params
+-			authMethod := &structs.VaultAuthMethod{
+-				Type:      "aws",
+-				MountPath: "aws",
+-				Params:    c.params,
+-			}
+-
+-			// Create AWS auth client which initializes the login data generator
+-			authClient := NewAWSAuthClient(authMethod)
+-			require.NotNil(t, authClient)
+-			require.NotNil(t, authClient.LoginDataGen)
+-
+-			// Generate login data - this tests the actual code path in provider_vault_auth_aws.go
+-			// including extraction of iam_endpoint and sts_endpoint from params
+-			loginData, err := authClient.LoginDataGen(authMethod)
+-			require.NoError(t, err)
+-			require.NotNil(t, loginData)
+-
+-			// Verify that all expected login data keys are present
+-			for _, key := range c.expectLoginDataKeys {
+-				val, exists := loginData[key]
+-				require.True(t, exists, "missing expected key: %s", key)
+-				require.NotEmpty(t, val, "expected non-empty value for key: %s", key)
+-			}
+-
+-			// If role was specified, verify it's in the login data
+-			if c.expectRole != "" {
+-				require.Equal(t, c.expectRole, loginData["role"])
+-			}
+-
+-			// Note: We can't directly verify that the endpoints were passed to consul-awsauth
+-			// without mocking the IAM/STS services, but we can verify:
+-			// 1. The function succeeds (doesn't error)
+-			// 2. Login data is generated with all required fields
+-			// 3. The code path that extracts iam_endpoint and sts_endpoint executes
+-
+-			// The actual endpoint usage is tested in consul-awsauth's own test suite
+-			// This test verifies the integration: extracting params and calling GenerateLoginData
+-		})
+-	}
+-}
+-
+ func TestVaultCAProvider_AzureAuthClient(t *testing.T) {
+ 	instance := instanceData{Compute: Compute{
+ 		Name: "a", ResourceGroupName: "b", SubscriptionID: "c", VMScaleSetName: "d",
+diff --git a/agent/consul/authmethod/awsauth/aws_test.go b/agent/consul/authmethod/awsauth/aws_test.go
+index 6ba40b7f38..279e4b3e46 100644
+--- a/agent/consul/authmethod/awsauth/aws_test.go
++++ b/agent/consul/authmethod/awsauth/aws_test.go
+@@ -10,7 +10,7 @@ import (
+ 	"net/http/httptest"
+ 	"testing"
+ 
+-	"github.com/aws/aws-sdk-go-v2/credentials"
++	"github.com/aws/aws-sdk-go/aws/credentials"
+ 	iamauth "github.com/hashicorp/consul-awsauth"
+ 	"github.com/hashicorp/consul-awsauth/iamauthtest"
+ 	"github.com/hashicorp/consul/agent/consul/authmethod"
+@@ -238,7 +238,7 @@ func setup(t *testing.T, config map[string]interface{}, server *iamauthtest.Serv
+ 
+ 	// Generate the login token
+ 	tokenData, err := iamauth.GenerateLoginData(&iamauth.LoginInput{
+-		Creds:                  credentials.NewStaticCredentialsProvider("fake", "fake", ""),
++		Creds:                  credentials.NewStaticCredentials("fake", "fake", ""),
+ 		IncludeIAMEntity:       v.config.EnableIAMEntityDetails,
+ 		STSEndpoint:            v.config.STSEndpoint,
+ 		STSRegion:              "fake-region",
+diff --git a/agent/envoyextensions/builtin/aws-lambda/aws_lambda.go b/agent/envoyextensions/builtin/aws-lambda/aws_lambda.go
+index 4a0b4875b8..9b969e052f 100644
+--- a/agent/envoyextensions/builtin/aws-lambda/aws_lambda.go
++++ b/agent/envoyextensions/builtin/aws-lambda/aws_lambda.go
+@@ -7,7 +7,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 
+-	arn_sdk "github.com/aws/aws-sdk-go-v2/aws/arn"
++	arn_sdk "github.com/aws/aws-sdk-go/aws/arn"
+ 	envoy_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+ 	envoy_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+ 	envoy_endpoint_v3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+diff --git a/command/login/aws.go b/command/login/aws.go
+index 078e870866..e7fb6af58e 100644
+--- a/command/login/aws.go
++++ b/command/login/aws.go
+@@ -4,13 +4,14 @@
+ package login
+ 
+ import (
+-	"context"
+ 	"encoding/json"
+ 	"flag"
+ 	"fmt"
+ 
+-	"github.com/aws/aws-sdk-go-v2/aws"
+-	"github.com/aws/aws-sdk-go-v2/config"
++	"github.com/aws/aws-sdk-go/aws"
++	"github.com/aws/aws-sdk-go/aws/credentials"
++	"github.com/aws/aws-sdk-go/aws/session"
++
+ 	iamauth "github.com/hashicorp/consul-awsauth"
+ 	"github.com/hashicorp/consul/agent/consul/authmethod/awsauth"
+ 	"github.com/hashicorp/go-hclog"
+@@ -20,7 +21,6 @@ type AWSLogin struct {
+ 	autoBearerToken     bool
+ 	includeEntity       bool
+ 	stsEndpoint         string
+-	iamEndpoint         string
+ 	region              string
+ 	serverIDHeaderValue string
+ 	accessKeyId         string
+@@ -42,9 +42,6 @@ func (a *AWSLogin) flags() *flag.FlagSet {
+ 	fs.StringVar(&a.stsEndpoint, "aws-sts-endpoint", "",
+ 		"URL for AWS STS API calls. [aws-iam only]")
+ 
+-	fs.StringVar(&a.iamEndpoint, "aws-iam-endpoint", "",
+-		"URL for AWS IAM API calls. Used when -aws-include-entity is set to true. [aws-iam only]")
+-
+ 	fs.StringVar(&a.region, "aws-region", "",
+ 		"Region for AWS API calls. If set, should match the region of -aws-sts-endpoint. "+
+ 			"If not provided, the region will be discovered from standard sources, such as "+
+@@ -96,57 +93,44 @@ func (a *AWSLogin) checkFlags() error {
+ // also included. The AWS credentials are used to retrieve the current user's role
+ // or user name for the iam:GetRole or iam:GetUser request.
+ func (a *AWSLogin) createAWSBearerToken() (string, error) {
+-	ctx := context.Background()
+-
+-	// Build config options for AWS SDK v2
+-	var configOpts []func(*config.LoadOptions) error
+-
+-	// Set region if provided
+-	if a.region != "" {
+-		configOpts = append(configOpts, config.WithRegion(a.region))
+-	}
+-
+-	// Set endpoint if provided (for STS)
+-	if a.stsEndpoint != "" {
+-		configOpts = append(configOpts, config.WithBaseEndpoint(a.stsEndpoint))
++	cfg := aws.Config{
++		Endpoint: aws.String(a.stsEndpoint),
++		Region:   aws.String(a.region),
++		// More detailed error message to help debug credential discovery.
++		CredentialsChainVerboseErrors: aws.Bool(true),
+ 	}
+ 
+-	// Set static credentials if provided
+ 	if a.accessKeyId != "" {
+-		configOpts = append(configOpts, config.WithCredentialsProvider(
+-			aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+-				return aws.Credentials{
+-					AccessKeyID:     a.accessKeyId,
+-					SecretAccessKey: a.secretAccessKey,
+-					SessionToken:    a.sessionToken,
+-				}, nil
+-			}),
+-		))
++		// Use creds from flags.
++		cfg.Credentials = credentials.NewStaticCredentials(
++			a.accessKeyId, a.secretAccessKey, a.sessionToken,
++		)
+ 	}
+ 
+-	// Load AWS config using SDK v2
+-	cfg, err := config.LoadDefaultConfig(ctx, configOpts...)
++	// Session loads creds from standard sources (env vars, file, EC2 metadata, ...)
++	sess, err := session.NewSessionWithOptions(session.Options{
++		Config: cfg,
++		// Allow loading from config files by default:
++		//   ~/.aws/config or AWS_CONFIG_FILE
++		//   ~/.aws/credentials or AWS_SHARED_CREDENTIALS_FILE
++		SharedConfigState: session.SharedConfigEnable,
++	})
+ 	if err != nil {
+ 		return "", err
+ 	}
+-
+-	// Validate region is set
+-	if cfg.Region == "" {
++	if sess.Config.Region == nil || *sess.Config.Region == "" {
+ 		return "", fmt.Errorf("AWS region not found")
+ 	}
+-
+-	// Validate credentials are available
+-	_, err = cfg.Credentials.Retrieve(ctx)
+-	if err != nil {
+-		return "", fmt.Errorf("AWS credentials not found: %w", err)
++	if sess.Config.Credentials == nil {
++		return "", fmt.Errorf("AWS credentials not found")
+ 	}
++	creds := sess.Config.Credentials
+ 
+ 	loginData, err := iamauth.GenerateLoginData(&iamauth.LoginInput{
+-		Creds:                  cfg.Credentials,
++		Creds:                  creds,
+ 		IncludeIAMEntity:       a.includeEntity,
+ 		STSEndpoint:            a.stsEndpoint,
+-		IAMEndpoint:            a.iamEndpoint,
+-		STSRegion:              cfg.Region,
++		STSRegion:              a.region,
+ 		Logger:                 hclog.New(nil),
+ 		ServerIDHeaderValue:    a.serverIDHeaderValue,
+ 		ServerIDHeaderName:     awsauth.IAMServerIDHeaderName,
+diff --git a/command/login/login_test.go b/command/login/login_test.go
+index fc550e57a6..794c7b3623 100644
+--- a/command/login/login_test.go
++++ b/command/login/login_test.go
+@@ -654,7 +654,6 @@ func TestLoginCommand_aws_iam(t *testing.T) {
+ 				"-method=iam-test",
+ 				"-token-sink-file", tokenSinkFile,
+ 				"-aws-sts-endpoint", fakeAws.URL + "/sts",
+-				"-aws-iam-endpoint", fakeAws.URL + "/iam",
+ 				"-aws-region", "fake-region",
+ 				"-aws-access-key-id", "fake-key-id",
+ 				"-aws-secret-access-key", "fake-secret-key",
+diff --git a/go.mod b/go.mod
+index 0f354118ed..c4c679b5b9 100644
+--- a/go.mod
++++ b/go.mod
+@@ -21,11 +21,7 @@ require (
+ 	github.com/armon/circbuf v0.0.0-20150827004946-bbbad097214e
+ 	github.com/armon/go-metrics v0.4.1
+ 	github.com/armon/go-radix v1.0.0
+-	github.com/aws/aws-sdk-go-v2 v1.41.0
+-	github.com/aws/aws-sdk-go-v2/config v1.32.6
+-	github.com/aws/aws-sdk-go-v2/credentials v1.19.6
+-	github.com/aws/aws-sdk-go-v2/service/acmpca v1.46.6
+-	github.com/aws/smithy-go v1.24.0
++	github.com/aws/aws-sdk-go v1.55.7
+ 	github.com/coreos/go-oidc/v3 v3.11.0
+ 	github.com/deckarep/golang-set/v2 v2.3.1
+ 	github.com/docker/go-connections v0.4.0
+@@ -47,7 +43,7 @@ require (
+ 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
+ 	github.com/hashi-derek/grpc-proxy v0.0.0-20231207191910-191266484d75
+ 	github.com/hashicorp/cap v0.10.0
+-	github.com/hashicorp/consul-awsauth v0.0.0-20260217094118-6b9b26380433
++	github.com/hashicorp/consul-awsauth v0.0.0-20250825122907-9e35fe9ded3a
+ 	github.com/hashicorp/consul-net-rpc v0.0.0-20221205195236-156cfab66a69
+ 	github.com/hashicorp/consul/api v1.33.2
+ 	github.com/hashicorp/consul/envoyextensions v0.9.2
+@@ -65,9 +61,9 @@ require (
+ 	github.com/hashicorp/go-memdb v1.3.4
+ 	github.com/hashicorp/go-multierror v1.1.1
+ 	github.com/hashicorp/go-raftchunking v0.7.0
+-	github.com/hashicorp/go-retryablehttp v0.7.8
++	github.com/hashicorp/go-retryablehttp v0.7.7
+ 	github.com/hashicorp/go-rootcerts v1.0.2
+-	github.com/hashicorp/go-secure-stdlib/awsutil/v2 v2.1.2
++	github.com/hashicorp/go-secure-stdlib/awsutil v0.1.6
+ 	github.com/hashicorp/go-sockaddr v1.0.5
+ 	github.com/hashicorp/go-syslog v1.0.0
+ 	github.com/hashicorp/go-uuid v1.0.3
+@@ -153,19 +149,21 @@ require (
+ 	github.com/Microsoft/go-winio v0.6.1 // indirect
+ 	github.com/agext/levenshtein v1.2.3 // indirect
+ 	github.com/apparentlymart/go-textseg/v13 v13.0.0 // indirect
+-	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.16 // indirect
+-	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.16 // indirect
+-	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.16 // indirect
+-	github.com/aws/aws-sdk-go-v2/internal/ini v1.8.4 // indirect
++	github.com/aws/aws-sdk-go-v2 v1.33.0 // indirect
++	github.com/aws/aws-sdk-go-v2/config v1.29.1 // indirect
++	github.com/aws/aws-sdk-go-v2/credentials v1.17.54 // indirect
++	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.24 // indirect
++	github.com/aws/aws-sdk-go-v2/internal/configsources v1.3.28 // indirect
++	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.6.28 // indirect
++	github.com/aws/aws-sdk-go-v2/internal/ini v1.8.1 // indirect
+ 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.200.0 // indirect
+ 	github.com/aws/aws-sdk-go-v2/service/ecs v1.53.8 // indirect
+-	github.com/aws/aws-sdk-go-v2/service/iam v1.52.3 // indirect
+-	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.4 // indirect
+-	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.16 // indirect
+-	github.com/aws/aws-sdk-go-v2/service/signin v1.0.4 // indirect
+-	github.com/aws/aws-sdk-go-v2/service/sso v1.30.8 // indirect
+-	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.12 // indirect
+-	github.com/aws/aws-sdk-go-v2/service/sts v1.41.5 // indirect
++	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.12.1 // indirect
++	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.12.9 // indirect
++	github.com/aws/aws-sdk-go-v2/service/sso v1.24.11 // indirect
++	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.28.10 // indirect
++	github.com/aws/aws-sdk-go-v2/service/sts v1.33.9 // indirect
++	github.com/aws/smithy-go v1.22.1 // indirect
+ 	github.com/benbjohnson/immutable v0.4.0 // indirect
+ 	github.com/beorn7/perks v1.0.1 // indirect
+ 	github.com/bgentry/speakeasy v0.1.0 // indirect
+diff --git a/go.sum b/go.sum
+index 8ed27e0486..959b83dcc0 100644
+--- a/go.sum
++++ b/go.sum
+@@ -122,42 +122,39 @@ github.com/armon/go-metrics v0.4.1/go.mod h1:E6amYzXo6aW1tqzoZGT755KkbgrJsSdpwZ+
+ github.com/armon/go-radix v0.0.0-20180808171621-7fddfc383310/go.mod h1:ufUuZ+zHj4x4TnLV4JWEpy2hxWSpsRywHrMgIH9cCH8=
+ github.com/armon/go-radix v1.0.0 h1:F4z6KzEeeQIMeLFa97iZU6vupzoecKdU5TX24SNppXI=
+ github.com/armon/go-radix v1.0.0/go.mod h1:ufUuZ+zHj4x4TnLV4JWEpy2hxWSpsRywHrMgIH9cCH8=
+-github.com/aws/aws-sdk-go-v2 v1.41.0 h1:tNvqh1s+v0vFYdA1xq0aOJH+Y5cRyZ5upu6roPgPKd4=
+-github.com/aws/aws-sdk-go-v2 v1.41.0/go.mod h1:MayyLB8y+buD9hZqkCW3kX1AKq07Y5pXxtgB+rRFhz0=
+-github.com/aws/aws-sdk-go-v2/config v1.32.6 h1:hFLBGUKjmLAekvi1evLi5hVvFQtSo3GYwi+Bx4lpJf8=
+-github.com/aws/aws-sdk-go-v2/config v1.32.6/go.mod h1:lcUL/gcd8WyjCrMnxez5OXkO3/rwcNmvfno62tnXNcI=
+-github.com/aws/aws-sdk-go-v2/credentials v1.19.6 h1:F9vWao2TwjV2MyiyVS+duza0NIRtAslgLUM0vTA1ZaE=
+-github.com/aws/aws-sdk-go-v2/credentials v1.19.6/go.mod h1:SgHzKjEVsdQr6Opor0ihgWtkWdfRAIwxYzSJ8O85VHY=
+-github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.16 h1:80+uETIWS1BqjnN9uJ0dBUaETh+P1XwFy5vwHwK5r9k=
+-github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.16/go.mod h1:wOOsYuxYuB/7FlnVtzeBYRcjSRtQpAW0hCP7tIULMwo=
+-github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.16 h1:rgGwPzb82iBYSvHMHXc8h9mRoOUBZIGFgKb9qniaZZc=
+-github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.16/go.mod h1:L/UxsGeKpGoIj6DxfhOWHWQ/kGKcd4I1VncE4++IyKA=
+-github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.16 h1:1jtGzuV7c82xnqOVfx2F0xmJcOw5374L7N6juGW6x6U=
+-github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.16/go.mod h1:M2E5OQf+XLe+SZGmmpaI2yy+J326aFf6/+54PoxSANc=
+-github.com/aws/aws-sdk-go-v2/internal/ini v1.8.4 h1:WKuaxf++XKWlHWu9ECbMlha8WOEGm0OUEZqm4K/Gcfk=
+-github.com/aws/aws-sdk-go-v2/internal/ini v1.8.4/go.mod h1:ZWy7j6v1vWGmPReu0iSGvRiise4YI5SkR3OHKTZ6Wuc=
+-github.com/aws/aws-sdk-go-v2/service/acmpca v1.46.6 h1:SvzJFRWEaynyuAuDY7+0k2/dBhiyPsxkQXYnJSNvNiw=
+-github.com/aws/aws-sdk-go-v2/service/acmpca v1.46.6/go.mod h1:RCHtHE7wK0p2uGY4njJBghsd6DSKarXhtsfLdUDq4RU=
++github.com/aws/aws-sdk-go v1.30.27/go.mod h1:5zCpMtNQVjRREroY7sYe8lOMRSxkhG6MZveU8YkpAk0=
++github.com/aws/aws-sdk-go v1.55.7 h1:UJrkFq7es5CShfBwlWAC8DA077vp8PyVbQd3lqLiztE=
++github.com/aws/aws-sdk-go v1.55.7/go.mod h1:eRwEWoyTWFMVYVQzKMNHWP5/RV4xIUGMQfXQHfHkpNU=
++github.com/aws/aws-sdk-go-v2 v1.33.0 h1:Evgm4DI9imD81V0WwD+TN4DCwjUMdc94TrduMLbgZJs=
++github.com/aws/aws-sdk-go-v2 v1.33.0/go.mod h1:P5WJBrYqqbWVaOxgH0X/FYYD47/nooaPOZPlQdmiN2U=
++github.com/aws/aws-sdk-go-v2/config v1.29.1 h1:JZhGawAyZ/EuJeBtbQYnaoftczcb2drR2Iq36Wgz4sQ=
++github.com/aws/aws-sdk-go-v2/config v1.29.1/go.mod h1:7bR2YD5euaxBhzt2y/oDkt3uNRb6tjFp98GlTFueRwk=
++github.com/aws/aws-sdk-go-v2/credentials v1.17.54 h1:4UmqeOqJPvdvASZWrKlhzpRahAulBfyTJQUaYy4+hEI=
++github.com/aws/aws-sdk-go-v2/credentials v1.17.54/go.mod h1:RTdfo0P0hbbTxIhmQrOsC/PquBZGabEPnCaxxKRPSnI=
++github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.24 h1:5grmdTdMsovn9kPZPI23Hhvp0ZyNm5cRO+IZFIYiAfw=
++github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.24/go.mod h1:zqi7TVKTswH3Ozq28PkmBmgzG1tona7mo9G2IJg4Cis=
++github.com/aws/aws-sdk-go-v2/internal/configsources v1.3.28 h1:igORFSiH3bfq4lxKFkTSYDhJEUCYo6C8VKiWJjYwQuQ=
++github.com/aws/aws-sdk-go-v2/internal/configsources v1.3.28/go.mod h1:3So8EA/aAYm36L7XIvCVwLa0s5N0P7o2b1oqnx/2R4g=
++github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.6.28 h1:1mOW9zAUMhTSrMDssEHS/ajx8JcAj/IcftzcmNlmVLI=
++github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.6.28/go.mod h1:kGlXVIWDfvt2Ox5zEaNglmq0hXPHgQFNMix33Tw22jA=
++github.com/aws/aws-sdk-go-v2/internal/ini v1.8.1 h1:VaRN3TlFdd6KxX1x3ILT5ynH6HvKgqdiXoTxAF4HQcQ=
++github.com/aws/aws-sdk-go-v2/internal/ini v1.8.1/go.mod h1:FbtygfRFze9usAadmnGJNc8KsP346kEe+y2/oyhGAGc=
+ github.com/aws/aws-sdk-go-v2/service/ec2 v1.200.0 h1:3hH6o7Z2WeE1twvz44Aitn6Qz8DZN3Dh5IB4Eh2xq7s=
+ github.com/aws/aws-sdk-go-v2/service/ec2 v1.200.0/go.mod h1:I76S7jN0nfsYTBtuTgTsJtK2Q8yJVDgrLr5eLN64wMA=
+ github.com/aws/aws-sdk-go-v2/service/ecs v1.53.8 h1:v1OectQdV/L+KSFSiqK00fXGN8FbaljRfNFysmWB8D0=
+ github.com/aws/aws-sdk-go-v2/service/ecs v1.53.8/go.mod h1:F0DbgxpvuSvtYun5poG67EHLvci4SgzsMVO6SsPUqKk=
+-github.com/aws/aws-sdk-go-v2/service/iam v1.52.3 h1:fwmGd1qLfbY1GyTT9yrM2p5a4qcUvJfiSynyq0nVBLE=
+-github.com/aws/aws-sdk-go-v2/service/iam v1.52.3/go.mod h1:9BlDzJDOLnYbPlbowGir6MqtQtb4GosbiAikWHqR4A0=
+-github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.4 h1:0ryTNEdJbzUCEWkVXEXoqlXV72J5keC1GvILMOuD00E=
+-github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.4/go.mod h1:HQ4qwNZh32C3CBeO6iJLQlgtMzqeG17ziAA/3KDJFow=
+-github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.16 h1:oHjJHeUy0ImIV0bsrX0X91GkV5nJAyv1l1CC9lnO0TI=
+-github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.16/go.mod h1:iRSNGgOYmiYwSCXxXaKb9HfOEj40+oTKn8pTxMlYkRM=
+-github.com/aws/aws-sdk-go-v2/service/signin v1.0.4 h1:HpI7aMmJ+mm1wkSHIA2t5EaFFv5EFYXePW30p1EIrbQ=
+-github.com/aws/aws-sdk-go-v2/service/signin v1.0.4/go.mod h1:C5RdGMYGlfM0gYq/tifqgn4EbyX99V15P2V3R+VHbQU=
+-github.com/aws/aws-sdk-go-v2/service/sso v1.30.8 h1:aM/Q24rIlS3bRAhTyFurowU8A0SMyGDtEOY/l/s/1Uw=
+-github.com/aws/aws-sdk-go-v2/service/sso v1.30.8/go.mod h1:+fWt2UHSb4kS7Pu8y+BMBvJF0EWx+4H0hzNwtDNRTrg=
+-github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.12 h1:AHDr0DaHIAo8c9t1emrzAlVDFp+iMMKnPdYy6XO4MCE=
+-github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.12/go.mod h1:GQ73XawFFiWxyWXMHWfhiomvP3tXtdNar/fi8z18sx0=
+-github.com/aws/aws-sdk-go-v2/service/sts v1.41.5 h1:SciGFVNZ4mHdm7gpD1dgZYnCuVdX1s+lFTg4+4DOy70=
+-github.com/aws/aws-sdk-go-v2/service/sts v1.41.5/go.mod h1:iW40X4QBmUxdP+fZNOpfmkdMZqsovezbAeO+Ubiv2pk=
+-github.com/aws/smithy-go v1.24.0 h1:LpilSUItNPFr1eY85RYgTIg5eIEPtvFbskaFcmmIUnk=
+-github.com/aws/smithy-go v1.24.0/go.mod h1:LEj2LM3rBRQJxPZTB4KuzZkaZYnZPnvgIhb4pu07mx0=
++github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.12.1 h1:iXtILhvDxB6kPvEXgsDhGaZCSC6LQET5ZHSdJozeI0Y=
++github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.12.1/go.mod h1:9nu0fVANtYiAePIBh2/pFUSwtJ402hLnp854CNoDOeE=
++github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.12.9 h1:TQmKDyETFGiXVhZfQ/I0cCFziqqX58pi4tKJGYGFSz0=
++github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.12.9/go.mod h1:HVLPK2iHQBUx7HfZeOQSEu3v2ubZaAY2YPbAm5/WUyY=
++github.com/aws/aws-sdk-go-v2/service/sso v1.24.11 h1:kuIyu4fTT38Kj7YCC7ouNbVZSSpqkZ+LzIfhCr6Dg+I=
++github.com/aws/aws-sdk-go-v2/service/sso v1.24.11/go.mod h1:Ro744S4fKiCCuZECXgOi760TiYylUM8ZBf6OGiZzJtY=
++github.com/aws/aws-sdk-go-v2/service/ssooidc v1.28.10 h1:l+dgv/64iVlQ3WsBbnn+JSbkj01jIi+SM0wYsj3y/hY=
++github.com/aws/aws-sdk-go-v2/service/ssooidc v1.28.10/go.mod h1:Fzsj6lZEb8AkTE5S68OhcbBqeWPsR8RnGuKPr8Todl8=
++github.com/aws/aws-sdk-go-v2/service/sts v1.33.9 h1:BRVDbewN6VZcwr+FBOszDKvYeXY1kJ+GGMCcpghlw0U=
++github.com/aws/aws-sdk-go-v2/service/sts v1.33.9/go.mod h1:f6vjfZER1M17Fokn0IzssOTMT2N8ZSq+7jnNF0tArvw=
++github.com/aws/smithy-go v1.22.1 h1:/HPHZQ0g7f4eUeK6HKglFz8uwVfZKgoI25rb/J+dnro=
++github.com/aws/smithy-go v1.22.1/go.mod h1:irrKGvNn1InZwb2d7fkIRNucdfwR8R+Ts3wxYa/cJHg=
+ github.com/benbjohnson/clock v1.1.0/go.mod h1:J11/hYXuz8f4ySSvYwY0FKfm+ezbsZBKZxNJlLklBHA=
+ github.com/benbjohnson/immutable v0.4.0 h1:CTqXbEerYso8YzVPxmWxh2gnoRQbbB9X1quUC8+vGZA=
+ github.com/benbjohnson/immutable v0.4.0/go.mod h1:iAr8OjJGLnLmVUr9MZ/rz4PWUy6Ouc2JLYuMArmvAJM=
+@@ -300,6 +297,7 @@ github.com/go-openapi/jsonreference v0.20.3 h1:EjGcjTW8pD1mRis6+w/gmoBdqv5+RbE9B
+ github.com/go-openapi/jsonreference v0.20.3/go.mod h1:FviDZ46i9ivh810gqzFLl5NttD5q3tSlMLqLr6okedM=
+ github.com/go-openapi/swag v0.22.5 h1:fVS63IE3M0lsuWRzuom3RLwUMVI2peDH01s6M70ugys=
+ github.com/go-openapi/swag v0.22.5/go.mod h1:Gl91UqO+btAM0plGGxHqJcQZ1ZTy6jbmridBTsDy8A0=
++github.com/go-sql-driver/mysql v1.5.0/go.mod h1:DCzpHaOWr8IXmIStZouvnhqoel9Qv2LBy8hT2VhHyBg=
+ github.com/go-stack/stack v1.8.0/go.mod h1:v0f6uXyyMGvRgIKkXu+yp6POWl0qKG85gN/melR3HDY=
+ github.com/go-test/deep v1.0.2/go.mod h1:wGDj63lr65AM2AQyKZd/NYHGb0R+1RLqB8NKt3aSFNA=
+ github.com/go-test/deep v1.1.0 h1:WOcxcdHcvdgThNXjw0t76K42FXTU7HpNQWHpA2HHNlg=
+@@ -429,8 +427,8 @@ github.com/hashi-derek/grpc-proxy v0.0.0-20231207191910-191266484d75 h1:V5Uqf7Vo
+ github.com/hashi-derek/grpc-proxy v0.0.0-20231207191910-191266484d75/go.mod h1:5eEnHfK72jOkp4gC1dI/Q/E9MFNOM/ewE/vql5ijV3g=
+ github.com/hashicorp/cap v0.10.0 h1:OJM3JQTwVO1DigRIPNTxM387oqXlokKhttZHotU0b1s=
+ github.com/hashicorp/cap v0.10.0/go.mod h1:HKbv27kfps+wONFNyNTHpAQmU/DCjjDuB5HF6mFsqPQ=
+-github.com/hashicorp/consul-awsauth v0.0.0-20260217094118-6b9b26380433 h1:hnoHGxFEjHVLGxWTXpNXoI0S3LMlmd6BelVX7FaH2OA=
+-github.com/hashicorp/consul-awsauth v0.0.0-20260217094118-6b9b26380433/go.mod h1:D1LiYVM9NJA2BSo7ob5cdf90HVHpPnjDo0txd1A1rH0=
++github.com/hashicorp/consul-awsauth v0.0.0-20250825122907-9e35fe9ded3a h1:Qd0N8lIr1QP/d7FYxseYjRLUtJp2+2R8k+mjiC2rmiY=
++github.com/hashicorp/consul-awsauth v0.0.0-20250825122907-9e35fe9ded3a/go.mod h1:++exZ1sI8JLIv4QvzGvTjZdf1eZARoZcaNEjNT9SZYA=
+ github.com/hashicorp/consul-net-rpc v0.0.0-20221205195236-156cfab66a69 h1:wzWurXrxfSyG1PHskIZlfuXlTSCj1Tsyatp9DtaasuY=
+ github.com/hashicorp/consul-net-rpc v0.0.0-20221205195236-156cfab66a69/go.mod h1:svUZZDvotY8zTODknUePc6mZ9pX8nN0ViGwWcUSOBEA=
+ github.com/hashicorp/errwrap v1.0.0/go.mod h1:YH+1FKiLXxHSkmPseP+kNlulaMuP3n2brvKWEqk/Jc4=
+@@ -479,12 +477,12 @@ github.com/hashicorp/go-raftchunking v0.7.0 h1:APNMnCXmTOhumkFv/GpJIbq7HteWF7EnG
+ github.com/hashicorp/go-raftchunking v0.7.0/go.mod h1:Dg/eBOaJzE0jYKNwNLs5IA5j0OSmL5HoCUiMy3mDmrI=
+ github.com/hashicorp/go-retryablehttp v0.5.3/go.mod h1:9B5zBasrRhHXnJnui7y6sL7es7NDiJgTc6Er0maI1Xs=
+ github.com/hashicorp/go-retryablehttp v0.6.6/go.mod h1:vAew36LZh98gCBJNLH42IQ1ER/9wtLZZ8meHqQvEYWY=
+-github.com/hashicorp/go-retryablehttp v0.7.8 h1:ylXZWnqa7Lhqpk0L1P1LzDtGcCR0rPVUrx/c8Unxc48=
+-github.com/hashicorp/go-retryablehttp v0.7.8/go.mod h1:rjiScheydd+CxvumBsIrFKlx3iS0jrZ7LvzFGFmuKbw=
++github.com/hashicorp/go-retryablehttp v0.7.7 h1:C8hUCYzor8PIfXHa4UrZkU4VvK8o9ISHxT2Q8+VepXU=
++github.com/hashicorp/go-retryablehttp v0.7.7/go.mod h1:pkQpWZeYWskR+D1tR2O5OcBFOxfA7DoAO6xtkuQnHTk=
+ github.com/hashicorp/go-rootcerts v1.0.2 h1:jzhAVGtqPKbwpyCPELlgNWhE1znq+qwJtW5Oi2viEzc=
+ github.com/hashicorp/go-rootcerts v1.0.2/go.mod h1:pqUvnprVnM5bf7AOirdbb01K4ccR319Vf4pU3K5EGc8=
+-github.com/hashicorp/go-secure-stdlib/awsutil/v2 v2.1.2 h1:KlDrZWx/wYpnUcFPB0s9uhPjyNZoeIfhrV2MN/Ly76s=
+-github.com/hashicorp/go-secure-stdlib/awsutil/v2 v2.1.2/go.mod h1:6+rVulOPNCQbL3Xv2iLCqM0JmU2WO2wRzP1C6hBKeB8=
++github.com/hashicorp/go-secure-stdlib/awsutil v0.1.6 h1:W9WN8p6moV1fjKLkeqEgkAMu5rauy9QeYDAmIaPuuiA=
++github.com/hashicorp/go-secure-stdlib/awsutil v0.1.6/go.mod h1:MpCPSPGLDILGb4JMm94/mMi3YysIqsXzGCzkEZjcjXg=
+ github.com/hashicorp/go-secure-stdlib/base62 v0.1.1/go.mod h1:EdWO6czbmthiwZ3/PUsDV+UD1D5IRU4ActiaWGwt0Yw=
+ github.com/hashicorp/go-secure-stdlib/mlock v0.1.1/go.mod h1:zq93CJChV6L9QTfGKtfBxKqD7BqqXx5O04A/ns2p5+I=
+ github.com/hashicorp/go-secure-stdlib/parseutil v0.1.1/go.mod h1:QmrqtbKuxxSWTN3ETMPuB+VtEiBJ/A9XhoYGv8E1uD8=
+@@ -583,6 +581,7 @@ github.com/jhump/protoreflect v1.6.0/go.mod h1:eaTn3RZAmMBcV0fifFvlm6VHNz3wSkYyX
+ github.com/jhump/protoreflect v1.11.0 h1:bvACHUD1Ua/3VxY4aAMpItKMhhwbimlKFJKsLsVgDjU=
+ github.com/jhump/protoreflect v1.11.0/go.mod h1:U7aMIjN0NWq9swDP7xDdoMfRHb35uiuTd3Z9nFXJf5E=
+ github.com/jmespath/go-jmespath v0.0.0-20180206201540-c2b33e8439af/go.mod h1:Nht3zPeWKUH0NzdCt2Blrr5ys8VGpn0CEB0cQHVjt7k=
++github.com/jmespath/go-jmespath v0.3.0/go.mod h1:9QtRXoHjLGCJ5IBSaohpXITPlowMeeYCZ7fLUTSywik=
+ github.com/jmespath/go-jmespath v0.4.0 h1:BEgLn5cpjn8UN1mAw4NjwDrS35OdebyEtFe+9YPoQUg=
+ github.com/jmespath/go-jmespath v0.4.0/go.mod h1:T8mJZnbsbmF+m6zOOFylbeCJqk5+pHWvzYPziyZiYoo=
+ github.com/jmespath/go-jmespath/internal/testify v1.5.1 h1:shLQSRRSCCPj3f2gpwzGwWFoC7ycTf1rcQZHOlsJ6N8=
+@@ -613,6 +612,7 @@ github.com/kr/logfmt v0.0.0-20140226030751-b84e30acd515/go.mod h1:+0opPa2QZZtGFB
+ github.com/kr/pretty v0.1.0/go.mod h1:dAy3ld7l9f0ibDNOQOHHMYYIIbhfbHSm3C4ZsoJORNo=
+ github.com/kr/pretty v0.2.0/go.mod h1:ipq/a2n7PKx3OHsz4KJII5eveXtPO4qwEXGdVfWzfnI=
+ github.com/kr/pretty v0.2.1/go.mod h1:ipq/a2n7PKx3OHsz4KJII5eveXtPO4qwEXGdVfWzfnI=
++github.com/kr/pretty v0.3.0/go.mod h1:640gp4NfQd8pI5XOwp5fnNeVWj67G7CFk/SaSQn7NBk=
+ github.com/kr/pretty v0.3.1 h1:flRD4NNwYAUpkphVc1HcthR4KEIFJ65n8Mw5qdRn3LE=
+ github.com/kr/pretty v0.3.1/go.mod h1:hoEshYVHaxMs3cyo3Yncou5ZscifuDolrwPKZanG3xk=
+ github.com/kr/pty v1.1.1/go.mod h1:pFQYn66WHrOpPYNljwOMqo10TkYh1fy3cYio2l3bCsQ=
+@@ -782,6 +782,7 @@ github.com/rivo/uniseg v0.2.0/go.mod h1:J6wj4VEh+S6ZtnVlnTBMWIodfgj8LQOQFoIToxlJ
+ github.com/rogpeppe/fastuuid v0.0.0-20150106093220-6724a57986af/go.mod h1:XWv6SoW27p1b0cqNHllgS5HIMJraePCO15w5zCzIWYg=
+ github.com/rogpeppe/fastuuid v1.2.0/go.mod h1:jVj6XXZzXRy/MSR5jhDC/2q6DgLz+nrA6LYCDYWNEvQ=
+ github.com/rogpeppe/go-internal v1.3.0/go.mod h1:M8bDsm7K2OlrFYOpmOWEs/qY81heoFRclV5y23lUDJ4=
++github.com/rogpeppe/go-internal v1.6.1/go.mod h1:xXDCJY+GAPziupqXw64V24skbSoqbTEfhy4qGm1nDQc=
+ github.com/rogpeppe/go-internal v1.13.1 h1:KvO1DLK/DRN07sQ1LQKScxyZJuNnedQ5/wKSR38lUII=
+ github.com/rogpeppe/go-internal v1.13.1/go.mod h1:uMEvuHeurkdAXX61udpOXGD/AzZDWNMNyH2VO9fmH0o=
+ github.com/rs/zerolog v1.4.0/go.mod h1:YbFCdg8HfsridGWAh22vktObvhZbQsZXe4/zB0OKkWU=
+@@ -1108,6 +1109,7 @@ golang.org/x/sys v0.0.0-20200501052902-10377860bb8e/go.mod h1:h1NjWce9XRLGQEsW7w
+ golang.org/x/sys v0.0.0-20200511232937-7e40ca221e25/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200515095857-1151b9dac4a9/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200523222454-059865788121/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
++golang.org/x/sys v0.0.0-20200602225109-6fdc65e7d980/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200615200032-f1bc736245b1/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200625212154-ddb9806d33ae/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200803210538-64077c9b5642/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=

@@ -1,0 +1,118 @@
+diff --git a/echo.go b/echo.go
+index 18c1101..128f84f 100644
+--- a/echo.go
++++ b/echo.go
+@@ -612,16 +612,15 @@ func (e *Echo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	// Acquire context
+ 	c := e.pool.Get().(*context)
+ 	c.Reset(r, w)
+-
+ 	h := NotFoundHandler
+ 
+ 	if e.premiddleware == nil {
+-		e.findRouter(r.Host).Find(r.Method, GetPath(r), c)
++		e.findRouter(r.Host).Find(r.Method, r.URL.EscapedPath(), c)
+ 		h = c.Handler()
+ 		h = applyMiddleware(h, e.middleware...)
+ 	} else {
+ 		h = func(c Context) error {
+-			e.findRouter(r.Host).Find(r.Method, GetPath(r), c)
++			e.findRouter(r.Host).Find(r.Method, r.URL.EscapedPath(), c)
+ 			h := c.Handler()
+ 			h = applyMiddleware(h, e.middleware...)
+ 			return h(c)
+@@ -832,15 +831,6 @@ func WrapMiddleware(m func(http.Handler) http.Handler) MiddlewareFunc {
+ 	}
+ }
+ 
+-// GetPath returns RawPath, if it's empty returns Path from URL
+-func GetPath(r *http.Request) string {
+-	path := r.URL.RawPath
+-	if path == "" {
+-		path = r.URL.Path
+-	}
+-	return path
+-}
+-
+ func (e *Echo) findRouter(host string) *Router {
+ 	if len(e.routers) > 0 {
+ 		if r, ok := e.routers[host]; ok {
+diff --git a/middleware/middleware.go b/middleware/middleware.go
+index d0b7153..12260dd 100644
+--- a/middleware/middleware.go
++++ b/middleware/middleware.go
+@@ -1,6 +1,8 @@
+ package middleware
+ 
+ import (
++	"net/http"
++	"net/url"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
+@@ -32,6 +34,17 @@ func captureTokens(pattern *regexp.Regexp, input string) *strings.Replacer {
+ 	return strings.NewReplacer(replace...)
+ }
+ 
++//rewritePath sets request url path and raw path
++func rewritePath(replacer *strings.Replacer, target string, req *http.Request) error {
++	replacerRawPath := replacer.Replace(target)
++	replacerPath, err := url.PathUnescape(replacerRawPath)
++	if err != nil {
++		return err
++	}
++	req.URL.Path, req.URL.RawPath = replacerPath, replacerRawPath
++	return nil
++}
++
+ // DefaultSkipper returns false which processes the middleware.
+ func DefaultSkipper(echo.Context) bool {
+ 	return false
+diff --git a/middleware/proxy.go b/middleware/proxy.go
+index a9b91f6..cd50b76 100644
+--- a/middleware/proxy.go
++++ b/middleware/proxy.go
+@@ -227,9 +227,12 @@ func ProxyWithConfig(config ProxyConfig) echo.MiddlewareFunc {
+ 
+ 			// Rewrite
+ 			for k, v := range config.rewriteRegex {
+-				replacer := captureTokens(k, echo.GetPath(req))
++				//use req.URL.Path here or else we will have double escaping
++				replacer := captureTokens(k, req.URL.Path)
+ 				if replacer != nil {
+-					req.URL.Path = replacer.Replace(v)
++					if err := rewritePath(replacer, v, req); err != nil {
++						return echo.NewHTTPError(http.StatusBadRequest, "invalid url")
++					}
+ 				}
+ 			}
+ 
+diff --git a/middleware/rewrite.go b/middleware/rewrite.go
+index d1387af..a4d851c 100644
+--- a/middleware/rewrite.go
++++ b/middleware/rewrite.go
+@@ -1,6 +1,7 @@
+ package middleware
+ 
+ import (
++	"net/http"
+ 	"regexp"
+ 	"strings"
+ 
+@@ -70,12 +71,14 @@ func RewriteWithConfig(config RewriteConfig) echo.MiddlewareFunc {
+ 			}
+ 
+ 			req := c.Request()
+-
+ 			// Rewrite
+ 			for k, v := range config.rulesRegex {
++				//use req.URL.Path here or else we will have double escaping
+ 				replacer := captureTokens(k, req.URL.Path)
+ 				if replacer != nil {
+-					req.URL.Path = replacer.Replace(v)
++					if err := rewritePath(replacer, v, req); err != nil {
++						return echo.NewHTTPError(http.StatusBadRequest, "invalid url")
++					}
+ 					break
+ 				}
+ 			}

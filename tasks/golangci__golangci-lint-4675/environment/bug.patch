@@ -1,0 +1,218 @@
+diff --git a/pkg/goanalysis/pkgerrors/errors.go b/pkg/goanalysis/errors.go
+similarity index 60%
+rename from pkg/goanalysis/pkgerrors/errors.go
+rename to pkg/goanalysis/errors.go
+index 91f6dd39..f59e02cc 100644
+--- a/pkg/goanalysis/pkgerrors/errors.go
++++ b/pkg/goanalysis/errors.go
+@@ -1,4 +1,4 @@
+-package pkgerrors
++package goanalysis
+ 
+ import (
+ 	"errors"
+@@ -7,6 +7,7 @@ import (
+ 	"golang.org/x/tools/go/packages"
+ 
+ 	"github.com/golangci/golangci-lint/pkg/lint/linter"
++	libpackages "github.com/golangci/golangci-lint/pkg/packages"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+@@ -18,7 +19,7 @@ func (e *IllTypedError) Error() string {
+ 	return fmt.Sprintf("errors in package: %v", e.Pkg.Errors)
+ }
+ 
+-func BuildIssuesFromIllTypedError(errs []error, lintCtx *linter.Context) ([]result.Issue, error) {
++func buildIssuesFromIllTypedError(errs []error, lintCtx *linter.Context) ([]result.Issue, error) {
+ 	var issues []result.Issue
+ 	uniqReportedIssues := map[string]bool{}
+ 
+@@ -35,8 +36,8 @@ func BuildIssuesFromIllTypedError(errs []error, lintCtx *linter.Context) ([]resu
+ 			continue
+ 		}
+ 
+-		for _, err := range extractErrors(ill.Pkg) {
+-			issue, perr := parseError(err)
++		for _, err := range libpackages.ExtractErrors(ill.Pkg) {
++			i, perr := parseError(err)
+ 			if perr != nil { // failed to parse
+ 				if uniqReportedIssues[err.Msg] {
+ 					continue
+@@ -44,8 +45,8 @@ func BuildIssuesFromIllTypedError(errs []error, lintCtx *linter.Context) ([]resu
+ 				uniqReportedIssues[err.Msg] = true
+ 				lintCtx.Log.Errorf("typechecking error: %s", err.Msg)
+ 			} else {
+-				issue.Pkg = ill.Pkg // to save to cache later
+-				issues = append(issues, *issue)
++				i.Pkg = ill.Pkg // to save to cache later
++				issues = append(issues, *i)
+ 			}
+ 		}
+ 	}
+@@ -56,3 +57,16 @@ func BuildIssuesFromIllTypedError(errs []error, lintCtx *linter.Context) ([]resu
+ 
+ 	return issues, nil
+ }
++
++func parseError(srcErr packages.Error) (*result.Issue, error) {
++	pos, err := libpackages.ParseErrorPosition(srcErr.Pos)
++	if err != nil {
++		return nil, err
++	}
++
++	return &result.Issue{
++		Pos:        *pos,
++		Text:       srcErr.Msg,
++		FromLinter: "typecheck",
++	}, nil
++}
+diff --git a/pkg/goanalysis/pkgerrors/parse_test.go b/pkg/goanalysis/linter_test.go
+similarity index 93%
+rename from pkg/goanalysis/pkgerrors/parse_test.go
+rename to pkg/goanalysis/linter_test.go
+index 86d62666..44ded600 100644
+--- a/pkg/goanalysis/pkgerrors/parse_test.go
++++ b/pkg/goanalysis/linter_test.go
+@@ -1,4 +1,4 @@
+-package pkgerrors
++package goanalysis
+ 
+ import (
+ 	"fmt"
+@@ -8,7 +8,7 @@ import (
+ 	"golang.org/x/tools/go/packages"
+ )
+ 
+-func Test_parseError(t *testing.T) {
++func TestParseError(t *testing.T) {
+ 	cases := []struct {
+ 		in, out string
+ 		good    bool
+diff --git a/pkg/goanalysis/runner_action.go b/pkg/goanalysis/runner_action.go
+index 58ea297e..6b57cb0c 100644
+--- a/pkg/goanalysis/runner_action.go
++++ b/pkg/goanalysis/runner_action.go
+@@ -15,7 +15,6 @@ import (
+ 
+ 	"github.com/golangci/golangci-lint/internal/errorutil"
+ 	"github.com/golangci/golangci-lint/internal/pkgcache"
+-	"github.com/golangci/golangci-lint/pkg/goanalysis/pkgerrors"
+ )
+ 
+ type actionAllocator struct {
+@@ -185,7 +184,7 @@ func (act *action) analyze() {
+ 		// It looks like there should be !pass.Analyzer.RunDespiteErrors
+ 		// but govet's cgocall crashes on it. Govet itself contains !pass.Analyzer.RunDespiteErrors condition here,
+ 		// but it exits before it if packages.Load have failed.
+-		act.err = fmt.Errorf("analysis skipped: %w", &pkgerrors.IllTypedError{Pkg: act.pkg})
++		act.err = fmt.Errorf("analysis skipped: %w", &IllTypedError{Pkg: act.pkg})
+ 	} else {
+ 		startedAt = time.Now()
+ 		act.result, act.err = pass.Analyzer.Run(pass)
+diff --git a/pkg/goanalysis/runners.go b/pkg/goanalysis/runners.go
+index c02d33b7..b832fc32 100644
+--- a/pkg/goanalysis/runners.go
++++ b/pkg/goanalysis/runners.go
+@@ -13,7 +13,6 @@ import (
+ 	"golang.org/x/tools/go/packages"
+ 
+ 	"github.com/golangci/golangci-lint/internal/pkgcache"
+-	"github.com/golangci/golangci-lint/pkg/goanalysis/pkgerrors"
+ 	"github.com/golangci/golangci-lint/pkg/lint/linter"
+ 	"github.com/golangci/golangci-lint/pkg/logutils"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+@@ -75,7 +74,7 @@ func runAnalyzers(cfg runAnalyzersConfig, lintCtx *linter.Context) ([]result.Iss
+ 		return retIssues
+ 	}
+ 
+-	errIssues, err := pkgerrors.BuildIssuesFromIllTypedError(errs, lintCtx)
++	errIssues, err := buildIssuesFromIllTypedError(errs, lintCtx)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/goanalysis/pkgerrors/parse.go b/pkg/packages/errors.go
+similarity index 60%
+rename from pkg/goanalysis/pkgerrors/parse.go
+rename to pkg/packages/errors.go
+index b25b50f7..ff37651a 100644
+--- a/pkg/goanalysis/pkgerrors/parse.go
++++ b/pkg/packages/errors.go
+@@ -1,4 +1,4 @@
+-package pkgerrors
++package packages
+ 
+ import (
+ 	"errors"
+@@ -6,26 +6,9 @@ import (
+ 	"go/token"
+ 	"strconv"
+ 	"strings"
+-
+-	"golang.org/x/tools/go/packages"
+-
+-	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+-func parseError(srcErr packages.Error) (*result.Issue, error) {
+-	pos, err := parseErrorPosition(srcErr.Pos)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return &result.Issue{
+-		Pos:        *pos,
+-		Text:       srcErr.Msg,
+-		FromLinter: "typecheck",
+-	}, nil
+-}
+-
+-func parseErrorPosition(pos string) (*token.Position, error) {
++func ParseErrorPosition(pos string) (*token.Position, error) {
+ 	// file:line(<optional>:colon)
+ 	parts := strings.Split(pos, ":")
+ 	if len(parts) == 1 {
+diff --git a/pkg/goanalysis/pkgerrors/extract.go b/pkg/packages/util.go
+similarity index 93%
+rename from pkg/goanalysis/pkgerrors/extract.go
+rename to pkg/packages/util.go
+index d1257e66..6a7789eb 100644
+--- a/pkg/goanalysis/pkgerrors/extract.go
++++ b/pkg/packages/util.go
+@@ -1,4 +1,4 @@
+-package pkgerrors
++package packages
+ 
+ import (
+ 	"fmt"
+@@ -12,7 +12,7 @@ import (
+ // ex: `/example/main.go:11:17: foobar`
+ var reFile = regexp.MustCompile(`^.+\.go:\d+:\d+: .+`)
+ 
+-func extractErrors(pkg *packages.Package) []packages.Error {
++func ExtractErrors(pkg *packages.Package) []packages.Error {
+ 	errors := extractErrorsImpl(pkg, map[*packages.Package]bool{})
+ 	if len(errors) == 0 {
+ 		return errors
+@@ -38,7 +38,7 @@ func extractErrors(pkg *packages.Package) []packages.Error {
+ 	if len(pkg.GoFiles) != 0 {
+ 		// errors were extracted from deps and have at least one file in package
+ 		for i := range uniqErrors {
+-			if _, parseErr := parseErrorPosition(uniqErrors[i].Pos); parseErr == nil {
++			if _, parseErr := ParseErrorPosition(uniqErrors[i].Pos); parseErr == nil {
+ 				continue
+ 			}
+ 
+diff --git a/pkg/goanalysis/pkgerrors/extract_test.go b/pkg/packages/util_test.go
+similarity index 99%
+rename from pkg/goanalysis/pkgerrors/extract_test.go
+rename to pkg/packages/util_test.go
+index 1e014ea4..53084299 100644
+--- a/pkg/goanalysis/pkgerrors/extract_test.go
++++ b/pkg/packages/util_test.go
+@@ -1,4 +1,4 @@
+-package pkgerrors
++package packages
+ 
+ import (
+ 	"testing"

@@ -1,0 +1,848 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 37d1adb..8d7cc4a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,19 +1,5 @@
+ # Changelog
+ 
+-## v5.0.3 - 2026-02-06
+-
+-**Security**
+-
+-* Fix directory traversal vulnerability under Windows in Static middleware when default Echo filesystem is used. Reported by @shblue21.
+-
+-This applies to cases when:
+-- Windows is used as OS
+-- `middleware.StaticConfig.Filesystem` is `nil` (default)
+-- `echo.Filesystem` is has not been set explicitly (default)
+-
+-Exposure is restricted to the active process working directory and its subfolders.
+-
+-
+ ## v5.0.2 - 2026-02-02
+ 
+ **Security**
+diff --git a/_fixture/dist/public/test.txt b/_fixture/dist/public/test.txt
+deleted file mode 100644
+index dd93716..0000000
+--- a/_fixture/dist/public/test.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-test.txt contents
+diff --git a/context.go b/context.go
+index f91ea7a..3511cf7 100644
+--- a/context.go
++++ b/context.go
+@@ -15,7 +15,6 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"net/url"
+-	"path"
+ 	"path/filepath"
+ 	"strings"
+ 	"sync"
+@@ -580,7 +579,6 @@ func (c *Context) FileFS(file string, filesystem fs.FS) error {
+ }
+ 
+ func fsFile(c *Context, file string, filesystem fs.FS) error {
+-	file = path.Clean(file) // `os.Open` and `os.DirFs.Open()` behave differently, later does not like ``, `.`, `..` at all, but we allowed those now need to clean
+ 	f, err := filesystem.Open(file)
+ 	if err != nil {
+ 		return ErrNotFound
+diff --git a/echo.go b/echo.go
+index 4855e84..4e38995 100644
+--- a/echo.go
++++ b/echo.go
+@@ -785,11 +785,14 @@ func newDefaultFS() *defaultFS {
+ 	dir, _ := os.Getwd()
+ 	return &defaultFS{
+ 		prefix: dir,
+-		fs:     os.DirFS(dir),
++		fs:     nil,
+ 	}
+ }
+ 
+ func (fs defaultFS) Open(name string) (fs.File, error) {
++	if fs.fs == nil {
++		return os.Open(name) // #nosec G304
++	}
+ 	return fs.fs.Open(name)
+ }
+ 
+diff --git a/group_test.go b/group_test.go
+index 7078b64..819b6df 100644
+--- a/group_test.go
++++ b/group_test.go
+@@ -467,14 +467,13 @@ func TestGroup_Static(t *testing.T) {
+ 
+ func TestGroup_StaticMultiTest(t *testing.T) {
+ 	var testCases = []struct {
+-		name                  string
+-		givenPrefix           string
+-		givenRoot             string
+-		whenURL               string
+-		expectHeaderLocation  string
+-		expectBodyStartsWith  string
+-		expectBodyNotContains string
+-		expectStatus          int
++		name                 string
++		givenPrefix          string
++		givenRoot            string
++		whenURL              string
++		expectHeaderLocation string
++		expectBodyStartsWith string
++		expectStatus         int
+ 	}{
+ 		{
+ 			name:                 "ok",
+@@ -583,22 +582,6 @@ func TestGroup_StaticMultiTest(t *testing.T) {
+ 			expectStatus:         http.StatusOK,
+ 			expectBodyStartsWith: "<!doctype html>",
+ 		},
+-		{
+-			name:                  "nok, URL encoded path traversal (single encoding, slash - unix separator)",
+-			givenRoot:             "_fixture/dist/public",
+-			whenURL:               "/%2e%2e%2fprivate.txt",
+-			expectStatus:          http.StatusNotFound,
+-			expectBodyStartsWith:  "{\"message\":\"Not Found\"}\n",
+-			expectBodyNotContains: `private file`,
+-		},
+-		{
+-			name:                  "nok, URL encoded path traversal (single encoding, backslash - windows separator)",
+-			givenRoot:             "_fixture/dist/public",
+-			whenURL:               "/%2e%2e%5cprivate.txt",
+-			expectStatus:          http.StatusNotFound,
+-			expectBodyStartsWith:  "{\"message\":\"Not Found\"}\n",
+-			expectBodyNotContains: `private file`,
+-		},
+ 		{
+ 			name:                 "do not allow directory traversal (backslash - windows separator)",
+ 			givenPrefix:          "/",
+@@ -635,9 +618,6 @@ func TestGroup_StaticMultiTest(t *testing.T) {
+ 			} else {
+ 				assert.Equal(t, "", body)
+ 			}
+-			if tc.expectBodyNotContains != "" {
+-				assert.NotContains(t, body, tc.expectBodyNotContains)
+-			}
+ 
+ 			if tc.expectHeaderLocation != "" {
+ 				assert.Equal(t, tc.expectHeaderLocation, rec.Result().Header["Location"][0])
+diff --git a/middleware/static.go b/middleware/static.go
+index 4526033..ee1c8be 100644
+--- a/middleware/static.go
++++ b/middleware/static.go
+@@ -15,7 +15,6 @@ import (
+ 	"path"
+ 	"strconv"
+ 	"strings"
+-	"sync"
+ 
+ 	"github.com/labstack/echo/v5"
+ )
+@@ -119,12 +118,13 @@ const directoryListHTMLTemplate = `
+ 	</header>
+ 	<ul>
+ 		{{ range .Files }}
++    {{ $href := .Name }}{{ if ne $.Name "/" }}{{ $href = print $.Name "/" .Name }}{{ end }}
+ 		<li>
+ 		{{ if .Dir }}
+ 			{{ $name := print .Name "/" }}
+-			<a class="dir" href="{{ $name }}">{{ $name }}</a>
++			<a class="dir" href="{{ $href }}">{{ $name }}</a>
+ 			{{ else }}
+-			<a class="file" href="{{ .Name }}">{{ .Name }}</a>
++			<a class="file" href="{{ $href }}">{{ .Name }}</a>
+ 			<span>{{ .Size }}</span>
+ 		{{ end }}
+ 		</li>
+@@ -157,10 +157,7 @@ func (config StaticConfig) ToMiddleware() (echo.MiddlewareFunc, error) {
+ 	// Defaults
+ 	if config.Root == "" {
+ 		config.Root = "." // For security we want to restrict to CWD.
+-	} else {
+-		config.Root = path.Clean(config.Root) // fs.Open is very picky about ``, `.`, `..` in paths, so remove some of them up.
+ 	}
+-
+ 	if config.Skipper == nil {
+ 		config.Skipper = DefaultStaticConfig.Skipper
+ 	}
+@@ -176,19 +173,6 @@ func (config StaticConfig) ToMiddleware() (echo.MiddlewareFunc, error) {
+ 		return nil, fmt.Errorf("echo static middleware directory list template parsing error: %w", tErr)
+ 	}
+ 
+-	var once *sync.Once
+-	var fsErr error
+-	currentFS := config.Filesystem
+-	if config.Filesystem == nil {
+-		once = &sync.Once{}
+-	} else if config.Root != "." {
+-		tmpFs, fErr := fs.Sub(config.Filesystem, path.Join(".", config.Root))
+-		if fErr != nil {
+-			return nil, fmt.Errorf("static middleware failed to create sub-filesystem from config.Root, error: %w", fErr)
+-		}
+-		currentFS = tmpFs
+-	}
+-
+ 	return func(next echo.HandlerFunc) echo.HandlerFunc {
+ 		return func(c *echo.Context) (err error) {
+ 			if config.Skipper(c) {
+@@ -213,7 +197,8 @@ func (config StaticConfig) ToMiddleware() (echo.MiddlewareFunc, error) {
+ 			// 3. The "/" prefix forces absolute path interpretation, removing ".." components
+ 			// 4. Backslashes are treated as literal characters (not path separators), preventing traversal
+ 			// See static_windows.go for Go 1.20+ filepath.Clean compatibility notes
+-			filePath := path.Clean("./" + p)
++			requestedPath := path.Clean("/" + p) // "/"+ for security
++			filePath := path.Join(config.Root, requestedPath)
+ 
+ 			if config.IgnoreBase {
+ 				routePath := path.Base(strings.TrimRight(c.Path(), "/*"))
+@@ -224,17 +209,9 @@ func (config StaticConfig) ToMiddleware() (echo.MiddlewareFunc, error) {
+ 				}
+ 			}
+ 
+-			if once != nil {
+-				once.Do(func() {
+-					if tmp, tmpErr := fs.Sub(c.Echo().Filesystem, config.Root); tmpErr != nil {
+-						fsErr = fmt.Errorf("static middleware failed to create sub-filesystem: %w", tmpErr)
+-					} else {
+-						currentFS = tmp
+-					}
+-				})
+-				if fsErr != nil {
+-					return fsErr
+-				}
++			currentFS := config.Filesystem
++			if currentFS == nil {
++				currentFS = c.Echo().Filesystem
+ 			}
+ 
+ 			file, err := currentFS.Open(filePath)
+@@ -254,7 +231,7 @@ func (config StaticConfig) ToMiddleware() (echo.MiddlewareFunc, error) {
+ 					return err
+ 				}
+ 				// is case HTML5 mode is enabled + echo 404 we serve index to the client
+-				file, err = currentFS.Open(config.Index)
++				file, err = currentFS.Open(path.Join(config.Root, config.Index))
+ 				if err != nil {
+ 					return err
+ 				}
+@@ -271,7 +248,7 @@ func (config StaticConfig) ToMiddleware() (echo.MiddlewareFunc, error) {
+ 				index, err := currentFS.Open(path.Join(filePath, config.Index))
+ 				if err != nil {
+ 					if config.Browse {
+-						return listDir(dirListTemplate, filePath, currentFS, c.Response())
++						return listDir(dirListTemplate, requestedPath, filePath, currentFS, c.Response())
+ 					}
+ 
+ 					return next(c)
+@@ -301,7 +278,7 @@ func serveFile(c *echo.Context, file fs.File, info os.FileInfo) error {
+ 	return nil
+ }
+ 
+-func listDir(t *template.Template, pathInFs string, filesystem fs.FS, res http.ResponseWriter) error {
++func listDir(t *template.Template, requestedPath string, pathInFs string, filesystem fs.FS, res http.ResponseWriter) error {
+ 	files, err := fs.ReadDir(filesystem, pathInFs)
+ 	if err != nil {
+ 		return fmt.Errorf("static middleware failed to read directory for listing: %w", err)
+@@ -313,7 +290,7 @@ func listDir(t *template.Template, pathInFs string, filesystem fs.FS, res http.R
+ 		Name  string
+ 		Files []any
+ 	}{
+-		Name: pathInFs,
++		Name: requestedPath,
+ 	}
+ 
+ 	for _, f := range files {
+diff --git a/middleware/static_other.go b/middleware/static_other.go
+index 0227622..35dbfb3 100644
+--- a/middleware/static_other.go
++++ b/middleware/static_other.go
+@@ -1,30 +1,15 @@
+ // SPDX-License-Identifier: MIT
+ // SPDX-FileCopyrightText: © 2015 LabStack LLC and Echo contributors
+ 
++//go:build !windows
++
+ package middleware
+ 
+ import (
+-	"errors"
+-	"io/fs"
+ 	"os"
+ )
+ 
+ // We ignore these errors as there could be handler that matches request path.
+ func isIgnorableOpenFileError(err error) bool {
+-	if os.IsNotExist(err) {
+-		return true
+-	}
+-	// As of Go 1.20 Windows path checks are more strict on the provided path and considers [UNC](https://en.wikipedia.org/wiki/Path_(computing)#UNC)
+-	// paths with missing host etc parts as invalid. Previously it would result you `fs.ErrNotExist`.
+-	// Also `fs.Open` on all OSes does not accept ``, `.`, `..` at all.
+-	//
+-	// so we need to treat those errors the same as `fs.ErrNotExists` so we can continue handling
+-	// errors in the middleware/handler chain. Otherwise we might end up with status 500 instead of finding a route
+-	// or return 404 not found.
+-	var pErr *fs.PathError
+-	if errors.As(err, &pErr) {
+-		err = pErr.Err
+-		return err.Error() == "invalid argument"
+-	}
+-	return false
++	return os.IsNotExist(err)
+ }
+diff --git a/middleware/static_test.go b/middleware/static_test.go
+index c31e1a4..d0f3235 100644
+--- a/middleware/static_test.go
++++ b/middleware/static_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
++	"strings"
+ 	"testing"
+ 	"testing/fstest"
+ 
+@@ -20,7 +21,9 @@ func TestStatic_useCaseForApiAndSPAs(t *testing.T) {
+ 
+ 	// serve single page application (SPA) files from server root
+ 	e.Use(StaticWithConfig(StaticConfig{
+-		Root: "testdata/dist/public",
++		Root: ".",
++		// by default Echo filesystem is fixed to `./` but this does not allow `../` (moving up in folder structure past filesystem root)
++		Filesystem: os.DirFS("../_fixture"),
+ 	}))
+ 
+ 	// all requests to `/api/*` will end up in echo handlers (assuming there is not `api` folder and files)
+@@ -40,7 +43,7 @@ func TestStatic_useCaseForApiAndSPAs(t *testing.T) {
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, http.StatusOK, rec.Code)
+-	assert.Contains(t, rec.Body.String(), "<h1>Hello from index</h1>\n")
++	assert.Contains(t, rec.Body.String(), "<title>Echo</title>")
+ 
+ }
+ 
+@@ -51,7 +54,6 @@ func TestStatic(t *testing.T) {
+ 		givenAttachedToGroup string
+ 		whenURL              string
+ 		expectContains       string
+-		expectNotContains    string
+ 		expectLength         string
+ 		expectCode           int
+ 	}{
+@@ -59,55 +61,55 @@ func TestStatic(t *testing.T) {
+ 			name:           "ok, serve index with Echo message",
+ 			whenURL:        "/",
+ 			expectCode:     http.StatusOK,
+-			expectContains: "<h1>Hello from index</h1>",
++			expectContains: "<title>Echo</title>",
+ 		},
+ 		{
+-			name:           "ok, serve file from subdirectory",
+-			whenURL:        "/assets/readme.md",
+-			expectCode:     http.StatusOK,
+-			expectContains: "This directory is used for the static middleware test",
++			name:         "ok, serve file from subdirectory",
++			whenURL:      "/images/walle.png",
++			expectCode:   http.StatusOK,
++			expectLength: "219885",
+ 		},
+ 		{
+ 			name: "ok, when html5 mode serve index for any static file that does not exist",
+ 			givenConfig: &StaticConfig{
+-				Root:  "testdata/dist/public",
++				Root:  "_fixture",
+ 				HTML5: true,
+ 			},
+ 			whenURL:        "/random",
+ 			expectCode:     http.StatusOK,
+-			expectContains: "<h1>Hello from index</h1>",
++			expectContains: "<title>Echo</title>",
+ 		},
+ 		{
+ 			name: "ok, serve index as directory index listing files directory",
+ 			givenConfig: &StaticConfig{
+-				Root:   "testdata/dist/public/assets",
++				Root:   "_fixture/certs",
+ 				Browse: true,
+ 			},
+ 			whenURL:        "/",
+ 			expectCode:     http.StatusOK,
+-			expectContains: `<a class="file" href="readme.md">readme.md</a>`,
++			expectContains: "cert.pem",
+ 		},
+ 		{
+ 			name: "ok, serve directory index with IgnoreBase and browse",
+ 			givenConfig: &StaticConfig{
+-				Root:       "testdata/dist/public/assets/", // <-- last `assets/` is overlapping with group path and needs to be ignored
++				Root:       "_fixture/_fixture/", // <-- last `_fixture/` is overlapping with group path and needs to be ignored
+ 				IgnoreBase: true,
+ 				Browse:     true,
+ 			},
+-			givenAttachedToGroup: "/assets",
+-			whenURL:              "/assets/",
++			givenAttachedToGroup: "/_fixture",
++			whenURL:              "/_fixture/",
+ 			expectCode:           http.StatusOK,
+-			expectContains:       `<a class="file" href="readme.md">readme.md</a>`,
++			expectContains:       `<a class="file" href="README.md">README.md</a>`,
+ 		},
+ 		{
+ 			name: "ok, serve file with IgnoreBase",
+ 			givenConfig: &StaticConfig{
+-				Root:       "testdata/dist/public/assets", // <-- last `assets/` is overlapping with group path and needs to be ignored
++				Root:       "_fixture/_fixture/", // <-- last `_fixture/` is overlapping with group path and needs to be ignored
+ 				IgnoreBase: true,
+ 				Browse:     true,
+ 			},
+-			givenAttachedToGroup: "/assets",
+-			whenURL:              "/assets/readme.md",
++			givenAttachedToGroup: "/_fixture",
++			whenURL:              "/_fixture/README.md",
+ 			expectCode:           http.StatusOK,
+ 			expectContains:       "This directory is used for the static middleware test",
+ 		},
+@@ -117,6 +119,18 @@ func TestStatic(t *testing.T) {
+ 			expectCode:     http.StatusNotFound,
+ 			expectContains: "{\"message\":\"Not Found\"}\n",
+ 		},
++		{
++			name:           "nok, do not allow directory traversal (backslash - windows separator)",
++			whenURL:        `/..\\middleware/basic_auth.go`,
++			expectCode:     http.StatusNotFound,
++			expectContains: "{\"message\":\"Not Found\"}\n",
++		},
++		{
++			name:           "nok,do not allow directory traversal (slash - unix separator)",
++			whenURL:        `/../middleware/basic_auth.go`,
++			expectCode:     http.StatusNotFound,
++			expectContains: "{\"message\":\"Not Found\"}\n",
++		},
+ 		{
+ 			name:           "ok, when no file then a handler will care of the request",
+ 			whenURL:        "/regular-handler",
+@@ -126,7 +140,7 @@ func TestStatic(t *testing.T) {
+ 		{
+ 			name: "ok, skip middleware and serve handler",
+ 			givenConfig: &StaticConfig{
+-				Root: "testdata/dist/public",
++				Root: "_fixture/images/",
+ 				Skipper: func(c *echo.Context) bool {
+ 					return true
+ 				},
+@@ -138,9 +152,9 @@ func TestStatic(t *testing.T) {
+ 		{
+ 			name: "nok, when html5 fail if the index file does not exist",
+ 			givenConfig: &StaticConfig{
+-				Root:  "testdata/dist/public",
++				Root:  "_fixture",
+ 				HTML5: true,
+-				Index: "missing.html", // that folder contains `index.html`
++				Index: "missing.html",
+ 			},
+ 			whenURL:    "/random",
+ 			expectCode: http.StatusInternalServerError,
+@@ -148,68 +162,36 @@ func TestStatic(t *testing.T) {
+ 		{
+ 			name: "ok, serve from http.FileSystem",
+ 			givenConfig: &StaticConfig{
+-				Root:       "public",
+-				Filesystem: os.DirFS("testdata/dist"),
++				Root:       "_fixture",
++				Filesystem: os.DirFS(".."),
+ 			},
+ 			whenURL:        "/",
+ 			expectCode:     http.StatusOK,
+-			expectContains: "<h1>Hello from index</h1>",
+-		},
+-		{
+-			name:              "nok, do not allow directory traversal (backslash - windows separator)",
+-			whenURL:           `/..\\private.txt`,
+-			expectCode:        http.StatusNotFound,
+-			expectContains:    "{\"message\":\"Not Found\"}\n",
+-			expectNotContains: `private file`,
+-		},
+-		{
+-			name:              "nok,do not allow directory traversal (slash - unix separator)",
+-			whenURL:           `/../private.txt`,
+-			expectCode:        http.StatusNotFound,
+-			expectContains:    "{\"message\":\"Not Found\"}\n",
+-			expectNotContains: `private file`,
+-		},
+-		{
+-			name:              "nok, URL encoded path traversal (single encoding, slash - unix separator)",
+-			whenURL:           "/%2e%2e%2fprivate.txt",
+-			expectCode:        http.StatusNotFound,
+-			expectContains:    "{\"message\":\"Not Found\"}\n",
+-			expectNotContains: `private file`,
+-		},
+-		{
+-			name:              "nok, URL encoded path traversal (single encoding, backslash - windows separator)",
+-			whenURL:           "/%2e%2e%5cprivate.txt",
+-			expectCode:        http.StatusNotFound,
+-			expectContains:    "{\"message\":\"Not Found\"}\n",
+-			expectNotContains: `private file`,
++			expectContains: "<title>Echo</title>",
+ 		},
+ 		{
+-			name:              "nok, URL encoded path traversal (double encoding, slash - unix separator)",
+-			whenURL:           "/%252e%252e%252fprivate.txt",
+-			expectCode:        http.StatusNotFound,
+-			expectContains:    "{\"message\":\"Not Found\"}\n",
+-			expectNotContains: `private file`,
++			name:           "nok, URL encoded path traversal (single encoding)",
++			whenURL:        "/%2e%2e%2fmiddleware/basic_auth.go",
++			expectCode:     http.StatusNotFound,
++			expectContains: "{\"message\":\"Not Found\"}\n",
+ 		},
+ 		{
+-			name:              "nok, URL encoded path traversal (double encoding, backslash - windows separator)",
+-			whenURL:           "/%252e%252e%255cprivate.txt",
+-			expectCode:        http.StatusNotFound,
+-			expectContains:    "{\"message\":\"Not Found\"}\n",
+-			expectNotContains: `private file`,
++			name:           "nok, URL encoded path traversal (double encoding)",
++			whenURL:        "/%252e%252e%252fmiddleware/basic_auth.go",
++			expectCode:     http.StatusNotFound,
++			expectContains: "{\"message\":\"Not Found\"}\n",
+ 		},
+ 		{
+-			name:              "nok, URL encoded path traversal (mixed encoding)",
+-			whenURL:           "/%2e%2e/private.txt",
+-			expectCode:        http.StatusNotFound,
+-			expectContains:    "{\"message\":\"Not Found\"}\n",
+-			expectNotContains: `private file`,
++			name:           "nok, URL encoded path traversal (mixed encoding)",
++			whenURL:        "/%2e%2e/middleware/basic_auth.go",
++			expectCode:     http.StatusNotFound,
++			expectContains: "{\"message\":\"Not Found\"}\n",
+ 		},
+ 		{
+-			name:              "nok, backslash URL encoded",
+-			whenURL:           "/..%5c..%5cprivate.txt",
+-			expectCode:        http.StatusNotFound,
+-			expectContains:    "{\"message\":\"Not Found\"}\n",
+-			expectNotContains: `private file`,
++			name:           "nok, backslash URL encoded",
++			whenURL:        "/..%5c..%5cmiddleware/basic_auth.go",
++			expectCode:     http.StatusNotFound,
++			expectContains: "{\"message\":\"Not Found\"}\n",
+ 		},
+ 		//{ // Under windows, %00 gets cleaned out by `http.ReadRequest` making this test to fail with different code
+ 		//	name:           "nok, null byte injection",
+@@ -218,26 +200,25 @@ func TestStatic(t *testing.T) {
+ 		//	expectContains: "{\"message\":\"Internal Server Error\"}\n",
+ 		//},
+ 		{
+-			name:              "nok, mixed backslash and forward slash traversal",
+-			whenURL:           "/..\\../private.txt",
+-			expectCode:        http.StatusNotFound,
+-			expectContains:    "{\"message\":\"Not Found\"}\n",
+-			expectNotContains: `private file`,
++			name:           "nok, mixed backslash and forward slash traversal",
++			whenURL:        "/..\\../middleware/basic_auth.go",
++			expectCode:     http.StatusNotFound,
++			expectContains: "{\"message\":\"Not Found\"}\n",
+ 		},
+ 		{
+-			name:              "nok, trailing dots (Windows edge case)",
+-			whenURL:           "/../private.txt...",
+-			expectCode:        http.StatusNotFound,
+-			expectContains:    "{\"message\":\"Not Found\"}\n",
+-			expectNotContains: `private file`,
++			name:           "nok, trailing dots (Windows edge case)",
++			whenURL:        "/../middleware/basic_auth.go...",
++			expectCode:     http.StatusNotFound,
++			expectContains: "{\"message\":\"Not Found\"}\n",
+ 		},
+ 	}
+ 
+ 	for _, tc := range testCases {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			e := echo.New()
++			e.Filesystem = os.DirFS("../")
+ 
+-			config := StaticConfig{Root: "testdata/dist/public"}
++			config := StaticConfig{Root: "_fixture"}
+ 			if tc.givenConfig != nil {
+ 				config = *tc.givenConfig
+ 			}
+@@ -266,15 +247,169 @@ func TestStatic(t *testing.T) {
+ 			e.ServeHTTP(rec, req)
+ 
+ 			assert.Equal(t, tc.expectCode, rec.Code)
+-			responseBody := rec.Body.String()
+ 			if tc.expectContains != "" {
++				responseBody := rec.Body.String()
+ 				assert.Contains(t, responseBody, tc.expectContains)
+ 			}
+-			if tc.expectNotContains != "" {
+-				assert.NotContains(t, responseBody, tc.expectNotContains)
+-			}
+ 			if tc.expectLength != "" {
+-				assert.Equal(t, tc.expectLength, rec.Header().Get(echo.HeaderContentLength))
++				assert.Equal(t, rec.Header().Get(echo.HeaderContentLength), tc.expectLength)
++			}
++		})
++	}
++}
++
++func TestStatic_GroupWithStatic(t *testing.T) {
++	var testCases = []struct {
++		name                 string
++		givenGroup           string
++		givenPrefix          string
++		givenRoot            string
++		whenURL              string
++		expectStatus         int
++		expectHeaderLocation string
++		expectBodyStartsWith string
++	}{
++		{
++			name:                 "ok",
++			givenPrefix:          "/images",
++			givenRoot:            "_fixture/images",
++			whenURL:              "/group/images/walle.png",
++			expectStatus:         http.StatusOK,
++			expectBodyStartsWith: string([]byte{0x89, 0x50, 0x4e, 0x47}),
++		},
++		{
++			name:                 "No file",
++			givenPrefix:          "/images",
++			givenRoot:            "_fixture/scripts",
++			whenURL:              "/group/images/bolt.png",
++			expectStatus:         http.StatusNotFound,
++			expectBodyStartsWith: "{\"message\":\"Not Found\"}\n",
++		},
++		{
++			name:                 "Directory not found (no trailing slash)",
++			givenPrefix:          "/images",
++			givenRoot:            "_fixture/images",
++			whenURL:              "/group/images/",
++			expectStatus:         http.StatusNotFound,
++			expectBodyStartsWith: "{\"message\":\"Not Found\"}\n",
++		},
++		{
++			name:                 "Directory redirect",
++			givenPrefix:          "/",
++			givenRoot:            "_fixture",
++			whenURL:              "/group/folder",
++			expectStatus:         http.StatusMovedPermanently,
++			expectHeaderLocation: "/group/folder/",
++			expectBodyStartsWith: "",
++		},
++		{
++			name:                 "Directory redirect",
++			givenPrefix:          "/",
++			givenRoot:            "_fixture",
++			whenURL:              "/group/folder%2f..",
++			expectStatus:         http.StatusMovedPermanently,
++			expectHeaderLocation: "/group/folder/../",
++			expectBodyStartsWith: "",
++		},
++		{
++			name:                 "Prefixed directory 404 (request URL without slash)",
++			givenGroup:           "_fixture",
++			givenPrefix:          "/folder/", // trailing slash will intentionally not match "/folder"
++			givenRoot:            "_fixture",
++			whenURL:              "/_fixture/folder", // no trailing slash
++			expectStatus:         http.StatusNotFound,
++			expectBodyStartsWith: "{\"message\":\"Not Found\"}\n",
++		},
++		{
++			name:                 "Prefixed directory redirect (without slash redirect to slash)",
++			givenGroup:           "_fixture",
++			givenPrefix:          "/folder", // no trailing slash shall match /folder and /folder/*
++			givenRoot:            "_fixture",
++			whenURL:              "/_fixture/folder", // no trailing slash
++			expectStatus:         http.StatusMovedPermanently,
++			expectHeaderLocation: "/_fixture/folder/",
++			expectBodyStartsWith: "",
++		},
++		{
++			name:                 "Directory with index.html",
++			givenPrefix:          "/",
++			givenRoot:            "_fixture",
++			whenURL:              "/group/",
++			expectStatus:         http.StatusOK,
++			expectBodyStartsWith: "<!doctype html>",
++		},
++		{
++			name:                 "Prefixed directory with index.html (prefix ending with slash)",
++			givenPrefix:          "/assets/",
++			givenRoot:            "_fixture",
++			whenURL:              "/group/assets/",
++			expectStatus:         http.StatusOK,
++			expectBodyStartsWith: "<!doctype html>",
++		},
++		{
++			name:                 "Prefixed directory with index.html (prefix ending without slash)",
++			givenPrefix:          "/assets",
++			givenRoot:            "_fixture",
++			whenURL:              "/group/assets/",
++			expectStatus:         http.StatusOK,
++			expectBodyStartsWith: "<!doctype html>",
++		},
++		{
++			name:                 "Sub-directory with index.html",
++			givenPrefix:          "/",
++			givenRoot:            "_fixture",
++			whenURL:              "/group/folder/",
++			expectStatus:         http.StatusOK,
++			expectBodyStartsWith: "<!doctype html>",
++		},
++		{
++			name:                 "do not allow directory traversal (backslash - windows separator)",
++			givenPrefix:          "/",
++			givenRoot:            "_fixture/",
++			whenURL:              `/group/..\\middleware/basic_auth.go`,
++			expectStatus:         http.StatusNotFound,
++			expectBodyStartsWith: "{\"message\":\"Not Found\"}\n",
++		},
++		{
++			name:                 "do not allow directory traversal (slash - unix separator)",
++			givenPrefix:          "/",
++			givenRoot:            "_fixture/",
++			whenURL:              `/group/../middleware/basic_auth.go`,
++			expectStatus:         http.StatusNotFound,
++			expectBodyStartsWith: "{\"message\":\"Not Found\"}\n",
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			e := echo.New()
++			e.Filesystem = os.DirFS("../") // so we can access test files
++
++			group := "/group"
++			if tc.givenGroup != "" {
++				group = tc.givenGroup
++			}
++			g := e.Group(group)
++			g.Static(tc.givenPrefix, tc.givenRoot)
++
++			req := httptest.NewRequest(http.MethodGet, tc.whenURL, nil)
++			rec := httptest.NewRecorder()
++
++			e.ServeHTTP(rec, req)
++
++			assert.Equal(t, tc.expectStatus, rec.Code)
++			body := rec.Body.String()
++			if tc.expectBodyStartsWith != "" {
++				assert.True(t, strings.HasPrefix(body, tc.expectBodyStartsWith))
++			} else {
++				assert.Equal(t, "", body)
++			}
++
++			if tc.expectHeaderLocation != "" {
++				assert.Equal(t, tc.expectHeaderLocation, rec.Header().Get(echo.HeaderLocation))
++			} else {
++				_, ok := rec.Result().Header[echo.HeaderLocation]
++				assert.False(t, ok)
+ 			}
+ 		})
+ 	}
+@@ -472,7 +607,7 @@ func TestStatic_DirectoryBrowsing(t *testing.T) {
+ 			},
+ 			whenURL:        "/assets",
+ 			expectCode:     http.StatusOK,
+-			expectContains: `<a class="file" href="readme.md">readme.md</a>`,
++			expectContains: `<a class="file" href="/assets/readme.md">readme.md</a>`,
+ 			expectNotContains: []string{
+ 				`<h1>Hello from index</h1>`, // should see the listing, not index.html contents
+ 				`private.txt`,               // file from the parent folder
+diff --git a/middleware/static_windows.go b/middleware/static_windows.go
+new file mode 100644
+index 0000000..7a1b5cc
+--- /dev/null
++++ b/middleware/static_windows.go
+@@ -0,0 +1,34 @@
++// SPDX-License-Identifier: MIT
++// SPDX-FileCopyrightText: © 2015 LabStack LLC and Echo contributors
++
++package middleware
++
++import (
++	"errors"
++	"io/fs"
++	"os"
++)
++
++// We ignore these errors as there could be handler that matches request path.
++//
++// As of Go 1.20 filepath.Clean has different behaviour on OS related filesystems so we need to use path.Clean
++// on Windows which has some caveats. The Open methods might return different errors than earlier versions and
++// as of 1.20 path checks are more strict on the provided path and considers [UNC](https://en.wikipedia.org/wiki/Path_(computing)#UNC)
++// paths with missing host etc parts as invalid. Previously it would result you `fs.ErrNotExist`.
++//
++// For 1.20@Windows we need to treat those errors the same as `fs.ErrNotExists` so we can continue handling
++// errors in the middleware/handler chain. Otherwise we might end up with status 500 instead of finding a route
++// or return 404 not found.
++func isIgnorableOpenFileError(err error) bool {
++	if os.IsNotExist(err) {
++		return true
++	}
++	var pErr *fs.PathError
++	if errors.As(err, &pErr) {
++		err = pErr.Err
++	}
++	errTxt := err.Error()
++	return errTxt == "http: invalid or unsafe file path" ||
++		errTxt == "invalid path" ||
++		errTxt == "invalid argument"
++}
+diff --git a/middleware/testdata/dist/private.txt b/middleware/testdata/dist/private.txt
+deleted file mode 100644
+index 0f9d243..0000000
+--- a/middleware/testdata/dist/private.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-private file
+diff --git a/middleware/testdata/dist/public/assets/readme.md b/middleware/testdata/dist/public/assets/readme.md
+deleted file mode 100644
+index 1d5f827..0000000
+--- a/middleware/testdata/dist/public/assets/readme.md
++++ /dev/null
+@@ -1 +0,0 @@
+-This directory is used for the static middleware test
+diff --git a/middleware/testdata/dist/public/assets/subfolder/subfolder.md b/middleware/testdata/dist/public/assets/subfolder/subfolder.md
+deleted file mode 100644
+index 74c928b..0000000
+--- a/middleware/testdata/dist/public/assets/subfolder/subfolder.md
++++ /dev/null
+@@ -1 +0,0 @@
+-file inside subfolder
+diff --git a/middleware/testdata/dist/public/index.html b/middleware/testdata/dist/public/index.html
+deleted file mode 100644
+index df6d901..0000000
+--- a/middleware/testdata/dist/public/index.html
++++ /dev/null
+@@ -1 +0,0 @@
+-<h1>Hello from index</h1>
+diff --git a/middleware/testdata/dist/public/test.txt b/middleware/testdata/dist/public/test.txt
+deleted file mode 100644
+index dd93716..0000000
+--- a/middleware/testdata/dist/public/test.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-test.txt contents
+diff --git a/middleware/testdata/private.txt b/middleware/testdata/private.txt
+deleted file mode 100644
+index 0f9d243..0000000
+--- a/middleware/testdata/private.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-private file
+diff --git a/version.go b/version.go
+index 527adb3..d055626 100644
+--- a/version.go
++++ b/version.go
+@@ -5,5 +5,5 @@ package echo
+ 
+ const (
+ 	// Version of Echo
+-	Version = "5.0.3"
++	Version = "5.0.2"
+ )

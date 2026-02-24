@@ -1,0 +1,274 @@
+diff --git a/pkg/goanalysis/pkgerrors/errors.go b/pkg/goanalysis/pkgerrors/errors.go
+new file mode 100644
+index 00000000..91f6dd39
+--- /dev/null
++++ b/pkg/goanalysis/pkgerrors/errors.go
+@@ -0,0 +1,58 @@
++package pkgerrors
++
++import (
++	"errors"
++	"fmt"
++
++	"golang.org/x/tools/go/packages"
++
++	"github.com/golangci/golangci-lint/pkg/lint/linter"
++	"github.com/golangci/golangci-lint/pkg/result"
++)
++
++type IllTypedError struct {
++	Pkg *packages.Package
++}
++
++func (e *IllTypedError) Error() string {
++	return fmt.Sprintf("errors in package: %v", e.Pkg.Errors)
++}
++
++func BuildIssuesFromIllTypedError(errs []error, lintCtx *linter.Context) ([]result.Issue, error) {
++	var issues []result.Issue
++	uniqReportedIssues := map[string]bool{}
++
++	var other error
++
++	for _, err := range errs {
++		err := err
++
++		var ill *IllTypedError
++		if !errors.As(err, &ill) {
++			if other == nil {
++				other = err
++			}
++			continue
++		}
++
++		for _, err := range extractErrors(ill.Pkg) {
++			issue, perr := parseError(err)
++			if perr != nil { // failed to parse
++				if uniqReportedIssues[err.Msg] {
++					continue
++				}
++				uniqReportedIssues[err.Msg] = true
++				lintCtx.Log.Errorf("typechecking error: %s", err.Msg)
++			} else {
++				issue.Pkg = ill.Pkg // to save to cache later
++				issues = append(issues, *issue)
++			}
++		}
++	}
++
++	if len(issues) == 0 && other != nil {
++		return nil, other
++	}
++
++	return issues, nil
++}
+diff --git a/pkg/goanalysis/pkgerrors/extract.go b/pkg/goanalysis/pkgerrors/extract.go
+new file mode 100644
+index 00000000..d1257e66
+--- /dev/null
++++ b/pkg/goanalysis/pkgerrors/extract.go
+@@ -0,0 +1,102 @@
++package pkgerrors
++
++import (
++	"fmt"
++	"regexp"
++	"strings"
++
++	"golang.org/x/tools/go/packages"
++)
++
++// reFile matches a line who starts with path and position.
++// ex: `/example/main.go:11:17: foobar`
++var reFile = regexp.MustCompile(`^.+\.go:\d+:\d+: .+`)
++
++func extractErrors(pkg *packages.Package) []packages.Error {
++	errors := extractErrorsImpl(pkg, map[*packages.Package]bool{})
++	if len(errors) == 0 {
++		return errors
++	}
++
++	seenErrors := map[string]bool{}
++	var uniqErrors []packages.Error
++	for _, err := range errors {
++		msg := stackCrusher(err.Error())
++		if seenErrors[msg] {
++			continue
++		}
++
++		if msg != err.Error() {
++			continue
++		}
++
++		seenErrors[msg] = true
++
++		uniqErrors = append(uniqErrors, err)
++	}
++
++	if len(pkg.GoFiles) != 0 {
++		// errors were extracted from deps and have at least one file in package
++		for i := range uniqErrors {
++			if _, parseErr := parseErrorPosition(uniqErrors[i].Pos); parseErr == nil {
++				continue
++			}
++
++			// change pos to local file to properly process it by processors (properly read line etc.)
++			uniqErrors[i].Msg = fmt.Sprintf("%s: %s", uniqErrors[i].Pos, uniqErrors[i].Msg)
++			uniqErrors[i].Pos = fmt.Sprintf("%s:1", pkg.GoFiles[0])
++		}
++
++		// some errors like "code in directory  expects import" don't have Pos, set it here
++		for i := range uniqErrors {
++			err := &uniqErrors[i]
++			if err.Pos == "" {
++				err.Pos = fmt.Sprintf("%s:1", pkg.GoFiles[0])
++			}
++		}
++	}
++
++	return uniqErrors
++}
++
++func extractErrorsImpl(pkg *packages.Package, seenPackages map[*packages.Package]bool) []packages.Error {
++	if seenPackages[pkg] {
++		return nil
++	}
++	seenPackages[pkg] = true
++
++	if !pkg.IllTyped { // otherwise, it may take hours to traverse all deps many times
++		return nil
++	}
++
++	if len(pkg.Errors) > 0 {
++		return pkg.Errors
++	}
++
++	var errors []packages.Error
++	for _, iPkg := range pkg.Imports {
++		iPkgErrors := extractErrorsImpl(iPkg, seenPackages)
++		if iPkgErrors != nil {
++			errors = append(errors, iPkgErrors...)
++		}
++	}
++
++	return errors
++}
++
++func stackCrusher(msg string) string {
++	index := strings.Index(msg, "(")
++	lastIndex := strings.LastIndex(msg, ")")
++
++	if index == -1 || index == len(msg)-1 || lastIndex == -1 || lastIndex != len(msg)-1 {
++		return msg
++	}
++
++	frag := msg[index+1 : lastIndex]
++
++	if !reFile.MatchString(frag) {
++		return msg
++	}
++
++	return stackCrusher(frag)
++}
+diff --git a/pkg/goanalysis/pkgerrors/parse.go b/pkg/goanalysis/pkgerrors/parse.go
+new file mode 100644
+index 00000000..b25b50f7
+--- /dev/null
++++ b/pkg/goanalysis/pkgerrors/parse.go
+@@ -0,0 +1,54 @@
++package pkgerrors
++
++import (
++	"errors"
++	"fmt"
++	"go/token"
++	"strconv"
++	"strings"
++
++	"golang.org/x/tools/go/packages"
++
++	"github.com/golangci/golangci-lint/pkg/result"
++)
++
++func parseError(srcErr packages.Error) (*result.Issue, error) {
++	pos, err := parseErrorPosition(srcErr.Pos)
++	if err != nil {
++		return nil, err
++	}
++
++	return &result.Issue{
++		Pos:        *pos,
++		Text:       srcErr.Msg,
++		FromLinter: "typecheck",
++	}, nil
++}
++
++func parseErrorPosition(pos string) (*token.Position, error) {
++	// file:line(<optional>:colon)
++	parts := strings.Split(pos, ":")
++	if len(parts) == 1 {
++		return nil, errors.New("no colons")
++	}
++
++	file := parts[0]
++	line, err := strconv.Atoi(parts[1])
++	if err != nil {
++		return nil, fmt.Errorf("can't parse line number %q: %w", parts[1], err)
++	}
++
++	var column int
++	if len(parts) == 3 { // no column
++		column, err = strconv.Atoi(parts[2])
++		if err != nil {
++			return nil, fmt.Errorf("failed to parse column from %q: %w", parts[2], err)
++		}
++	}
++
++	return &token.Position{
++		Filename: file,
++		Line:     line,
++		Column:   column,
++	}, nil
++}
+diff --git a/pkg/goanalysis/runner_action.go b/pkg/goanalysis/runner_action.go
+index 6b57cb0c..58ea297e 100644
+--- a/pkg/goanalysis/runner_action.go
++++ b/pkg/goanalysis/runner_action.go
+@@ -15,6 +15,7 @@ import (
+ 
+ 	"github.com/golangci/golangci-lint/internal/errorutil"
+ 	"github.com/golangci/golangci-lint/internal/pkgcache"
++	"github.com/golangci/golangci-lint/pkg/goanalysis/pkgerrors"
+ )
+ 
+ type actionAllocator struct {
+@@ -184,7 +185,7 @@ func (act *action) analyze() {
+ 		// It looks like there should be !pass.Analyzer.RunDespiteErrors
+ 		// but govet's cgocall crashes on it. Govet itself contains !pass.Analyzer.RunDespiteErrors condition here,
+ 		// but it exits before it if packages.Load have failed.
+-		act.err = fmt.Errorf("analysis skipped: %w", &IllTypedError{Pkg: act.pkg})
++		act.err = fmt.Errorf("analysis skipped: %w", &pkgerrors.IllTypedError{Pkg: act.pkg})
+ 	} else {
+ 		startedAt = time.Now()
+ 		act.result, act.err = pass.Analyzer.Run(pass)
+diff --git a/pkg/goanalysis/runners.go b/pkg/goanalysis/runners.go
+index b832fc32..c02d33b7 100644
+--- a/pkg/goanalysis/runners.go
++++ b/pkg/goanalysis/runners.go
+@@ -13,6 +13,7 @@ import (
+ 	"golang.org/x/tools/go/packages"
+ 
+ 	"github.com/golangci/golangci-lint/internal/pkgcache"
++	"github.com/golangci/golangci-lint/pkg/goanalysis/pkgerrors"
+ 	"github.com/golangci/golangci-lint/pkg/lint/linter"
+ 	"github.com/golangci/golangci-lint/pkg/logutils"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+@@ -74,7 +75,7 @@ func runAnalyzers(cfg runAnalyzersConfig, lintCtx *linter.Context) ([]result.Iss
+ 		return retIssues
+ 	}
+ 
+-	errIssues, err := buildIssuesFromIllTypedError(errs, lintCtx)
++	errIssues, err := pkgerrors.BuildIssuesFromIllTypedError(errs, lintCtx)
+ 	if err != nil {
+ 		return nil, err
+ 	}

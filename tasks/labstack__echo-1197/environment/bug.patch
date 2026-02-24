@@ -1,0 +1,179 @@
+diff --git a/echo.go b/echo.go
+index 3c03659..2b3b8eb 100644
+--- a/echo.go
++++ b/echo.go
+@@ -260,7 +260,6 @@ var (
+ 	ErrBadGateway                  = NewHTTPError(http.StatusBadGateway)
+ 	ErrInternalServerError         = NewHTTPError(http.StatusInternalServerError)
+ 	ErrRequestTimeout              = NewHTTPError(http.StatusRequestTimeout)
+-	ErrServiceUnavailable          = NewHTTPError(http.StatusServiceUnavailable)
+ 	ErrValidatorNotRegistered      = errors.New("validator not registered")
+ 	ErrRendererNotRegistered       = errors.New("renderer not registered")
+ 	ErrInvalidRedirectCode         = errors.New("invalid redirect status code")
+diff --git a/middleware/proxy.go b/middleware/proxy.go
+index 1789c75..2686c30 100644
+--- a/middleware/proxy.go
++++ b/middleware/proxy.go
+@@ -6,6 +6,7 @@ import (
+ 	"math/rand"
+ 	"net"
+ 	"net/http"
++	"net/http/httputil"
+ 	"net/url"
+ 	"regexp"
+ 	"strings"
+@@ -37,14 +38,10 @@ type (
+ 		// "/users/*/orders/*": "/user/$1/order/$2",
+ 		Rewrite map[string]string
+ 
+-    // Context key to store selected ProxyTarget into context.
++		// Context key to store selected ProxyTarget into context.
+ 		// Optional. Default value "target".
+ 		ContextKey string
+ 
+-    // To customize the transport to remote.
+-		// Examples: If custom TLS certificates are required.
+-		Transport http.RoundTripper
+-
+ 		rewriteRegex map[*regexp.Regexp]string
+ 	}
+ 
+@@ -88,6 +85,10 @@ var (
+ 	}
+ )
+ 
++func proxyHTTP(t *ProxyTarget) http.Handler {
++	return httputil.NewSingleHostReverseProxy(t.URL)
++}
++
+ func proxyRaw(t *ProxyTarget, c echo.Context) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		in, _, err := c.Response().Hijack()
+@@ -249,7 +250,7 @@ func ProxyWithConfig(config ProxyConfig) echo.MiddlewareFunc {
+ 				proxyRaw(tgt, c).ServeHTTP(res, req)
+ 			case req.Header.Get(echo.HeaderAccept) == "text/event-stream":
+ 			default:
+-				proxyHTTP(tgt, c, config).ServeHTTP(res, req)
++				proxyHTTP(tgt).ServeHTTP(res, req)
+ 			}
+ 
+ 			return
+diff --git a/middleware/proxy_1_11.go b/middleware/proxy_1_11.go
+deleted file mode 100644
+index db56629..0000000
+--- a/middleware/proxy_1_11.go
++++ /dev/null
+@@ -1,24 +0,0 @@
+-// +build go1.11
+-
+-package middleware
+-
+-import (
+-	"fmt"
+-	"github.com/labstack/echo"
+-	"net/http"
+-	"net/http/httputil"
+-)
+-
+-func proxyHTTP(tgt *ProxyTarget, c echo.Context, config ProxyConfig) http.Handler {
+-	proxy := httputil.NewSingleHostReverseProxy(tgt.URL)
+-	proxy.ErrorHandler = func(resp http.ResponseWriter, req *http.Request, err error) {
+-		descr := tgt.URL.String()
+-		if tgt.Name != "" {
+-			descr = fmt.Sprintf("%s(%s)", tgt.Name, tgt.URL.String())
+-		}
+-		c.Logger().Errorf("remote %s unreachable, could not forward: %v", descr, err)
+-		c.Error(echo.ErrServiceUnavailable)
+-	}
+-	proxy.Transport = config.Transport
+-	return proxy
+-}
+diff --git a/middleware/proxy_1_11_n.go b/middleware/proxy_1_11_n.go
+deleted file mode 100644
+index d4620e2..0000000
+--- a/middleware/proxy_1_11_n.go
++++ /dev/null
+@@ -1,13 +0,0 @@
+-// +build !go1.11
+-
+-package middleware
+-
+-import (
+-	"github.com/labstack/echo"
+-	"net/http"
+-	"net/http/httputil"
+-)
+-
+-func proxyHTTP(t *ProxyTarget, c echo.Context, config ProxyConfig) http.Handler {
+-	return httputil.NewSingleHostReverseProxy(t.URL)
+-}
+diff --git a/middleware/proxy_1_11_test.go b/middleware/proxy_1_11_test.go
+deleted file mode 100644
+index 19bbc26..0000000
+--- a/middleware/proxy_1_11_test.go
++++ /dev/null
+@@ -1,52 +0,0 @@
+-// +build go1.11
+-
+-package middleware
+-
+-import (
+-	"github.com/labstack/echo"
+-	"github.com/stretchr/testify/assert"
+-	"net/http"
+-	"net/http/httptest"
+-	"net/url"
+-	"testing"
+-)
+-
+-func TestProxy_1_11(t *testing.T) {
+-	// Setup
+-	url1, _ := url.Parse("http://127.0.0.1:27121")
+-	url2, _ := url.Parse("http://127.0.0.1:27122")
+-
+-	targets := []*ProxyTarget{
+-		{
+-			Name: "target 1",
+-			URL:  url1,
+-		},
+-		{
+-			Name: "target 2",
+-			URL:  url2,
+-		},
+-	}
+-	rb := NewRandomBalancer(nil)
+-	// must add targets:
+-	for _, target := range targets {
+-		assert.True(t, rb.AddTarget(target))
+-	}
+-
+-	// must ignore duplicates:
+-	for _, target := range targets {
+-		assert.False(t, rb.AddTarget(target))
+-	}
+-
+-	// Random
+-	e := echo.New()
+-	e.Use(Proxy(rb))
+-	req := httptest.NewRequest(echo.GET, "/", nil)
+-	rec := newCloseNotifyRecorder()
+-
+-	// Remote unreachable
+-	rec = newCloseNotifyRecorder()
+-	req.URL.Path = "/api/users"
+-	e.ServeHTTP(rec, req)
+-	assert.Equal(t, "/api/users", req.URL.Path)
+-	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+-}
+diff --git a/middleware/proxy_test.go b/middleware/proxy_test.go
+index d003941..3a79b83 100644
+--- a/middleware/proxy_test.go
++++ b/middleware/proxy_test.go
+@@ -124,7 +124,6 @@ func TestProxy(t *testing.T) {
+ 	req.URL.Path = "/users/jack/orders/1"
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, "/user/jack/order/1", req.URL.Path)
+-	assert.Equal(t, http.StatusOK, rec.Code)
+ 
+ 	// ProxyTarget is set in context
+ 	contextObserver := func(next echo.HandlerFunc) echo.HandlerFunc {

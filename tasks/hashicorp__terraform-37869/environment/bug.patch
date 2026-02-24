@@ -1,0 +1,226 @@
+diff --git a/.changes/v1.13/BUG FIXES-20251103-112034.yaml b/.changes/v1.13/BUG FIXES-20251103-112034.yaml
+deleted file mode 100644
+index abe076ad3b..0000000000
+--- a/.changes/v1.13/BUG FIXES-20251103-112034.yaml	
++++ /dev/null
+@@ -1,5 +0,0 @@
+-kind: BUG FIXES
+-body: Allow filesystem functions to return inconsistent results when evaluated within provider configuration
+-time: 2025-11-03T11:20:34.913068-05:00
+-custom:
+-    Issue: "37854"
+diff --git a/internal/command/apply_test.go b/internal/command/apply_test.go
+index 4907f3dc61..ee35032a09 100644
+--- a/internal/command/apply_test.go
++++ b/internal/command/apply_test.go
+@@ -2900,72 +2900,3 @@ func mustNewDynamicValue(val string, ty cty.Type) plans.DynamicValue {
+ 	}
+ 	return ret
+ }
+-
+-func TestProviderInconsistentFileFunc(t *testing.T) {
+-	// Verify that providers can still accept inconsistent results from
+-	// filesystem functions. We allow this for backwards compatibility, but
+-	// ephemeral values should be used in the long-term to allow for controlled
+-	// changes in values between plan and apply.
+-	td := t.TempDir()
+-	planDir := filepath.Join(td, "plan")
+-	applyDir := filepath.Join(td, "apply")
+-	testCopyDir(t, testFixturePath("changed-file-func-plan"), planDir)
+-	testCopyDir(t, testFixturePath("changed-file-func-apply"), applyDir)
+-	t.Chdir(planDir)
+-
+-	p := planVarsFixtureProvider()
+-	p.GetProviderSchemaResponse = &providers.GetProviderSchemaResponse{
+-		Provider: providers.Schema{
+-			Body: &configschema.Block{
+-				Attributes: map[string]*configschema.Attribute{
+-					"foo": {Type: cty.String, Optional: true},
+-				},
+-			},
+-		},
+-		ResourceTypes: map[string]providers.Schema{
+-			"test_instance": {
+-				Body: &configschema.Block{
+-					Attributes: map[string]*configschema.Attribute{
+-						"id": {Type: cty.String, Optional: true, Computed: true},
+-					},
+-				},
+-			},
+-		},
+-	}
+-
+-	view, done := testView(t)
+-	c := &PlanCommand{
+-		Meta: Meta{
+-			testingOverrides: metaOverridesForProvider(p),
+-			View:             view,
+-		},
+-	}
+-
+-	args := []string{
+-		"-out", filepath.Join(applyDir, "planfile"),
+-	}
+-	code := c.Run(args)
+-	output := done(t)
+-	if code != 0 {
+-		t.Fatalf("non-zero exit %d\n\n%s", code, output.Stderr())
+-	}
+-
+-	t.Chdir(applyDir)
+-
+-	view, done = testView(t)
+-	apply := &ApplyCommand{
+-		Meta: Meta{
+-			testingOverrides: metaOverridesForProvider(p),
+-			Ui:               new(cli.MockUi),
+-			View:             view,
+-		},
+-	}
+-	args = []string{
+-		"planfile",
+-	}
+-	code = apply.Run(args)
+-	output = done(t)
+-	if code != 0 {
+-		t.Fatalf("non-zero exit %d\n\n%s", code, output.Stderr())
+-	}
+-}
+diff --git a/internal/command/testdata/changed-file-func-apply/data b/internal/command/testdata/changed-file-func-apply/data
+deleted file mode 100644
+index 095d8985b6..0000000000
+--- a/internal/command/testdata/changed-file-func-apply/data
++++ /dev/null
+@@ -1 +0,0 @@
+-apply
+diff --git a/internal/command/testdata/changed-file-func-apply/main.tf b/internal/command/testdata/changed-file-func-apply/main.tf
+deleted file mode 100644
+index ee50704596..0000000000
+--- a/internal/command/testdata/changed-file-func-apply/main.tf
++++ /dev/null
+@@ -1,6 +0,0 @@
+-provider "test" {
+-    foo = file("./data")
+-}
+-
+-resource "test_instance" "foo" {
+-}
+diff --git a/internal/command/testdata/changed-file-func-plan/data b/internal/command/testdata/changed-file-func-plan/data
+deleted file mode 100644
+index 856cc8f41a..0000000000
+--- a/internal/command/testdata/changed-file-func-plan/data
++++ /dev/null
+@@ -1 +0,0 @@
+-plan
+diff --git a/internal/command/testdata/changed-file-func-plan/main.tf b/internal/command/testdata/changed-file-func-plan/main.tf
+deleted file mode 100644
+index ee50704596..0000000000
+--- a/internal/command/testdata/changed-file-func-plan/main.tf
++++ /dev/null
+@@ -1,6 +0,0 @@
+-provider "test" {
+-    foo = file("./data")
+-}
+-
+-resource "test_instance" "foo" {
+-}
+diff --git a/internal/lang/functions.go b/internal/lang/functions.go
+index fba6bef2a0..7f944a32a6 100644
+--- a/internal/lang/functions.go
++++ b/internal/lang/functions.go
+@@ -52,17 +52,6 @@ var templateFunctions = collections.NewSetCmp[string](
+ // Functions returns the set of functions that should be used to when evaluating
+ // expressions in the receiving scope.
+ func (s *Scope) Functions() map[string]function.Function {
+-	// For backwards compatibility, filesystem functions are allowed to return
+-	// inconsistent results when called from within a provider configuration, so
+-	// here we override the checks with a noop wrapper. This misbehavior was
+-	// found to be used by a number of configurations, which took advantage of
+-	// it to create the equivalent of ephemeral values before they formally
+-	// existed in the language.
+-	immutableResults := immutableResults
+-	if s.ForProvider {
+-		immutableResults = filesystemNoopWrapper
+-	}
+-
+ 	s.funcsLock.Lock()
+ 	if s.funcs == nil {
+ 		s.funcs = baseFunctions(s.BaseDir)
+@@ -479,10 +468,6 @@ func immutableResults(name string, priorResults *FunctionResults) func(fn functi
+ 	}
+ }
+ 
+-func filesystemNoopWrapper(name string, priorResults *FunctionResults) func(fn function.ImplFunc) function.ImplFunc {
+-	return noopWrapper
+-}
+-
+ func noopWrapper(fn function.ImplFunc) function.ImplFunc {
+ 	return fn
+ }
+diff --git a/internal/lang/scope.go b/internal/lang/scope.go
+index aa16ce71d7..9c7cb4666a 100644
+--- a/internal/lang/scope.go
++++ b/internal/lang/scope.go
+@@ -78,12 +78,6 @@ type Scope struct {
+ 	// PlanTimestamp is a timestamp representing when the plan was made. It will
+ 	// either have been generated during this operation or read from the plan.
+ 	PlanTimestamp time.Time
+-
+-	// ForProvider indicates a special case where a provider configuration is
+-	// being evaluated and can tolerate inconsistent results which are not
+-	// marked as ephemeral.
+-	// FIXME: plan to officially deprecate this workaround.
+-	ForProvider bool
+ }
+ 
+ // SetActiveExperiments allows a caller to declare that a set of experiments
+diff --git a/internal/terraform/eval_context_builtin.go b/internal/terraform/eval_context_builtin.go
+index 96dfea0798..6a35b2e902 100644
+--- a/internal/terraform/eval_context_builtin.go
++++ b/internal/terraform/eval_context_builtin.go
+@@ -327,23 +327,6 @@ func (ctx *BuiltinEvalContext) EvaluateBlock(body hcl.Body, schema *configschema
+ 	return val, body, diags
+ }
+ 
+-// EvaluateBlockForProvider is a workaround to allow providers to access a more
+-// ephemeral context, where filesystem functions can return inconsistent
+-// results. Prior to ephemeral values, some configurations were using this
+-// loophole to inject different credentials between plan and apply. This
+-// exception is not added to the EvalContext interface, so in order to access
+-// this workaround the context type must be asserted as BuiltinEvalContext.
+-func (ctx *BuiltinEvalContext) EvaluateBlockForProvider(body hcl.Body, schema *configschema.Block, self addrs.Referenceable, keyData InstanceKeyEvalData) (cty.Value, hcl.Body, tfdiags.Diagnostics) {
+-	var diags tfdiags.Diagnostics
+-	scope := ctx.EvaluationScope(self, nil, keyData)
+-	scope.ForProvider = true
+-	body, evalDiags := scope.ExpandBlock(body, schema)
+-	diags = diags.Append(evalDiags)
+-	val, evalDiags := scope.EvalBlock(body, schema)
+-	diags = diags.Append(evalDiags)
+-	return val, body, diags
+-}
+-
+ func (ctx *BuiltinEvalContext) EvaluateExpr(expr hcl.Expression, wantType cty.Type, self addrs.Referenceable) (cty.Value, tfdiags.Diagnostics) {
+ 	scope := ctx.EvaluationScope(self, nil, EvalDataForNoInstanceKey)
+ 	return scope.EvalExpr(expr, wantType)
+diff --git a/internal/terraform/node_provider.go b/internal/terraform/node_provider.go
+index e691451c46..85f5b8eda6 100644
+--- a/internal/terraform/node_provider.go
++++ b/internal/terraform/node_provider.go
+@@ -111,16 +111,8 @@ func (n *NodeApplyableProvider) ConfigureProvider(ctx EvalContext, provider prov
+ 		return diags
+ 	}
+ 
+-	// BuiltinEvalContext contains a workaround for providers to allow
+-	// inconsistent filesystem function results, which can be accepted due to
+-	// the ephemeral nature of a provider configuration.
+-	eval := ctx.EvaluateBlock
+-	if ctx, ok := ctx.(*BuiltinEvalContext); ok {
+-		eval = ctx.EvaluateBlockForProvider
+-	}
+-
+ 	configSchema := resp.Provider.Body
+-	configVal, configBody, evalDiags := eval(configBody, configSchema, nil, EvalDataForNoInstanceKey)
++	configVal, configBody, evalDiags := ctx.EvaluateBlock(configBody, configSchema, nil, EvalDataForNoInstanceKey)
+ 	diags = diags.Append(evalDiags)
+ 	if evalDiags.HasErrors() {
+ 		if config == nil {

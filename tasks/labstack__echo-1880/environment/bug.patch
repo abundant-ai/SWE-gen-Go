@@ -1,0 +1,258 @@
+diff --git a/bind.go b/bind.go
+index c9208f6..dfdf82d 100644
+--- a/bind.go
++++ b/bind.go
+@@ -2,6 +2,7 @@ package echo
+ 
+ import (
+ 	"encoding"
++	"encoding/json"
+ 	"encoding/xml"
+ 	"errors"
+ 	"fmt"
+@@ -65,13 +66,13 @@ func (b *DefaultBinder) BindBody(c Context, i interface{}) (err error) {
+ 	ctype := req.Header.Get(HeaderContentType)
+ 	switch {
+ 	case strings.HasPrefix(ctype, MIMEApplicationJSON):
+-		if err = c.Echo().JSONSerializer.Deserialize(c, i); err != nil {
+-			switch err.(type) {
+-			case *HTTPError:
+-				return err
+-			default:
+-				return NewHTTPError(http.StatusBadRequest, err.Error()).SetInternal(err)
++		if err = json.NewDecoder(req.Body).Decode(i); err != nil {
++			if ute, ok := err.(*json.UnmarshalTypeError); ok {
++				return NewHTTPError(http.StatusBadRequest, fmt.Sprintf("Unmarshal type error: expected=%v, got=%v, field=%v, offset=%v", ute.Type, ute.Value, ute.Field, ute.Offset)).SetInternal(err)
++			} else if se, ok := err.(*json.SyntaxError); ok {
++				return NewHTTPError(http.StatusBadRequest, fmt.Sprintf("Syntax error: offset=%v, error=%v", se.Offset, se.Error())).SetInternal(err)
+ 			}
++			return NewHTTPError(http.StatusBadRequest, err.Error()).SetInternal(err)
+ 		}
+ 	case strings.HasPrefix(ctype, MIMEApplicationXML), strings.HasPrefix(ctype, MIMETextXML):
+ 		if err = xml.NewDecoder(req.Body).Decode(i); err != nil {
+diff --git a/context.go b/context.go
+index 544b4da..0cee48c 100644
+--- a/context.go
++++ b/context.go
+@@ -2,6 +2,7 @@ package echo
+ 
+ import (
+ 	"bytes"
++	"encoding/json"
+ 	"encoding/xml"
+ 	"fmt"
+ 	"io"
+@@ -456,16 +457,17 @@ func (c *context) String(code int, s string) (err error) {
+ }
+ 
+ func (c *context) jsonPBlob(code int, callback string, i interface{}) (err error) {
+-	indent := ""
+-	if _, pretty := c.QueryParams()["pretty"]; c.echo.Debug || pretty {
+-		indent = defaultIndent
++	enc := json.NewEncoder(c.response)
++	_, pretty := c.QueryParams()["pretty"]
++	if c.echo.Debug || pretty {
++		enc.SetIndent("", "  ")
+ 	}
+ 	c.writeContentType(MIMEApplicationJavaScriptCharsetUTF8)
+ 	c.response.WriteHeader(code)
+ 	if _, err = c.response.Write([]byte(callback + "(")); err != nil {
+ 		return
+ 	}
+-	if err = c.echo.JSONSerializer.Serialize(c, i, indent); err != nil {
++	if err = enc.Encode(i); err != nil {
+ 		return
+ 	}
+ 	if _, err = c.response.Write([]byte(");")); err != nil {
+@@ -475,9 +477,13 @@ func (c *context) jsonPBlob(code int, callback string, i interface{}) (err error
+ }
+ 
+ func (c *context) json(code int, i interface{}, indent string) error {
++	enc := json.NewEncoder(c.response)
++	if indent != "" {
++		enc.SetIndent("", indent)
++	}
+ 	c.writeContentType(MIMEApplicationJSONCharsetUTF8)
+ 	c.response.Status = code
+-	return c.echo.JSONSerializer.Serialize(c, i, indent)
++	return enc.Encode(i)
+ }
+ 
+ func (c *context) JSON(code int, i interface{}) (err error) {
+diff --git a/echo.go b/echo.go
+index afb1e27..dd0cbf3 100644
+--- a/echo.go
++++ b/echo.go
+@@ -90,7 +90,6 @@ type (
+ 		HidePort         bool
+ 		HTTPErrorHandler HTTPErrorHandler
+ 		Binder           Binder
+-		JSONSerializer   JSONSerializer
+ 		Validator        Validator
+ 		Renderer         Renderer
+ 		Logger           Logger
+@@ -126,12 +125,6 @@ type (
+ 		Validate(i interface{}) error
+ 	}
+ 
+-	// JSONSerializer is the interface that encodes and decodes JSON to and from interfaces.
+-	JSONSerializer interface {
+-		Serialize(c Context, i interface{}, indent string) error
+-		Deserialize(c Context, i interface{}) error
+-	}
+-
+ 	// Renderer is the interface that wraps the Render function.
+ 	Renderer interface {
+ 		Render(io.Writer, string, interface{}, Context) error
+@@ -322,7 +315,6 @@ func New() (e *Echo) {
+ 	e.TLSServer.Handler = e
+ 	e.HTTPErrorHandler = e.DefaultHTTPErrorHandler
+ 	e.Binder = &DefaultBinder{}
+-	e.JSONSerializer = &DefaultJSONSerializer{}
+ 	e.Logger.SetLevel(log.ERROR)
+ 	e.StdLogger = stdLog.New(e.Logger.Output(), e.Logger.Prefix()+": ", 0)
+ 	e.pool.New = func() interface{} {
+diff --git a/json.go b/json.go
+deleted file mode 100644
+index 16b2d05..0000000
+--- a/json.go
++++ /dev/null
+@@ -1,31 +0,0 @@
+-package echo
+-
+-import (
+-	"encoding/json"
+-	"fmt"
+-	"net/http"
+-)
+-
+-// DefaultJSONSerializer implements JSON encoding using encoding/json.
+-type DefaultJSONSerializer struct{}
+-
+-// Serialize converts an interface into a json and writes it to the response.
+-// You can optionally use the indent parameter to produce pretty JSONs.
+-func (d DefaultJSONSerializer) Serialize(c Context, i interface{}, indent string) error {
+-	enc := json.NewEncoder(c.Response())
+-	if indent != "" {
+-		enc.SetIndent("", indent)
+-	}
+-	return enc.Encode(i)
+-}
+-
+-// Deserialize reads a JSON from a request body and converts it into an interface.
+-func (d DefaultJSONSerializer) Deserialize(c Context, i interface{}) error {
+-	err := json.NewDecoder(c.Request().Body).Decode(i)
+-	if ute, ok := err.(*json.UnmarshalTypeError); ok {
+-		return NewHTTPError(http.StatusBadRequest, fmt.Sprintf("Unmarshal type error: expected=%v, got=%v, field=%v, offset=%v", ute.Type, ute.Value, ute.Field, ute.Offset)).SetInternal(err)
+-	} else if se, ok := err.(*json.SyntaxError); ok {
+-		return NewHTTPError(http.StatusBadRequest, fmt.Sprintf("Syntax error: offset=%v, error=%v", se.Offset, se.Error())).SetInternal(err)
+-	}
+-	return err
+-}
+diff --git a/json_test.go b/json_test.go
+deleted file mode 100644
+index 27ee43e..0000000
+--- a/json_test.go
++++ /dev/null
+@@ -1,101 +0,0 @@
+-package echo
+-
+-import (
+-	testify "github.com/stretchr/testify/assert"
+-	"net/http"
+-	"net/http/httptest"
+-	"strings"
+-	"testing"
+-)
+-
+-// Note this test is deliberately simple as there's not a lot to test.
+-// Just need to ensure it writes JSONs. The heavy work is done by the context methods.
+-func TestDefaultJSONCodec_Encode(t *testing.T) {
+-	e := New()
+-	req := httptest.NewRequest(http.MethodPost, "/", nil)
+-	rec := httptest.NewRecorder()
+-	c := e.NewContext(req, rec).(*context)
+-
+-	assert := testify.New(t)
+-
+-	// Echo
+-	assert.Equal(e, c.Echo())
+-
+-	// Request
+-	assert.NotNil(c.Request())
+-
+-	// Response
+-	assert.NotNil(c.Response())
+-
+-	//--------
+-	// Default JSON encoder
+-	//--------
+-
+-	enc := new(DefaultJSONSerializer)
+-
+-	err := enc.Serialize(c, user{1, "Jon Snow"}, "")
+-	if assert.NoError(err) {
+-		assert.Equal(userJSON+"\n", rec.Body.String())
+-	}
+-
+-	req = httptest.NewRequest(http.MethodPost, "/", nil)
+-	rec = httptest.NewRecorder()
+-	c = e.NewContext(req, rec).(*context)
+-	err = enc.Serialize(c, user{1, "Jon Snow"}, "  ")
+-	if assert.NoError(err) {
+-		assert.Equal(userJSONPretty+"\n", rec.Body.String())
+-	}
+-}
+-
+-// Note this test is deliberately simple as there's not a lot to test.
+-// Just need to ensure it writes JSONs. The heavy work is done by the context methods.
+-func TestDefaultJSONCodec_Decode(t *testing.T) {
+-	e := New()
+-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(userJSON))
+-	rec := httptest.NewRecorder()
+-	c := e.NewContext(req, rec).(*context)
+-
+-	assert := testify.New(t)
+-
+-	// Echo
+-	assert.Equal(e, c.Echo())
+-
+-	// Request
+-	assert.NotNil(c.Request())
+-
+-	// Response
+-	assert.NotNil(c.Response())
+-
+-	//--------
+-	// Default JSON encoder
+-	//--------
+-
+-	enc := new(DefaultJSONSerializer)
+-
+-	var u = user{}
+-	err := enc.Deserialize(c, &u)
+-	if assert.NoError(err) {
+-		assert.Equal(u, user{ID: 1, Name: "Jon Snow"})
+-	}
+-
+-	var userUnmarshalSyntaxError = user{}
+-	req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(invalidContent))
+-	rec = httptest.NewRecorder()
+-	c = e.NewContext(req, rec).(*context)
+-	err = enc.Deserialize(c, &userUnmarshalSyntaxError)
+-	assert.IsType(&HTTPError{}, err)
+-	assert.EqualError(err, "code=400, message=Syntax error: offset=1, error=invalid character 'i' looking for beginning of value, internal=invalid character 'i' looking for beginning of value")
+-
+-	var userUnmarshalTypeError = struct {
+-		ID   string `json:"id"`
+-		Name string `json:"name"`
+-	}{}
+-
+-	req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(userJSON))
+-	rec = httptest.NewRecorder()
+-	c = e.NewContext(req, rec).(*context)
+-	err = enc.Deserialize(c, &userUnmarshalTypeError)
+-	assert.IsType(&HTTPError{}, err)
+-	assert.EqualError(err, "code=400, message=Unmarshal type error: expected=string, got=number, field=id, offset=7, internal=json: cannot unmarshal number into Go struct field .id of type string")
+-
+-}

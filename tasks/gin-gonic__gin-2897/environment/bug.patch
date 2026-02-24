@@ -1,0 +1,393 @@
+diff --git a/context.go b/context.go
+index bc2c38e..bea95cc 100644
+--- a/context.go
++++ b/context.go
+@@ -55,9 +55,8 @@ type Context struct {
+ 	index    int8
+ 	fullPath string
+ 
+-	engine       *Engine
+-	params       *Params
+-	skippedNodes *[]skippedNode
++	engine *Engine
++	params *Params
+ 
+ 	// This mutex protect Keys map
+ 	mu sync.RWMutex
+@@ -100,7 +99,6 @@ func (c *Context) reset() {
+ 	c.queryCache = nil
+ 	c.formCache = nil
+ 	*c.params = (*c.params)[:0]
+-	*c.skippedNodes = (*c.skippedNodes)[:0]
+ }
+ 
+ // Copy returns a copy of the current context that can be safely used outside the request's scope.
+diff --git a/gin.go b/gin.go
+index 1774717..af83161 100644
+--- a/gin.go
++++ b/gin.go
+@@ -144,7 +144,6 @@ type Engine struct {
+ 	pool             sync.Pool
+ 	trees            methodTrees
+ 	maxParams        uint16
+-	maxSections      uint16
+ 	trustedProxies   []string
+ 	trustedCIDRs     []*net.IPNet
+ }
+@@ -201,8 +200,7 @@ func Default() *Engine {
+ 
+ func (engine *Engine) allocateContext() *Context {
+ 	v := make(Params, 0, engine.maxParams)
+-	skippedNodes := make([]skippedNode, 0, engine.maxSections)
+-	return &Context{engine: engine, params: &v, skippedNodes: &skippedNodes}
++	return &Context{engine: engine, params: &v}
+ }
+ 
+ // Delims sets template left and right delims and returns a Engine instance.
+@@ -308,10 +306,6 @@ func (engine *Engine) addRoute(method, path string, handlers HandlersChain) {
+ 	if paramsCount := countParams(path); paramsCount > engine.maxParams {
+ 		engine.maxParams = paramsCount
+ 	}
+-
+-	if sectionsCount := countSections(path); sectionsCount > engine.maxSections {
+-		engine.maxSections = sectionsCount
+-	}
+ }
+ 
+ // Routes returns a slice of registered routes, including some useful information, such as:
+@@ -545,7 +539,7 @@ func (engine *Engine) handleHTTPRequest(c *Context) {
+ 		}
+ 		root := t[i].root
+ 		// Find route in tree
+-		value := root.getValue(rPath, c.params, c.skippedNodes, unescape)
++		value := root.getValue(rPath, c.params, unescape)
+ 		if value.params != nil {
+ 			c.Params = *value.params
+ 		}
+@@ -573,7 +567,7 @@ func (engine *Engine) handleHTTPRequest(c *Context) {
+ 			if tree.method == httpMethod {
+ 				continue
+ 			}
+-			if value := tree.root.getValue(rPath, nil, c.skippedNodes, unescape); value.handlers != nil {
++			if value := tree.root.getValue(rPath, nil, unescape); value.handlers != nil {
+ 				c.handlers = engine.allNoMethod
+ 				serveError(c, http.StatusMethodNotAllowed, default405Body)
+ 				return
+diff --git a/gin_integration_test.go b/gin_integration_test.go
+index 8c22e7b..0b67b54 100644
+--- a/gin_integration_test.go
++++ b/gin_integration_test.go
+@@ -408,13 +408,8 @@ func TestTreeRunDynamicRouting(t *testing.T) {
+ 	router.GET("/ab/*xx", func(c *Context) { c.String(http.StatusOK, "/ab/*xx") })
+ 	router.GET("/", func(c *Context) { c.String(http.StatusOK, "home") })
+ 	router.GET("/:cc", func(c *Context) { c.String(http.StatusOK, "/:cc") })
+-	router.GET("/c1/:dd/e", func(c *Context) { c.String(http.StatusOK, "/c1/:dd/e") })
+-	router.GET("/c1/:dd/e1", func(c *Context) { c.String(http.StatusOK, "/c1/:dd/e1") })
+-	router.GET("/c1/:dd/f1", func(c *Context) { c.String(http.StatusOK, "/c1/:dd/f1") })
+-	router.GET("/c1/:dd/f2", func(c *Context) { c.String(http.StatusOK, "/c1/:dd/f2") })
+ 	router.GET("/:cc/cc", func(c *Context) { c.String(http.StatusOK, "/:cc/cc") })
+ 	router.GET("/:cc/:dd/ee", func(c *Context) { c.String(http.StatusOK, "/:cc/:dd/ee") })
+-	router.GET("/:cc/:dd/f", func(c *Context) { c.String(http.StatusOK, "/:cc/:dd/f") })
+ 	router.GET("/:cc/:dd/:ee/ff", func(c *Context) { c.String(http.StatusOK, "/:cc/:dd/:ee/ff") })
+ 	router.GET("/:cc/:dd/:ee/:ff/gg", func(c *Context) { c.String(http.StatusOK, "/:cc/:dd/:ee/:ff/gg") })
+ 	router.GET("/:cc/:dd/:ee/:ff/:gg/hh", func(c *Context) { c.String(http.StatusOK, "/:cc/:dd/:ee/:ff/:gg/hh") })
+@@ -451,10 +446,6 @@ func TestTreeRunDynamicRouting(t *testing.T) {
+ 	testRequest(t, ts.URL+"/all", "", "/:cc")
+ 	testRequest(t, ts.URL+"/all/cc", "", "/:cc/cc")
+ 	testRequest(t, ts.URL+"/a/cc", "", "/:cc/cc")
+-	testRequest(t, ts.URL+"/c1/d/e", "", "/c1/:dd/e")
+-	testRequest(t, ts.URL+"/c1/d/e1", "", "/c1/:dd/e1")
+-	testRequest(t, ts.URL+"/c1/d/ee", "", "/:cc/:dd/ee")
+-	testRequest(t, ts.URL+"/c1/d/f", "", "/:cc/:dd/f")
+ 	testRequest(t, ts.URL+"/c/d/ee", "", "/:cc/:dd/ee")
+ 	testRequest(t, ts.URL+"/c/d/e/ff", "", "/:cc/:dd/:ee/ff")
+ 	testRequest(t, ts.URL+"/c/d/e/f/gg", "", "/:cc/:dd/:ee/:ff/gg")
+@@ -537,12 +528,6 @@ func TestTreeRunDynamicRouting(t *testing.T) {
+ 	testRequest(t, ts.URL+"/get/abc/123abf/testss", "", "/get/abc/123abf/:param")
+ 	testRequest(t, ts.URL+"/get/abc/123abfff/te", "", "/get/abc/123abfff/:param")
+ 	// 404 not found
+-	testRequest(t, ts.URL+"/c/d/e", "404 Not Found")
+-	testRequest(t, ts.URL+"/c/d/e1", "404 Not Found")
+-	testRequest(t, ts.URL+"/c/d/eee", "404 Not Found")
+-	testRequest(t, ts.URL+"/c1/d/eee", "404 Not Found")
+-	testRequest(t, ts.URL+"/c1/d/e2", "404 Not Found")
+-	testRequest(t, ts.URL+"/cc/dd/ee/ff/gg/hh1", "404 Not Found")
+ 	testRequest(t, ts.URL+"/a/dd", "404 Not Found")
+ 	testRequest(t, ts.URL+"/addr/dd/aa", "404 Not Found")
+ 	testRequest(t, ts.URL+"/something/secondthing/121", "404 Not Found")
+diff --git a/tree.go b/tree.go
+index c8a7548..fb0a593 100644
+--- a/tree.go
++++ b/tree.go
+@@ -17,7 +17,6 @@ import (
+ var (
+ 	strColon = []byte(":")
+ 	strStar  = []byte("*")
+-	strSlash = []byte("/")
+ )
+ 
+ // Param is a single URL parameter, consisting of a key and a value.
+@@ -99,11 +98,6 @@ func countParams(path string) uint16 {
+ 	return n
+ }
+ 
+-func countSections(path string) uint16 {
+-	s := bytesconv.StringToBytes(path)
+-	return uint16(bytes.Count(s, strSlash))
+-}
+-
+ type nodeType uint8
+ 
+ const (
+@@ -399,19 +393,16 @@ type nodeValue struct {
+ 	fullPath string
+ }
+ 
+-type skippedNode struct {
+-	path        string
+-	node        *node
+-	paramsCount int16
+-}
+-
+ // Returns the handle registered with the given path (key). The values of
+ // wildcards are saved to a map.
+ // If no handle can be found, a TSR (trailing slash redirect) recommendation is
+ // made if a handle exists with an extra (without the) trailing slash for the
+ // given path.
+-func (n *node) getValue(path string, params *Params, skippedNodes *[]skippedNode, unescape bool) (value nodeValue) {
+-	var globalParamsCount int16
++func (n *node) getValue(path string, params *Params, unescape bool) (value nodeValue) {
++	var (
++		skippedPath string
++		latestNode  = n // Caching the latest node
++	)
+ 
+ walk: // Outer loop for walking the tree
+ 	for {
+@@ -426,20 +417,15 @@ walk: // Outer loop for walking the tree
+ 					if c == idxc {
+ 						//  strings.HasPrefix(n.children[len(n.children)-1].path, ":") == n.wildChild
+ 						if n.wildChild {
+-							index := len(*skippedNodes)
+-							*skippedNodes = (*skippedNodes)[:index+1]
+-							(*skippedNodes)[index] = skippedNode{
+-								path: prefix + path,
+-								node: &node{
+-									path:      n.path,
+-									wildChild: n.wildChild,
+-									nType:     n.nType,
+-									priority:  n.priority,
+-									children:  n.children,
+-									handlers:  n.handlers,
+-									fullPath:  n.fullPath,
+-								},
+-								paramsCount: globalParamsCount,
++							skippedPath = prefix + path
++							latestNode = &node{
++								path:      n.path,
++								wildChild: n.wildChild,
++								nType:     n.nType,
++								priority:  n.priority,
++								children:  n.children,
++								handlers:  n.handlers,
++								fullPath:  n.fullPath,
+ 							}
+ 						}
+ 
+@@ -448,22 +434,10 @@ walk: // Outer loop for walking the tree
+ 					}
+ 				}
+ 				// If the path at the end of the loop is not equal to '/' and the current node has no child nodes
+-				// the current node needs to roll back to last vaild skippedNode
+-
+-				if path != "/" && !n.wildChild {
+-					for l := len(*skippedNodes); l > 0; {
+-						skippedNode := (*skippedNodes)[l-1]
+-						*skippedNodes = (*skippedNodes)[:l-1]
+-						if strings.HasSuffix(skippedNode.path, path) {
+-							path = skippedNode.path
+-							n = skippedNode.node
+-							if value.params != nil {
+-								*value.params = (*value.params)[:skippedNode.paramsCount]
+-							}
+-							globalParamsCount = skippedNode.paramsCount
+-							continue walk
+-						}
+-					}
++				// the current node needs to be equal to the latest matching node
++				matched := path != "/" && !n.wildChild
++				if matched {
++					n = latestNode
+ 				}
+ 
+ 				// If there is no wildcard pattern, recommend a redirection
+@@ -477,12 +451,18 @@ walk: // Outer loop for walking the tree
+ 
+ 				// Handle wildcard child, which is always at the end of the array
+ 				n = n.children[len(n.children)-1]
+-				globalParamsCount++
+ 
+ 				switch n.nType {
+ 				case param:
+ 					// fix truncate the parameter
+ 					// tree_test.go  line: 204
++					if matched {
++						path = prefix + path
++						// The saved path is used after the prefix route is intercepted by matching
++						if n.indices == "/" {
++							path = skippedPath[1:]
++						}
++					}
+ 
+ 					// Find param end (either '/' or path end)
+ 					end := 0
+@@ -568,22 +548,9 @@ walk: // Outer loop for walking the tree
+ 
+ 		if path == prefix {
+ 			// If the current path does not equal '/' and the node does not have a registered handle and the most recently matched node has a child node
+-			// the current node needs to roll back to last vaild skippedNode
+-			if n.handlers == nil && path != "/" {
+-				for l := len(*skippedNodes); l > 0; {
+-					skippedNode := (*skippedNodes)[l-1]
+-					*skippedNodes = (*skippedNodes)[:l-1]
+-					if strings.HasSuffix(skippedNode.path, path) {
+-						path = skippedNode.path
+-						n = skippedNode.node
+-						if value.params != nil {
+-							*value.params = (*value.params)[:skippedNode.paramsCount]
+-						}
+-						globalParamsCount = skippedNode.paramsCount
+-						continue walk
+-					}
+-				}
+-				//	n = latestNode.children[len(latestNode.children)-1]
++			// the current node needs to be equal to the latest matching node
++			if latestNode.wildChild && n.handlers == nil && path != "/" {
++				n = latestNode.children[len(latestNode.children)-1]
+ 			}
+ 			// We should have reached the node containing the handle.
+ 			// Check if this node has a handle registered.
+@@ -614,21 +581,19 @@ walk: // Outer loop for walking the tree
+ 			return
+ 		}
+ 
+-		// roll back to last vaild skippedNode
+-		if path != "/" {
+-			for l := len(*skippedNodes); l > 0; {
+-				skippedNode := (*skippedNodes)[l-1]
+-				*skippedNodes = (*skippedNodes)[:l-1]
+-				if strings.HasSuffix(skippedNode.path, path) {
+-					path = skippedNode.path
+-					n = skippedNode.node
+-					if value.params != nil {
+-						*value.params = (*value.params)[:skippedNode.paramsCount]
+-					}
+-					globalParamsCount = skippedNode.paramsCount
+-					continue walk
+-				}
+-			}
++		if path != "/" && len(skippedPath) > 0 && strings.HasSuffix(skippedPath, path) {
++			path = skippedPath
++			// Reduce the number of cycles
++			n, latestNode = latestNode, n
++			// skippedPath cannot execute
++			// example:
++			// * /:cc/cc
++			// call /a/cc 	     expectations:match/200      Actual:match/200
++			// call /a/dd 	     expectations:unmatch/404    Actual: panic
++			// call /addr/dd/aa  expectations:unmatch/404    Actual: panic
++			// skippedPath: It can only be executed if the secondary route is not found
++			skippedPath = ""
++			continue walk
+ 		}
+ 
+ 		// Nothing found. We can recommend to redirect to the same URL with an
+diff --git a/tree_test.go b/tree_test.go
+index 49b3b57..8ae5b7d 100644
+--- a/tree_test.go
++++ b/tree_test.go
+@@ -33,11 +33,6 @@ func getParams() *Params {
+ 	return &ps
+ }
+ 
+-func getSkippedNodes() *[]skippedNode {
+-	ps := make([]skippedNode, 0, 20)
+-	return &ps
+-}
+-
+ func checkRequests(t *testing.T, tree *node, requests testRequests, unescapes ...bool) {
+ 	unescape := false
+ 	if len(unescapes) >= 1 {
+@@ -45,7 +40,7 @@ func checkRequests(t *testing.T, tree *node, requests testRequests, unescapes ..
+ 	}
+ 
+ 	for _, request := range requests {
+-		value := tree.getValue(request.path, getParams(), getSkippedNodes(), unescape)
++		value := tree.getValue(request.path, getParams(), unescape)
+ 
+ 		if value.handlers == nil {
+ 			if !request.nilHandler {
+@@ -162,8 +157,6 @@ func TestTreeWildcard(t *testing.T) {
+ 		"/aa/*xx",
+ 		"/ab/*xx",
+ 		"/:cc",
+-		"/c1/:dd/e",
+-		"/c1/:dd/e1",
+ 		"/:cc/cc",
+ 		"/:cc/:dd/ee",
+ 		"/:cc/:dd/:ee/ff",
+@@ -245,9 +238,6 @@ func TestTreeWildcard(t *testing.T) {
+ 		{"/alldd", false, "/:cc", Params{Param{Key: "cc", Value: "alldd"}}},
+ 		{"/all/cc", false, "/:cc/cc", Params{Param{Key: "cc", Value: "all"}}},
+ 		{"/a/cc", false, "/:cc/cc", Params{Param{Key: "cc", Value: "a"}}},
+-		{"/c1/d/e", false, "/c1/:dd/e", Params{Param{Key: "dd", Value: "d"}}},
+-		{"/c1/d/e1", false, "/c1/:dd/e1", Params{Param{Key: "dd", Value: "d"}}},
+-		{"/c1/d/ee", false, "/:cc/:dd/ee", Params{Param{Key: "cc", Value: "c1"}, Param{Key: "dd", Value: "d"}}},
+ 		{"/cc/cc", false, "/:cc/cc", Params{Param{Key: "cc", Value: "cc"}}},
+ 		{"/ccc/cc", false, "/:cc/cc", Params{Param{Key: "cc", Value: "ccc"}}},
+ 		{"/deedwjfs/cc", false, "/:cc/cc", Params{Param{Key: "cc", Value: "deedwjfs"}}},
+@@ -615,7 +605,7 @@ func TestTreeTrailingSlashRedirect(t *testing.T) {
+ 		"/doc/",
+ 	}
+ 	for _, route := range tsrRoutes {
+-		value := tree.getValue(route, nil, getSkippedNodes(), false)
++		value := tree.getValue(route, nil, false)
+ 		if value.handlers != nil {
+ 			t.Fatalf("non-nil handler for TSR route '%s", route)
+ 		} else if !value.tsr {
+@@ -632,7 +622,7 @@ func TestTreeTrailingSlashRedirect(t *testing.T) {
+ 		"/api/world/abc",
+ 	}
+ 	for _, route := range noTsrRoutes {
+-		value := tree.getValue(route, nil, getSkippedNodes(), false)
++		value := tree.getValue(route, nil, false)
+ 		if value.handlers != nil {
+ 			t.Fatalf("non-nil handler for No-TSR route '%s", route)
+ 		} else if value.tsr {
+@@ -651,7 +641,7 @@ func TestTreeRootTrailingSlashRedirect(t *testing.T) {
+ 		t.Fatalf("panic inserting test route: %v", recv)
+ 	}
+ 
+-	value := tree.getValue("/", nil, getSkippedNodes(), false)
++	value := tree.getValue("/", nil, false)
+ 	if value.handlers != nil {
+ 		t.Fatalf("non-nil handler")
+ 	} else if value.tsr {
+@@ -831,7 +821,7 @@ func TestTreeInvalidNodeType(t *testing.T) {
+ 
+ 	// normal lookup
+ 	recv := catchPanic(func() {
+-		tree.getValue("/test", nil, getSkippedNodes(), false)
++		tree.getValue("/test", nil, false)
+ 	})
+ 	if rs, ok := recv.(string); !ok || rs != panicMsg {
+ 		t.Fatalf("Expected panic '"+panicMsg+"', got '%v'", recv)
+@@ -856,7 +846,7 @@ func TestTreeInvalidParamsType(t *testing.T) {
+ 	params := make(Params, 0)
+ 
+ 	// try to trigger slice bounds out of range with capacity 0
+-	tree.getValue("/test", &params, getSkippedNodes(), false)
++	tree.getValue("/test", &params, false)
+ }
+ 
+ func TestTreeWildcardConflictEx(t *testing.T) {

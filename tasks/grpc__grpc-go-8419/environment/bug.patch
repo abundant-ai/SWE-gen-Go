@@ -1,0 +1,224 @@
+diff --git a/internal/xds/bootstrap/bootstrap.go b/internal/xds/bootstrap/bootstrap.go
+index 6c7b2332..f409e4bd 100644
+--- a/internal/xds/bootstrap/bootstrap.go
++++ b/internal/xds/bootstrap/bootstrap.go
+@@ -576,9 +576,6 @@ func (c *Config) UnmarshalJSON(data []byte) error {
+ // the presence of the errors) and may return a Config object with certain
+ // fields left unspecified, in which case the caller should use some sane
+ // defaults.
+-//
+-// This function returns an error if it's unable to parse the contents of the
+-// bootstrap config. It returns (nil, nil) if none of the env vars are set.
+ func GetConfiguration() (*Config, error) {
+ 	fName := envconfig.XDSBootstrapFileName
+ 	fContent := envconfig.XDSBootstrapFileContent
+@@ -601,7 +598,7 @@ func GetConfiguration() (*Config, error) {
+ 		return NewConfigFromContents([]byte(fContent))
+ 	}
+ 
+-	return nil, nil
++	return nil, fmt.Errorf("bootstrap environment variables (%q or %q) not defined", envconfig.XDSBootstrapFileNameEnv, envconfig.XDSBootstrapFileContentEnv)
+ }
+ 
+ // NewConfigFromContents creates a new bootstrap configuration from the provided
+diff --git a/internal/xds/bootstrap/bootstrap_test.go b/internal/xds/bootstrap/bootstrap_test.go
+index 88f27a4a..d0571978 100644
+--- a/internal/xds/bootstrap/bootstrap_test.go
++++ b/internal/xds/bootstrap/bootstrap_test.go
+@@ -383,19 +383,12 @@ func (s) TestGetConfiguration_Failure(t *testing.T) {
+ 	cancel := setupBootstrapOverride(bootstrapFileMap)
+ 	defer cancel()
+ 
+-	for _, name := range []string{"nonExistentBootstrapFile", "badJSON", "noBalancerName", "emptyXdsServer"} {
++	for _, name := range []string{"nonExistentBootstrapFile", "empty", "badJSON", "noBalancerName", "emptyXdsServer"} {
+ 		t.Run(name, func(t *testing.T) {
+ 			testGetConfigurationWithFileNameEnv(t, name, true, nil)
+ 			testGetConfigurationWithFileContentEnv(t, name, true, nil)
+ 		})
+ 	}
+-	const name = "empty"
+-	t.Run(name, func(t *testing.T) {
+-		testGetConfigurationWithFileNameEnv(t, name, true, nil)
+-		// If both the env vars are empty, a nil config with a nil error must be
+-		// returned.
+-		testGetConfigurationWithFileContentEnv(t, name, false, nil)
+-	})
+ }
+ 
+ // Tests the functionality in GetConfiguration with different bootstrap file
+@@ -469,9 +462,9 @@ func (s) TestGetConfiguration_BootstrapEnvPriority(t *testing.T) {
+ 	envconfig.XDSBootstrapFileContent = ""
+ 	defer func() { envconfig.XDSBootstrapFileContent = origBootstrapContent }()
+ 
+-	// When both env variables are empty, GetConfiguration should return nil.
+-	if cfg, err := GetConfiguration(); err != nil || cfg != nil {
+-		t.Errorf("GetConfiguration() returned (%v, %v), want (<nil>, <nil>)", cfg, err)
++	// When both env variables are empty, GetConfiguration should fail.
++	if _, err := GetConfiguration(); err == nil {
++		t.Errorf("GetConfiguration() returned nil error, expected to fail")
+ 	}
+ 
+ 	// When one of them is set, it should be used.
+diff --git a/xds/internal/xdsclient/pool.go b/xds/internal/xdsclient/pool.go
+index e5a34ae3..113e6e8e 100644
+--- a/xds/internal/xdsclient/pool.go
++++ b/xds/internal/xdsclient/pool.go
+@@ -25,7 +25,6 @@ import (
+ 
+ 	v3statuspb "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
+ 	estats "google.golang.org/grpc/experimental/stats"
+-	"google.golang.org/grpc/internal/envconfig"
+ 	istats "google.golang.org/grpc/internal/stats"
+ 	"google.golang.org/grpc/internal/xds/bootstrap"
+ 	"google.golang.org/protobuf/proto"
+@@ -35,10 +34,7 @@ var (
+ 	// DefaultPool is the default pool for xDS clients. It is created at init
+ 	// time and reads bootstrap configuration from env vars to create the xDS
+ 	// client.
+-	DefaultPool = &Pool{
+-		clients:          make(map[string]*clientImpl),
+-		getConfiguration: sync.OnceValues(bootstrap.GetConfiguration),
+-	}
++	DefaultPool = &Pool{clients: make(map[string]*clientImpl)}
+ )
+ 
+ // Pool represents a pool of xDS clients that share the same bootstrap
+@@ -47,12 +43,9 @@ type Pool struct {
+ 	// Note that mu should ideally only have to guard clients. But here, we need
+ 	// it to guard config as well since SetFallbackBootstrapConfig writes to
+ 	// config.
+-	mu             sync.Mutex
+-	clients        map[string]*clientImpl
+-	fallbackConfig *bootstrap.Config
+-	// getConfiguration is a sync.OnceValues that attempts to read the bootstrap
+-	// configuration from environment variables once.
+-	getConfiguration func() (*bootstrap.Config, error)
++	mu      sync.Mutex
++	clients map[string]*clientImpl
++	config  *bootstrap.Config
+ }
+ 
+ // OptionsForTesting contains options to configure xDS client creation for
+@@ -85,9 +78,7 @@ type OptionsForTesting struct {
+ func NewPool(config *bootstrap.Config) *Pool {
+ 	return &Pool{
+ 		clients: make(map[string]*clientImpl),
+-		getConfiguration: func() (*bootstrap.Config, error) {
+-			return config, nil
+-		},
++		config:  config,
+ 	}
+ }
+ 
+@@ -163,7 +154,12 @@ func (p *Pool) GetClientForTesting(name string) (XDSClient, func(), error) {
+ func (p *Pool) SetFallbackBootstrapConfig(config *bootstrap.Config) {
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+-	p.fallbackConfig = config
++
++	if p.config != nil {
++		logger.Error("Attempt to set a bootstrap configuration even though one is already set via environment variables.")
++		return
++	}
++	p.config = config
+ }
+ 
+ // DumpResources returns the status and contents of all xDS resources.
+@@ -195,11 +191,7 @@ func (p *Pool) DumpResources() *v3statuspb.ClientStatusResponse {
+ func (p *Pool) BootstrapConfigForTesting() *bootstrap.Config {
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+-	cfg, _ := p.getConfiguration()
+-	if cfg != nil {
+-		return cfg
+-	}
+-	return p.fallbackConfig
++	return p.config
+ }
+ 
+ // UnsetBootstrapConfigForTesting unsets the bootstrap configuration used by
+@@ -209,8 +201,7 @@ func (p *Pool) BootstrapConfigForTesting() *bootstrap.Config {
+ func (p *Pool) UnsetBootstrapConfigForTesting() {
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+-	p.fallbackConfig = nil
+-	p.getConfiguration = sync.OnceValues(bootstrap.GetConfiguration)
++	p.config = nil
+ }
+ 
+ func (p *Pool) clientRefCountedClose(name string) {
+@@ -252,19 +243,26 @@ func (p *Pool) newRefCounted(name string, metricsRecorder estats.MetricsRecorder
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+ 
+-	config, err := p.getConfiguration()
+-	if err != nil {
+-		return nil, nil, fmt.Errorf("xds: failed to read xDS bootstrap config from env vars:  %v", err)
+-	}
+-
+-	if config == nil {
+-		// If the environment variables are not set, then fallback bootstrap
+-		// configuration should be set before attempting to create an xDS client,
+-		// else xDS client creation will fail.
+-		config = p.fallbackConfig
+-	}
+-	if config == nil {
+-		return nil, nil, fmt.Errorf("failed to read xDS bootstrap config from env vars: bootstrap environment variables (%q or %q) not defined and fallback config not set", envconfig.XDSBootstrapFileNameEnv, envconfig.XDSBootstrapFileContentEnv)
++	if p.config == nil {
++		if len(p.clients) != 0 || p != DefaultPool {
++			// If the current pool `p` already contains xDS clients or it is not
++			// the `DefaultPool`, the bootstrap config should have been already
++			// present in the pool.
++			return nil, nil, fmt.Errorf("xds: bootstrap configuration not set in the pool")
++		}
++		// If the current pool `p` is the `DefaultPool` and has no clients, it
++		// might be the first time an xDS client is being created on it. So,
++		// the bootstrap configuration is read from environment variables.
++		//
++		// DefaultPool is initialized with bootstrap configuration from one of the
++		// supported environment variables. If the environment variables are not
++		// set, then fallback bootstrap configuration should be set before
++		// attempting to create an xDS client, else xDS client creation will fail.
++		config, err := bootstrap.GetConfiguration()
++		if err != nil {
++			return nil, nil, fmt.Errorf("xds: failed to read xDS bootstrap config from env vars:  %v", err)
++		}
++		p.config = config
+ 	}
+ 
+ 	if c := p.clients[name]; c != nil {
+@@ -272,16 +270,16 @@ func (p *Pool) newRefCounted(name string, metricsRecorder estats.MetricsRecorder
+ 		return c, sync.OnceFunc(func() { p.clientRefCountedClose(name) }), nil
+ 	}
+ 
+-	c, err := newClientImpl(config, metricsRecorder, name)
++	c, err := newClientImpl(p.config, metricsRecorder, name)
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
+ 	if logger.V(2) {
+-		c.logger.Infof("Created client with name %q and bootstrap configuration:\n %s", name, config)
++		c.logger.Infof("Created client with name %q and bootstrap configuration:\n %s", name, p.config)
+ 	}
+ 	p.clients[name] = c
+ 	xdsClientImplCreateHook(name)
+ 
+-	logger.Infof("xDS node ID: %s", config.Node().GetId())
++	logger.Infof("xDS node ID: %s", p.config.Node().GetId())
+ 	return c, sync.OnceFunc(func() { p.clientRefCountedClose(name) }), nil
+ }
+diff --git a/xds/internal/xdsclient/pool/pool_test.go b/xds/internal/xdsclient/pool/pool_test.go
+index 8b8cfe4b..b12cc737 100644
+--- a/xds/internal/xdsclient/pool/pool_test.go
++++ b/xds/internal/xdsclient/pool/pool_test.go
+@@ -73,10 +73,6 @@ func (s) TestDefaultPool_LazyLoadBootstrapConfig(t *testing.T) {
+ 		t.Fatalf("DefaultPool.BootstrapConfigForTesting() = %v, want nil", cfg)
+ 	}
+ 
+-	// The pool will attempt to read the env vars only once. Reset the pool's
+-	// state to make it re-read the env vars during next client creation.
+-	xdsclient.DefaultPool.UnsetBootstrapConfigForTesting()
+-
+ 	_, closeFunc, err = xdsclient.DefaultPool.NewClient(t.Name(), &stats.NoopMetricsRecorder{})
+ 	if err != nil {
+ 		t.Fatalf("Failed to create xDS client: %v", err)

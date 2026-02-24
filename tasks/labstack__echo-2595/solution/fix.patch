@@ -1,0 +1,227 @@
+diff --git a/middleware/body_dump.go b/middleware/body_dump.go
+index fa7891b..946ffc5 100644
+--- a/middleware/body_dump.go
++++ b/middleware/body_dump.go
+@@ -3,6 +3,7 @@ package middleware
+ import (
+ 	"bufio"
+ 	"bytes"
++	"errors"
+ 	"io"
+ 	"net"
+ 	"net/http"
+@@ -98,9 +99,16 @@ func (w *bodyDumpResponseWriter) Write(b []byte) (int, error) {
+ }
+ 
+ func (w *bodyDumpResponseWriter) Flush() {
+-	w.ResponseWriter.(http.Flusher).Flush()
++	err := responseControllerFlush(w.ResponseWriter)
++	if err != nil && errors.Is(err, http.ErrNotSupported) {
++		panic(errors.New("response writer flushing is not supported"))
++	}
+ }
+ 
+ func (w *bodyDumpResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+-	return w.ResponseWriter.(http.Hijacker).Hijack()
++	return responseControllerHijack(w.ResponseWriter)
++}
++
++func (w *bodyDumpResponseWriter) Unwrap() http.ResponseWriter {
++	return w.ResponseWriter
+ }
+diff --git a/middleware/compress.go b/middleware/compress.go
+index 3e9bd32..c77062d 100644
+--- a/middleware/compress.go
++++ b/middleware/compress.go
+@@ -191,13 +191,15 @@ func (w *gzipResponseWriter) Flush() {
+ 	}
+ 
+ 	w.Writer.(*gzip.Writer).Flush()
+-	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+-		flusher.Flush()
+-	}
++	_ = responseControllerFlush(w.ResponseWriter)
++}
++
++func (w *gzipResponseWriter) Unwrap() http.ResponseWriter {
++	return w.ResponseWriter
+ }
+ 
+ func (w *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+-	return w.ResponseWriter.(http.Hijacker).Hijack()
++	return responseControllerHijack(w.ResponseWriter)
+ }
+ 
+ func (w *gzipResponseWriter) Push(target string, opts *http.PushOptions) error {
+diff --git a/middleware/responsecontroller_1.19.go b/middleware/responsecontroller_1.19.go
+new file mode 100644
+index 0000000..104784f
+--- /dev/null
++++ b/middleware/responsecontroller_1.19.go
+@@ -0,0 +1,41 @@
++//go:build !go1.20
++
++package middleware
++
++import (
++	"bufio"
++	"fmt"
++	"net"
++	"net/http"
++)
++
++// TODO: remove when Go 1.23 is released and we do not support 1.19 anymore
++func responseControllerFlush(rw http.ResponseWriter) error {
++	for {
++		switch t := rw.(type) {
++		case interface{ FlushError() error }:
++			return t.FlushError()
++		case http.Flusher:
++			t.Flush()
++			return nil
++		case interface{ Unwrap() http.ResponseWriter }:
++			rw = t.Unwrap()
++		default:
++			return fmt.Errorf("%w", http.ErrNotSupported)
++		}
++	}
++}
++
++// TODO: remove when Go 1.23 is released and we do not support 1.19 anymore
++func responseControllerHijack(rw http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
++	for {
++		switch t := rw.(type) {
++		case http.Hijacker:
++			return t.Hijack()
++		case interface{ Unwrap() http.ResponseWriter }:
++			rw = t.Unwrap()
++		default:
++			return nil, nil, fmt.Errorf("%w", http.ErrNotSupported)
++		}
++	}
++}
+diff --git a/middleware/responsecontroller_1.20.go b/middleware/responsecontroller_1.20.go
+new file mode 100644
+index 0000000..02a0cb7
+--- /dev/null
++++ b/middleware/responsecontroller_1.20.go
+@@ -0,0 +1,17 @@
++//go:build go1.20
++
++package middleware
++
++import (
++	"bufio"
++	"net"
++	"net/http"
++)
++
++func responseControllerFlush(rw http.ResponseWriter) error {
++	return http.NewResponseController(rw).Flush()
++}
++
++func responseControllerHijack(rw http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
++	return http.NewResponseController(rw).Hijack()
++}
+diff --git a/response.go b/response.go
+index d9c9aa6..117881c 100644
+--- a/response.go
++++ b/response.go
+@@ -2,6 +2,7 @@ package echo
+ 
+ import (
+ 	"bufio"
++	"errors"
+ 	"net"
+ 	"net/http"
+ )
+@@ -84,14 +85,17 @@ func (r *Response) Write(b []byte) (n int, err error) {
+ // buffered data to the client.
+ // See [http.Flusher](https://golang.org/pkg/net/http/#Flusher)
+ func (r *Response) Flush() {
+-	r.Writer.(http.Flusher).Flush()
++	err := responseControllerFlush(r.Writer)
++	if err != nil && errors.Is(err, http.ErrNotSupported) {
++		panic(errors.New("response writer flushing is not supported"))
++	}
+ }
+ 
+ // Hijack implements the http.Hijacker interface to allow an HTTP handler to
+ // take over the connection.
+ // See [http.Hijacker](https://golang.org/pkg/net/http/#Hijacker)
+ func (r *Response) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+-	return r.Writer.(http.Hijacker).Hijack()
++	return responseControllerHijack(r.Writer)
+ }
+ 
+ // Unwrap returns the original http.ResponseWriter.
+diff --git a/responsecontroller_1.19.go b/responsecontroller_1.19.go
+new file mode 100644
+index 0000000..75c6e3e
+--- /dev/null
++++ b/responsecontroller_1.19.go
+@@ -0,0 +1,41 @@
++//go:build !go1.20
++
++package echo
++
++import (
++	"bufio"
++	"fmt"
++	"net"
++	"net/http"
++)
++
++// TODO: remove when Go 1.23 is released and we do not support 1.19 anymore
++func responseControllerFlush(rw http.ResponseWriter) error {
++	for {
++		switch t := rw.(type) {
++		case interface{ FlushError() error }:
++			return t.FlushError()
++		case http.Flusher:
++			t.Flush()
++			return nil
++		case interface{ Unwrap() http.ResponseWriter }:
++			rw = t.Unwrap()
++		default:
++			return fmt.Errorf("%w", http.ErrNotSupported)
++		}
++	}
++}
++
++// TODO: remove when Go 1.23 is released and we do not support 1.19 anymore
++func responseControllerHijack(rw http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
++	for {
++		switch t := rw.(type) {
++		case http.Hijacker:
++			return t.Hijack()
++		case interface{ Unwrap() http.ResponseWriter }:
++			rw = t.Unwrap()
++		default:
++			return nil, nil, fmt.Errorf("%w", http.ErrNotSupported)
++		}
++	}
++}
+diff --git a/responsecontroller_1.20.go b/responsecontroller_1.20.go
+new file mode 100644
+index 0000000..fa2fe8b
+--- /dev/null
++++ b/responsecontroller_1.20.go
+@@ -0,0 +1,17 @@
++//go:build go1.20
++
++package echo
++
++import (
++	"bufio"
++	"net"
++	"net/http"
++)
++
++func responseControllerFlush(rw http.ResponseWriter) error {
++	return http.NewResponseController(rw).Flush()
++}
++
++func responseControllerHijack(rw http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
++	return http.NewResponseController(rw).Hijack()
++}

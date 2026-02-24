@@ -1,0 +1,121 @@
+diff --git a/stats/opentelemetry/client_tracing.go b/stats/opentelemetry/client_tracing.go
+index 868d6a2f..6b725fb6 100644
+--- a/stats/opentelemetry/client_tracing.go
++++ b/stats/opentelemetry/client_tracing.go
+@@ -21,6 +21,7 @@ import (
+ 	"log"
+ 	"strings"
+ 
++	"go.opentelemetry.io/otel/attribute"
+ 	otelcodes "go.opentelemetry.io/otel/codes"
+ 	"go.opentelemetry.io/otel/trace"
+ 	"google.golang.org/grpc"
+@@ -83,7 +84,10 @@ func (h *clientTracingHandler) finishTrace(err error, ts trace.Span) {
+ // It creates a new outgoing carrier which serializes information about this
+ // span into gRPC Metadata, if TextMapPropagator is provided in the trace
+ // options. if TextMapPropagator is not provided, it returns the context as is.
+-func (h *clientTracingHandler) traceTagRPC(ctx context.Context, ai *attemptInfo, nameResolutionDelayed bool) (context.Context, *attemptInfo) {
++//
++// Note: The passed attemptInfo pointer (ai) is mutated in-place. Fields such as
++// ai.traceSpan are updated directly. No new attemptInfo is returned.
++func (h *clientTracingHandler) traceTagRPC(ctx context.Context, ai *attemptInfo, nameResolutionDelayed bool) context.Context {
+ 	// Add a "Delayed name resolution complete" event to the call span
+ 	// if there was name resolution delay. In case of multiple retry attempts,
+ 	// ensure that event is added only once.
+@@ -98,7 +102,7 @@ func (h *clientTracingHandler) traceTagRPC(ctx context.Context, ai *attemptInfo,
+ 	carrier := otelinternaltracing.NewOutgoingCarrier(ctx)
+ 	h.options.TraceOptions.TextMapPropagator.Inject(ctx, carrier)
+ 	ai.traceSpan = span
+-	return carrier.Context(), ai
++	return carrier.Context()
+ }
+ 
+ // createCallTraceSpan creates a call span to put in the provided context using
+@@ -121,7 +125,12 @@ func (h *clientTracingHandler) HandleConn(context.Context, stats.ConnStats) {}
+ // TagRPC implements per RPC attempt context management for traces.
+ func (h *clientTracingHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+ 	ctx, ai := getOrCreateRPCAttemptInfo(ctx)
+-	ctx, ai = h.traceTagRPC(ctx, ai, info.NameResolutionDelay)
++	ci := getCallInfo(ctx)
++	if ci == nil {
++		logger.Error("context passed into client side stats handler (TagRPC) has no call info")
++		return ctx
++	}
++	ctx = h.traceTagRPC(ctx, ai, info.NameResolutionDelay)
+ 	return setRPCInfo(ctx, &rpcInfo{ai: ai})
+ }
+ 
+@@ -132,5 +141,15 @@ func (h *clientTracingHandler) HandleRPC(ctx context.Context, rs stats.RPCStats)
+ 		logger.Error("ctx passed into client side tracing handler trace event handling has no client attempt data present")
+ 		return
+ 	}
++
++	// Client-specific Begin attributes.
++	if begin, ok := rs.(*stats.Begin); ok {
++		ci := getCallInfo(ctx)
++		previousRPCAttempts := ci.previousRPCAttempts.Add(1) - 1
++		ri.ai.traceSpan.SetAttributes(
++			attribute.Int64("previous-rpc-attempts", int64(previousRPCAttempts)),
++			attribute.Bool("transparent-retry", begin.IsTransparentRetryAttempt),
++		)
++	}
+ 	populateSpan(rs, ri.ai)
+ }
+diff --git a/stats/opentelemetry/opentelemetry.go b/stats/opentelemetry/opentelemetry.go
+index cd01f86c..91091c99 100644
+--- a/stats/opentelemetry/opentelemetry.go
++++ b/stats/opentelemetry/opentelemetry.go
+@@ -179,6 +179,9 @@ type callInfo struct {
+ 	// nameResolutionEventAdded is set when the resolver delay trace event
+ 	// is added. Prevents duplicate events, since it is reported per-attempt.
+ 	nameResolutionEventAdded atomic.Bool
++	// previousRPCAttempts holds the count of RPC attempts that have happened
++	// before current attempt. Transparent retries are excluded.
++	previousRPCAttempts atomic.Uint32
+ }
+ 
+ type callInfoKey struct{}
+@@ -239,9 +242,8 @@ type attemptInfo struct {
+ 	// message counters for sent and received messages (used for
+ 	// generating message IDs), and the number of previous RPC attempts for the
+ 	// associated call.
+-	countSentMsg        uint32
+-	countRecvMsg        uint32
+-	previousRPCAttempts uint32
++	countSentMsg uint32
++	countRecvMsg uint32
+ }
+ 
+ type clientMetrics struct {
+diff --git a/stats/opentelemetry/trace.go b/stats/opentelemetry/trace.go
+index 40ac7a1b..3ee66d1e 100644
+--- a/stats/opentelemetry/trace.go
++++ b/stats/opentelemetry/trace.go
+@@ -17,8 +17,6 @@
+ package opentelemetry
+ 
+ import (
+-	"sync/atomic"
+-
+ 	"go.opentelemetry.io/otel/attribute"
+ 	otelcodes "go.opentelemetry.io/otel/codes"
+ 	"go.opentelemetry.io/otel/trace"
+@@ -40,18 +38,6 @@ func populateSpan(rs stats.RPCStats, ai *attemptInfo) {
+ 	span := ai.traceSpan
+ 
+ 	switch rs := rs.(type) {
+-	case *stats.Begin:
+-		// Note: Go always added Client and FailFast attributes even though they are not
+-		// defined by the OpenCensus gRPC spec. Thus, they are unimportant for
+-		// correctness.
+-		span.SetAttributes(
+-			attribute.Bool("Client", rs.Client),
+-			attribute.Bool("FailFast", rs.FailFast),
+-			attribute.Int64("previous-rpc-attempts", int64(ai.previousRPCAttempts)),
+-			attribute.Bool("transparent-retry", rs.IsTransparentRetryAttempt),
+-		)
+-		// increment previous rpc attempts applicable for next attempt
+-		atomic.AddUint32(&ai.previousRPCAttempts, 1)
+ 	case *stats.DelayedPickComplete:
+ 		span.AddEvent("Delayed LB pick complete")
+ 	case *stats.InPayload:

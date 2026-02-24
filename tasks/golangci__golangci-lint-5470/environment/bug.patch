@@ -1,0 +1,287 @@
+diff --git a/.golangci.next.reference.yml b/.golangci.next.reference.yml
+index 5c445cbd..5de82980 100644
+--- a/.golangci.next.reference.yml
++++ b/.golangci.next.reference.yml
+@@ -4123,15 +4123,15 @@ output:
+     - file # filepath, line, and column.
+ 
+   # Show statistics per linter.
+-  # Default: true
+-  show-stats: false
++  # Default: false
++  show-stats: true
+ 
+ 
+ # Options for analysis running.
+ run:
+-  # Timeout for total work, e.g. 30s, 5m.
++  # Timeout for analysis, e.g. 30s, 5m.
+   # If the value is lower or equal to 0, the timeout is disabled.
+-  # Default: 0 (disabled)
++  # Default: 1m
+   timeout: 5m
+ 
+   # The mode used to evaluate relative paths.
+@@ -4181,12 +4181,13 @@ run:
+   allow-serial-runners: true
+ 
+   # Define the Go version limit.
+-  # Default: use Go version from the go.mod file, fallback on the env var `GOVERSION`, fallback on 1.22.
+-  go: '1.23'
++  # Mainly related to generics support since go1.18.
++  # Default: use Go version from the go.mod file, fallback on the env var `GOVERSION`, fallback on 1.17
++  go: '1.19'
+ 
+   # Number of operating system threads (`GOMAXPROCS`) that can execute golangci-lint simultaneously.
+-  # Default: 0 (automatically set to match Linux container CPU quota and
+-  # fall back to the number of logical CPUs in the machine)
++  # If it is explicitly set to 0 (i.e. not the default) then golangci-lint will automatically set the value to match Linux container CPU quota.
++  # Default: the number of logical CPUs in the machine
+   concurrency: 4
+ 
+ 
+diff --git a/.golangci.yml b/.golangci.yml
+index f39cb811..06bab229 100644
+--- a/.golangci.yml
++++ b/.golangci.yml
+@@ -202,3 +202,5 @@ linters-settings:
+       - name: unused-parameter
+       - name: unused-receiver
+ 
++run:
++  timeout: 5m
+diff --git a/jsonschema/golangci.next.jsonschema.json b/jsonschema/golangci.next.jsonschema.json
+index 25231fde..4891a551 100644
+--- a/jsonschema/golangci.next.jsonschema.json
++++ b/jsonschema/golangci.next.jsonschema.json
+@@ -3744,10 +3744,10 @@
+           "examples": [4]
+         },
+         "timeout": {
+-          "description": "Timeout for total work. Disabled by default",
++          "description": "Timeout for the analysis.",
+           "type": "string",
+           "pattern": "^\\d*[sm]$",
+-          "default": "0",
++          "default": "1m",
+           "examples": ["30s", "5m"]
+         },
+         "issues-exit-code": {
+@@ -3888,7 +3888,7 @@
+         "show-stats": {
+           "description": "Show statistics per linter.",
+           "type": "boolean",
+-          "default": true
++          "default": false
+         },
+         "sort-order": {
+           "type": "array",
+diff --git a/pkg/commands/flagsets.go b/pkg/commands/flagsets.go
+index 4081501e..aee7fd33 100644
+--- a/pkg/commands/flagsets.go
++++ b/pkg/commands/flagsets.go
+@@ -42,18 +42,18 @@ func setupFormattersFlagSet(v *viper.Viper, fs *pflag.FlagSet) {
+ }
+ 
+ func setupRunFlagSet(v *viper.Viper, fs *pflag.FlagSet) {
+-	internal.AddFlagAndBindP(v, fs, fs.IntP, "concurrency", "j", "run.concurrency", 0,
+-		color.GreenString("Number of CPUs to use (Default: Automatically set to match Linux container CPU quota"+
+-			" and fall back to the number of logical CPUs in the machine)"))
++	internal.AddFlagAndBindP(v, fs, fs.IntP, "concurrency", "j", "run.concurrency", getDefaultConcurrency(),
++		color.GreenString("Number of CPUs to use (Default: number of logical CPUs)"))
+ 
+ 	internal.AddFlagAndBind(v, fs, fs.String, "modules-download-mode", "run.modules-download-mode", "",
+ 		color.GreenString("Modules download mode. If not empty, passed as -mod=<mode> to go tools"))
+ 	internal.AddFlagAndBind(v, fs, fs.Int, "issues-exit-code", "run.issues-exit-code", exitcodes.IssuesFound,
+ 		color.GreenString("Exit code when issues were found"))
++	internal.AddFlagAndBind(v, fs, fs.String, "go", "run.go", "", color.GreenString("Targeted Go version"))
+ 	internal.AddHackedStringSlice(fs, "build-tags", color.GreenString("Build tags"))
+ 
+ 	internal.AddFlagAndBind(v, fs, fs.Duration, "timeout", "run.timeout", defaultTimeout,
+-		color.GreenString("Timeout for total work. Disabled by default"))
++		color.GreenString("Timeout for total work. If <= 0, the timeout is disabled"))
+ 
+ 	internal.AddFlagAndBind(v, fs, fs.Bool, "tests", "run.tests", true, color.GreenString("Analyze tests (*_test.go)"))
+ 
+@@ -72,7 +72,7 @@ func setupRunFlagSet(v *viper.Viper, fs *pflag.FlagSet) {
+ func setupOutputFlagSet(v *viper.Viper, fs *pflag.FlagSet) {
+ 	internal.AddFlagAndBind(v, fs, fs.String, "path-prefix", "output.path-prefix", "",
+ 		color.GreenString("Path prefix to add to output"))
+-	internal.AddFlagAndBind(v, fs, fs.Bool, "show-stats", "output.show-stats", true, color.GreenString("Show statistics per linter"))
++	internal.AddFlagAndBind(v, fs, fs.Bool, "show-stats", "output.show-stats", false, color.GreenString("Show statistics per linter"))
+ 
+ 	setupOutputFormatsFlagSet(v, fs)
+ }
+diff --git a/pkg/commands/run.go b/pkg/commands/run.go
+index a6685213..319d6e23 100644
+--- a/pkg/commands/run.go
++++ b/pkg/commands/run.go
+@@ -43,7 +43,7 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/timeutils"
+ )
+ 
+-const defaultTimeout = 0 * time.Minute
++const defaultTimeout = time.Minute
+ 
+ const (
+ 	// envFailOnWarnings value: "1"
+@@ -161,7 +161,6 @@ func (c *runCommand) persistentPreRunE(cmd *cobra.Command, args []string) error
+ 	}
+ 
+ 	if c.cfg.Run.Concurrency == 0 {
+-		// `runtime.GOMAXPROCS` defaults to the value of `runtime.NumCPU`.
+ 		backup := runtime.GOMAXPROCS(0)
+ 
+ 		// Automatically set GOMAXPROCS to match Linux container CPU quota.
+@@ -246,11 +245,12 @@ func (c *runCommand) execute(_ *cobra.Command, _ []string) {
+ 		}
+ 	}()
+ 
+-	ctx, cancel := context.WithCancel(context.Background())
++	ctx := context.Background()
+ 	if c.cfg.Run.Timeout > 0 {
++		var cancel context.CancelFunc
+ 		ctx, cancel = context.WithTimeout(ctx, c.cfg.Run.Timeout)
++		defer cancel()
+ 	}
+-	defer cancel()
+ 
+ 	if needTrackResources {
+ 		go watchResources(ctx, trackResourcesEndCh, c.log, c.debugf)
+@@ -590,6 +590,16 @@ func setupRunPersistentFlags(fs *pflag.FlagSet, opts *runOptions) {
+ 	fs.StringVar(&opts.TracePath, "trace-path", "", color.GreenString("Path to trace output file"))
+ }
+ 
++func getDefaultConcurrency() int {
++	if os.Getenv(envHelpRun) == "1" {
++		// Make stable concurrency for generating help documentation.
++		const prettyConcurrency = 8
++		return prettyConcurrency
++	}
++
++	return runtime.NumCPU()
++}
++
+ func printMemStats(ms *runtime.MemStats, logger logutils.Log) {
+ 	logger.Infof("Mem stats: alloc=%s total_alloc=%s sys=%s "+
+ 		"heap_alloc=%s heap_sys=%s heap_idle=%s heap_released=%s heap_in_use=%s "+
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index fe72c8d6..aa24e3dd 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -15,10 +15,6 @@ import (
+ 	"golang.org/x/mod/modfile"
+ )
+ 
+-// defaultGoVersion the value should be "oldstable" - 1.
+-// If the current stable version is 1.24 then 1.23 - 1 = 1.22.
+-const defaultGoVersion = "1.22"
+-
+ // Config encapsulates the config data specified in the golangci-lint YAML config file.
+ type Config struct {
+ 	cfgDir   string // Path to the directory containing golangci-lint config file.
+@@ -97,7 +93,7 @@ func IsGoGreaterThanOrEqual(current, limit string) bool {
+ }
+ 
+ func detectGoVersion(ctx context.Context) string {
+-	return cmp.Or(detectGoVersionFromGoMod(ctx), defaultGoVersion)
++	return cmp.Or(detectGoVersionFromGoMod(ctx), "1.17")
+ }
+ 
+ // detectGoVersionFromGoMod tries to get Go version from go.mod.
+diff --git a/test/run_test.go b/test/run_test.go
+index 5dbe7e72..d607c1f6 100644
+--- a/test/run_test.go
++++ b/test/run_test.go
+@@ -37,7 +37,6 @@ func TestAutogeneratedNoIssues(t *testing.T) {
+ 
+ 	testshared.NewRunnerBuilder(t).
+ 		WithConfig(cfg).
+-		WithArgs("--show-stats=false").
+ 		WithTargetPath(testdataDir, "autogenerated").
+ 		WithBinPath(binPath).
+ 		Runner().
+@@ -48,7 +47,6 @@ func TestAutogeneratedNoIssues(t *testing.T) {
+ func TestEmptyDirRun(t *testing.T) {
+ 	testshared.NewRunnerBuilder(t).
+ 		WithEnviron("GO111MODULE=off").
+-		WithArgs("--show-stats=false").
+ 		WithTargetPath(testdataDir, "nogofiles").
+ 		Runner().
+ 		Install().
+@@ -71,7 +69,6 @@ func TestNotExistingDirRun(t *testing.T) {
+ 
+ func TestSymlinkLoop(t *testing.T) {
+ 	testshared.NewRunnerBuilder(t).
+-		WithArgs("--show-stats=false").
+ 		WithTargetPath(testdataDir, "symlink_loop", "...").
+ 		Runner().
+ 		Install().
+@@ -123,9 +120,7 @@ func TestTestsAreLintedByDefault(t *testing.T) {
+ func TestCgoOk(t *testing.T) {
+ 	testshared.NewRunnerBuilder(t).
+ 		WithNoConfig().
+-		WithArgs(
+-			"--timeout=3m",
+-			"--show-stats=false",
++		WithArgs("--timeout=3m",
+ 			"--enable-all",
+ 		).
+ 		WithTargetPath(testdataDir, "cgo").
+@@ -363,10 +358,7 @@ func TestUnsafeOk(t *testing.T) {
+ 
+ 	testshared.NewRunnerBuilder(t).
+ 		WithConfig(cfg).
+-		WithArgs(
+-			"--show-stats=false",
+-			"--enable-all",
+-		).
++		WithArgs("--enable-all").
+ 		WithTargetPath(testdataDir, "unsafe").
+ 		WithBinPath(binPath).
+ 		Runner().
+@@ -379,10 +371,7 @@ func TestSortedResults(t *testing.T) {
+ 
+ 	testshared.NewRunnerBuilder(t).
+ 		WithNoConfig().
+-		WithArgs(
+-			"--show-stats=false",
+-			"--output.text.print-issued-lines=false",
+-		).
++		WithArgs("--output.text.print-issued-lines=false").
+ 		WithTargetPath(testdataDir, "sort_results").
+ 		WithBinPath(binPath).
+ 		Runner().
+@@ -396,11 +385,7 @@ func TestSortedResults(t *testing.T) {
+ func TestIdentifierUsedOnlyInTests(t *testing.T) {
+ 	testshared.NewRunnerBuilder(t).
+ 		WithNoConfig().
+-		WithArgs(
+-			"--show-stats=false",
+-			"--disable-all",
+-			"-Eunused",
+-		).
++		WithArgs("--disable-all", "-Eunused").
+ 		WithTargetPath(testdataDir, "used_only_in_tests").
+ 		Runner().
+ 		Install().
+@@ -410,7 +395,6 @@ func TestIdentifierUsedOnlyInTests(t *testing.T) {
+ 
+ func TestUnusedCheckExported(t *testing.T) {
+ 	testshared.NewRunnerBuilder(t).
+-		WithArgs("--show-stats=false").
+ 		WithConfigFile("testdata_etc/unused_exported/golangci.yml").
+ 		WithTargetPath("testdata_etc/unused_exported/...").
+ 		Runner().
+diff --git a/test/testshared/integration/run.go b/test/testshared/integration/run.go
+index 5d69be77..3aa6e289 100644
+--- a/test/testshared/integration/run.go
++++ b/test/testshared/integration/run.go
+@@ -63,7 +63,6 @@ func testOneSource(t *testing.T, log *logutils.StderrLog, binPath, sourcePath st
+ 
+ 	args := []string{
+ 		"--disable-all",
+-		"--show-stats=false",
+ 		"--output.json.path=stdout",
+ 		"--max-same-issues=100",
+ 		"--max-issues-per-linter=100",

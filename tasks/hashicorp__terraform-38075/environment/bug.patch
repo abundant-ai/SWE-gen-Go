@@ -1,0 +1,298 @@
+diff --git a/internal/command/init_run_experiment.go b/internal/command/init_run_experiment.go
+index c9ef0abda9..34983553f6 100644
+--- a/internal/command/init_run_experiment.go
++++ b/internal/command/init_run_experiment.go
+@@ -438,7 +438,6 @@ func (c *InitCommand) initPssBackend(ctx context.Context, root *configs.Module,
+ 
+ 		opts = &BackendOpts{
+ 			StateStoreConfig:       root.StateStore,
+-			ProviderRequirements:   root.ProviderRequirements,
+ 			Locks:                  configLocks,
+ 			CreateDefaultWorkspace: initArgs.CreateDefaultWorkspace,
+ 			ConfigOverride:         configOverride,
+diff --git a/internal/command/init_test.go b/internal/command/init_test.go
+index 2f2a02d0db..82eedcd785 100644
+--- a/internal/command/init_test.go
++++ b/internal/command/init_test.go
+@@ -4630,47 +4630,6 @@ func TestInit_stateStore_to_backend(t *testing.T) {
+ 	}
+ }
+ 
+-func TestInit_unitialized_stateStore(t *testing.T) {
+-	// Create a temporary working directory that is empty
+-	td := t.TempDir()
+-	cfg := `terraform {
+-	  required_providers {
+-	    test = {
+-	      source = "hashicorp/test"
+-	    }
+-	  }
+-	  state_store "test_store" {
+-	    provider "test" {}
+-	    value = "foobar"
+-	  }
+-	}
+-	`
+-	if err := os.WriteFile(filepath.Join(td, "main.tf"), []byte(cfg), 0644); err != nil {
+-		t.Fatalf("err: %s", err)
+-	}
+-	t.Chdir(td)
+-
+-	ui := cli.NewMockUi()
+-	view, done := testView(t)
+-	cApply := &ApplyCommand{
+-		Meta: Meta{
+-			Ui:                        ui,
+-			View:                      view,
+-			AllowExperimentalFeatures: true,
+-		},
+-	}
+-	code := cApply.Run([]string{})
+-	testOutput := done(t)
+-	if code == 0 {
+-		t.Fatalf("expected apply to fail: \n%s", testOutput.All())
+-	}
+-	log.Printf("[TRACE] TestInit_stateStore_to_backend: uninitialised apply with state store complete")
+-	expectedErr := `provider registry.terraform.io/hashicorp/test: required by this configuration but no version is selected`
+-	if !strings.Contains(testOutput.Stderr(), expectedErr) {
+-		t.Fatalf("unexpected error, expected %q, given: %s", expectedErr, testOutput.Stderr())
+-	}
+-}
+-
+ // newMockProviderSource is a helper to succinctly construct a mock provider
+ // source that contains a set of packages matching the given provider versions
+ // that are available for installation (from temporary local files).
+diff --git a/internal/command/meta_backend.go b/internal/command/meta_backend.go
+index 55256c8877..6911fd4c5c 100644
+--- a/internal/command/meta_backend.go
++++ b/internal/command/meta_backend.go
+@@ -62,8 +62,6 @@ type BackendOpts struct {
+ 	// the root module, or nil if no such block is present.
+ 	StateStoreConfig *configs.StateStore
+ 
+-	ProviderRequirements *configs.RequiredProviders
+-
+ 	// Locks allows state-migration logic to detect when the provider used for pluggable state storage
+ 	// during the last init (i.e. what's in the backend state file) is mismatched with the provider
+ 	// version in use currently.
+@@ -776,33 +774,6 @@ func (m *Meta) stateStoreConfig(opts *BackendOpts) (*configs.StateStore, int, tf
+ 		return nil, 0, diags
+ 	}
+ 
+-	if errs := c.VerifyDependencySelections(opts.Locks, opts.ProviderRequirements); len(errs) > 0 {
+-		var buf strings.Builder
+-		for _, err := range errs {
+-			fmt.Fprintf(&buf, "\n  - %s", err.Error())
+-		}
+-		var suggestion string
+-		switch {
+-		case opts.Locks == nil:
+-			// If we get here then it suggests that there's a caller that we
+-			// didn't yet update to populate DependencyLocks, which is a bug.
+-			panic("This run has no dependency lock information provided at all, which is a bug in Terraform; please report it!")
+-		case opts.Locks.Empty():
+-			suggestion = "To make the initial dependency selections that will initialize the dependency lock file, run:\n  terraform init"
+-		default:
+-			suggestion = "To update the locked dependency selections to match a changed configuration, run:\n  terraform init -upgrade"
+-		}
+-		diags = diags.Append(tfdiags.Sourceless(
+-			tfdiags.Error,
+-			"Inconsistent dependency lock file",
+-			fmt.Sprintf(
+-				"The following dependency selections recorded in the lock file are inconsistent with the current configuration:%s\n\n%s",
+-				buf.String(), suggestion,
+-			),
+-		))
+-		return nil, 0, diags
+-	}
+-
+ 	// Get the provider version from locks, as this impacts the hash
+ 	// NOTE: this assumes that we will never allow users to override config definint which provider is used for state storage
+ 	stateStoreProviderVersion, vDiags := getStateStorageProviderVersion(opts.StateStoreConfig, opts.Locks)
+@@ -1906,10 +1877,9 @@ func (m *Meta) backend(configPath string, viewType arguments.ViewType) (backendr
+ 		}
+ 	case root.StateStore != nil:
+ 		opts = &BackendOpts{
+-			StateStoreConfig:     root.StateStore,
+-			ProviderRequirements: root.ProviderRequirements,
+-			Locks:                locks,
+-			ViewType:             viewType,
++			StateStoreConfig: root.StateStore,
++			Locks:            locks,
++			ViewType:         viewType,
+ 		}
+ 	default:
+ 		// there is no config; defaults to local state storage
+@@ -2228,8 +2198,6 @@ func getStateStorageProviderVersion(c *configs.StateStore, locks *depsfile.Locks
+ 
+ 	pLock := locks.Provider(c.ProviderAddr)
+ 	if pLock == nil {
+-		// This should never happen as the user would've already hit
+-		// an error earlier prompting them to run init
+ 		diags = diags.Append(fmt.Errorf("The provider %s (%q) is not present in the lockfile, despite being used for state store %q. This is a bug in Terraform and should be reported.",
+ 			c.Provider.Name,
+ 			c.ProviderAddr,
+diff --git a/internal/command/meta_backend_test.go b/internal/command/meta_backend_test.go
+index ee1747d615..1c06899471 100644
+--- a/internal/command/meta_backend_test.go
++++ b/internal/command/meta_backend_test.go
+@@ -2194,10 +2194,9 @@ func TestMetaBackend_configuredBackendToStateStore(t *testing.T) {
+ 		[]providerreqs.Hash{""},
+ 	)
+ 	_, beDiags := m.Backend(&BackendOpts{
+-		Init:                 true,
+-		StateStoreConfig:     mod.StateStore,
+-		ProviderRequirements: mod.ProviderRequirements,
+-		Locks:                locks,
++		Init:             true,
++		StateStoreConfig: mod.StateStore,
++		Locks:            locks,
+ 	})
+ 	if !beDiags.HasErrors() {
+ 		t.Fatal("expected an error to be returned during partial implementation of PSS")
+@@ -2261,10 +2260,9 @@ func TestMetaBackend_configureStateStoreVariableUse(t *testing.T) {
+ 
+ 			// Get the operations backend
+ 			_, err := m.Backend(&BackendOpts{
+-				Init:                 true,
+-				StateStoreConfig:     mod.StateStore,
+-				ProviderRequirements: mod.ProviderRequirements,
+-				Locks:                locks,
++				Init:             true,
++				StateStoreConfig: mod.StateStore,
++				Locks:            locks,
+ 			})
+ 			if err == nil {
+ 				t.Fatal("should error")
+@@ -2722,11 +2720,10 @@ func TestMetaBackend_stateStoreConfig(t *testing.T) {
+ 		overrideValue := "overridden"
+ 		configOverride := configs.SynthBody("synth", map[string]cty.Value{"value": cty.StringVal(overrideValue)})
+ 		opts := &BackendOpts{
+-			StateStoreConfig:     config,
+-			ProviderRequirements: &configs.RequiredProviders{},
+-			ConfigOverride:       configOverride,
+-			Init:                 true,
+-			Locks:                locks,
++			StateStoreConfig: config,
++			ConfigOverride:   configOverride,
++			Init:             true,
++			Locks:            locks,
+ 		}
+ 
+ 		mock := testStateStoreMock(t)
+@@ -2782,10 +2779,9 @@ func TestMetaBackend_stateStoreConfig(t *testing.T) {
+ 		delete(mock.GetProviderSchemaResponse.StateStores, "test_store") // Remove the only state store impl.
+ 
+ 		opts := &BackendOpts{
+-			StateStoreConfig:     config,
+-			ProviderRequirements: &configs.RequiredProviders{},
+-			Init:                 true,
+-			Locks:                locks,
++			StateStoreConfig: config,
++			Init:             true,
++			Locks:            locks,
+ 		}
+ 
+ 		m := testMetaBackend(t, nil)
+@@ -2811,10 +2807,9 @@ func TestMetaBackend_stateStoreConfig(t *testing.T) {
+ 		mock.GetProviderSchemaResponse.StateStores["test_bore"] = testStore
+ 
+ 		opts := &BackendOpts{
+-			StateStoreConfig:     config,
+-			ProviderRequirements: &configs.RequiredProviders{},
+-			Init:                 true,
+-			Locks:                locks,
++			StateStoreConfig: config,
++			Init:             true,
++			Locks:            locks,
+ 		}
+ 
+ 		m := testMetaBackend(t, nil)
+diff --git a/internal/configs/state_store.go b/internal/configs/state_store.go
+index d8bb237a19..d3b80d0e6d 100644
+--- a/internal/configs/state_store.go
++++ b/internal/configs/state_store.go
+@@ -5,9 +5,7 @@ package configs
+ 
+ import (
+ 	"fmt"
+-	"log"
+ 	"os"
+-	"sort"
+ 
+ 	version "github.com/hashicorp/go-version"
+ 	"github.com/hashicorp/hcl/v2"
+@@ -15,8 +13,6 @@ import (
+ 	tfaddr "github.com/hashicorp/terraform-registry-address"
+ 	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/configs/configschema"
+-	"github.com/hashicorp/terraform/internal/depsfile"
+-	"github.com/hashicorp/terraform/internal/getproviders/providerreqs"
+ 	"github.com/hashicorp/terraform/internal/getproviders/reattach"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+ 	"github.com/zclconf/go-cty/cty"
+@@ -137,64 +133,6 @@ func resolveStateStoreProviderType(requiredProviders map[string]*RequiredProvide
+ 	}
+ }
+ 
+-func (ss *StateStore) VerifyDependencySelections(depLocks *depsfile.Locks, reqs *RequiredProviders) []error {
+-	var errs []error
+-
+-	for _, reqProvider := range reqs.RequiredProviders {
+-		providerAddr := reqProvider.Type
+-		constraints := providerreqs.MustParseVersionConstraints(reqProvider.Requirement.Required.String())
+-
+-		if !depsfile.ProviderIsLockable(providerAddr) {
+-			continue // disregard builtin providers, and such
+-		}
+-		if depLocks != nil && depLocks.ProviderIsOverridden(providerAddr) {
+-			// The "overridden" case is for unusual special situations like
+-			// dev overrides, so we'll explicitly note it in the logs just in
+-			// case we see bug reports with these active and it helps us
+-			// understand why we ended up using the "wrong" plugin.
+-			log.Printf("[DEBUG] StateStore.VerifyDependencySelections: skipping %s because it's overridden by a special configuration setting", providerAddr)
+-			continue
+-		}
+-
+-		var lock *depsfile.ProviderLock
+-		if depLocks != nil { // Should always be true in main code, but unfortunately sometimes not true in old tests that don't fill out arguments completely
+-			lock = depLocks.Provider(providerAddr)
+-		}
+-		if lock == nil {
+-			log.Printf("[TRACE] StateStore.VerifyDependencySelections: provider %s has no lock file entry to satisfy %q", providerAddr, providerreqs.VersionConstraintsString(constraints))
+-			errs = append(errs, fmt.Errorf("provider %s: required by this configuration but no version is selected", providerAddr))
+-			continue
+-		}
+-
+-		selectedVersion := lock.Version()
+-		allowedVersions := providerreqs.MeetingConstraints(constraints)
+-		log.Printf("[TRACE] StateStore.VerifyDependencySelections: provider %s has %s to satisfy %q", providerAddr, selectedVersion.String(), providerreqs.VersionConstraintsString(constraints))
+-		if !allowedVersions.Has(selectedVersion) {
+-			// The most likely cause of this is that the author of a module
+-			// has changed its constraints, but this could also happen in
+-			// some other unusual situations, such as the user directly
+-			// editing the lock file to record something invalid. We'll
+-			// distinguish those cases here in order to avoid the more
+-			// specific error message potentially being a red herring in
+-			// the edge-cases.
+-			currentConstraints := providerreqs.VersionConstraintsString(constraints)
+-			lockedConstraints := providerreqs.VersionConstraintsString(lock.VersionConstraints())
+-			switch {
+-			case currentConstraints != lockedConstraints:
+-				errs = append(errs, fmt.Errorf("provider %s: locked version selection %s doesn't match the updated version constraints %q", providerAddr, selectedVersion.String(), currentConstraints))
+-			default:
+-				errs = append(errs, fmt.Errorf("provider %s: version constraints %q don't match the locked version selection %s", providerAddr, currentConstraints, selectedVersion.String()))
+-			}
+-		}
+-	}
+-
+-	// Return multiple errors in an arbitrary-but-deterministic order.
+-	sort.Slice(errs, func(i, j int) bool {
+-		return errs[i].Error() < errs[j].Error()
+-	})
+-	return errs
+-}
+-
+ // Hash produces a hash value for the receiver that covers:
+ // 1) the portions of the config that conform to the state_store schema.
+ // 2) the portions of the config that conform to the provider schema.

@@ -1,0 +1,215 @@
+diff --git a/.github/workflows/golangci-lint.yml b/.github/workflows/golangci-lint.yml
+index 8f069d3..6034bcb 100644
+--- a/.github/workflows/golangci-lint.yml
++++ b/.github/workflows/golangci-lint.yml
+@@ -20,7 +20,7 @@ jobs:
+       - name: install Go
+         uses: actions/setup-go@v2
+         with:
+-          go-version-file: .go-version
++          go-version: 1.18.x
+       - name: Install snmp_exporter/generator dependencies
+         run: sudo apt-get update && sudo apt-get -y install libsnmp-dev
+         if: github.repository == 'prometheus/snmp_exporter'
+diff --git a/.go-version b/.go-version
+deleted file mode 100644
+index adc97d8..0000000
+--- a/.go-version
++++ /dev/null
+@@ -1 +0,0 @@
+-1.18
+diff --git a/Makefile b/Makefile
+index 4f526d7..f35cf58 100644
+--- a/Makefile
++++ b/Makefile
+@@ -18,11 +18,3 @@ test: deps common-test
+ 
+ .PHONY: test-short
+ test-short: deps common-test-short
+-
+-.PHONY: generate-go-collector-test-files
+-VERSIONS := 1.17 1.18 1.19
+-generate-go-collector-test-files:
+-	for GO_VERSION in $(VERSIONS); do \
+-    	docker run --rm -v $(PWD):/workspace -w /workspace golang:$$GO_VERSION go run prometheus/gen_go_collector_metrics_set.go; \
+-		mv -f go_collector_metrics* prometheus; \
+-    done
+diff --git a/prometheus/gen_go_collector_metrics_set.go b/prometheus/gen_go_collector_metrics_set.go
+index 74b67ac..2f60ea3 100644
+--- a/prometheus/gen_go_collector_metrics_set.go
++++ b/prometheus/gen_go_collector_metrics_set.go
+@@ -25,42 +25,29 @@ import (
+ 	"os"
+ 	"runtime"
+ 	"runtime/metrics"
++	"strconv"
+ 	"strings"
+ 	"text/template"
+ 
+ 	"github.com/prometheus/client_golang/prometheus"
+ 	"github.com/prometheus/client_golang/prometheus/internal"
+-
+-	"github.com/hashicorp/go-version"
+ )
+ 
+ func main() {
+-	var givenVersion string
+-	toolVersion := runtime.Version()
+ 	if len(os.Args) != 2 {
+-		log.Printf("requires Go version (e.g. go1.17) as an argument. Since it is not specified, assuming %s.", toolVersion)
+-		givenVersion = toolVersion
+-	} else {
+-		givenVersion = os.Args[1]
++		log.Fatal("requires Go version (e.g. go1.17) as an argument")
+ 	}
+-	log.Printf("given version for Go: %s", givenVersion)
+-	log.Printf("tool version for Go: %s", toolVersion)
+-
+-	tv, err := version.NewVersion(strings.TrimPrefix(givenVersion, "go"))
+-	if err != nil {
+-		log.Fatal(err)
++	toolVersion := runtime.Version()
++	mtv := majorVersion(toolVersion)
++	mv := majorVersion(os.Args[1])
++	if mtv != mv {
++		log.Fatalf("using Go version %q but expected Go version %q", mtv, mv)
+ 	}
+-	gv, err := version.NewVersion(strings.TrimPrefix(toolVersion, "go"))
++	version, err := parseVersion(mv)
+ 	if err != nil {
+-		log.Fatal(err)
+-	}
+-	if !gv.Equal(tv) {
+-		log.Fatalf("using Go version %q but expected Go version %q", tv, gv)
++		log.Fatalf("parsing Go version: %v", err)
+ 	}
+ 
+-	v := goVersion(gv.Segments()[1])
+-	log.Printf("generating metrics for Go version %q", v)
+-
+ 	// Generate code.
+ 	var buf bytes.Buffer
+ 	err = testFile.Execute(&buf, struct {
+@@ -69,7 +56,7 @@ func main() {
+ 		Cardinality  int
+ 	}{
+ 		Descriptions: metrics.All(),
+-		GoVersion:    v,
++		GoVersion:    version,
+ 		Cardinality:  rmCardinality(),
+ 	})
+ 	if err != nil {
+@@ -83,7 +70,7 @@ func main() {
+ 	}
+ 
+ 	// Write it to a file.
+-	fname := fmt.Sprintf("go_collector_metrics_%s_test.go", v.Abbr())
++	fname := fmt.Sprintf("go_collector_metrics_%s_test.go", version.Abbr())
+ 	if err := os.WriteFile(fname, result, 0o644); err != nil {
+ 		log.Fatalf("writing file: %v", err)
+ 	}
+@@ -99,6 +86,19 @@ func (g goVersion) Abbr() string {
+ 	return fmt.Sprintf("go1%d", g)
+ }
+ 
++func parseVersion(s string) (goVersion, error) {
++	i := strings.IndexRune(s, '.')
++	if i < 0 {
++		return goVersion(-1), fmt.Errorf("bad Go version format")
++	}
++	i, err := strconv.Atoi(s[i+1:])
++	return goVersion(i), err
++}
++
++func majorVersion(v string) string {
++	return v[:strings.LastIndexByte(v, '.')]
++}
++
+ func rmCardinality() int {
+ 	cardinality := 0
+ 
+@@ -123,7 +123,6 @@ func rmCardinality() int {
+ 			name[strings.IndexRune(name, ':')+1:],
+ 		)
+ 		cardinality += len(buckets) + 3 // Plus total count, sum, and the implicit infinity bucket.
+-
+ 		// runtime/metrics bucket boundaries are lower-bound-inclusive, but
+ 		// always represents each actual *boundary* so Buckets is always
+ 		// 1 longer than Counts, while in Prometheus the mapping is one-to-one,
+@@ -135,12 +134,6 @@ func rmCardinality() int {
+ 			// We already counted the infinity bucket separately.
+ 			cardinality--
+ 		}
+-		// Prometheus also doesn't have buckets for -Inf, so they need to be omitted.
+-		// See the following PR for more information:
+-		// https://github.com/prometheus/client_golang/pull/1049
+-		if buckets[0] == math.Inf(-1) {
+-			cardinality--
+-		}
+ 	}
+ 
+ 	return cardinality
+diff --git a/prometheus/go_collector_latest_test.go b/prometheus/go_collector_latest_test.go
+index df18d5d..11094c8 100644
+--- a/prometheus/go_collector_latest_test.go
++++ b/prometheus/go_collector_latest_test.go
+@@ -269,7 +269,7 @@ func TestMemStatsEquivalence(t *testing.T) {
+ }
+ 
+ func TestExpectedRuntimeMetrics(t *testing.T) {
+-	goMetrics := collectGoMetrics(t, goRuntimeMemStatsCollection|goRuntimeMetricsCollection)
++	goMetrics := collectGoMetrics(t, goRuntimeMetricsCollection)
+ 	goMetricSet := make(map[string]Metric)
+ 	for _, m := range goMetrics {
+ 		goMetricSet[m.Desc().fqName] = m
+diff --git a/prometheus/go_collector_metrics_go119_test.go b/prometheus/go_collector_metrics_go119_test.go
+deleted file mode 100644
+index ec3430a..0000000
+--- a/prometheus/go_collector_metrics_go119_test.go
++++ /dev/null
+@@ -1,45 +0,0 @@
+-// Code generated by gen_go_collector_metrics_set.go; DO NOT EDIT.
+-//go:generate go run gen_go_collector_metrics_set.go go1.19
+-
+-//go:build go1.19 && !go1.20
+-// +build go1.19,!go1.20
+-
+-package prometheus
+-
+-var expectedRuntimeMetrics = map[string]string{
+-	"/cgo/go-to-c-calls:calls":                    "go_cgo_go_to_c_calls_calls_total",
+-	"/gc/cycles/automatic:gc-cycles":              "go_gc_cycles_automatic_gc_cycles_total",
+-	"/gc/cycles/forced:gc-cycles":                 "go_gc_cycles_forced_gc_cycles_total",
+-	"/gc/cycles/total:gc-cycles":                  "go_gc_cycles_total_gc_cycles_total",
+-	"/gc/heap/allocs-by-size:bytes":               "go_gc_heap_allocs_by_size_bytes",
+-	"/gc/heap/allocs:bytes":                       "go_gc_heap_allocs_bytes_total",
+-	"/gc/heap/allocs:objects":                     "go_gc_heap_allocs_objects_total",
+-	"/gc/heap/frees-by-size:bytes":                "go_gc_heap_frees_by_size_bytes",
+-	"/gc/heap/frees:bytes":                        "go_gc_heap_frees_bytes_total",
+-	"/gc/heap/frees:objects":                      "go_gc_heap_frees_objects_total",
+-	"/gc/heap/goal:bytes":                         "go_gc_heap_goal_bytes",
+-	"/gc/heap/objects:objects":                    "go_gc_heap_objects_objects",
+-	"/gc/heap/tiny/allocs:objects":                "go_gc_heap_tiny_allocs_objects_total",
+-	"/gc/limiter/last-enabled:gc-cycle":           "go_gc_limiter_last_enabled_gc_cycle",
+-	"/gc/pauses:seconds":                          "go_gc_pauses_seconds",
+-	"/gc/stack/starting-size:bytes":               "go_gc_stack_starting_size_bytes",
+-	"/memory/classes/heap/free:bytes":             "go_memory_classes_heap_free_bytes",
+-	"/memory/classes/heap/objects:bytes":          "go_memory_classes_heap_objects_bytes",
+-	"/memory/classes/heap/released:bytes":         "go_memory_classes_heap_released_bytes",
+-	"/memory/classes/heap/stacks:bytes":           "go_memory_classes_heap_stacks_bytes",
+-	"/memory/classes/heap/unused:bytes":           "go_memory_classes_heap_unused_bytes",
+-	"/memory/classes/metadata/mcache/free:bytes":  "go_memory_classes_metadata_mcache_free_bytes",
+-	"/memory/classes/metadata/mcache/inuse:bytes": "go_memory_classes_metadata_mcache_inuse_bytes",
+-	"/memory/classes/metadata/mspan/free:bytes":   "go_memory_classes_metadata_mspan_free_bytes",
+-	"/memory/classes/metadata/mspan/inuse:bytes":  "go_memory_classes_metadata_mspan_inuse_bytes",
+-	"/memory/classes/metadata/other:bytes":        "go_memory_classes_metadata_other_bytes",
+-	"/memory/classes/os-stacks:bytes":             "go_memory_classes_os_stacks_bytes",
+-	"/memory/classes/other:bytes":                 "go_memory_classes_other_bytes",
+-	"/memory/classes/profiling/buckets:bytes":     "go_memory_classes_profiling_buckets_bytes",
+-	"/memory/classes/total:bytes":                 "go_memory_classes_total_bytes",
+-	"/sched/gomaxprocs:threads":                   "go_sched_gomaxprocs_threads",
+-	"/sched/goroutines:goroutines":                "go_sched_goroutines_goroutines",
+-	"/sched/latencies:seconds":                    "go_sched_latencies_seconds",
+-}
+-
+-const expectedRuntimeMetricsCardinality = 81

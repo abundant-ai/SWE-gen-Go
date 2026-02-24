@@ -1,0 +1,456 @@
+diff --git a/README.md b/README.md
+index f8302c3..8ee3f96 100644
+--- a/README.md
++++ b/README.md
+@@ -400,3 +400,20 @@ handler := func() {
+ logrus.RegisterExitHandler(handler)
+ ...
+ ```
++
++#### Thread safty
++
++By default Logger is protected by mutex for concurrent writes, this mutex is invoked when calling hooks and writing logs.
++If you are sure such locking is not needed, you can call logger.SetNoLock() to disable the locking.
++
++Situation when locking is not needed includes:
++
++* You have no hooks registered, or hooks calling is already thread-safe.
++
++* Writing to logger.Out is already thread-safe, for example:
++
++  1) logger.Out is protected by locks.
++
++  2) logger.Out is a os.File handler opened with `O_APPEND` flag, and every write is smaller than 4k. (This allow multi-thread/multi-process writing)
++
++     (Refer to http://www.notthewizard.com/2014/06/17/are-files-appends-really-atomic/)
+diff --git a/entry.go b/entry.go
+index 54bfc57..4edbe7a 100644
+--- a/entry.go
++++ b/entry.go
+@@ -3,11 +3,21 @@ package logrus
+ import (
+ 	"bytes"
+ 	"fmt"
+-	"io"
+ 	"os"
++	"sync"
+ 	"time"
+ )
+ 
++var bufferPool *sync.Pool
++
++func init() {
++	bufferPool = &sync.Pool{
++		New: func() interface{} {
++			return new(bytes.Buffer)
++		},
++	}
++}
++
+ // Defines the key when adding errors using WithError.
+ var ErrorKey = "error"
+ 
+@@ -29,6 +39,9 @@ type Entry struct {
+ 
+ 	// Message passed to Debug, Info, Warn, Error, Fatal or Panic
+ 	Message string
++
++	// When formatter is called in entry.log(), an Buffer may be set to entry
++	Buffer *bytes.Buffer
+ }
+ 
+ func NewEntry(logger *Logger) *Entry {
+@@ -39,21 +52,15 @@ func NewEntry(logger *Logger) *Entry {
+ 	}
+ }
+ 
+-// Returns a reader for the entry, which is a proxy to the formatter.
+-func (entry *Entry) Reader() (*bytes.Buffer, error) {
+-	serialized, err := entry.Logger.Formatter.Format(entry)
+-	return bytes.NewBuffer(serialized), err
+-}
+-
+ // Returns the string representation from the reader and ultimately the
+ // formatter.
+ func (entry *Entry) String() (string, error) {
+-	reader, err := entry.Reader()
++	serialized, err := entry.Logger.Formatter.Format(entry)
+ 	if err != nil {
+ 		return "", err
+ 	}
+-
+-	return reader.String(), err
++	str := string(serialized)
++	return str, nil
+ }
+ 
+ // Add an error as single field (using the key defined in ErrorKey) to the Entry.
+@@ -81,6 +88,7 @@ func (entry *Entry) WithFields(fields Fields) *Entry {
+ // This function is not declared with a pointer value because otherwise
+ // race conditions will occur when using multiple goroutines
+ func (entry Entry) log(level Level, msg string) {
++	var buffer *bytes.Buffer
+ 	entry.Time = time.Now()
+ 	entry.Level = level
+ 	entry.Message = msg
+@@ -90,20 +98,23 @@ func (entry Entry) log(level Level, msg string) {
+ 		fmt.Fprintf(os.Stderr, "Failed to fire hook: %v\n", err)
+ 		entry.Logger.mu.Unlock()
+ 	}
+-
+-	reader, err := entry.Reader()
++	buffer = bufferPool.Get().(*bytes.Buffer)
++	buffer.Reset()
++	defer bufferPool.Put(buffer)
++	entry.Buffer = buffer
++	serialized, err := entry.Logger.Formatter.Format(&entry)
++	entry.Buffer = nil
+ 	if err != nil {
+ 		entry.Logger.mu.Lock()
+ 		fmt.Fprintf(os.Stderr, "Failed to obtain reader, %v\n", err)
+ 		entry.Logger.mu.Unlock()
+-	}
+-
+-	entry.Logger.mu.Lock()
+-	defer entry.Logger.mu.Unlock()
+-
+-	_, err = io.Copy(entry.Logger.Out, reader)
+-	if err != nil {
+-		fmt.Fprintf(os.Stderr, "Failed to write to log, %v\n", err)
++	} else {
++		entry.Logger.mu.Lock()
++		_, err = entry.Logger.Out.Write(serialized)
++		if err != nil {
++			fmt.Fprintf(os.Stderr, "Failed to write to log, %v\n", err)
++		}
++		entry.Logger.mu.Unlock()
+ 	}
+ 
+ 	// To avoid Entry#log() returning a value that only would make sense for
+diff --git a/logger.go b/logger.go
+index 9052a80..b769f3d 100644
+--- a/logger.go
++++ b/logger.go
+@@ -26,8 +26,31 @@ type Logger struct {
+ 	// to) `logrus.Info`, which allows Info(), Warn(), Error() and Fatal() to be
+ 	// logged. `logrus.Debug` is useful in
+ 	Level Level
+-	// Used to sync writing to the log.
+-	mu sync.Mutex
++	// Used to sync writing to the log. Locking is enabled by Default
++	mu MutexWrap
++	// Reusable empty entry
++	entryPool sync.Pool
++}
++
++type MutexWrap struct {
++	lock     sync.Mutex
++	disabled bool
++}
++
++func (mw *MutexWrap) Lock() {
++	if !mw.disabled {
++		mw.lock.Lock()
++	}
++}
++
++func (mw *MutexWrap) Unlock() {
++	if !mw.disabled {
++		mw.lock.Unlock()
++	}
++}
++
++func (mw *MutexWrap) Disable() {
++	mw.disabled = true
+ }
+ 
+ // Creates a new logger. Configuration should be set by changing `Formatter`,
+@@ -51,162 +74,235 @@ func New() *Logger {
+ 	}
+ }
+ 
++func (logger *Logger) newEntry() *Entry {
++	entry, ok := logger.entryPool.Get().(*Entry)
++	if ok {
++		return entry
++	}
++	return NewEntry(logger)
++}
++
++func (logger *Logger) releaseEntry(entry *Entry) {
++	logger.entryPool.Put(entry)
++}
++
+ // Adds a field to the log entry, note that it doesn't log until you call
+ // Debug, Print, Info, Warn, Fatal or Panic. It only creates a log entry.
+ // If you want multiple fields, use `WithFields`.
+ func (logger *Logger) WithField(key string, value interface{}) *Entry {
+-	return NewEntry(logger).WithField(key, value)
++	entry := logger.newEntry()
++	defer logger.releaseEntry(entry)
++	return entry.WithField(key, value)
+ }
+ 
+ // Adds a struct of fields to the log entry. All it does is call `WithField` for
+ // each `Field`.
+ func (logger *Logger) WithFields(fields Fields) *Entry {
+-	return NewEntry(logger).WithFields(fields)
++	entry := logger.newEntry()
++	defer logger.releaseEntry(entry)
++	return entry.WithFields(fields)
+ }
+ 
+ // Add an error as single field to the log entry.  All it does is call
+ // `WithError` for the given `error`.
+ func (logger *Logger) WithError(err error) *Entry {
+-	return NewEntry(logger).WithError(err)
++	entry := logger.newEntry()
++	defer logger.releaseEntry(entry)
++	return entry.WithError(err)
+ }
+ 
+ func (logger *Logger) Debugf(format string, args ...interface{}) {
+ 	if logger.Level >= DebugLevel {
+-		NewEntry(logger).Debugf(format, args...)
++		entry := logger.newEntry()
++		entry.Debugf(format, args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Infof(format string, args ...interface{}) {
+ 	if logger.Level >= InfoLevel {
+-		NewEntry(logger).Infof(format, args...)
++		entry := logger.newEntry()
++		entry.Infof(format, args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Printf(format string, args ...interface{}) {
+-	NewEntry(logger).Printf(format, args...)
++	entry := logger.newEntry()
++	entry.Printf(format, args...)
++	logger.releaseEntry(entry)
+ }
+ 
+ func (logger *Logger) Warnf(format string, args ...interface{}) {
+ 	if logger.Level >= WarnLevel {
+-		NewEntry(logger).Warnf(format, args...)
++		entry := logger.newEntry()
++		entry.Warnf(format, args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Warningf(format string, args ...interface{}) {
+ 	if logger.Level >= WarnLevel {
+-		NewEntry(logger).Warnf(format, args...)
++		entry := logger.newEntry()
++		entry.Warnf(format, args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Errorf(format string, args ...interface{}) {
+ 	if logger.Level >= ErrorLevel {
+-		NewEntry(logger).Errorf(format, args...)
++		entry := logger.newEntry()
++		entry.Errorf(format, args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Fatalf(format string, args ...interface{}) {
+ 	if logger.Level >= FatalLevel {
+-		NewEntry(logger).Fatalf(format, args...)
++		entry := logger.newEntry()
++		entry.Fatalf(format, args...)
++		logger.releaseEntry(entry)
+ 	}
+ 	Exit(1)
+ }
+ 
+ func (logger *Logger) Panicf(format string, args ...interface{}) {
+ 	if logger.Level >= PanicLevel {
+-		NewEntry(logger).Panicf(format, args...)
++		entry := logger.newEntry()
++		entry.Panicf(format, args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Debug(args ...interface{}) {
+ 	if logger.Level >= DebugLevel {
+-		NewEntry(logger).Debug(args...)
++		entry := logger.newEntry()
++		entry.Debug(args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Info(args ...interface{}) {
+ 	if logger.Level >= InfoLevel {
+-		NewEntry(logger).Info(args...)
++		entry := logger.newEntry()
++		entry.Info(args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Print(args ...interface{}) {
+-	NewEntry(logger).Info(args...)
++	entry := logger.newEntry()
++	entry.Info(args...)
++	logger.releaseEntry(entry)
+ }
+ 
+ func (logger *Logger) Warn(args ...interface{}) {
+ 	if logger.Level >= WarnLevel {
+-		NewEntry(logger).Warn(args...)
++		entry := logger.newEntry()
++		entry.Warn(args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Warning(args ...interface{}) {
+ 	if logger.Level >= WarnLevel {
+-		NewEntry(logger).Warn(args...)
++		entry := logger.newEntry()
++		entry.Warn(args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Error(args ...interface{}) {
+ 	if logger.Level >= ErrorLevel {
+-		NewEntry(logger).Error(args...)
++		entry := logger.newEntry()
++		entry.Error(args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Fatal(args ...interface{}) {
+ 	if logger.Level >= FatalLevel {
+-		NewEntry(logger).Fatal(args...)
++		entry := logger.newEntry()
++		entry.Fatal(args...)
++		logger.releaseEntry(entry)
+ 	}
+ 	Exit(1)
+ }
+ 
+ func (logger *Logger) Panic(args ...interface{}) {
+ 	if logger.Level >= PanicLevel {
+-		NewEntry(logger).Panic(args...)
++		entry := logger.newEntry()
++		entry.Panic(args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Debugln(args ...interface{}) {
+ 	if logger.Level >= DebugLevel {
+-		NewEntry(logger).Debugln(args...)
++		entry := logger.newEntry()
++		entry.Debugln(args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Infoln(args ...interface{}) {
+ 	if logger.Level >= InfoLevel {
+-		NewEntry(logger).Infoln(args...)
++		entry := logger.newEntry()
++		entry.Infoln(args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Println(args ...interface{}) {
+-	NewEntry(logger).Println(args...)
++	entry := logger.newEntry()
++	entry.Println(args...)
++	logger.releaseEntry(entry)
+ }
+ 
+ func (logger *Logger) Warnln(args ...interface{}) {
+ 	if logger.Level >= WarnLevel {
+-		NewEntry(logger).Warnln(args...)
++		entry := logger.newEntry()
++		entry.Warnln(args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Warningln(args ...interface{}) {
+ 	if logger.Level >= WarnLevel {
+-		NewEntry(logger).Warnln(args...)
++		entry := logger.newEntry()
++		entry.Warnln(args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Errorln(args ...interface{}) {
+ 	if logger.Level >= ErrorLevel {
+-		NewEntry(logger).Errorln(args...)
++		entry := logger.newEntry()
++		entry.Errorln(args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
+ 
+ func (logger *Logger) Fatalln(args ...interface{}) {
+ 	if logger.Level >= FatalLevel {
+-		NewEntry(logger).Fatalln(args...)
++		entry := logger.newEntry()
++		entry.Fatalln(args...)
++		logger.releaseEntry(entry)
+ 	}
+ 	Exit(1)
+ }
+ 
+ func (logger *Logger) Panicln(args ...interface{}) {
+ 	if logger.Level >= PanicLevel {
+-		NewEntry(logger).Panicln(args...)
++		entry := logger.newEntry()
++		entry.Panicln(args...)
++		logger.releaseEntry(entry)
+ 	}
+ }
++
++//When file is opened with appending mode, it's safe to
++//write concurrently to a file (within 4k message on Linux).
++//In these cases user can choose to disable the lock.
++func (logger *Logger) SetNoLock() {
++	logger.mu.Disable()
++}
+diff --git a/text_formatter.go b/text_formatter.go
+index 6afd0e0..cce61f2 100644
+--- a/text_formatter.go
++++ b/text_formatter.go
+@@ -57,6 +57,7 @@ type TextFormatter struct {
+ }
+ 
+ func (f *TextFormatter) Format(entry *Entry) ([]byte, error) {
++	var b *bytes.Buffer
+ 	var keys []string = make([]string, 0, len(entry.Data))
+ 	for k := range entry.Data {
+ 		keys = append(keys, k)
+@@ -65,8 +66,11 @@ func (f *TextFormatter) Format(entry *Entry) ([]byte, error) {
+ 	if !f.DisableSorting {
+ 		sort.Strings(keys)
+ 	}
+-
+-	b := &bytes.Buffer{}
++	if entry.Buffer != nil {
++		b = entry.Buffer
++	} else {
++		b = &bytes.Buffer{}
++	}
+ 
+ 	prefixFieldClashes(entry.Data)
+ 

@@ -1,0 +1,200 @@
+diff --git a/internal/xds/balancer/clusterresolver/configbuilder.go b/internal/xds/balancer/clusterresolver/configbuilder.go
+index 702ba76c..6aabc935 100644
+--- a/internal/xds/balancer/clusterresolver/configbuilder.go
++++ b/internal/xds/balancer/clusterresolver/configbuilder.go
+@@ -280,7 +280,7 @@ func priorityLocalitiesToClusterImpl(localities []xdsresource.Locality, priority
+ 			// populate a new locality weight attribute for each address The
+ 			// attribute will have the weight (as an integer) of the locality
+ 			// the address is part of." - A52
+-			resolverEndpoint = wrrlocality.SetAddrInfo(resolverEndpoint, wrrlocality.AddrInfo{LocalityWeight: lw})
++			resolverEndpoint = wrrlocality.SetAddrInfoInEndpoint(resolverEndpoint, wrrlocality.AddrInfo{LocalityWeight: lw})
+ 			var ew uint32 = 1
+ 			if endpoint.Weight != 0 {
+ 				ew = endpoint.Weight
+diff --git a/internal/xds/balancer/clusterresolver/configbuilder_test.go b/internal/xds/balancer/clusterresolver/configbuilder_test.go
+index a82c0eb7..af6f8d5b 100644
+--- a/internal/xds/balancer/clusterresolver/configbuilder_test.go
++++ b/internal/xds/balancer/clusterresolver/configbuilder_test.go
+@@ -676,7 +676,7 @@ func testEndpointWithAttrs(endpoint resolver.Endpoint, localityWeight, endpointW
+ 		endpoint = xdsinternal.SetLocalityIDInEndpoint(endpoint, *lID)
+ 	}
+ 	endpoint = hierarchy.SetInEndpoint(endpoint, path)
+-	endpoint = wrrlocality.SetAddrInfo(endpoint, wrrlocality.AddrInfo{LocalityWeight: localityWeight})
++	endpoint = wrrlocality.SetAddrInfoInEndpoint(endpoint, wrrlocality.AddrInfo{LocalityWeight: localityWeight})
+ 	endpoint = weight.Set(endpoint, weight.EndpointInfo{Weight: localityWeight * endpointWeight})
+ 	return endpoint
+ }
+diff --git a/internal/xds/balancer/wrrlocality/balancer.go b/internal/xds/balancer/wrrlocality/balancer.go
+index f5f2a89d..b11aaa17 100644
+--- a/internal/xds/balancer/wrrlocality/balancer.go
++++ b/internal/xds/balancer/wrrlocality/balancer.go
+@@ -113,9 +113,16 @@ type AddrInfo struct {
+ 	LocalityWeight uint32
+ }
+ 
+-// SetAddrInfo returns a copy of endpoint in which the Attributes field is
++// SetAddrInfo returns a copy of addr in which the BalancerAttributes field is
+ // updated with AddrInfo.
+-func SetAddrInfo(endpoint resolver.Endpoint, addrInfo AddrInfo) resolver.Endpoint {
++func SetAddrInfo(addr resolver.Address, addrInfo AddrInfo) resolver.Address {
++	addr.BalancerAttributes = addr.BalancerAttributes.WithValue(attributeKey{}, addrInfo)
++	return addr
++}
++
++// SetAddrInfoInEndpoint returns a copy of endpoint in which the Attributes
++// field is updated with AddrInfo.
++func SetAddrInfoInEndpoint(endpoint resolver.Endpoint, addrInfo AddrInfo) resolver.Endpoint {
+ 	endpoint.Attributes = endpoint.Attributes.WithValue(attributeKey{}, addrInfo)
+ 	return endpoint
+ }
+@@ -124,10 +131,10 @@ func (a AddrInfo) String() string {
+ 	return fmt.Sprintf("Locality Weight: %d", a.LocalityWeight)
+ }
+ 
+-// getAddrInfo returns the AddrInfo stored in the Attributes field of
+-// ep. Returns false if no AddrInfo found.
+-func getAddrInfo(ep resolver.Endpoint) (AddrInfo, bool) {
+-	v := ep.Attributes.Value(attributeKey{})
++// getAddrInfo returns the AddrInfo stored in the BalancerAttributes field of
++// addr. Returns false if no AddrInfo found.
++func getAddrInfo(addr resolver.Address) (AddrInfo, bool) {
++	v := addr.BalancerAttributes.Value(attributeKey{})
+ 	ai, ok := v.(AddrInfo)
+ 	return ai, ok
+ }
+@@ -159,15 +166,15 @@ func (b *wrrLocalityBalancer) UpdateClientConnState(s balancer.ClientConnState)
+ 	}
+ 
+ 	weightedTargets := make(map[string]weightedtarget.Target)
+-	for _, ep := range s.ResolverState.Endpoints {
++	for _, addr := range s.ResolverState.Addresses {
+ 		// This get of LocalityID could potentially return a zero value. This
+ 		// shouldn't happen though (this attribute that is set actually gets
+ 		// used to build localities in the first place), and thus don't error
+ 		// out, and just build a weighted target with undefined behavior.
+-		locality := xdsinternal.LocalityString(xdsinternal.LocalityIDFromEndpoint(ep))
+-		ai, ok := getAddrInfo(ep)
++		locality := xdsinternal.LocalityString(xdsinternal.GetLocalityID(addr))
++		ai, ok := getAddrInfo(addr)
+ 		if !ok {
+-			return fmt.Errorf("xds_wrr_locality: missing locality weight information in endpoint %q", ep)
++			return fmt.Errorf("xds_wrr_locality: missing locality weight information in address %q", addr)
+ 		}
+ 		weightedTargets[locality] = weightedtarget.Target{Weight: ai.LocalityWeight, ChildPolicy: lbCfg.ChildPolicy}
+ 	}
+diff --git a/internal/xds/balancer/wrrlocality/balancer_test.go b/internal/xds/balancer/wrrlocality/balancer_test.go
+index 31cfec84..b006a52b 100644
+--- a/internal/xds/balancer/wrrlocality/balancer_test.go
++++ b/internal/xds/balancer/wrrlocality/balancer_test.go
+@@ -176,23 +176,26 @@ func (s) TestUpdateClientConnState(t *testing.T) {
+ 	// Create the addresses with two localities with certain locality weights.
+ 	// This represents what addresses the wrr_locality balancer will receive in
+ 	// UpdateClientConnState.
+-	ep1 := resolver.Endpoint{Addresses: []resolver.Address{{Addr: "locality-1"}}}
+-	ep1 = xdsinternal.SetLocalityIDInEndpoint(ep1, clients.Locality{
++	addr1 := resolver.Address{
++		Addr: "locality-1",
++	}
++	addr1 = xdsinternal.SetLocalityID(addr1, clients.Locality{
+ 		Region:  "region-1",
+ 		Zone:    "zone-1",
+ 		SubZone: "subzone-1",
+ 	})
+-	ep1 = SetAddrInfo(ep1, AddrInfo{LocalityWeight: 2})
++	addr1 = SetAddrInfo(addr1, AddrInfo{LocalityWeight: 2})
+ 
+-	ep2 := resolver.Endpoint{Addresses: []resolver.Address{{Addr: "locality-2"}}}
+-	ep2 = xdsinternal.SetLocalityIDInEndpoint(ep2, clients.Locality{
++	addr2 := resolver.Address{
++		Addr: "locality-2",
++	}
++	addr2 = xdsinternal.SetLocalityID(addr2, clients.Locality{
+ 		Region:  "region-2",
+ 		Zone:    "zone-2",
+ 		SubZone: "subzone-2",
+ 	})
+-	ep2 = SetAddrInfo(ep2, AddrInfo{LocalityWeight: 1})
+-
+-	eps := []resolver.Endpoint{ep1, ep2}
++	addr2 = SetAddrInfo(addr2, AddrInfo{LocalityWeight: 1})
++	addrs := []resolver.Address{addr1, addr2}
+ 
+ 	err := wrrL.UpdateClientConnState(balancer.ClientConnState{
+ 		BalancerConfig: &LBConfig{
+@@ -201,7 +204,7 @@ func (s) TestUpdateClientConnState(t *testing.T) {
+ 			},
+ 		},
+ 		ResolverState: resolver.State{
+-			Endpoints: eps,
++			Addresses: addrs,
+ 		},
+ 	})
+ 	if err != nil {
+diff --git a/internal/xds/xds.go b/internal/xds/xds.go
+index b05d8660..866fc53b 100644
+--- a/internal/xds/xds.go
++++ b/internal/xds/xds.go
+@@ -105,12 +105,6 @@ func SetLocalityIDInEndpoint(endpoint resolver.Endpoint, l clients.Locality) res
+ 	return endpoint
+ }
+ 
+-// LocalityIDFromEndpoint returns the locality ID of ep.
+-func LocalityIDFromEndpoint(ep resolver.Endpoint) clients.Locality {
+-	path, _ := ep.Attributes.Value(localityKey).(clients.Locality)
+-	return path
+-}
+-
+ // UnknownCSMLabels are TelemetryLabels emitted from CDS if CSM Telemetry Label
+ // data is not present in the CDS Resource.
+ var UnknownCSMLabels = map[string]string{
+diff --git a/interop/orcalb.go b/interop/orcalb.go
+index a0466899..b19defb6 100644
+--- a/interop/orcalb.go
++++ b/interop/orcalb.go
+@@ -29,7 +29,6 @@ import (
+ 	"google.golang.org/grpc/balancer/base"
+ 	"google.golang.org/grpc/connectivity"
+ 	"google.golang.org/grpc/orca"
+-	"google.golang.org/grpc/resolver"
+ )
+ 
+ func init() {
+@@ -60,33 +59,18 @@ func (o *orcab) ExitIdle() {
+ 	}
+ }
+ 
+-// endpointsToAddrs flattens a list of endpoints to addresses to maintain
+-// existing behavior.
+-// TODO: https://github.com/grpc/grpc-go/issues/8809 - delegate subchannel
+-// management to the pickfirst balancer using the endpoint sharding balancer.
+-func endpointsToAddrs(eps []resolver.Endpoint) []resolver.Address {
+-	addrs := make([]resolver.Address, 0, len(eps))
+-	for _, ep := range eps {
+-		if len(ep.Addresses) == 0 {
+-			continue
+-		}
+-		addrs = append(addrs, ep.Addresses[0])
+-	}
+-	return addrs
+-}
+-
+ func (o *orcab) UpdateClientConnState(s balancer.ClientConnState) error {
+ 	if o.sc != nil {
+-		o.sc.UpdateAddresses(endpointsToAddrs(s.ResolverState.Endpoints))
++		o.sc.UpdateAddresses(s.ResolverState.Addresses)
+ 		return nil
+ 	}
+ 
+-	if len(s.ResolverState.Endpoints) == 0 {
+-		o.ResolverError(fmt.Errorf("produced no endpoints"))
+-		return fmt.Errorf("resolver produced no endpoints")
++	if len(s.ResolverState.Addresses) == 0 {
++		o.ResolverError(fmt.Errorf("produced no addresses"))
++		return fmt.Errorf("resolver produced no addresses")
+ 	}
+ 	var err error
+-	o.sc, err = o.cc.NewSubConn(endpointsToAddrs(s.ResolverState.Endpoints), balancer.NewSubConnOptions{StateListener: o.updateSubConnState})
++	o.sc, err = o.cc.NewSubConn(s.ResolverState.Addresses, balancer.NewSubConnOptions{StateListener: o.updateSubConnState})
+ 	if err != nil {
+ 		o.cc.UpdateState(balancer.State{ConnectivityState: connectivity.TransientFailure, Picker: base.NewErrPicker(fmt.Errorf("error creating subconn: %v", err))})
+ 		return nil

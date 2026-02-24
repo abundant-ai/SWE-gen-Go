@@ -1,0 +1,96 @@
+diff --git a/internal/command/e2etest/testdata/full-workflow-with-state-store-fs/main.tf b/internal/command/e2etest/testdata/full-workflow-with-state-store-fs/main.tf
+index d2f5c9b444..d2c773a6fc 100644
+--- a/internal/command/e2etest/testdata/full-workflow-with-state-store-fs/main.tf
++++ b/internal/command/e2etest/testdata/full-workflow-with-state-store-fs/main.tf
+@@ -7,6 +7,8 @@ terraform {
+ 
+   state_store "simple6_fs" {
+     provider "simple6" {}
++
++    workspace_dir = "states"
+   }
+ }
+ 
+diff --git a/internal/command/workspace_new.go b/internal/command/workspace_new.go
+index d36c76efef..d217fd38e9 100644
+--- a/internal/command/workspace_new.go
++++ b/internal/command/workspace_new.go
+@@ -10,9 +10,12 @@ import (
+ 	"time"
+ 
+ 	"github.com/hashicorp/cli"
++	"github.com/hashicorp/terraform/internal/backend/local"
++	backendPluggable "github.com/hashicorp/terraform/internal/backend/pluggable"
+ 	"github.com/hashicorp/terraform/internal/command/arguments"
+ 	"github.com/hashicorp/terraform/internal/command/clistate"
+ 	"github.com/hashicorp/terraform/internal/command/views"
++	"github.com/hashicorp/terraform/internal/states"
+ 	"github.com/hashicorp/terraform/internal/states/statefile"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+ 	"github.com/posener/complete"
+@@ -93,12 +96,38 @@ func (c *WorkspaceNewCommand) Run(args []string) int {
+ 		}
+ 	}
+ 
+-	_, sDiags := b.StateMgr(workspace)
++	// Create the new workspace
++	//
++	// In local, remote and remote-state backends obtaining a state manager
++	// creates an empty state file for the new workspace as a side-effect.
++	//
++	// The cloud backend also has logic in StateMgr for creating projects and
++	// workspaces if they don't already exist.
++	sMgr, sDiags := b.StateMgr(workspace)
+ 	if sDiags.HasErrors() {
+ 		c.Ui.Error(sDiags.Err().Error())
+ 		return 1
+ 	}
+ 
++	if l, ok := b.(*local.Local); ok {
++		if _, ok := l.Backend.(*backendPluggable.Pluggable); ok {
++			// Obtaining the state manager would have not created the state file as a side effect
++			// if a pluggable state store is in use.
++			//
++			// Instead, explicitly create the new workspace by saving an empty state file.
++			// We only do this when the backend in use is pluggable, to avoid impacting users
++			// of remote-state backends.
++			if err := sMgr.WriteState(states.NewState()); err != nil {
++				c.Ui.Error(err.Error())
++				return 1
++			}
++			if err := sMgr.PersistState(nil); err != nil {
++				c.Ui.Error(err.Error())
++				return 1
++			}
++		}
++	}
++
+ 	// now set the current workspace locally
+ 	if err := c.SetWorkspace(workspace); err != nil {
+ 		c.Ui.Error(fmt.Sprintf("Error selecting new workspace: %s", err))
+diff --git a/internal/plugin6/grpc_provider.go b/internal/plugin6/grpc_provider.go
+index 0339cefeee..2f517f363a 100644
+--- a/internal/plugin6/grpc_provider.go
++++ b/internal/plugin6/grpc_provider.go
+@@ -1841,6 +1841,7 @@ func (p *GRPCProvider) DeleteState(r providers.DeleteStateRequest) (resp provide
+ 
+ 	protoReq := &proto6.DeleteState_Request{
+ 		TypeName: r.TypeName,
++		StateId:  r.StateId,
+ 	}
+ 
+ 	schema := p.GetProviderSchema()
+diff --git a/internal/providers/testing/provider_mock.go b/internal/providers/testing/provider_mock.go
+index 8aa55051e3..e164593fc6 100644
+--- a/internal/providers/testing/provider_mock.go
++++ b/internal/providers/testing/provider_mock.go
+@@ -361,6 +361,9 @@ func (p *MockProvider) WriteStateBytes(r providers.WriteStateBytesRequest) (resp
+ 
+ 	// If we haven't already, record in the mock that
+ 	// the matching workspace exists
++	if p.MockStates == nil {
++		p.MockStates = make(map[string]interface{})
++	}
+ 	p.MockStates[r.StateId] = true
+ 
+ 	return p.WriteStateBytesResponse

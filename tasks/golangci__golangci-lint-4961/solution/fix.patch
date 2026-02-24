@@ -1,0 +1,243 @@
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 14c684d4..93b331be 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -1,11 +1,7 @@
+ package config
+ 
+ import (
+-	"fmt"
+-	"go/version"
+ 	"os"
+-	"regexp"
+-	"runtime"
+ 	"strings"
+ 
+ 	hcversion "github.com/hashicorp/go-version"
+@@ -92,56 +88,3 @@ func detectGoVersion() string {
+ 
+ 	return "1.17"
+ }
+-
+-// Trims the Go version to keep only M.m.
+-// Since Go 1.21 the version inside the go.mod can be a patched version (ex: 1.21.0).
+-// The version can also include information which we want to remove (ex: 1.21alpha1)
+-// https://go.dev/doc/toolchain#versions
+-// This a problem with staticcheck and gocritic.
+-func trimGoVersion(v string) string {
+-	if v == "" {
+-		return ""
+-	}
+-
+-	exp := regexp.MustCompile(`(\d\.\d+)(?:\.\d+|[a-z]+\d)`)
+-
+-	if exp.MatchString(v) {
+-		return exp.FindStringSubmatch(v)[1]
+-	}
+-
+-	return v
+-}
+-
+-func getRuntimeGoVersion() string {
+-	goVersion := runtime.Version()
+-
+-	parts := strings.Fields(goVersion)
+-
+-	if len(parts) == 0 {
+-		return goVersion
+-	}
+-
+-	// When using GOEXPERIMENT, the version returned might look something like "go1.23.0 X:boringcrypto".
+-	return parts[0]
+-}
+-
+-func checkGoVersion(goVersion string) error {
+-	langVersion := version.Lang(getRuntimeGoVersion())
+-
+-	runtimeVersion, err := hcversion.NewVersion(strings.TrimPrefix(langVersion, "go"))
+-	if err != nil {
+-		return err
+-	}
+-
+-	targetedVersion, err := hcversion.NewVersion(trimGoVersion(goVersion))
+-	if err != nil {
+-		return err
+-	}
+-
+-	if runtimeVersion.LessThan(targetedVersion) {
+-		return fmt.Errorf("the Go language version (%s) used to build golangci-lint is lower than the targeted Go version (%s)",
+-			langVersion, goVersion)
+-	}
+-
+-	return nil
+-}
+diff --git a/pkg/config/loader.go b/pkg/config/loader.go
+index 05f32433..efdbfce1 100644
+--- a/pkg/config/loader.go
++++ b/pkg/config/loader.go
+@@ -14,6 +14,7 @@ import (
+ 
+ 	"github.com/golangci/golangci-lint/pkg/exitcodes"
+ 	"github.com/golangci/golangci-lint/pkg/fsutils"
++	"github.com/golangci/golangci-lint/pkg/goutil"
+ 	"github.com/golangci/golangci-lint/pkg/logutils"
+ )
+ 
+@@ -74,7 +75,7 @@ func (l *Loader) Load(opts LoadOptions) error {
+ 
+ 	l.handleGoVersion()
+ 
+-	err = checkGoVersion(l.cfg.Run.Go)
++	err = goutil.CheckGoVersion(l.cfg.Run.Go)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -295,7 +296,7 @@ func (l *Loader) handleGoVersion() {
+ 		l.cfg.LintersSettings.Gofumpt.LangVersion = l.cfg.Run.Go
+ 	}
+ 
+-	trimmedGoVersion := trimGoVersion(l.cfg.Run.Go)
++	trimmedGoVersion := goutil.TrimGoVersion(l.cfg.Run.Go)
+ 
+ 	l.cfg.LintersSettings.Revive.Go = trimmedGoVersion
+ 
+diff --git a/pkg/goanalysis/runner_loadingpackage.go b/pkg/goanalysis/runner_loadingpackage.go
+index f0ffd4cb..8abe2b6c 100644
+--- a/pkg/goanalysis/runner_loadingpackage.go
++++ b/pkg/goanalysis/runner_loadingpackage.go
+@@ -9,8 +9,6 @@ import (
+ 	"go/types"
+ 	"os"
+ 	"reflect"
+-	"runtime"
+-	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 
+@@ -18,6 +16,7 @@ import (
+ 	"golang.org/x/tools/go/packages"
+ 
+ 	"github.com/golangci/golangci-lint/pkg/goanalysis/load"
++	"github.com/golangci/golangci-lint/pkg/goutil"
+ 	"github.com/golangci/golangci-lint/pkg/logutils"
+ )
+ 
+@@ -153,12 +152,18 @@ func (lp *loadingPackage) loadFromSource(loadMode LoadMode) error {
+ 		return imp.Types, nil
+ 	}
+ 
++	// TODO(ldez) temporary workaround
++	rv, err := goutil.CleanRuntimeVersion()
++	if err != nil {
++		return err
++	}
++
+ 	tc := &types.Config{
+ 		Importer: importerFunc(importer),
+ 		Error: func(err error) {
+ 			pkg.Errors = append(pkg.Errors, lp.convertError(err)...)
+ 		},
+-		GoVersion: getGoVersion(),
++		GoVersion: rv, // TODO(ldez) temporary workaround
+ 	}
+ 
+ 	_ = types.NewChecker(tc, pkg.Fset, pkg.Types, pkg.TypesInfo).Files(pkg.Syntax)
+@@ -502,17 +507,3 @@ func sizeOfReflectValueTreeBytes(rv reflect.Value, visitedPtrs map[uintptr]struc
+ 		panic("unknown rv of type " + rv.String())
+ 	}
+ }
+-
+-// TODO(ldez) temporary workaround
+-func getGoVersion() string {
+-	goVersion := runtime.Version()
+-
+-	parts := strings.Fields(goVersion)
+-
+-	if len(parts) == 0 {
+-		return goVersion
+-	}
+-
+-	// When using GOEXPERIMENT, the version returned might look something like "go1.23.0 X:boringcrypto".
+-	return parts[0]
+-}
+diff --git a/pkg/goutil/version.go b/pkg/goutil/version.go
+new file mode 100644
+index 00000000..4f42ebd1
+--- /dev/null
++++ b/pkg/goutil/version.go
+@@ -0,0 +1,75 @@
++package goutil
++
++import (
++	"fmt"
++	"go/version"
++	"regexp"
++	"runtime"
++	"strings"
++
++	hcversion "github.com/hashicorp/go-version"
++)
++
++func CheckGoVersion(goVersion string) error {
++	rv, err := CleanRuntimeVersion()
++	if err != nil {
++		return fmt.Errorf("clean runtime version: %w", err)
++	}
++
++	langVersion := version.Lang(rv)
++
++	runtimeVersion, err := hcversion.NewVersion(strings.TrimPrefix(langVersion, "go"))
++	if err != nil {
++		return err
++	}
++
++	targetedVersion, err := hcversion.NewVersion(TrimGoVersion(goVersion))
++	if err != nil {
++		return err
++	}
++
++	if runtimeVersion.LessThan(targetedVersion) {
++		return fmt.Errorf("the Go language version (%s) used to build golangci-lint is lower than the targeted Go version (%s)",
++			langVersion, goVersion)
++	}
++
++	return nil
++}
++
++// TrimGoVersion Trims the Go version to keep only M.m.
++// Since Go 1.21 the version inside the go.mod can be a patched version (ex: 1.21.0).
++// The version can also include information which we want to remove (ex: 1.21alpha1)
++// https://go.dev/doc/toolchain#versions
++// This a problem with staticcheck and gocritic.
++func TrimGoVersion(v string) string {
++	if v == "" {
++		return ""
++	}
++
++	exp := regexp.MustCompile(`(\d\.\d+)(?:\.\d+|[a-z]+\d)`)
++
++	if exp.MatchString(v) {
++		return exp.FindStringSubmatch(v)[1]
++	}
++
++	return v
++}
++
++func CleanRuntimeVersion() (string, error) {
++	return cleanRuntimeVersion(runtime.Version())
++}
++
++func cleanRuntimeVersion(rv string) (string, error) {
++	parts := strings.Fields(rv)
++
++	for _, part := range parts {
++		// Allow to handle:
++		// - GOEXPERIMENT -> "go1.23.0 X:boringcrypto"
++		// - devel -> "devel go1.24-e705a2d Wed Aug 7 01:16:42 2024 +0000 linux/amd64"
++		if strings.HasPrefix(part, "go1.") {
++			return part, nil
++		}
++	}
++
++	return "", fmt.Errorf("invalid Go runtime version: %s", rv)
++}

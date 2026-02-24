@@ -1,0 +1,498 @@
+diff --git a/README.md b/README.md
+index 6051f6a..09a3d50 100644
+--- a/README.md
++++ b/README.md
+@@ -8,8 +8,6 @@ Go configuration with fangs
+ Viper is a complete configuration solution. Designed to work within an
+ application to handle file based configuration and seamlessly marry that with
+ command line flags which can also be used to control application behavior.
+-Viper also supports retrieving configuration values from remote key/value stores. 
+-Etcd and Consul are supported. 
+ 
+ ## Why Viper?
+ 
+@@ -28,8 +26,10 @@ Viper does the following for you:
+ Viper believes that:
+ 
+ 1. command line flags take precedence over options set in config files
+-2. config files take precedence over options set in remote key/value stores
+-3. remote key/value stores take precedence over defaults
++2. config files take precedence over defaults
++
++Config files often can be found in multiple locations. Viper allows you to set
++multiple paths to search for the config file in.
+ 
+ Viper configuration keys are case insensitive.
+ 
+@@ -70,46 +70,6 @@ Viper configuration keys are case insensitive.
+         fmt.Println("verbose enabled")
+ 	}
+ 
+-### Remote Key/Value Store Support
+-Viper will read a config string (as JSON, TOML, or YAML) retrieved from a
+-path in a Key/Value store such as Etcd or Consul.  These values take precedence
+-over default values, but are overriden by configuration values retrieved from disk, 
+-flags, or environment variables.
+-
+-Viper uses [crypt](https://github.com/xordataexchange/crypt) to retrieve configuration
+-from the k/v store, which means that you can store your configuration values
+-encrypted and have them automatically decrypted if you have the correct
+-gpg keyring.  Encryption is optional.
+-
+-You can use remote configuration in conjunction with local configuration, or
+-independently of it.  
+-
+-`crypt` has a command-line helper that you can use to put configurations
+-in your k/v store. `crypt` defaults to etcd on http://127.0.0.1:4001.
+-
+-	go get github.com/xordataexchange/crypt/bin/crypt
+-	crypt set -plaintext /config/hugo.json /Users/hugo/settings/config.json
+-
+-Confirm that your value was set:
+-
+-	crypt get -plaintext /config/hugo.json
+-
+-See the `crypt` documentation for examples of how to set encrypted values, or how
+-to use Consul.
+-
+-### Remote Key/Value Store Example - Unencrypted
+-
+-	viper.AddRemoteProvider("etcd", "http://127.0.0.1:4001","/config/hugo.json")
+-	viper.SetConfigType("json") // because there is no file extension in a stream of bytes
+-	err := viper.ReadRemoteConfig()
+-
+-### Remote Key/Value Store Example - Encrypted
+-
+-	viper.AddSecureRemoteProvier("etcd","http://127.0.0.1:4001","/config/hugo.json","/etc/secrets/mykeyring.gpg")
+-	viper.SetConfigType("json") // because there is no file extension in a stream of bytes
+-	err := viper.ReadRemoteConfig()
+-
+-
+ 
+ ## Q & A
+ 
+diff --git a/viper.go b/viper.go
+index aa81a0c..720b759 100644
+--- a/viper.go
++++ b/viper.go
+@@ -5,15 +5,13 @@
+ 
+ // Viper is a application configuration system.
+ // It believes that applications can be configured a variety of ways
+-// via flags, ENVIRONMENT variables, configuration files retrieved
+-// from the file system, or a remote key/value store.
++// via flags, ENVIRONMENT variables, configuration files.
+ 
+ // Each item takes precedence over the item below it:
+ 
+ // flag
+ // env
+ // config
+-// key/value store
+ // default
+ 
+ package viper
+@@ -27,7 +25,6 @@ import (
+ 	"os"
+ 	"path"
+ 	"path/filepath"
+-	"reflect"
+ 	"runtime"
+ 	"strings"
+ 	"time"
+@@ -38,33 +35,17 @@ import (
+ 	"github.com/spf13/cast"
+ 	jww "github.com/spf13/jwalterweatherman"
+ 	"github.com/spf13/pflag"
+-	crypt "github.com/xordataexchange/crypt/config"
+ 	"gopkg.in/yaml.v1"
+ )
+ 
+-// remoteProvider stores the configuration necessary
+-// to connect to a remote key/value store.
+-// Optional secretKeyring to unencrypt encrypted values
+-// can be provided.
+-type remoteProvider struct {
+-	provider      string
+-	endpoint      string
+-	path          string
+-	secretKeyring string
+-}
+-
+ // A set of paths to look for the config file in
+ var configPaths []string
+ 
+-// A set of remote providers to search for the configuration
+-var remoteProviders []*remoteProvider
+-
+ // Name of file to look for inside the path
+ var configName string = "config"
+ 
+ // extensions Supported
+ var SupportedExts []string = []string{"json", "toml", "yaml", "yml"}
+-var SupportedRemoteProviders []string = []string{"etcd", "consul"}
+ var configFile string
+ var configType string
+ 
+@@ -72,7 +53,6 @@ var config map[string]interface{} = make(map[string]interface{})
+ var override map[string]interface{} = make(map[string]interface{})
+ var env map[string]string = make(map[string]string)
+ var defaults map[string]interface{} = make(map[string]interface{})
+-var kvstore map[string]interface{} = make(map[string]interface{})
+ var pflags map[string]*pflag.Flag = make(map[string]*pflag.Flag)
+ var aliases map[string]string = make(map[string]string)
+ 
+@@ -101,76 +81,6 @@ func AddConfigPath(in string) {
+ 	}
+ }
+ 
+-// AddRemoteProvider adds a remote configuration source.
+-// Remote Providers are searched in the order they are added.
+-// provider is a string value, "etcd" or "consul" are currently supported.
+-// endpoint is the url.  etcd requires http://ip:port  consul requires ip:port
+-// path is the path in the k/v store to retrieve configuration
+-// To retrieve a config file called myapp.json from /configs/myapp.json
+-// you should set path to /configs and set config name (SetConfigName()) to
+-// "myapp"
+-func AddRemoteProvider(provider, endpoint, path string) error {
+-	if !stringInSlice(provider, SupportedRemoteProviders) {
+-		return UnsupportedRemoteProviderError(provider)
+-	}
+-	if provider != "" && endpoint != "" {
+-		jww.INFO.Printf("adding %s:%s to remote provider list", provider, endpoint)
+-		rp := &remoteProvider{
+-			endpoint: endpoint,
+-			provider: provider,
+-			path:     path,
+-		}
+-		if !providerPathExists(rp) {
+-			remoteProviders = append(remoteProviders, rp)
+-		}
+-	}
+-	return nil
+-}
+-
+-// AddSecureRemoteProvider adds a remote configuration source.
+-// Secure Remote Providers are searched in the order they are added.
+-// provider is a string value, "etcd" or "consul" are currently supported.
+-// endpoint is the url.  etcd requires http://ip:port  consul requires ip:port
+-// secretkeyring is the filepath to your openpgp secret keyring.  e.g. /etc/secrets/myring.gpg
+-// path is the path in the k/v store to retrieve configuration
+-// To retrieve a config file called myapp.json from /configs/myapp.json
+-// you should set path to /configs and set config name (SetConfigName()) to
+-// "myapp"
+-// Secure Remote Providers are implemented with github.com/xordataexchange/crypt
+-func AddSecureRemoteProvider(provider, endpoint, path, secretkeyring string) error {
+-	if !stringInSlice(provider, SupportedRemoteProviders) {
+-		return UnsupportedRemoteProviderError(provider)
+-	}
+-	if provider != "" && endpoint != "" {
+-		jww.INFO.Printf("adding %s:%s to remote provider list", provider, endpoint)
+-		rp := &remoteProvider{
+-			endpoint: endpoint,
+-			provider: provider,
+-			path:     path,
+-		}
+-		if !providerPathExists(rp) {
+-			remoteProviders = append(remoteProviders, rp)
+-		}
+-	}
+-	return nil
+-}
+-
+-func providerPathExists(p *remoteProvider) bool {
+-
+-	for _, y := range remoteProviders {
+-		if reflect.DeepEqual(y, p) {
+-			return true
+-		}
+-	}
+-	return false
+-}
+-
+-type UnsupportedRemoteProviderError string
+-
+-func (str UnsupportedRemoteProviderError) Error() string {
+-	return fmt.Sprintf("Unsupported Remote Provider Type %q", string(str))
+-}
+-
+ func GetString(key string) string {
+ 	return cast.ToString(Get(key))
+ }
+@@ -222,10 +132,6 @@ func Marshal(rawVal interface{}) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	err = mapstructure.Decode(kvstore, rawVal)
+-	if err != nil {
+-		return err
+-	}
+ 
+ 	insensativiseMaps()
+ 
+@@ -315,12 +221,6 @@ func find(key string) interface{} {
+ 		return val
+ 	}
+ 
+-	val, exists = kvstore[key]
+-	if exists {
+-		jww.TRACE.Println(key, "found in key/value store:", val)
+-		return val
+-	}
+-
+ 	val, exists = defaults[key]
+ 	if exists {
+ 		jww.TRACE.Println(key, "found in defaults:", val)
+@@ -389,10 +289,6 @@ func registerAlias(alias string, key string) {
+ 				delete(config, alias)
+ 				config[key] = val
+ 			}
+-			if val, ok := kvstore[alias]; ok {
+-				delete(kvstore, alias)
+-				kvstore[key] = val
+-			}
+ 			if val, ok := defaults[alias]; ok {
+ 				delete(defaults, alias)
+ 				defaults[key] = val
+@@ -435,8 +331,7 @@ func SetDefault(key string, value interface{}) {
+ }
+ 
+ // The user provided value (via flag)
+-// Will be used instead of values obtained via
+-// config file, ENV, default, or key/value store
++// Will be used instead of values obtained via config file, ENV or default
+ func Set(key string, value interface{}) {
+ 	// If alias passed in, then set the proper override
+ 	key = realKey(strings.ToLower(key))
+@@ -450,7 +345,7 @@ func (str UnsupportedConfigError) Error() string {
+ }
+ 
+ // Viper will discover and load the configuration file from disk
+-// and key/value stores, searching in one of the defined paths.
++// searching in one of the defined paths.
+ func ReadInConfig() error {
+ 	jww.INFO.Println("Attempting to read in config file")
+ 	if !stringInSlice(getConfigType(), SupportedExts) {
+@@ -462,98 +357,38 @@ func ReadInConfig() error {
+ 		return err
+ 	}
+ 
+-	MarshallReader(bytes.NewReader(file), config)
++	MarshallReader(bytes.NewReader(file))
+ 	return nil
+ }
+-func ReadRemoteConfig() error {
+-	err := getKeyValueConfig()
+-	if err != nil {
+-		return err
+-	}
+-	return nil
+-}
+-func MarshallReader(in io.Reader, c map[string]interface{}) {
++
++func MarshallReader(in io.Reader) {
+ 	buf := new(bytes.Buffer)
+ 	buf.ReadFrom(in)
+ 
+ 	switch getConfigType() {
+ 	case "yaml", "yml":
+-		if err := yaml.Unmarshal(buf.Bytes(), &c); err != nil {
++		if err := yaml.Unmarshal(buf.Bytes(), &config); err != nil {
+ 			jww.ERROR.Fatalf("Error parsing config: %s", err)
+ 		}
+ 
+ 	case "json":
+-		if err := json.Unmarshal(buf.Bytes(), &c); err != nil {
++		if err := json.Unmarshal(buf.Bytes(), &config); err != nil {
+ 			jww.ERROR.Fatalf("Error parsing config: %s", err)
+ 		}
+ 
+ 	case "toml":
+-		if _, err := toml.Decode(buf.String(), &c); err != nil {
++		if _, err := toml.Decode(buf.String(), &config); err != nil {
+ 			jww.ERROR.Fatalf("Error parsing config: %s", err)
+ 		}
+ 	}
+ 
+-	insensativiseMap(c)
++	insensativiseMap(config)
+ }
+ 
+ func insensativiseMaps() {
+ 	insensativiseMap(config)
+ 	insensativiseMap(defaults)
+ 	insensativiseMap(override)
+-	insensativiseMap(kvstore)
+-}
+-
+-// retrieve the first found remote configuration
+-func getKeyValueConfig() error {
+-	for _, rp := range remoteProviders {
+-		val, err := getRemoteConfig(rp)
+-		if err != nil {
+-			continue
+-		}
+-		kvstore = val
+-		return nil
+-	}
+-	return RemoteConfigError("No Files Found")
+-}
+-
+-type RemoteConfigError string
+-
+-func (rce RemoteConfigError) Error() string {
+-	return fmt.Sprintf("Remote Configurations Error: %s", string(rce))
+-}
+-
+-func getRemoteConfig(provider *remoteProvider) (map[string]interface{}, error) {
+-	var cm crypt.ConfigManager
+-	var err error
+-
+-	if provider.secretKeyring != "" {
+-		kr, err := os.Open(provider.secretKeyring)
+-		defer kr.Close()
+-		if err != nil {
+-			return nil, err
+-		}
+-		if provider.provider == "etcd" {
+-			cm, err = crypt.NewEtcdConfigManager([]string{provider.endpoint}, kr)
+-		} else {
+-			cm, err = crypt.NewConsulConfigManager([]string{provider.endpoint}, kr)
+-		}
+-	} else {
+-		if provider.provider == "etcd" {
+-			cm, err = crypt.NewStandardEtcdConfigManager([]string{provider.endpoint})
+-		} else {
+-			cm, err = crypt.NewStandardConsulConfigManager([]string{provider.endpoint})
+-		}
+-	}
+-	if err != nil {
+-		return nil, err
+-	}
+-	b, err := cm.Get(provider.path)
+-	if err != nil {
+-		return nil, err
+-	}
+-	reader := bytes.NewReader(b)
+-	MarshallReader(reader, kvstore)
+-	return kvstore, err
+ }
+ 
+ func insensativiseMap(m map[string]interface{}) {
+@@ -577,10 +412,6 @@ func AllKeys() []string {
+ 		m[key] = struct{}{}
+ 	}
+ 
+-	for key, _ := range kvstore {
+-		m[key] = struct{}{}
+-	}
+-
+ 	for key, _ := range override {
+ 		m[key] = struct{}{}
+ 	}
+@@ -763,8 +594,6 @@ func absPathify(inPath string) string {
+ func Debug() {
+ 	fmt.Println("Config:")
+ 	pretty.Println(config)
+-	fmt.Println("Key/Value Store:")
+-	pretty.Println(kvstore)
+ 	fmt.Println("Env:")
+ 	pretty.Println(env)
+ 	fmt.Println("Defaults:")
+@@ -784,7 +613,6 @@ func Reset() {
+ 	configFile = ""
+ 	configType = ""
+ 
+-	kvstore = make(map[string]interface{})
+ 	config = make(map[string]interface{})
+ 	override = make(map[string]interface{})
+ 	env = make(map[string]string)
+diff --git a/viper_test.go b/viper_test.go
+index bc4059f..09d8c78 100644
+--- a/viper_test.go
++++ b/viper_test.go
+@@ -54,12 +54,6 @@ var jsonExample = []byte(`{
+     }
+ }`)
+ 
+-var remoteExample = []byte(`{
+-"id":"0002",
+-"type":"cronut",
+-"newkey":"remote"
+-}`)
+-
+ //stubs for PFlag Values
+ type stringValue string
+ 
+@@ -95,7 +89,7 @@ func TestMarshalling(t *testing.T) {
+ 	SetConfigType("yaml")
+ 	r := bytes.NewReader(yamlExample)
+ 
+-	MarshallReader(r, config)
++	MarshallReader(r)
+ 	assert.True(t, InConfig("name"))
+ 	assert.False(t, InConfig("state"))
+ 	assert.Equal(t, "steve", Get("name"))
+@@ -136,7 +130,7 @@ func TestYML(t *testing.T) {
+ 	SetConfigType("yml")
+ 	r := bytes.NewReader(yamlExample)
+ 
+-	MarshallReader(r, config)
++	MarshallReader(r)
+ 	assert.Equal(t, "steve", Get("name"))
+ }
+ 
+@@ -144,7 +138,7 @@ func TestJSON(t *testing.T) {
+ 	SetConfigType("json")
+ 	r := bytes.NewReader(jsonExample)
+ 
+-	MarshallReader(r, config)
++	MarshallReader(r)
+ 	assert.Equal(t, "0001", Get("id"))
+ }
+ 
+@@ -152,30 +146,14 @@ func TestTOML(t *testing.T) {
+ 	SetConfigType("toml")
+ 	r := bytes.NewReader(tomlExample)
+ 
+-	MarshallReader(r, config)
++	MarshallReader(r)
+ 	assert.Equal(t, "TOML Example", Get("title"))
+ }
+ 
+-func TestRemotePrecedence(t *testing.T) {
+-	SetConfigType("json")
+-	r := bytes.NewReader(jsonExample)
+-	MarshallReader(r, config)
+-	remote := bytes.NewReader(remoteExample)
+-	assert.Equal(t, "0001", Get("id"))
+-	MarshallReader(remote, kvstore)
+-	assert.Equal(t, "0001", Get("id"))
+-	assert.NotEqual(t, "cronut", Get("type"))
+-	assert.Equal(t, "remote", Get("newkey"))
+-	Set("newkey", "newvalue")
+-	assert.NotEqual(t, "remote", Get("newkey"))
+-	assert.Equal(t, "newvalue", Get("newkey"))
+-	Set("newkey", "remote")
+-}
+-
+ func TestEnv(t *testing.T) {
+ 	SetConfigType("json")
+ 	r := bytes.NewReader(jsonExample)
+-	MarshallReader(r, config)
++	MarshallReader(r)
+ 	BindEnv("id")
+ 	BindEnv("f", "FOOD")
+ 
+@@ -193,9 +171,9 @@ func TestEnv(t *testing.T) {
+ }
+ 
+ func TestAllKeys(t *testing.T) {
+-	ks := sort.StringSlice{"title", "newkey", "owner", "name", "beard", "ppu", "batters", "hobbies", "clothing", "age", "hacker", "id", "type", "eyes"}
++	ks := sort.StringSlice{"title", "owner", "name", "beard", "ppu", "batters", "hobbies", "clothing", "age", "hacker", "id", "type", "eyes"}
+ 	dob, _ := time.Parse(time.RFC3339, "1979-05-27T07:32:00Z")
+-	all := map[string]interface{}{"hacker": true, "beard": true, "newkey": "remote", "batters": map[string]interface{}{"batter": []interface{}{map[string]interface{}{"type": "Regular"}, map[string]interface{}{"type": "Chocolate"}, map[string]interface{}{"type": "Blueberry"}, map[string]interface{}{"type": "Devil's Food"}}}, "hobbies": []interface{}{"skateboarding", "snowboarding", "go"}, "ppu": 0.55, "clothing": map[interface{}]interface{}{"jacket": "leather", "trousers": "denim"}, "name": "crunk", "owner": map[string]interface{}{"organization": "MongoDB", "Bio": "MongoDB Chief Developer Advocate & Hacker at Large", "dob": dob}, "id": "13", "title": "TOML Example", "age": 35, "type": "donut", "eyes": "brown"}
++	all := map[string]interface{}{"hacker": true, "beard": true, "batters": map[string]interface{}{"batter": []interface{}{map[string]interface{}{"type": "Regular"}, map[string]interface{}{"type": "Chocolate"}, map[string]interface{}{"type": "Blueberry"}, map[string]interface{}{"type": "Devil's Food"}}}, "hobbies": []interface{}{"skateboarding", "snowboarding", "go"}, "ppu": 0.55, "clothing": map[interface{}]interface{}{"jacket": "leather", "trousers": "denim"}, "name": "crunk", "owner": map[string]interface{}{"organization": "MongoDB", "Bio": "MongoDB Chief Developer Advocate & Hacker at Large", "dob": dob}, "id": "13", "title": "TOML Example", "age": 35, "type": "donut", "eyes": "brown"}
+ 
+ 	var allkeys sort.StringSlice
+ 	allkeys = AllKeys()

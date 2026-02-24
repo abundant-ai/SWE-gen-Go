@@ -1,0 +1,274 @@
+diff --git a/middleware/middleware.go b/middleware/middleware.go
+index 60834b5..12260dd 100644
+--- a/middleware/middleware.go
++++ b/middleware/middleware.go
+@@ -2,6 +2,7 @@ package middleware
+ 
+ import (
+ 	"net/http"
++	"net/url"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
+@@ -33,29 +34,15 @@ func captureTokens(pattern *regexp.Regexp, input string) *strings.Replacer {
+ 	return strings.NewReplacer(replace...)
+ }
+ 
+-func rewriteRulesRegex(rewrite map[string]string) map[*regexp.Regexp]string {
+-	// Initialize
+-	rulesRegex := map[*regexp.Regexp]string{}
+-	for k, v := range rewrite {
+-		k = regexp.QuoteMeta(k)
+-		k = strings.Replace(k, `\*`, "(.*)", -1)
+-		if strings.HasPrefix(k, `\^`) {
+-			k = strings.Replace(k, `\^`, "^", -1)
+-		}
+-		k = k + "$"
+-		rulesRegex[regexp.MustCompile(k)] = v
+-	}
+-	return rulesRegex
+-}
+-
+-func rewritePath(rewriteRegex map[*regexp.Regexp]string, req *http.Request) {
+-	for k, v := range rewriteRegex {
+-		replacerRawPath := captureTokens(k, req.URL.EscapedPath())
+-		if replacerRawPath != nil {
+-			replacerPath := captureTokens(k, req.URL.Path)
+-			req.URL.RawPath, req.URL.Path = replacerRawPath.Replace(v), replacerPath.Replace(v)
+-		}
++//rewritePath sets request url path and raw path
++func rewritePath(replacer *strings.Replacer, target string, req *http.Request) error {
++	replacerRawPath := replacer.Replace(target)
++	replacerPath, err := url.PathUnescape(replacerRawPath)
++	if err != nil {
++		return err
+ 	}
++	req.URL.Path, req.URL.RawPath = replacerPath, replacerRawPath
++	return nil
+ }
+ 
+ // DefaultSkipper returns false which processes the middleware.
+diff --git a/middleware/proxy.go b/middleware/proxy.go
+index 1b972eb..cd50b76 100644
+--- a/middleware/proxy.go
++++ b/middleware/proxy.go
+@@ -8,6 +8,7 @@ import (
+ 	"net/http"
+ 	"net/url"
+ 	"regexp"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -205,8 +206,13 @@ func ProxyWithConfig(config ProxyConfig) echo.MiddlewareFunc {
+ 	if config.Balancer == nil {
+ 		panic("echo: proxy middleware requires balancer")
+ 	}
++	config.rewriteRegex = map[*regexp.Regexp]string{}
+ 
+-	config.rewriteRegex = rewriteRulesRegex(config.Rewrite)
++	// Initialize
++	for k, v := range config.Rewrite {
++		k = strings.Replace(k, "*", "(\\S*)", -1)
++		config.rewriteRegex[regexp.MustCompile(k)] = v
++	}
+ 
+ 	return func(next echo.HandlerFunc) echo.HandlerFunc {
+ 		return func(c echo.Context) (err error) {
+@@ -219,8 +225,16 @@ func ProxyWithConfig(config ProxyConfig) echo.MiddlewareFunc {
+ 			tgt := config.Balancer.Next(c)
+ 			c.Set(config.ContextKey, tgt)
+ 
+-			// Set rewrite path and raw path
+-			rewritePath(config.rewriteRegex, req)
++			// Rewrite
++			for k, v := range config.rewriteRegex {
++				//use req.URL.Path here or else we will have double escaping
++				replacer := captureTokens(k, req.URL.Path)
++				if replacer != nil {
++					if err := rewritePath(replacer, v, req); err != nil {
++						return echo.NewHTTPError(http.StatusBadRequest, "invalid url")
++					}
++				}
++			}
+ 
+ 			// Fix header
+ 			// Basically it's not good practice to unconditionally pass incoming x-real-ip header to upstream.
+@@ -251,5 +265,3 @@ func ProxyWithConfig(config ProxyConfig) echo.MiddlewareFunc {
+ 		}
+ 	}
+ }
+-
+-
+diff --git a/middleware/proxy_test.go b/middleware/proxy_test.go
+index 534e45f..4bb7464 100644
+--- a/middleware/proxy_test.go
++++ b/middleware/proxy_test.go
+@@ -94,35 +94,36 @@ func TestProxy(t *testing.T) {
+ 			"/users/*/orders/*": "/user/$1/order/$2",
+ 		},
+ 	}))
+-	req.URL, _ = url.Parse("/api/users")
++	req.URL.Path = "/api/users"
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, "/users", req.URL.EscapedPath())
+ 	assert.Equal(t, http.StatusOK, rec.Code)
+-	req.URL, _ = url.Parse( "/js/main.js")
++	req.URL.Path = "/js/main.js"
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, "/public/javascripts/main.js", req.URL.EscapedPath())
+ 	assert.Equal(t, http.StatusOK, rec.Code)
+-	req.URL, _ = url.Parse("/old")
++	req.URL.Path = "/old"
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, "/new", req.URL.EscapedPath())
+ 	assert.Equal(t, http.StatusOK, rec.Code)
+-	req.URL, _ = url.Parse( "/users/jack/orders/1")
++	req.URL.Path = "/users/jack/orders/1"
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, "/user/jack/order/1", req.URL.EscapedPath())
+ 	assert.Equal(t, http.StatusOK, rec.Code)
+-	req.URL, _ = url.Parse("/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F")
++	req.URL.Path = "/users/jill/orders/T%2FcO4lW%2Ft%2FVp%2F"
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, "/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F", req.URL.EscapedPath())
+ 	assert.Equal(t, http.StatusOK, rec.Code)
+-	req.URL, _ = url.Parse("/api/new users")
++	req.URL.Path =  "/users/jill/orders/%%%%"
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+-	assert.Equal(t, "/new%20users", req.URL.EscapedPath())
++	assert.Equal(t, http.StatusBadRequest, rec.Code)
++
+ 	// ModifyResponse
+ 	e = echo.New()
+ 	e.Use(ProxyWithConfig(ProxyConfig{
+diff --git a/middleware/rewrite.go b/middleware/rewrite.go
+index 0965e31..855c863 100644
+--- a/middleware/rewrite.go
++++ b/middleware/rewrite.go
+@@ -1,8 +1,11 @@
+ package middleware
+ 
+ import (
+-	"github.com/labstack/echo/v4"
++	"net/http"
+ 	"regexp"
++	"strings"
++
++	"github.com/labstack/echo/v4"
+ )
+ 
+ type (
+@@ -51,8 +54,18 @@ func RewriteWithConfig(config RewriteConfig) echo.MiddlewareFunc {
+ 	if config.Skipper == nil {
+ 		config.Skipper = DefaultBodyDumpConfig.Skipper
+ 	}
++	config.rulesRegex = map[*regexp.Regexp]string{}
+ 
+-	config.rulesRegex = rewriteRulesRegex(config.Rules)
++	// Initialize
++	for k, v := range config.Rules {
++		k = regexp.QuoteMeta(k)
++		k = strings.Replace(k, `\*`, "(.*)", -1)
++		if strings.HasPrefix(k, `\^`) {
++			k = strings.Replace(k, `\^`, "^", -1)
++		}
++		k = k + "$"
++		config.rulesRegex[regexp.MustCompile(k)] = v
++	}
+ 
+ 	return func(next echo.HandlerFunc) echo.HandlerFunc {
+ 		return func(c echo.Context) (err error) {
+@@ -61,8 +74,17 @@ func RewriteWithConfig(config RewriteConfig) echo.MiddlewareFunc {
+ 			}
+ 
+ 			req := c.Request()
+-			// Set rewrite path and raw path
+-			rewritePath(config.rulesRegex, req)
++			// Rewrite
++			for k, v := range config.rulesRegex {
++				//use req.URL.Path here or else we will have double escaping
++				replacer := captureTokens(k, req.URL.Path)
++				if replacer != nil {
++					if err := rewritePath(replacer, v, req); err != nil {
++						return echo.NewHTTPError(http.StatusBadRequest, "invalid url")
++					}
++					break
++				}
++			}
+ 			return next(c)
+ 		}
+ 	}
+diff --git a/middleware/rewrite_test.go b/middleware/rewrite_test.go
+index abf11b2..a9b3437 100644
+--- a/middleware/rewrite_test.go
++++ b/middleware/rewrite_test.go
+@@ -4,7 +4,6 @@ import (
+ 	"io/ioutil"
+ 	"net/http"
+ 	"net/http/httptest"
+-	"net/url"
+ 	"testing"
+ 
+ 	"github.com/labstack/echo/v4"
+@@ -24,28 +23,33 @@ func TestRewrite(t *testing.T) {
+ 	}))
+ 	req := httptest.NewRequest(http.MethodGet, "/", nil)
+ 	rec := httptest.NewRecorder()
+-	req.URL, _ = url.Parse("/api/users")
++	req.URL.Path = "/api/users"
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, "/users", req.URL.EscapedPath())
+-	req.URL, _ = url.Parse("/js/main.js")
++	req.URL.Path = "/js/main.js"
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, "/public/javascripts/main.js", req.URL.EscapedPath())
+-	req.URL, _ = url.Parse("/old")
++	req.URL.Path = "/old"
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, "/new", req.URL.EscapedPath())
+-	req.URL, _ = url.Parse("/users/jack/orders/1")
++	req.URL.Path = "/users/jack/orders/1"
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, "/user/jack/order/1", req.URL.EscapedPath())
+-	req.URL, _ = url.Parse("/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F")
++	req.URL.Path = "/api/new users"
++	rec = httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	assert.Equal(t, "/new%20users", req.URL.EscapedPath())
++	req.URL.Path = "/users/jill/orders/T%2FcO4lW%2Ft%2FVp%2F"
+ 	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+ 	assert.Equal(t, "/user/jill/order/T%2FcO4lW%2Ft%2FVp%2F", req.URL.EscapedPath())
+-	req.URL, _ = url.Parse("/api/new users")
++	req.URL.Path = "/users/jill/orders/%%%%"
++	rec = httptest.NewRecorder()
+ 	e.ServeHTTP(rec, req)
+-	assert.Equal(t, "/new%20users", req.URL.EscapedPath())
++	assert.Equal(t, http.StatusBadRequest, rec.Code)
+ }
+ 
+ // Issue #1086
+@@ -54,10 +58,11 @@ func TestEchoRewritePreMiddleware(t *testing.T) {
+ 	r := e.Router()
+ 
+ 	// Rewrite old url to new one
+-	e.Pre(Rewrite(map[string]string{
++	e.Pre(RewriteWithConfig(RewriteConfig{
++		Rules: map[string]string{
+ 			"/old": "/new",
+ 		},
+-	))
++	}))
+ 
+ 	// Route
+ 	r.Add(http.MethodGet, "/new", func(c echo.Context) error {

@@ -1,0 +1,398 @@
+diff --git a/internal/backend/remote-state/inmem/backend.go b/internal/backend/remote-state/inmem/backend.go
+index 96cddd0911..2197a280ee 100644
+--- a/internal/backend/remote-state/inmem/backend.go
++++ b/internal/backend/remote-state/inmem/backend.go
+@@ -71,22 +71,27 @@ func (b *Backend) Configure(configVal cty.Value) tfdiags.Diagnostics {
+ 	states.Lock()
+ 	defer states.Unlock()
+ 
+-	defaultClient := &RemoteClient{
+-		Name: backend.DefaultStateName,
+-	}
++	// Some tests may configure this backend multiple times
++	// and expect the same state from memory afterwards.
++	_, ok := states.m[backend.DefaultStateName]
++	if !ok {
++		defaultClient := &RemoteClient{
++			Name: backend.DefaultStateName,
++		}
+ 
+-	states.m[backend.DefaultStateName] = &remote.State{
+-		Client: defaultClient,
+-	}
++		states.m[backend.DefaultStateName] = &remote.State{
++			Client: defaultClient,
++		}
+ 
+-	// set the default client lock info per the test config
+-	if v := configVal.GetAttr("lock_id"); !v.IsNull() {
+-		info := statemgr.NewLockInfo()
+-		info.ID = v.AsString()
+-		info.Operation = "test"
+-		info.Info = "test config"
++		// set the default client lock info per the test config
++		if v := configVal.GetAttr("lock_id"); !v.IsNull() {
++			info := statemgr.NewLockInfo()
++			info.ID = v.AsString()
++			info.Operation = "test"
++			info.Info = "test config"
+ 
+-		locks.lock(backend.DefaultStateName, info)
++			locks.lock(backend.DefaultStateName, info)
++		}
+ 	}
+ 
+ 	return nil
+diff --git a/internal/backend/remote-state/inmem/testing.go b/internal/backend/remote-state/inmem/testing.go
+new file mode 100644
+index 0000000000..1a7f9d0699
+--- /dev/null
++++ b/internal/backend/remote-state/inmem/testing.go
+@@ -0,0 +1,34 @@
++// Copyright (c) HashiCorp, Inc.
++// SPDX-License-Identifier: BUSL-1.1
++
++package inmem
++
++import (
++	"testing"
++
++	statespkg "github.com/hashicorp/terraform/internal/states"
++)
++
++func ReadState(t *testing.T, wsName string) *statespkg.State {
++	states.Lock()
++	defer states.Unlock()
++
++	stateMgr, ok := states.m[wsName]
++	if !ok {
++		t.Fatalf("state not found for workspace %s", wsName)
++	}
++
++	return stateMgr.State()
++}
++
++func ReadWorkspaces(t *testing.T) []string {
++	states.Lock()
++	defer states.Unlock()
++
++	workspaces := make([]string, 0, len(states.m))
++	for wsName := range states.m {
++		workspaces = append(workspaces, wsName)
++	}
++
++	return workspaces
++}
+diff --git a/internal/cloud/testing.go b/internal/cloud/testing.go
+index 4d197c430f..62ced1c389 100644
+--- a/internal/cloud/testing.go
++++ b/internal/cloud/testing.go
+@@ -245,9 +245,9 @@ func testBackendWithOutputs(t *testing.T) (*Cloud, func()) {
+ func testBackend(t *testing.T, obj cty.Value, handlers map[string]func(http.ResponseWriter, *http.Request)) (*Cloud, *MockClient, func()) {
+ 	var s *httptest.Server
+ 	if handlers != nil {
+-		s = testServerWithHandlers(handlers)
++		s = TestServerWithHandlers(t, handlers)
+ 	} else {
+-		s = testServer(t)
++		s = TestServer(t)
+ 	}
+ 	b := New(testDisco(s))
+ 
+@@ -324,7 +324,7 @@ func testBackend(t *testing.T, obj cty.Value, handlers map[string]func(http.Resp
+ // testUnconfiguredBackend is used for testing the configuration of the backend
+ // with the mock client
+ func testUnconfiguredBackend(t *testing.T) (*Cloud, func()) {
+-	s := testServer(t)
++	s := TestServer(t)
+ 	b := New(testDisco(s))
+ 
+ 	// Normally, the client is created during configuration, but the configuration uses the
+@@ -395,15 +395,15 @@ func testLocalBackend(t *testing.T, cloud *Cloud) backendrun.OperationsBackend {
+ 	return b
+ }
+ 
+-// testServer returns a started *httptest.Server used for local testing with the default set of
++// TestServer returns a started *httptest.Server used for local testing with the default set of
+ // request handlers.
+-func testServer(t *testing.T) *httptest.Server {
+-	return testServerWithHandlers(testDefaultRequestHandlers)
++func TestServer(t *testing.T) *httptest.Server {
++	return TestServerWithHandlers(t, testDefaultRequestHandlers)
+ }
+ 
+-// testServerWithHandlers returns a started *httptest.Server with the given set of request handlers
++// TestServerWithHandlers returns a started *httptest.Server with the given set of request handlers
+ // overriding any default request handlers (testDefaultRequestHandlers).
+-func testServerWithHandlers(handlers map[string]func(http.ResponseWriter, *http.Request)) *httptest.Server {
++func TestServerWithHandlers(t *testing.T, handlers map[string]func(http.ResponseWriter, *http.Request)) *httptest.Server {
+ 	mux := http.NewServeMux()
+ 	for route, handler := range handlers {
+ 		mux.HandleFunc(route, handler)
+@@ -414,6 +414,11 @@ func testServerWithHandlers(handlers map[string]func(http.ResponseWriter, *http.
+ 		}
+ 	}
+ 
++	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
++		t.Logf("unexpected %s request received for %q", req.Method, req.URL.String())
++		w.WriteHeader(http.StatusBadRequest)
++	})
++
+ 	return httptest.NewServer(mux)
+ }
+ 
+diff --git a/internal/command/meta_backend.go b/internal/command/meta_backend.go
+index cd68ad1f64..238a6eb6f0 100644
+--- a/internal/command/meta_backend.go
++++ b/internal/command/meta_backend.go
+@@ -1159,11 +1159,16 @@ func (m *Meta) backendFromConfig(opts *BackendOpts) (backend.Backend, tfdiags.Di
+ 			stateStoreConfig.Provider.Name,
+ 			stateStoreConfig.ProviderAddr,
+ 		)
+-		return nil, diags.Append(&hcl.Diagnostic{
+-			Severity: hcl.DiagError,
+-			Summary:  "Not implemented yet",
+-			Detail:   "Migration from backend to state store is not implemented yet",
+-		})
++
++		if !opts.Init {
++			initReason := fmt.Sprintf("Migrating from backend %q to state store %q in provider %s (%q)",
++				s.Backend.Type, stateStoreConfig.Type,
++				stateStoreConfig.Provider.Name, stateStoreConfig.ProviderAddr)
++			diags = diags.Append(errBackendInitDiag(initReason))
++			return nil, diags
++		}
++
++		return m.backend_to_stateStore(s.Backend, sMgr, stateStoreConfig, cHash, opts)
+ 
+ 	// Potentially changing a backend configuration
+ 	case backendConfig != nil && !s.Backend.Empty() &&
+@@ -1958,6 +1963,198 @@ func (m *Meta) backend(configPath string, viewType arguments.ViewType) (backendr
+ 	return be, diags
+ }
+ 
++func (m *Meta) backend_to_stateStore(bcs *workdir.BackendConfigState, sMgr *clistate.LocalState, c *configs.StateStore, cHash int, opts *BackendOpts) (backend.Backend, tfdiags.Diagnostics) {
++	var diags tfdiags.Diagnostics
++
++	vt := arguments.ViewJSON
++	// Set default viewtype if none was set as the StateLocker needs to know exactly
++	// what viewType we want to have.
++	if opts == nil || opts.ViewType != vt {
++		vt = arguments.ViewHuman
++	}
++
++	s := sMgr.State()
++
++	cloudMode := cloud.DetectConfigChangeType(bcs, nil, false)
++	diags = diags.Append(m.assertSupportedCloudInitOptions(cloudMode))
++	if diags.HasErrors() {
++		return nil, diags
++	}
++
++	view := views.NewInit(vt, m.View)
++	if cloudMode == cloud.ConfigMigrationOut {
++		view.Output(views.BackendCloudMigrateStateStoreMessage, c.Type)
++	} else {
++		view.Output(views.BackendMigrateStateStoreMessage, bcs.Type, c.Type)
++	}
++
++	// Initialize the configured backend
++	b, moreDiags := m.savedBackend(sMgr)
++	diags = diags.Append(moreDiags)
++	if moreDiags.HasErrors() {
++		return nil, diags
++	}
++
++	// Get the state store as an instance of backend.Backend
++	ssBackend, storeConfigVal, providerConfigVal, moreDiags := m.stateStoreInitFromConfig(c, opts.Locks)
++	diags = diags.Append(moreDiags)
++	if diags.HasErrors() {
++		return nil, diags
++	}
++
++	// Perform the migration
++	err := m.backendMigrateState(&backendMigrateOpts{
++		SourceType:      bcs.Type,
++		DestinationType: c.Type,
++		Source:          b,
++		Destination:     ssBackend,
++		ViewType:        vt,
++	})
++	if err != nil {
++		diags = diags.Append(err)
++		return nil, diags
++	}
++
++	rDiags := m.removeLocalState(bcs.Type, b)
++	if rDiags.HasErrors() {
++		diags = diags.Append(rDiags)
++		return nil, diags
++	}
++
++	if m.stateLock {
++		view := views.NewStateLocker(vt, m.View)
++		stateLocker := clistate.NewLocker(m.stateLockTimeout, view)
++		if err := stateLocker.Lock(sMgr, "init is initializing state_store first time"); err != nil {
++			diags = diags.Append(fmt.Errorf("Error locking state: %s", err))
++			return nil, diags
++		}
++		defer stateLocker.Unlock()
++	}
++
++	// Store the state_store metadata in our saved state location
++
++	var pVersion *version.Version // This will remain nil for builtin providers or unmanaged providers.
++	if c.ProviderAddr.IsBuiltIn() {
++		diags = diags.Append(&hcl.Diagnostic{
++			Severity: hcl.DiagWarning,
++			Summary:  "State storage is using a builtin provider",
++			Detail:   "Terraform is using a builtin provider for initializing state storage. Terraform will be less able to detect when state migrations are required in future init commands.",
++		})
++	} else {
++		isReattached, err := reattach.IsProviderReattached(c.ProviderAddr, os.Getenv("TF_REATTACH_PROVIDERS"))
++		if err != nil {
++			diags = diags.Append(fmt.Errorf("Unable to determine if state storage provider is reattached while initializing state store for the first time. This is a bug in Terraform and should be reported: %w", err))
++			return nil, diags
++		}
++		if isReattached {
++			diags = diags.Append(&hcl.Diagnostic{
++				Severity: hcl.DiagWarning,
++				Summary:  "State storage provider is not managed by Terraform",
++				Detail:   "Terraform is using a provider supplied via TF_REATTACH_PROVIDERS for initializing state storage. Terraform will be less able to detect when state migrations are required in future init commands.",
++			})
++		} else {
++			// The provider is not built in and is being managed by Terraform
++			// This is the most common scenario, by far.
++			var vDiags tfdiags.Diagnostics
++			pVersion, vDiags = getStateStorageProviderVersion(c, opts.Locks)
++			diags = diags.Append(vDiags)
++			if vDiags.HasErrors() {
++				return nil, diags
++			}
++		}
++	}
++
++	// Update the stored metadata
++	s.Backend = nil
++	s.StateStore = &workdir.StateStoreConfigState{
++		Type: c.Type,
++		Hash: uint64(cHash),
++		Provider: &workdir.ProviderConfigState{
++			Source:  &c.ProviderAddr,
++			Version: pVersion,
++		},
++	}
++	err = s.StateStore.SetConfig(storeConfigVal, ssBackend.ConfigSchema())
++	if err != nil {
++		diags = diags.Append(fmt.Errorf("Failed to set state store configuration: %w", err))
++		return nil, diags
++	}
++
++	// We need to briefly convert away from backend.Backend interface to use the method
++	// for accessing the provider schema. In this method we _always_ expect the concrete value
++	// to be backendPluggable.Pluggable.
++	plug := ssBackend.(*backendPluggable.Pluggable)
++	err = s.StateStore.Provider.SetConfig(providerConfigVal, plug.ProviderSchema())
++	if err != nil {
++		diags = diags.Append(fmt.Errorf("Failed to set state store provider configuration: %w", err))
++		return nil, diags
++	}
++
++	// Update backend state file
++	if err := sMgr.WriteState(s); err != nil {
++		diags = diags.Append(errBackendWriteSavedDiag(err))
++		return nil, diags
++	}
++	if err := sMgr.PersistState(); err != nil {
++		diags = diags.Append(errBackendWriteSavedDiag(err))
++		return nil, diags
++	}
++
++	return b, diags
++}
++
++func (m *Meta) removeLocalState(backendType string, b backend.Backend) tfdiags.Diagnostics {
++	var diags tfdiags.Diagnostics
++
++	if backendType != "local" {
++		return diags
++	}
++
++	workspaces, wDiags := b.Workspaces()
++	if wDiags.HasErrors() {
++		diags = diags.Append(&errBackendLocalRead{wDiags.Err()})
++		return diags
++	}
++
++	var localStates []statemgr.Full
++	for _, workspace := range workspaces {
++		localState, sDiags := b.StateMgr(workspace)
++		if sDiags.HasErrors() {
++			diags = diags.Append(&errBackendLocalRead{sDiags.Err()})
++			return diags
++		}
++		if err := localState.RefreshState(); err != nil {
++			diags = diags.Append(&errBackendLocalRead{err})
++			return diags
++		}
++
++		// We only care about non-empty states.
++		if localS := localState.State(); !localS.Empty() {
++			log.Printf("[TRACE] Meta.Backend: will need to migrate workspace states because of existing %q workspace", workspace)
++			localStates = append(localStates, localState)
++		} else {
++			log.Printf("[TRACE] Meta.Backend: ignoring local %q workspace because its state is empty", workspace)
++		}
++	}
++
++	if len(localStates) > 0 {
++		log.Printf("[TRACE] Meta.removeLocalState: removing old state snapshots (%d) from old backend", len(localStates))
++		for idx, localState := range localStates {
++			// We always delete the local state, unless that was our new state too.
++			if err := localState.WriteState(nil); err != nil {
++				diags = diags.Append(&errBackendMigrateLocalDelete{err})
++				return diags
++			}
++			if err := localState.PersistState(nil); err != nil {
++				diags = diags.Append(&errBackendMigrateLocalDelete{err})
++				return diags
++			}
++			log.Printf("[DEBUG] Meta.removeLocalState: deleted local state for workspace %q", workspaces[idx])
++		}
++	}
++	return diags
++}
++
+ //-------------------------------------------------------------------
+ // State Store Config Scenarios
+ // The functions below cover handling all the various scenarios that
+diff --git a/internal/command/views/init.go b/internal/command/views/init.go
+index d4997af929..bb9775aab0 100644
+--- a/internal/command/views/init.go
++++ b/internal/command/views/init.go
+@@ -303,6 +303,14 @@ var MessageRegistry map[InitMessageCode]InitMessage = map[InitMessageCode]InitMe
+ 		HumanValue: "Migrating from HCP Terraform or Terraform Enterprise to local state.",
+ 		JSONValue:  "Migrating from HCP Terraform or Terraform Enterprise to local state.",
+ 	},
++	"backend_cloud_migrate_state_store": {
++		HumanValue: "Migrating from HCP Terraform Terraform Enterprise to state store %q.",
++		JSONValue:  "Migrating from HCP Terraform Terraform Enterprise to state store %q.",
++	},
++	"backend_migrate_state_store": {
++		HumanValue: "Migrating from backend %q to state store %q.",
++		JSONValue:  "Migrating from backend %q to state store %q.",
++	},
+ 	"state_store_migrate_local": {
+ 		HumanValue: stateMigrateLocalHuman,
+ 		JSONValue:  stateMigrateLocalJSON,
+@@ -365,6 +373,10 @@ const (
+ 	BackendMigrateLocalMessage InitMessageCode = "backend_migrate_local"
+ 	// BackendCloudMigrateLocalMessage indicates migration from cloud to local
+ 	BackendCloudMigrateLocalMessage InitMessageCode = "backend_cloud_migrate_local"
++	// BackendCloudMigrateStateStoreMessage indicates migration from cloud to a state store
++	BackendCloudMigrateStateStoreMessage InitMessageCode = "backend_cloud_migrate_state_store"
++	// BackendMigrateStateStoreMessage indicates migration from a backend to a state store
++	BackendMigrateStateStoreMessage InitMessageCode = "backend_migrate_state_store"
+ 	// StateMigrateLocalMessage indicates migration from state store to local
+ 	StateMigrateLocalMessage InitMessageCode = "state_store_migrate_local"
+ 	// FindingMatchingVersionMessage indicates that Terraform is looking for a provider version that matches the constraint during installation

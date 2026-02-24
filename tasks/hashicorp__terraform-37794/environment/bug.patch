@@ -1,0 +1,220 @@
+diff --git a/.changes/v1.15/ENHANCEMENTS-20251022-162909.yaml b/.changes/v1.15/ENHANCEMENTS-20251022-162909.yaml
+deleted file mode 100644
+index 5e78468cbf..0000000000
+--- a/.changes/v1.15/ENHANCEMENTS-20251022-162909.yaml
++++ /dev/null
+@@ -1,5 +0,0 @@
+-kind: ENHANCEMENTS
+-body: 'ssh-based provisioner (file + remote-exec): Re-enable support for PowerShell'
+-time: 2025-10-22T16:29:09.342697+01:00
+-custom:
+-    Issue: "37794"
+diff --git a/internal/communicator/ssh/communicator.go b/internal/communicator/ssh/communicator.go
+index 37e130f893..1cec681bde 100644
+--- a/internal/communicator/ssh/communicator.go
++++ b/internal/communicator/ssh/communicator.go
+@@ -436,7 +436,7 @@ func (c *Communicator) Upload(path string, input io.Reader) error {
+ 		return scpUploadFile(targetFile, input, w, stdoutR, size)
+ 	}
+ 
+-	cmd, err := quoteScpCommand([]string{"scp", "-vt", targetDir}, c.connInfo.TargetPlatform)
++	cmd, err := quoteShell([]string{"scp", "-vt", targetDir}, c.connInfo.TargetPlatform)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -509,7 +509,7 @@ func (c *Communicator) UploadDir(dst string, src string) error {
+ 		return uploadEntries()
+ 	}
+ 
+-	cmd, err := quoteScpCommand([]string{"scp", "-rvt", dst}, c.connInfo.TargetPlatform)
++	cmd, err := quoteShell([]string{"scp", "-rvt", dst}, c.connInfo.TargetPlatform)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -886,15 +886,14 @@ func (c *bastionConn) Close() error {
+ 	return c.Bastion.Close()
+ }
+ 
+-func quoteScpCommand(args []string, targetPlatform string) (string, error) {
++func quoteShell(args []string, targetPlatform string) (string, error) {
+ 	if targetPlatform == TargetPlatformUnix {
+ 		return shquot.POSIXShell(args), nil
+ 	}
+ 	if targetPlatform == TargetPlatformWindows {
+-		cmd, args := shquot.WindowsArgvSplit(args)
+-		return fmt.Sprintf("%s %s", cmd, args), nil
++		return shquot.WindowsArgv(args), nil
+ 	}
+ 
+-	return "", fmt.Errorf("Cannot quote scp command, target platform unknown: %s", targetPlatform)
++	return "", fmt.Errorf("Cannot quote shell command, target platform unknown: %s", targetPlatform)
+ 
+ }
+diff --git a/internal/communicator/ssh/communicator_test.go b/internal/communicator/ssh/communicator_test.go
+index 4842bde92d..77ad0bdc1d 100644
+--- a/internal/communicator/ssh/communicator_test.go
++++ b/internal/communicator/ssh/communicator_test.go
+@@ -23,7 +23,6 @@ import (
+ 	"testing"
+ 	"time"
+ 
+-	"github.com/google/go-cmp/cmp"
+ 	"github.com/hashicorp/terraform/internal/communicator/remote"
+ 	"github.com/zclconf/go-cty/cty"
+ 	"golang.org/x/crypto/ssh"
+@@ -661,7 +660,7 @@ func TestAccHugeUploadFile(t *testing.T) {
+ 		return scpUploadFile(targetFile, source, w, stdoutR, size)
+ 	}
+ 
+-	cmd, err := quoteScpCommand([]string{"scp", "-vt", targetDir}, c.connInfo.TargetPlatform)
++	cmd, err := quoteShell([]string{"scp", "-vt", targetDir}, c.connInfo.TargetPlatform)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -681,146 +680,6 @@ func TestAccHugeUploadFile(t *testing.T) {
+ 	}
+ }
+ 
+-func TestQuoteScpCommand(t *testing.T) {
+-	testCases := []struct {
+-		inputArgs   []string
+-		platform    string
+-		expectedCmd string
+-	}{
+-		// valid Unix command
+-		{
+-			[]string{"scp", "-vt", "/var/path"},
+-			TargetPlatformUnix,
+-			"'scp' -vt /var/path",
+-		},
+-
+-		// command injection attempt in Unix
+-		{
+-			[]string{"scp", "-vt", "/var/path;rm"},
+-			TargetPlatformUnix,
+-			"'scp' -vt /var/path\\;rm",
+-		},
+-		{
+-			[]string{"scp", "-vt", "/var/path&&rm"},
+-			TargetPlatformUnix,
+-			"'scp' -vt /var/path\\&\\&rm",
+-		},
+-		{
+-			[]string{"scp", "-vt", "/var/path|rm"},
+-			TargetPlatformUnix,
+-			"'scp' -vt /var/path\\|rm",
+-		},
+-		{
+-			[]string{"scp", "-vt", "/var/path||rm"},
+-			TargetPlatformUnix,
+-			"'scp' -vt /var/path\\|\\|rm",
+-		},
+-		{
+-			[]string{"scp", "-vt", "/var/path; rm"},
+-			TargetPlatformUnix,
+-			"'scp' -vt '/var/path; rm'",
+-		},
+-		{
+-			[]string{"scp", "-vt", "/var/path`rm`"},
+-			TargetPlatformUnix,
+-			"'scp' -vt /var/path\\`rm\\`",
+-		},
+-		{
+-			[]string{"scp", "-vt", "/var/path$(rm)"},
+-			TargetPlatformUnix,
+-			"'scp' -vt /var/path\\$\\(rm\\)",
+-		},
+-
+-		// valid Windows commands
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp"},
+-			TargetPlatformWindows,
+-			"scp -vt C:\\Windows\\Temp",
+-		},
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp With Space"},
+-			TargetPlatformWindows,
+-			"scp -vt \"C:\\Windows\\Temp With Space\"",
+-		},
+-
+-		// command injection attempt in Windows
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp ;rmdir"},
+-			TargetPlatformWindows,
+-			"scp -vt \"C:\\Windows\\Temp ;rmdir\"",
+-		},
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp\";rmdir"},
+-			TargetPlatformWindows,
+-			"scp -vt \"C:\\Windows\\Temp\\\";rmdir\"",
+-		},
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp\nrmdir"},
+-			TargetPlatformWindows,
+-			"scp -vt \"C:\\Windows\\Temp\nrmdir\"",
+-		},
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp\trmdir"},
+-			TargetPlatformWindows,
+-			"scp -vt \"C:\\Windows\\Temp\trmdir\"",
+-		},
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp\vrmdir"},
+-			TargetPlatformWindows,
+-			"scp -vt \"C:\\Windows\\Temp\vrmdir\"",
+-		},
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp\u0020rmdir"},
+-			TargetPlatformWindows,
+-			"scp -vt \"C:\\Windows\\Temp rmdir\"",
+-		},
+-
+-		// There is no special handling of the injection attempts below
+-		// but we include them anyway to demonstrate this
+-		// and to avoid any regressions due to upstream changes.
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp;rmdir"},
+-			TargetPlatformWindows,
+-			"scp -vt C:\\Windows\\Temp;rmdir",
+-		},
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp&rmdir"},
+-			TargetPlatformWindows,
+-			"scp -vt C:\\Windows\\Temp&rmdir",
+-		},
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp&&rmdir"},
+-			TargetPlatformWindows,
+-			"scp -vt C:\\Windows\\Temp&&rmdir",
+-		},
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp|rmdir"},
+-			TargetPlatformWindows,
+-			"scp -vt C:\\Windows\\Temp|rmdir",
+-		},
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp||rmdir"},
+-			TargetPlatformWindows,
+-			"scp -vt C:\\Windows\\Temp||rmdir",
+-		},
+-		{
+-			[]string{"scp", "-vt", "C:\\Windows\\Temp$(rmdir)"},
+-			TargetPlatformWindows,
+-			"scp -vt C:\\Windows\\Temp$(rmdir)",
+-		},
+-	}
+-
+-	for _, tc := range testCases {
+-		cmd, err := quoteScpCommand(tc.inputArgs, tc.platform)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		if diff := cmp.Diff(tc.expectedCmd, cmd); diff != "" {
+-			t.Fatalf("unexpected command for %q: %s", tc.inputArgs, diff)
+-		}
+-	}
+-}
+-
+ func TestScriptPath(t *testing.T) {
+ 	cases := []struct {
+ 		Input   string

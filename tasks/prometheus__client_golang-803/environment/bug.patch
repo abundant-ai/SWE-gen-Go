@@ -1,0 +1,785 @@
+diff --git a/prometheus/counter.go b/prometheus/counter.go
+index 3f8fd79..0e1b48c 100644
+--- a/prometheus/counter.go
++++ b/prometheus/counter.go
+@@ -163,7 +163,7 @@ func (c *counter) updateExemplar(v float64, l Labels) {
+ // (e.g. number of HTTP requests, partitioned by response code and
+ // method). Create instances with NewCounterVec.
+ type CounterVec struct {
+-	*MetricVec
++	*metricVec
+ }
+ 
+ // NewCounterVec creates a new CounterVec based on the provided CounterOpts and
+@@ -176,11 +176,11 @@ func NewCounterVec(opts CounterOpts, labelNames []string) *CounterVec {
+ 		opts.ConstLabels,
+ 	)
+ 	return &CounterVec{
+-		MetricVec: NewMetricVec(desc, func(lvs ...string) Metric {
++		metricVec: newMetricVec(desc, func(lvs ...string) Metric {
+ 			if len(lvs) != len(desc.variableLabels) {
+ 				panic(makeInconsistentCardinalityError(desc.fqName, desc.variableLabels, lvs))
+ 			}
+-			result := &counter{desc: desc, labelPairs: MakeLabelPairs(desc, lvs), now: time.Now}
++			result := &counter{desc: desc, labelPairs: makeLabelPairs(desc, lvs), now: time.Now}
+ 			result.init(result) // Init self-collection.
+ 			return result
+ 		}),
+@@ -188,7 +188,7 @@ func NewCounterVec(opts CounterOpts, labelNames []string) *CounterVec {
+ }
+ 
+ // GetMetricWithLabelValues returns the Counter for the given slice of label
+-// values (same order as the variable labels in Desc). If that combination of
++// values (same order as the VariableLabels in Desc). If that combination of
+ // label values is accessed for the first time, a new Counter is created.
+ //
+ // It is possible to call this method without using the returned Counter to only
+@@ -202,7 +202,7 @@ func NewCounterVec(opts CounterOpts, labelNames []string) *CounterVec {
+ // Counter with the same label values is created later.
+ //
+ // An error is returned if the number of label values is not the same as the
+-// number of variable labels in Desc (minus any curried labels).
++// number of VariableLabels in Desc (minus any curried labels).
+ //
+ // Note that for more than one label value, this method is prone to mistakes
+ // caused by an incorrect order of arguments. Consider GetMetricWith(Labels) as
+@@ -211,7 +211,7 @@ func NewCounterVec(opts CounterOpts, labelNames []string) *CounterVec {
+ // with a performance overhead (for creating and processing the Labels map).
+ // See also the GaugeVec example.
+ func (v *CounterVec) GetMetricWithLabelValues(lvs ...string) (Counter, error) {
+-	metric, err := v.MetricVec.GetMetricWithLabelValues(lvs...)
++	metric, err := v.metricVec.getMetricWithLabelValues(lvs...)
+ 	if metric != nil {
+ 		return metric.(Counter), err
+ 	}
+@@ -219,19 +219,19 @@ func (v *CounterVec) GetMetricWithLabelValues(lvs ...string) (Counter, error) {
+ }
+ 
+ // GetMetricWith returns the Counter for the given Labels map (the label names
+-// must match those of the variable labels in Desc). If that label map is
++// must match those of the VariableLabels in Desc). If that label map is
+ // accessed for the first time, a new Counter is created. Implications of
+ // creating a Counter without using it and keeping the Counter for later use are
+ // the same as for GetMetricWithLabelValues.
+ //
+ // An error is returned if the number and names of the Labels are inconsistent
+-// with those of the variable labels in Desc (minus any curried labels).
++// with those of the VariableLabels in Desc (minus any curried labels).
+ //
+ // This method is used for the same purpose as
+ // GetMetricWithLabelValues(...string). See there for pros and cons of the two
+ // methods.
+ func (v *CounterVec) GetMetricWith(labels Labels) (Counter, error) {
+-	metric, err := v.MetricVec.GetMetricWith(labels)
++	metric, err := v.metricVec.getMetricWith(labels)
+ 	if metric != nil {
+ 		return metric.(Counter), err
+ 	}
+@@ -275,7 +275,7 @@ func (v *CounterVec) With(labels Labels) Counter {
+ // registered with a given registry (usually the uncurried version). The Reset
+ // method deletes all metrics, even if called on a curried vector.
+ func (v *CounterVec) CurryWith(labels Labels) (*CounterVec, error) {
+-	vec, err := v.MetricVec.CurryWith(labels)
++	vec, err := v.curryWith(labels)
+ 	if vec != nil {
+ 		return &CounterVec{vec}, err
+ 	}
+diff --git a/prometheus/desc.go b/prometheus/desc.go
+index 957d93a..2f19f5e 100644
+--- a/prometheus/desc.go
++++ b/prometheus/desc.go
+@@ -51,7 +51,7 @@ type Desc struct {
+ 	// constLabelPairs contains precalculated DTO label pairs based on
+ 	// the constant labels.
+ 	constLabelPairs []*dto.LabelPair
+-	// variableLabels contains names of labels for which the metric
++	// VariableLabels contains names of labels for which the metric
+ 	// maintains variable values.
+ 	variableLabels []string
+ 	// id is a hash of the values of the ConstLabels and fqName. This
+diff --git a/prometheus/example_metricvec_test.go b/prometheus/example_metricvec_test.go
+deleted file mode 100644
+index 8e893e5..0000000
+--- a/prometheus/example_metricvec_test.go
++++ /dev/null
+@@ -1,163 +0,0 @@
+-// Copyright 2020 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package prometheus_test
+-
+-import (
+-	//lint:ignore SA1019 Need to keep deprecated package for compatibility.
+-	"fmt"
+-
+-	"github.com/golang/protobuf/proto"
+-
+-	dto "github.com/prometheus/client_model/go"
+-
+-	"github.com/prometheus/client_golang/prometheus"
+-)
+-
+-// Info implements an info pseudo-metric, which is modeled as a Gauge that
+-// always has a value of 1. In practice, you would just use a Gauge directly,
+-// but for this example, we pretend it would be useful to have a “native”
+-// implementation.
+-type Info struct {
+-	desc       *prometheus.Desc
+-	labelPairs []*dto.LabelPair
+-}
+-
+-func (i Info) Desc() *prometheus.Desc {
+-	return i.desc
+-}
+-
+-func (i Info) Write(out *dto.Metric) error {
+-	out.Label = i.labelPairs
+-	out.Gauge = &dto.Gauge{Value: proto.Float64(1)}
+-	return nil
+-}
+-
+-// InfoVec is the vector version for Info. As an info metric never changes, we
+-// wouldn't really need to wrap GetMetricWithLabelValues and GetMetricWith
+-// because Info has no additional methods compared to the vanilla Metric that
+-// the unwrapped MetricVec methods return. However, to demonstrate all there is
+-// to do to fully implement a vector for a custom Metric implementation, we do
+-// it in this example anyway.
+-type InfoVec struct {
+-	*prometheus.MetricVec
+-}
+-
+-func NewInfoVec(name, help string, labelNames []string) *InfoVec {
+-	desc := prometheus.NewDesc(name, help, labelNames, nil)
+-	return &InfoVec{
+-		MetricVec: prometheus.NewMetricVec(desc, func(lvs ...string) prometheus.Metric {
+-			if len(lvs) != len(labelNames) {
+-				panic("inconsistent label cardinality")
+-			}
+-			return Info{desc: desc, labelPairs: prometheus.MakeLabelPairs(desc, lvs)}
+-		}),
+-	}
+-}
+-
+-func (v *InfoVec) GetMetricWithLabelValues(lvs ...string) (Info, error) {
+-	metric, err := v.MetricVec.GetMetricWithLabelValues(lvs...)
+-	return metric.(Info), err
+-}
+-
+-func (v *InfoVec) GetMetricWith(labels prometheus.Labels) (Info, error) {
+-	metric, err := v.MetricVec.GetMetricWith(labels)
+-	return metric.(Info), err
+-}
+-
+-func (v *InfoVec) WithLabelValues(lvs ...string) Info {
+-	i, err := v.GetMetricWithLabelValues(lvs...)
+-	if err != nil {
+-		panic(err)
+-	}
+-	return i
+-}
+-
+-func (v *InfoVec) With(labels prometheus.Labels) Info {
+-	i, err := v.GetMetricWith(labels)
+-	if err != nil {
+-		panic(err)
+-	}
+-	return i
+-}
+-
+-func (v *InfoVec) CurryWith(labels prometheus.Labels) (*InfoVec, error) {
+-	vec, err := v.MetricVec.CurryWith(labels)
+-	if vec != nil {
+-		return &InfoVec{vec}, err
+-	}
+-	return nil, err
+-}
+-
+-func (v *InfoVec) MustCurryWith(labels prometheus.Labels) *InfoVec {
+-	vec, err := v.CurryWith(labels)
+-	if err != nil {
+-		panic(err)
+-	}
+-	return vec
+-}
+-
+-func ExampleMetricVec() {
+-
+-	infoVec := NewInfoVec(
+-		"library_version_info",
+-		"Versions of the libraries used in this binary.",
+-		[]string{"library", "version"},
+-	)
+-
+-	infoVec.WithLabelValues("prometheus/client_golang", "1.7.1")
+-	infoVec.WithLabelValues("k8s.io/client-go", "0.18.8")
+-
+-	// Just for demonstration, let's check the state of the InfoVec by
+-	// registering it with a custom registry and then let it collect the
+-	// metrics.
+-	reg := prometheus.NewRegistry()
+-	reg.MustRegister(infoVec)
+-
+-	metricFamilies, err := reg.Gather()
+-	if err != nil || len(metricFamilies) != 1 {
+-		panic("unexpected behavior of custom test registry")
+-	}
+-	fmt.Println(proto.MarshalTextString(metricFamilies[0]))
+-
+-	// Output:
+-	// name: "library_version_info"
+-	// help: "Versions of the libraries used in this binary."
+-	// type: GAUGE
+-	// metric: <
+-	//   label: <
+-	//     name: "library"
+-	//     value: "k8s.io/client-go"
+-	//   >
+-	//   label: <
+-	//     name: "version"
+-	//     value: "0.18.8"
+-	//   >
+-	//   gauge: <
+-	//     value: 1
+-	//   >
+-	// >
+-	// metric: <
+-	//   label: <
+-	//     name: "library"
+-	//     value: "prometheus/client_golang"
+-	//   >
+-	//   label: <
+-	//     name: "version"
+-	//     value: "1.7.1"
+-	//   >
+-	//   gauge: <
+-	//     value: 1
+-	//   >
+-	// >
+-}
+diff --git a/prometheus/gauge.go b/prometheus/gauge.go
+index bd0733d..d67573f 100644
+--- a/prometheus/gauge.go
++++ b/prometheus/gauge.go
+@@ -132,7 +132,7 @@ func (g *gauge) Write(out *dto.Metric) error {
+ // (e.g. number of operations queued, partitioned by user and operation
+ // type). Create instances with NewGaugeVec.
+ type GaugeVec struct {
+-	*MetricVec
++	*metricVec
+ }
+ 
+ // NewGaugeVec creates a new GaugeVec based on the provided GaugeOpts and
+@@ -145,11 +145,11 @@ func NewGaugeVec(opts GaugeOpts, labelNames []string) *GaugeVec {
+ 		opts.ConstLabels,
+ 	)
+ 	return &GaugeVec{
+-		MetricVec: NewMetricVec(desc, func(lvs ...string) Metric {
++		metricVec: newMetricVec(desc, func(lvs ...string) Metric {
+ 			if len(lvs) != len(desc.variableLabels) {
+ 				panic(makeInconsistentCardinalityError(desc.fqName, desc.variableLabels, lvs))
+ 			}
+-			result := &gauge{desc: desc, labelPairs: MakeLabelPairs(desc, lvs)}
++			result := &gauge{desc: desc, labelPairs: makeLabelPairs(desc, lvs)}
+ 			result.init(result) // Init self-collection.
+ 			return result
+ 		}),
+@@ -157,7 +157,7 @@ func NewGaugeVec(opts GaugeOpts, labelNames []string) *GaugeVec {
+ }
+ 
+ // GetMetricWithLabelValues returns the Gauge for the given slice of label
+-// values (same order as the variable labels in Desc). If that combination of
++// values (same order as the VariableLabels in Desc). If that combination of
+ // label values is accessed for the first time, a new Gauge is created.
+ //
+ // It is possible to call this method without using the returned Gauge to only
+@@ -172,7 +172,7 @@ func NewGaugeVec(opts GaugeOpts, labelNames []string) *GaugeVec {
+ // example.
+ //
+ // An error is returned if the number of label values is not the same as the
+-// number of variable labels in Desc (minus any curried labels).
++// number of VariableLabels in Desc (minus any curried labels).
+ //
+ // Note that for more than one label value, this method is prone to mistakes
+ // caused by an incorrect order of arguments. Consider GetMetricWith(Labels) as
+@@ -180,7 +180,7 @@ func NewGaugeVec(opts GaugeOpts, labelNames []string) *GaugeVec {
+ // latter has a much more readable (albeit more verbose) syntax, but it comes
+ // with a performance overhead (for creating and processing the Labels map).
+ func (v *GaugeVec) GetMetricWithLabelValues(lvs ...string) (Gauge, error) {
+-	metric, err := v.MetricVec.GetMetricWithLabelValues(lvs...)
++	metric, err := v.metricVec.getMetricWithLabelValues(lvs...)
+ 	if metric != nil {
+ 		return metric.(Gauge), err
+ 	}
+@@ -188,19 +188,19 @@ func (v *GaugeVec) GetMetricWithLabelValues(lvs ...string) (Gauge, error) {
+ }
+ 
+ // GetMetricWith returns the Gauge for the given Labels map (the label names
+-// must match those of the variable labels in Desc). If that label map is
++// must match those of the VariableLabels in Desc). If that label map is
+ // accessed for the first time, a new Gauge is created. Implications of
+ // creating a Gauge without using it and keeping the Gauge for later use are
+ // the same as for GetMetricWithLabelValues.
+ //
+ // An error is returned if the number and names of the Labels are inconsistent
+-// with those of the variable labels in Desc (minus any curried labels).
++// with those of the VariableLabels in Desc (minus any curried labels).
+ //
+ // This method is used for the same purpose as
+ // GetMetricWithLabelValues(...string). See there for pros and cons of the two
+ // methods.
+ func (v *GaugeVec) GetMetricWith(labels Labels) (Gauge, error) {
+-	metric, err := v.MetricVec.GetMetricWith(labels)
++	metric, err := v.metricVec.getMetricWith(labels)
+ 	if metric != nil {
+ 		return metric.(Gauge), err
+ 	}
+@@ -244,7 +244,7 @@ func (v *GaugeVec) With(labels Labels) Gauge {
+ // registered with a given registry (usually the uncurried version). The Reset
+ // method deletes all metrics, even if called on a curried vector.
+ func (v *GaugeVec) CurryWith(labels Labels) (*GaugeVec, error) {
+-	vec, err := v.MetricVec.CurryWith(labels)
++	vec, err := v.curryWith(labels)
+ 	if vec != nil {
+ 		return &GaugeVec{vec}, err
+ 	}
+diff --git a/prometheus/histogram.go b/prometheus/histogram.go
+index f71e286..d4ea301 100644
+--- a/prometheus/histogram.go
++++ b/prometheus/histogram.go
+@@ -192,7 +192,7 @@ func newHistogram(desc *Desc, opts HistogramOpts, labelValues ...string) Histogr
+ 	h := &histogram{
+ 		desc:        desc,
+ 		upperBounds: opts.Buckets,
+-		labelPairs:  MakeLabelPairs(desc, labelValues),
++		labelPairs:  makeLabelPairs(desc, labelValues),
+ 		counts:      [2]*histogramCounts{{}, {}},
+ 		now:         time.Now,
+ 	}
+@@ -409,7 +409,7 @@ func (h *histogram) updateExemplar(v float64, bucket int, l Labels) {
+ // (e.g. HTTP request latencies, partitioned by status code and method). Create
+ // instances with NewHistogramVec.
+ type HistogramVec struct {
+-	*MetricVec
++	*metricVec
+ }
+ 
+ // NewHistogramVec creates a new HistogramVec based on the provided HistogramOpts and
+@@ -422,14 +422,14 @@ func NewHistogramVec(opts HistogramOpts, labelNames []string) *HistogramVec {
+ 		opts.ConstLabels,
+ 	)
+ 	return &HistogramVec{
+-		MetricVec: NewMetricVec(desc, func(lvs ...string) Metric {
++		metricVec: newMetricVec(desc, func(lvs ...string) Metric {
+ 			return newHistogram(desc, opts, lvs...)
+ 		}),
+ 	}
+ }
+ 
+ // GetMetricWithLabelValues returns the Histogram for the given slice of label
+-// values (same order as the variable labels in Desc). If that combination of
++// values (same order as the VariableLabels in Desc). If that combination of
+ // label values is accessed for the first time, a new Histogram is created.
+ //
+ // It is possible to call this method without using the returned Histogram to only
+@@ -444,7 +444,7 @@ func NewHistogramVec(opts HistogramOpts, labelNames []string) *HistogramVec {
+ // example.
+ //
+ // An error is returned if the number of label values is not the same as the
+-// number of variable labels in Desc (minus any curried labels).
++// number of VariableLabels in Desc (minus any curried labels).
+ //
+ // Note that for more than one label value, this method is prone to mistakes
+ // caused by an incorrect order of arguments. Consider GetMetricWith(Labels) as
+@@ -453,7 +453,7 @@ func NewHistogramVec(opts HistogramOpts, labelNames []string) *HistogramVec {
+ // with a performance overhead (for creating and processing the Labels map).
+ // See also the GaugeVec example.
+ func (v *HistogramVec) GetMetricWithLabelValues(lvs ...string) (Observer, error) {
+-	metric, err := v.MetricVec.GetMetricWithLabelValues(lvs...)
++	metric, err := v.metricVec.getMetricWithLabelValues(lvs...)
+ 	if metric != nil {
+ 		return metric.(Observer), err
+ 	}
+@@ -461,19 +461,19 @@ func (v *HistogramVec) GetMetricWithLabelValues(lvs ...string) (Observer, error)
+ }
+ 
+ // GetMetricWith returns the Histogram for the given Labels map (the label names
+-// must match those of the variable labels in Desc). If that label map is
++// must match those of the VariableLabels in Desc). If that label map is
+ // accessed for the first time, a new Histogram is created. Implications of
+ // creating a Histogram without using it and keeping the Histogram for later use
+ // are the same as for GetMetricWithLabelValues.
+ //
+ // An error is returned if the number and names of the Labels are inconsistent
+-// with those of the variable labels in Desc (minus any curried labels).
++// with those of the VariableLabels in Desc (minus any curried labels).
+ //
+ // This method is used for the same purpose as
+ // GetMetricWithLabelValues(...string). See there for pros and cons of the two
+ // methods.
+ func (v *HistogramVec) GetMetricWith(labels Labels) (Observer, error) {
+-	metric, err := v.MetricVec.GetMetricWith(labels)
++	metric, err := v.metricVec.getMetricWith(labels)
+ 	if metric != nil {
+ 		return metric.(Observer), err
+ 	}
+@@ -517,7 +517,7 @@ func (v *HistogramVec) With(labels Labels) Observer {
+ // registered with a given registry (usually the uncurried version). The Reset
+ // method deletes all metrics, even if called on a curried vector.
+ func (v *HistogramVec) CurryWith(labels Labels) (ObserverVec, error) {
+-	vec, err := v.MetricVec.CurryWith(labels)
++	vec, err := v.curryWith(labels)
+ 	if vec != nil {
+ 		return &HistogramVec{vec}, err
+ 	}
+@@ -602,7 +602,7 @@ func NewConstHistogram(
+ 		count:      count,
+ 		sum:        sum,
+ 		buckets:    buckets,
+-		labelPairs: MakeLabelPairs(desc, labelValues),
++		labelPairs: makeLabelPairs(desc, labelValues),
+ 	}, nil
+ }
+ 
+diff --git a/prometheus/summary.go b/prometheus/summary.go
+index cf70071..e8f3f15 100644
+--- a/prometheus/summary.go
++++ b/prometheus/summary.go
+@@ -208,7 +208,7 @@ func newSummary(desc *Desc, opts SummaryOpts, labelValues ...string) Summary {
+ 		// Use the lock-free implementation of a Summary without objectives.
+ 		s := &noObjectivesSummary{
+ 			desc:       desc,
+-			labelPairs: MakeLabelPairs(desc, labelValues),
++			labelPairs: makeLabelPairs(desc, labelValues),
+ 			counts:     [2]*summaryCounts{{}, {}},
+ 		}
+ 		s.init(s) // Init self-collection.
+@@ -221,7 +221,7 @@ func newSummary(desc *Desc, opts SummaryOpts, labelValues ...string) Summary {
+ 		objectives:       opts.Objectives,
+ 		sortedObjectives: make([]float64, 0, len(opts.Objectives)),
+ 
+-		labelPairs: MakeLabelPairs(desc, labelValues),
++		labelPairs: makeLabelPairs(desc, labelValues),
+ 
+ 		hotBuf:         make([]float64, 0, opts.BufCap),
+ 		coldBuf:        make([]float64, 0, opts.BufCap),
+@@ -513,7 +513,7 @@ func (s quantSort) Less(i, j int) bool {
+ // (e.g. HTTP request latencies, partitioned by status code and method). Create
+ // instances with NewSummaryVec.
+ type SummaryVec struct {
+-	*MetricVec
++	*metricVec
+ }
+ 
+ // NewSummaryVec creates a new SummaryVec based on the provided SummaryOpts and
+@@ -535,14 +535,14 @@ func NewSummaryVec(opts SummaryOpts, labelNames []string) *SummaryVec {
+ 		opts.ConstLabels,
+ 	)
+ 	return &SummaryVec{
+-		MetricVec: NewMetricVec(desc, func(lvs ...string) Metric {
++		metricVec: newMetricVec(desc, func(lvs ...string) Metric {
+ 			return newSummary(desc, opts, lvs...)
+ 		}),
+ 	}
+ }
+ 
+ // GetMetricWithLabelValues returns the Summary for the given slice of label
+-// values (same order as the variable labels in Desc). If that combination of
++// values (same order as the VariableLabels in Desc). If that combination of
+ // label values is accessed for the first time, a new Summary is created.
+ //
+ // It is possible to call this method without using the returned Summary to only
+@@ -557,7 +557,7 @@ func NewSummaryVec(opts SummaryOpts, labelNames []string) *SummaryVec {
+ // example.
+ //
+ // An error is returned if the number of label values is not the same as the
+-// number of variable labels in Desc (minus any curried labels).
++// number of VariableLabels in Desc (minus any curried labels).
+ //
+ // Note that for more than one label value, this method is prone to mistakes
+ // caused by an incorrect order of arguments. Consider GetMetricWith(Labels) as
+@@ -566,7 +566,7 @@ func NewSummaryVec(opts SummaryOpts, labelNames []string) *SummaryVec {
+ // with a performance overhead (for creating and processing the Labels map).
+ // See also the GaugeVec example.
+ func (v *SummaryVec) GetMetricWithLabelValues(lvs ...string) (Observer, error) {
+-	metric, err := v.MetricVec.GetMetricWithLabelValues(lvs...)
++	metric, err := v.metricVec.getMetricWithLabelValues(lvs...)
+ 	if metric != nil {
+ 		return metric.(Observer), err
+ 	}
+@@ -574,19 +574,19 @@ func (v *SummaryVec) GetMetricWithLabelValues(lvs ...string) (Observer, error) {
+ }
+ 
+ // GetMetricWith returns the Summary for the given Labels map (the label names
+-// must match those of the variable labels in Desc). If that label map is
++// must match those of the VariableLabels in Desc). If that label map is
+ // accessed for the first time, a new Summary is created. Implications of
+ // creating a Summary without using it and keeping the Summary for later use are
+ // the same as for GetMetricWithLabelValues.
+ //
+ // An error is returned if the number and names of the Labels are inconsistent
+-// with those of the variable labels in Desc (minus any curried labels).
++// with those of the VariableLabels in Desc (minus any curried labels).
+ //
+ // This method is used for the same purpose as
+ // GetMetricWithLabelValues(...string). See there for pros and cons of the two
+ // methods.
+ func (v *SummaryVec) GetMetricWith(labels Labels) (Observer, error) {
+-	metric, err := v.MetricVec.GetMetricWith(labels)
++	metric, err := v.metricVec.getMetricWith(labels)
+ 	if metric != nil {
+ 		return metric.(Observer), err
+ 	}
+@@ -630,7 +630,7 @@ func (v *SummaryVec) With(labels Labels) Observer {
+ // registered with a given registry (usually the uncurried version). The Reset
+ // method deletes all metrics, even if called on a curried vector.
+ func (v *SummaryVec) CurryWith(labels Labels) (ObserverVec, error) {
+-	vec, err := v.MetricVec.CurryWith(labels)
++	vec, err := v.curryWith(labels)
+ 	if vec != nil {
+ 		return &SummaryVec{vec}, err
+ 	}
+@@ -716,7 +716,7 @@ func NewConstSummary(
+ 		count:      count,
+ 		sum:        sum,
+ 		quantiles:  quantiles,
+-		labelPairs: MakeLabelPairs(desc, labelValues),
++		labelPairs: makeLabelPairs(desc, labelValues),
+ 	}, nil
+ }
+ 
+diff --git a/prometheus/value.go b/prometheus/value.go
+index 8304de4..6206928 100644
+--- a/prometheus/value.go
++++ b/prometheus/value.go
+@@ -63,7 +63,7 @@ func newValueFunc(desc *Desc, valueType ValueType, function func() float64) *val
+ 		desc:       desc,
+ 		valType:    valueType,
+ 		function:   function,
+-		labelPairs: MakeLabelPairs(desc, nil),
++		labelPairs: makeLabelPairs(desc, nil),
+ 	}
+ 	result.init(result)
+ 	return result
+@@ -95,7 +95,7 @@ func NewConstMetric(desc *Desc, valueType ValueType, value float64, labelValues
+ 		desc:       desc,
+ 		valType:    valueType,
+ 		val:        value,
+-		labelPairs: MakeLabelPairs(desc, labelValues),
++		labelPairs: makeLabelPairs(desc, labelValues),
+ 	}, nil
+ }
+ 
+@@ -145,14 +145,7 @@ func populateMetric(
+ 	return nil
+ }
+ 
+-// MakeLabelPairs is a helper function to create protobuf LabelPairs from the
+-// variable and constant labels in the provided Desc. The values for the
+-// variable labels are defined by the labelValues slice, which must be in the
+-// same order as the corresponding variable labels in the Desc.
+-//
+-// This function is only needed for custom Metric implementations. See MetricVec
+-// example.
+-func MakeLabelPairs(desc *Desc, labelValues []string) []*dto.LabelPair {
++func makeLabelPairs(desc *Desc, labelValues []string) []*dto.LabelPair {
+ 	totalLen := len(desc.variableLabels) + len(desc.constLabelPairs)
+ 	if totalLen == 0 {
+ 		// Super fast path.
+diff --git a/prometheus/vec.go b/prometheus/vec.go
+index 6ba49d8..abe9163 100644
+--- a/prometheus/vec.go
++++ b/prometheus/vec.go
+@@ -20,20 +20,12 @@ import (
+ 	"github.com/prometheus/common/model"
+ )
+ 
+-// MetricVec is a Collector to bundle metrics of the same name that differ in
+-// their label values. MetricVec is not used directly but as a building block
+-// for implementations of vectors of a given metric type, like GaugeVec,
+-// CounterVec, SummaryVec, and HistogramVec. It is exported so that it can be
+-// used for custom Metric implementations.
+-//
+-// To create a FooVec for custom Metric Foo, embed a pointer to MetricVec in
+-// FooVec and initialize it with NewMetricVec. Implement wrappers for
+-// GetMetricWithLabelValues and GetMetricWith that return (Foo, error) rather
+-// than (Metric, error). Similarly, create a wrapper for CurryWith that returns
+-// (*FooVec, error) rather than (*MetricVec, error). It is recommended to also
+-// add the convenience methods WithLabelValues, With, and MustCurryWith, which
+-// panic instead of returning errors. See also the MetricVec example.
+-type MetricVec struct {
++// metricVec is a Collector to bundle metrics of the same name that differ in
++// their label values. metricVec is not used directly (and therefore
++// unexported). It is used as a building block for implementations of vectors of
++// a given metric type, like GaugeVec, CounterVec, SummaryVec, and HistogramVec.
++// It also handles label currying.
++type metricVec struct {
+ 	*metricMap
+ 
+ 	curry []curriedLabelValue
+@@ -43,9 +35,9 @@ type MetricVec struct {
+ 	hashAddByte func(h uint64, b byte) uint64
+ }
+ 
+-// NewMetricVec returns an initialized metricVec.
+-func NewMetricVec(desc *Desc, newMetric func(lvs ...string) Metric) *MetricVec {
+-	return &MetricVec{
++// newMetricVec returns an initialized metricVec.
++func newMetricVec(desc *Desc, newMetric func(lvs ...string) Metric) *metricVec {
++	return &metricVec{
+ 		metricMap: &metricMap{
+ 			metrics:   map[uint64][]metricWithLabelValues{},
+ 			desc:      desc,
+@@ -71,7 +63,7 @@ func NewMetricVec(desc *Desc, newMetric func(lvs ...string) Metric) *MetricVec {
+ // latter has a much more readable (albeit more verbose) syntax, but it comes
+ // with a performance overhead (for creating and processing the Labels map).
+ // See also the CounterVec example.
+-func (m *MetricVec) DeleteLabelValues(lvs ...string) bool {
++func (m *metricVec) DeleteLabelValues(lvs ...string) bool {
+ 	h, err := m.hashLabelValues(lvs)
+ 	if err != nil {
+ 		return false
+@@ -90,7 +82,7 @@ func (m *MetricVec) DeleteLabelValues(lvs ...string) bool {
+ //
+ // This method is used for the same purpose as DeleteLabelValues(...string). See
+ // there for pros and cons of the two methods.
+-func (m *MetricVec) Delete(labels Labels) bool {
++func (m *metricVec) Delete(labels Labels) bool {
+ 	h, err := m.hashLabels(labels)
+ 	if err != nil {
+ 		return false
+@@ -103,32 +95,15 @@ func (m *MetricVec) Delete(labels Labels) bool {
+ // show up in GoDoc.
+ 
+ // Describe implements Collector.
+-func (m *MetricVec) Describe(ch chan<- *Desc) { m.metricMap.Describe(ch) }
++func (m *metricVec) Describe(ch chan<- *Desc) { m.metricMap.Describe(ch) }
+ 
+ // Collect implements Collector.
+-func (m *MetricVec) Collect(ch chan<- Metric) { m.metricMap.Collect(ch) }
++func (m *metricVec) Collect(ch chan<- Metric) { m.metricMap.Collect(ch) }
+ 
+ // Reset deletes all metrics in this vector.
+-func (m *MetricVec) Reset() { m.metricMap.Reset() }
+-
+-// CurryWith returns a vector curried with the provided labels, i.e. the
+-// returned vector has those labels pre-set for all labeled operations performed
+-// on it. The cardinality of the curried vector is reduced accordingly. The
+-// order of the remaining labels stays the same (just with the curried labels
+-// taken out of the sequence – which is relevant for the
+-// (GetMetric)WithLabelValues methods). It is possible to curry a curried
+-// vector, but only with labels not yet used for currying before.
+-//
+-// The metrics contained in the MetricVec are shared between the curried and
+-// uncurried vectors. They are just accessed differently. Curried and uncurried
+-// vectors behave identically in terms of collection. Only one must be
+-// registered with a given registry (usually the uncurried version). The Reset
+-// method deletes all metrics, even if called on a curried vector.
+-//
+-// Note that CurryWith is usually not called directly but through a wrapper
+-// around MetricVec, implementing a vector for a specific Metric
+-// implementation, for example GaugeVec.
+-func (m *MetricVec) CurryWith(labels Labels) (*MetricVec, error) {
++func (m *metricVec) Reset() { m.metricMap.Reset() }
++
++func (m *metricVec) curryWith(labels Labels) (*metricVec, error) {
+ 	var (
+ 		newCurry []curriedLabelValue
+ 		oldCurry = m.curry
+@@ -153,7 +128,7 @@ func (m *MetricVec) CurryWith(labels Labels) (*MetricVec, error) {
+ 		return nil, fmt.Errorf("%d unknown label(s) found during currying", l)
+ 	}
+ 
+-	return &MetricVec{
++	return &metricVec{
+ 		metricMap:   m.metricMap,
+ 		curry:       newCurry,
+ 		hashAdd:     m.hashAdd,
+@@ -161,34 +136,7 @@ func (m *MetricVec) CurryWith(labels Labels) (*MetricVec, error) {
+ 	}, nil
+ }
+ 
+-// GetMetricWithLabelValues returns the Metric for the given slice of label
+-// values (same order as the variable labels in Desc). If that combination of
+-// label values is accessed for the first time, a new Metric is created (by
+-// calling the newMetric function provided during construction of the
+-// MetricVec).
+-//
+-// It is possible to call this method without using the returned Metry to only
+-// create the new Metric but leave it in its intitial state.
+-//
+-// Keeping the Metric for later use is possible (and should be considered if
+-// performance is critical), but keep in mind that Reset, DeleteLabelValues and
+-// Delete can be used to delete the Metric from the MetricVec. In that case, the
+-// Metric will still exist, but it will not be exported anymore, even if a
+-// Metric with the same label values is created later.
+-//
+-// An error is returned if the number of label values is not the same as the
+-// number of variable labels in Desc (minus any curried labels).
+-//
+-// Note that for more than one label value, this method is prone to mistakes
+-// caused by an incorrect order of arguments. Consider GetMetricWith(Labels) as
+-// an alternative to avoid that type of mistake. For higher label numbers, the
+-// latter has a much more readable (albeit more verbose) syntax, but it comes
+-// with a performance overhead (for creating and processing the Labels map).
+-//
+-// Note that GetMetricWithLabelValues is usually not called directly but through
+-// a wrapper around MetricVec, implementing a vector for a specific Metric
+-// implementation, for example GaugeVec.
+-func (m *MetricVec) GetMetricWithLabelValues(lvs ...string) (Metric, error) {
++func (m *metricVec) getMetricWithLabelValues(lvs ...string) (Metric, error) {
+ 	h, err := m.hashLabelValues(lvs)
+ 	if err != nil {
+ 		return nil, err
+@@ -197,23 +145,7 @@ func (m *MetricVec) GetMetricWithLabelValues(lvs ...string) (Metric, error) {
+ 	return m.metricMap.getOrCreateMetricWithLabelValues(h, lvs, m.curry), nil
+ }
+ 
+-// GetMetricWith returns the Metric for the given Labels map (the label names
+-// must match those of the variable labels in Desc). If that label map is
+-// accessed for the first time, a new Metric is created. Implications of
+-// creating a Metric without using it and keeping the Metric for later use
+-// are the same as for GetMetricWithLabelValues.
+-//
+-// An error is returned if the number and names of the Labels are inconsistent
+-// with those of the variable labels in Desc (minus any curried labels).
+-//
+-// This method is used for the same purpose as
+-// GetMetricWithLabelValues(...string). See there for pros and cons of the two
+-// methods.
+-//
+-// Note that GetMetricWith is usually not called directly but through a wrapper
+-// around MetricVec, implementing a vector for a specific Metric implementation,
+-// for example GaugeVec.
+-func (m *MetricVec) GetMetricWith(labels Labels) (Metric, error) {
++func (m *metricVec) getMetricWith(labels Labels) (Metric, error) {
+ 	h, err := m.hashLabels(labels)
+ 	if err != nil {
+ 		return nil, err
+@@ -222,7 +154,7 @@ func (m *MetricVec) GetMetricWith(labels Labels) (Metric, error) {
+ 	return m.metricMap.getOrCreateMetricWithLabels(h, labels, m.curry), nil
+ }
+ 
+-func (m *MetricVec) hashLabelValues(vals []string) (uint64, error) {
++func (m *metricVec) hashLabelValues(vals []string) (uint64, error) {
+ 	if err := validateLabelValues(vals, len(m.desc.variableLabels)-len(m.curry)); err != nil {
+ 		return 0, err
+ 	}
+@@ -245,7 +177,7 @@ func (m *MetricVec) hashLabelValues(vals []string) (uint64, error) {
+ 	return h, nil
+ }
+ 
+-func (m *MetricVec) hashLabels(labels Labels) (uint64, error) {
++func (m *metricVec) hashLabels(labels Labels) (uint64, error) {
+ 	if err := validateValuesInLabels(labels, len(m.desc.variableLabels)-len(m.curry)); err != nil {
+ 		return 0, err
+ 	}

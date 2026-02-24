@@ -1,0 +1,347 @@
+diff --git a/.golangci.reference.yml b/.golangci.reference.yml
+index 27293fb8..6a623977 100644
+--- a/.golangci.reference.yml
++++ b/.golangci.reference.yml
+@@ -2881,8 +2881,6 @@ severity:
+   # - GitHub: https://help.github.com/en/actions/reference/workflow-commands-for-github-actions#setting-an-error-message
+   # - TeamCity: https://www.jetbrains.com/help/teamcity/service-messages.html#Inspection+Instance
+   #
+-  # `@linter` can be used as severity value to keep the severity from linters (e.g. revive, gosec, ...)
+-  #
+   # Default: ""
+   default-severity: error
+ 
+@@ -2890,12 +2888,13 @@ severity:
+   # Default: false
+   case-sensitive: true
+ 
++  # Don't override severity defined by linters.
++  # Default: false
++  keep-linter-severity: true
++
+   # When a list of severity rules are provided, severity information will be added to lint issues.
+   # Severity rules have the same filtering capability as exclude rules
+   # except you are allowed to specify one matcher per severity rule.
+-  #
+-  # `@linter` can be used as severity value to keep the severity from linters (e.g. revive, gosec, ...)
+-  #
+   # Only affects out formats that support setting severity information.
+   #
+   # Default: []
+diff --git a/pkg/config/severity.go b/pkg/config/severity.go
+index a6d2c9ec..49874c9a 100644
+--- a/pkg/config/severity.go
++++ b/pkg/config/severity.go
+@@ -8,9 +8,10 @@ import (
+ const severityRuleMinConditionsCount = 1
+ 
+ type Severity struct {
+-	Default       string         `mapstructure:"default-severity"`
+-	CaseSensitive bool           `mapstructure:"case-sensitive"`
+-	Rules         []SeverityRule `mapstructure:"rules"`
++	Default            string         `mapstructure:"default-severity"`
++	CaseSensitive      bool           `mapstructure:"case-sensitive"`
++	Rules              []SeverityRule `mapstructure:"rules"`
++	KeepLinterSeverity bool           `mapstructure:"keep-linter-severity"` // TODO(ldez): in v2 should be changed to `Override`.
+ }
+ 
+ func (s *Severity) Validate() error {
+diff --git a/pkg/lint/runner.go b/pkg/lint/runner.go
+index 13daa3b3..78be9382 100644
+--- a/pkg/lint/runner.go
++++ b/pkg/lint/runner.go
+@@ -302,6 +302,7 @@ func getSeverityRulesProcessor(cfg *config.Severity, log logutils.Log, files *fs
+ 		Default:       cfg.Default,
+ 		Rules:         severityRules,
+ 		CaseSensitive: cfg.CaseSensitive,
++		Override:      !cfg.KeepLinterSeverity,
+ 	}
+ 
+ 	return processors.NewSeverity(log.Child(logutils.DebugKeySeverityRules), files, severityOpts)
+diff --git a/pkg/result/processors/processor_test.go b/pkg/result/processors/processor_test.go
+index 216a8fcd..d263cf29 100644
+--- a/pkg/result/processors/processor_test.go
++++ b/pkg/result/processors/processor_test.go
+@@ -22,7 +22,6 @@ func newIssueFromIssueTestCase(c issueTestCase) result.Issue {
+ 	return result.Issue{
+ 		Text:       c.Text,
+ 		FromLinter: c.Linter,
+-		Severity:   c.Severity,
+ 		Pos: token.Position{
+ 			Filename: c.Path,
+ 			Line:     c.Line,
+diff --git a/pkg/result/processors/severity.go b/pkg/result/processors/severity.go
+index f087f951..943b14a4 100644
+--- a/pkg/result/processors/severity.go
++++ b/pkg/result/processors/severity.go
+@@ -8,8 +8,6 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+-const severityFromLinter = "@linter"
+-
+ var _ Processor = &Severity{}
+ 
+ type severityRule struct {
+@@ -26,6 +24,7 @@ type SeverityOptions struct {
+ 	Default       string
+ 	Rules         []SeverityRule
+ 	CaseSensitive bool
++	Override      bool
+ }
+ 
+ type Severity struct {
+@@ -37,6 +36,7 @@ type Severity struct {
+ 
+ 	defaultSeverity string
+ 	rules           []severityRule
++	override        bool
+ }
+ 
+ func NewSeverity(log logutils.Log, files *fsutils.Files, opts SeverityOptions) *Severity {
+@@ -45,6 +45,7 @@ func NewSeverity(log logutils.Log, files *fsutils.Files, opts SeverityOptions) *
+ 		files:           files,
+ 		log:             log,
+ 		defaultSeverity: opts.Default,
++		override:        opts.Override,
+ 	}
+ 
+ 	prefix := caseInsensitivePrefix
+@@ -63,30 +64,29 @@ func (p *Severity) Process(issues []result.Issue) ([]result.Issue, error) {
+ 		return issues, nil
+ 	}
+ 
+-	return transformIssues(issues, p.transform), nil
+-}
++	return transformIssues(issues, func(issue *result.Issue) *result.Issue {
++		if issue.Severity != "" && !p.override {
++			return issue
++		}
+ 
+-func (p *Severity) transform(issue *result.Issue) *result.Issue {
+-	for _, rule := range p.rules {
+-		if rule.match(issue, p.files, p.log) {
+-			if rule.severity == severityFromLinter || rule.severity == "" && p.defaultSeverity == severityFromLinter {
+-				return issue
+-			}
++		for _, rule := range p.rules {
++			rule := rule
+ 
+-			issue.Severity = rule.severity
+-			if issue.Severity == "" {
+-				issue.Severity = p.defaultSeverity
++			ruleSeverity := p.defaultSeverity
++			if rule.severity != "" {
++				ruleSeverity = rule.severity
+ 			}
+ 
+-			return issue
++			if rule.match(issue, p.files, p.log) {
++				issue.Severity = ruleSeverity
++				return issue
++			}
+ 		}
+-	}
+ 
+-	if p.defaultSeverity != severityFromLinter {
+ 		issue.Severity = p.defaultSeverity
+-	}
+ 
+-	return issue
++		return issue
++	}), nil
+ }
+ 
+ func (p *Severity) Name() string { return p.name }
+diff --git a/pkg/result/processors/severity_test.go b/pkg/result/processors/severity_test.go
+index cbf18e6c..9690b550 100644
+--- a/pkg/result/processors/severity_test.go
++++ b/pkg/result/processors/severity_test.go
+@@ -310,187 +310,3 @@ func TestSeverity_caseSensitive(t *testing.T) {
+ 
+ 	assert.Equal(t, expectedCases, resultingCases)
+ }
+-
+-func TestSeverity_transform(t *testing.T) {
+-	lineCache := fsutils.NewLineCache(fsutils.NewFileCache())
+-	files := fsutils.NewFiles(lineCache, "")
+-
+-	testCases := []struct {
+-		desc     string
+-		opts     SeverityOptions
+-		issue    *result.Issue
+-		expected *result.Issue
+-	}{
+-		{
+-			desc: "apply severity from rule",
+-			opts: SeverityOptions{
+-				Default: "error",
+-				Rules: []SeverityRule{
+-					{
+-						Severity: "info",
+-						BaseRule: BaseRule{
+-							Linters: []string{"linter1"},
+-						},
+-					},
+-				},
+-			},
+-			issue: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter1",
+-			},
+-			expected: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter1",
+-				Severity:   "info",
+-			},
+-		},
+-		{
+-			desc: "apply severity from default",
+-			opts: SeverityOptions{
+-				Default: "error",
+-				Rules: []SeverityRule{
+-					{
+-						Severity: "info",
+-						BaseRule: BaseRule{
+-							Linters: []string{"linter1"},
+-						},
+-					},
+-				},
+-			},
+-			issue: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter2",
+-			},
+-			expected: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter2",
+-				Severity:   "error",
+-			},
+-		},
+-		{
+-			desc: "severity from rule override severity from linter",
+-			opts: SeverityOptions{
+-				Default: "error",
+-				Rules: []SeverityRule{
+-					{
+-						Severity: "info",
+-						BaseRule: BaseRule{
+-							Linters: []string{"linter1"},
+-						},
+-					},
+-				},
+-			},
+-			issue: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter1",
+-				Severity:   "huge",
+-			},
+-			expected: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter1",
+-				Severity:   "info",
+-			},
+-		},
+-		{
+-			desc: "severity from default override severity from linter",
+-			opts: SeverityOptions{
+-				Default: "error",
+-				Rules: []SeverityRule{
+-					{
+-						Severity: "info",
+-						BaseRule: BaseRule{
+-							Linters: []string{"linter1"},
+-						},
+-					},
+-				},
+-			},
+-			issue: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter2",
+-				Severity:   "huge",
+-			},
+-			expected: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter2",
+-				Severity:   "error",
+-			},
+-		},
+-		{
+-			desc: "keep severity from linter as rule",
+-			opts: SeverityOptions{
+-				Default: "error",
+-				Rules: []SeverityRule{
+-					{
+-						Severity: severityFromLinter,
+-						BaseRule: BaseRule{
+-							Linters: []string{"linter1"},
+-						},
+-					},
+-				},
+-			},
+-			issue: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter1",
+-				Severity:   "huge",
+-			},
+-			expected: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter1",
+-				Severity:   "huge",
+-			},
+-		},
+-		{
+-			desc: "keep severity from linter as default",
+-			opts: SeverityOptions{
+-				Default: severityFromLinter,
+-				Rules: []SeverityRule{
+-					{
+-						Severity: "info",
+-						BaseRule: BaseRule{
+-							Linters: []string{"linter1"},
+-						},
+-					},
+-				},
+-			},
+-			issue: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter2",
+-				Severity:   "huge",
+-			},
+-			expected: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter2",
+-				Severity:   "huge",
+-			},
+-		},
+-		{
+-			desc: "keep severity from linter as default (without rule)",
+-			opts: SeverityOptions{
+-				Default: severityFromLinter,
+-			},
+-			issue: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter2",
+-				Severity:   "huge",
+-			},
+-			expected: &result.Issue{
+-				Text:       "This is a report",
+-				FromLinter: "linter2",
+-				Severity:   "huge",
+-			},
+-		},
+-	}
+-
+-	for _, test := range testCases {
+-		test := test
+-		t.Run(test.desc, func(t *testing.T) {
+-			t.Parallel()
+-
+-			p := NewSeverity(nil, files, test.opts)
+-
+-			newIssue := p.transform(test.issue)
+-
+-			assert.Equal(t, test.expected, newIssue)
+-		})
+-	}
+-}

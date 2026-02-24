@@ -1,0 +1,277 @@
+diff --git a/exp/api/remote/remote_api.go b/exp/api/remote/remote_api.go
+index afacd41..adec5fc 100644
+--- a/exp/api/remote/remote_api.go
++++ b/exp/api/remote/remote_api.go
+@@ -64,7 +64,8 @@ var defaultAPIOpts = &apiOpts{
+ 		Max:        10 * time.Second,
+ 		MaxRetries: 10,
+ 	},
+-	client:           http.DefaultClient,
++	client: http.DefaultClient,
++	// Hardcoded for now.
+ 	retryOnRateLimit: true,
+ 	compression:      SnappyBlockCompression,
+ 	path:             "api/v1/write",
+@@ -95,7 +96,7 @@ func WithAPIPath(path string) APIOption {
+ 	}
+ }
+ 
+-// WithAPINoRetryOnRateLimit returns APIOption that disables retrying on rate limit status code.
++// WithAPIRetryOnRateLimit returns APIOption that disables retrying on rate limit status code.
+ func WithAPINoRetryOnRateLimit() APIOption {
+ 	return func(o *apiOpts) error {
+ 		o.retryOnRateLimit = false
+@@ -372,46 +373,45 @@ type writeStorage interface {
+ 	// Other headers might be trimmed, depending on the configured middlewares
+ 	// e.g. a default SnappyMiddleware trims "Content-Encoding" and ensures that
+ 	// encoded body bytes are already decompressed.
+-	Store(req *http.Request, msgType WriteMessageType) (_ *WriteResponse, _ error)
++	Store(ctx context.Context, msgType WriteMessageType, req *http.Request) (_ *WriteResponse, _ error)
+ }
+ 
+-type writeHandler struct {
++type handler struct {
+ 	store                writeStorage
+ 	acceptedMessageTypes MessageTypes
+-	opts                 writeHandlerOpts
++	opts                 handlerOpts
+ }
+ 
+-type writeHandlerOpts struct {
++type handlerOpts struct {
+ 	logger      *slog.Logger
+ 	middlewares []func(http.Handler) http.Handler
+ }
+ 
+-// WriteHandlerOption represents an option for the write handler.
+-type WriteHandlerOption func(o *writeHandlerOpts)
++// HandlerOption represents an option for the handler.
++type HandlerOption func(o *handlerOpts)
+ 
+-// WithWriteHandlerLogger returns WriteHandlerOption that allows providing slog logger.
++// WithHandlerLogger returns HandlerOption that allows providing slog logger.
+ // By default, nothing is logged.
+-func WithWriteHandlerLogger(logger *slog.Logger) WriteHandlerOption {
+-	return func(o *writeHandlerOpts) {
++func WithHandlerLogger(logger *slog.Logger) HandlerOption {
++	return func(o *handlerOpts) {
+ 		o.logger = logger
+ 	}
+ }
+ 
+-// WithWriteHandlerMiddlewares returns WriteHandlerOption that allows providing middlewares.
++// WithHandlerMiddleware returns HandlerOption that allows providing middlewares.
+ // Multiple middlewares can be provided and will be applied in the order they are passed.
+-// This option replaces the default middlewares (SnappyDecompressorMiddleware), so if
+-// you want to have handler that works with the default Remote Write 2.0 protocol,
+-// SnappyDecompressorMiddleware (or any other decompression middleware) needs to be added explicitly.
+-func WithWriteHandlerMiddlewares(middlewares ...func(http.Handler) http.Handler) WriteHandlerOption {
+-	return func(o *writeHandlerOpts) {
++// When using this option, SnappyDecompressorMiddleware is not applied by default so
++// it (or any other decompression middleware) needs to be added explicitly.
++func WithHandlerMiddlewares(middlewares ...func(http.Handler) http.Handler) HandlerOption {
++	return func(o *handlerOpts) {
+ 		o.middlewares = middlewares
+ 	}
+ }
+ 
+-// SnappyDecodeMiddleware returns a middleware that checks if the request body is snappy-encoded and decompresses it.
++// SnappyDecompressorMiddleware returns a middleware that checks if the request body is snappy-encoded and decompresses it.
+ // If the request body is not snappy-encoded, it returns an error.
+-// Used by default in NewHandler.
+-func SnappyDecodeMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
++// Used by default in NewRemoteWriteHandler.
++func SnappyDecompressorMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
+ 	bufPool := sync.Pool{
+ 		New: func() any {
+ 			return bytes.NewBuffer(nil)
+@@ -455,18 +455,18 @@ func SnappyDecodeMiddleware(logger *slog.Logger) func(http.Handler) http.Handler
+ 	}
+ }
+ 
+-// NewWriteHandler returns HTTP handler that receives Remote Write 2.0
++// NewHandler returns HTTP handler that receives Remote Write 2.0
+ // protocol https://prometheus.io/docs/specs/remote_write_spec_2_0/.
+-func NewWriteHandler(store writeStorage, acceptedMessageTypes MessageTypes, opts ...WriteHandlerOption) http.Handler {
+-	o := writeHandlerOpts{
++func NewHandler(store writeStorage, acceptedMessageTypes MessageTypes, opts ...HandlerOption) http.Handler {
++	o := handlerOpts{
+ 		logger:      slog.New(nopSlogHandler{}),
+-		middlewares: []func(http.Handler) http.Handler{SnappyDecodeMiddleware(slog.New(nopSlogHandler{}))},
++		middlewares: []func(http.Handler) http.Handler{SnappyDecompressorMiddleware(slog.New(nopSlogHandler{}))},
+ 	}
+ 	for _, opt := range opts {
+ 		opt(&o)
+ 	}
+ 
+-	h := &writeHandler{
++	h := &handler{
+ 		opts:                 o,
+ 		store:                store,
+ 		acceptedMessageTypes: acceptedMessageTypes,
+@@ -513,7 +513,7 @@ func ParseProtoMsg(contentType string) (WriteMessageType, error) {
+ 	return WriteV1MessageType, nil
+ }
+ 
+-func (h *writeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	if r.Method != http.MethodPost {
+ 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+ 		return
+@@ -538,25 +538,20 @@ func (h *writeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	writeResponse, storeErr := h.store.Store(r, msgType)
+-	if writeResponse == nil {
+-		// User could forget to return write response; in this case we assume 0 samples
+-		// were written.
+-		writeResponse = NewWriteResponse()
+-	}
++	writeResponse, storeErr := h.store.Store(r.Context(), msgType, r)
+ 
+-	// Set required X-Prometheus-Remote-Write-Written-* response headers, in all cases, along with any user-defined headers.
+-	writeResponse.writeHeaders(w)
++	// Set required X-Prometheus-Remote-Write-Written-* response headers, in all cases, alongwith any user-defined headers.
++	writeResponse.SetHeaders(w)
+ 
+ 	if storeErr != nil {
+-		if writeResponse.statusCode == 0 {
++		if writeResponse.StatusCode() == 0 {
+ 			writeResponse.SetStatusCode(http.StatusInternalServerError)
+ 		}
+-		if writeResponse.statusCode/100 == 5 { // 5xx
+-			h.opts.logger.Error("Error while storing the remote write request", "err", storeErr)
++		if writeResponse.StatusCode()/100 == 5 { // 5xx
++			h.opts.logger.Error("Error while storing the remote write request", "err", storeErr.Error())
+ 		}
+-		http.Error(w, storeErr.Error(), writeResponse.statusCode)
++		http.Error(w, storeErr.Error(), writeResponse.StatusCode())
+ 		return
+ 	}
+-	w.WriteHeader(writeResponse.statusCode)
++	w.WriteHeader(writeResponse.StatusCode())
+ }
+diff --git a/exp/api/remote/remote_api_test.go b/exp/api/remote/remote_api_test.go
+index 9f982a4..655c503 100644
+--- a/exp/api/remote/remote_api_test.go
++++ b/exp/api/remote/remote_api_test.go
+@@ -71,8 +71,8 @@ type mockStorage struct {
+ 	mockErr  error
+ }
+ 
+-func (m *mockStorage) Store(req *http.Request, msgType WriteMessageType) (*WriteResponse, error) {
+-	w := NewWriteResponse()
++func (m *mockStorage) Store(_ context.Context, msgType WriteMessageType, req *http.Request) (*WriteResponse, error) {
++	w := &WriteResponse{}
+ 	if m.mockErr != nil {
+ 		if m.mockCode != nil {
+ 			w.SetStatusCode(*m.mockCode)
+@@ -147,7 +147,7 @@ func TestRemoteAPI_Write_WithHandler(t *testing.T) {
+ 	t.Run("success", func(t *testing.T) {
+ 		tLogger := slog.Default()
+ 		mStore := &mockStorage{}
+-		srv := httptest.NewServer(NewWriteHandler(mStore, MessageTypes{WriteV2MessageType}, WithWriteHandlerLogger(tLogger)))
++		srv := httptest.NewServer(NewHandler(mStore, MessageTypes{WriteV2MessageType}, WithHandlerLogger(tLogger)))
+ 		t.Cleanup(srv.Close)
+ 
+ 		client, err := NewAPI(srv.URL,
+@@ -182,7 +182,7 @@ func TestRemoteAPI_Write_WithHandler(t *testing.T) {
+ 			mockErr:  errors.New("storage error"),
+ 			mockCode: &mockCode,
+ 		}
+-		srv := httptest.NewServer(NewWriteHandler(mStore, MessageTypes{WriteV2MessageType}, WithWriteHandlerLogger(tLogger)))
++		srv := httptest.NewServer(NewHandler(mStore, MessageTypes{WriteV2MessageType}, WithHandlerLogger(tLogger)))
+ 		t.Cleanup(srv.Close)
+ 
+ 		client, err := NewAPI(srv.URL,
+diff --git a/exp/api/remote/remote_headers.go b/exp/api/remote/remote_headers.go
+index dfe1931..9eaf4de 100644
+--- a/exp/api/remote/remote_headers.go
++++ b/exp/api/remote/remote_headers.go
+@@ -125,19 +125,29 @@ func (w *WriteResponse) SetStatusCode(code int) {
+ 	w.statusCode = code
+ }
+ 
++// StatusCode returns the current HTTP status code.
++func (w *WriteResponse) StatusCode() int {
++	return w.statusCode
++}
++
+ // SetExtraHeader adds additional headers to be set in the response (apart from stats headers)
+ func (w *WriteResponse) SetExtraHeader(key, value string) {
+ 	w.extraHeaders.Set(key, value)
+ }
+ 
+-// writeHeaders sets response headers in a given response writer.
++// ExtraHeaders returns all additional headers to be set in the response (apart from stats headers).
++func (w *WriteResponse) ExtraHeaders() http.Header {
++	return w.extraHeaders
++}
++
++// SetHeaders sets response headers in a given response writer.
+ // Make sure to use it before http.ResponseWriter.WriteHeader and .Write.
+-func (w *WriteResponse) writeHeaders(rw http.ResponseWriter) {
+-	h := rw.Header()
+-	h.Set(writtenSamplesHeader, strconv.Itoa(w.Samples))
+-	h.Set(writtenHistogramsHeader, strconv.Itoa(w.Histograms))
+-	h.Set(writtenExemplarsHeader, strconv.Itoa(w.Exemplars))
+-	for k, v := range w.extraHeaders {
++func (r *WriteResponse) SetHeaders(w http.ResponseWriter) {
++	h := w.Header()
++	h.Set(writtenSamplesHeader, strconv.Itoa(r.Samples))
++	h.Set(writtenHistogramsHeader, strconv.Itoa(r.Histograms))
++	h.Set(writtenExemplarsHeader, strconv.Itoa(r.Exemplars))
++	for k, v := range r.ExtraHeaders() {
+ 		for _, vv := range v {
+ 			h.Add(k, vv)
+ 		}
+diff --git a/exp/api/remote/remote_headers_test.go b/exp/api/remote/remote_headers_test.go
+index 7606448..7327490 100644
+--- a/exp/api/remote/remote_headers_test.go
++++ b/exp/api/remote/remote_headers_test.go
+@@ -25,16 +25,16 @@ import (
+ func TestWriteResponse(t *testing.T) {
+ 	t.Run("new response has empty headers", func(t *testing.T) {
+ 		resp := NewWriteResponse()
+-		if len(resp.extraHeaders) != 0 {
+-			t.Errorf("expected empty headers, got %v", resp.extraHeaders)
++		if len(resp.ExtraHeaders()) != 0 {
++			t.Errorf("expected empty headers, got %v", resp.ExtraHeaders())
+ 		}
+ 	})
+ 
+-	t.Run("setters", func(t *testing.T) {
++	t.Run("setters and getters", func(t *testing.T) {
+ 		resp := NewWriteResponse()
+ 
+ 		resp.SetStatusCode(http.StatusOK)
+-		if got := resp.statusCode; got != http.StatusOK {
++		if got := resp.StatusCode(); got != http.StatusOK {
+ 			t.Errorf("expected status code %d, got %d", http.StatusOK, got)
+ 		}
+ 
+@@ -66,12 +66,12 @@ func TestWriteResponse(t *testing.T) {
+ 		}
+ 
+ 		resp.SetExtraHeader("Test-Header", "test-value")
+-		if got := resp.extraHeaders.Get("Test-Header"); got != "test-value" {
++		if got := resp.ExtraHeaders().Get("Test-Header"); got != "test-value" {
+ 			t.Errorf("expected header value %q, got %q", "test-value", got)
+ 		}
+ 	})
+ 
+-	t.Run("writeHeaders", func(t *testing.T) {
++	t.Run("set headers on response writer", func(t *testing.T) {
+ 		resp := NewWriteResponse()
+ 		resp.Add(WriteResponseStats{
+ 			Samples:    10,
+@@ -82,7 +82,7 @@ func TestWriteResponse(t *testing.T) {
+ 		resp.SetExtraHeader("Custom-Header", "custom-value")
+ 
+ 		w := httptest.NewRecorder()
+-		resp.writeHeaders(w)
++		resp.SetHeaders(w)
+ 
+ 		expectedHeaders := map[string]string{
+ 			"Custom-Header": "custom-value",

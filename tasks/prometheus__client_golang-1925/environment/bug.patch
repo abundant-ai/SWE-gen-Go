@@ -1,0 +1,186 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f542539..6bcf1cd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,7 +1,5 @@
+ ## Unreleased
+ 
+-* [FEATURE] HTTP handlers created by `promhttp` package now support metrics filtering by providing one or more `name[]` query parameters. The default behavior when none are provided remains the same, returning all metrics. #1925
+-
+ ## 1.23.2 / 2025-09-05
+ 
+ This release is made to upgrade to prometheus/common v0.66.1, which drops the dependencies github.com/grafana/regexp and go.uber.org/atomic and replaces gopkg.in/yaml.v2 with go.yaml.in/yaml/v2 (a drop-in replacement).
+diff --git a/prometheus/promhttp/http.go b/prometheus/promhttp/http.go
+index e681601..fd3c763 100644
+--- a/prometheus/promhttp/http.go
++++ b/prometheus/promhttp/http.go
+@@ -89,10 +89,6 @@ var gzipPool = sync.Pool{
+ // metrics used for instrumentation will be shared between them, providing
+ // global scrape counts.
+ //
+-// The handler supports filtering metrics by name using the `name[]` query parameter.
+-// Multiple metric names can be specified by providing the parameter multiple times.
+-// When no name[] parameters are provided, all metrics are returned.
+-//
+ // This function is meant to cover the bulk of basic use cases. If you are doing
+ // anything that requires more customization (including using a non-default
+ // Gatherer, different instrumentation, and non-default HandlerOpts), use the
+@@ -109,10 +105,6 @@ func Handler() http.Handler {
+ // Gatherers, with non-default HandlerOpts, and/or with custom (or no)
+ // instrumentation. Use the InstrumentMetricHandler function to apply the same
+ // kind of instrumentation as it is used by the Handler function.
+-//
+-// The handler supports filtering metrics by name using the `name[]` query parameter.
+-// Multiple metric names can be specified by providing the parameter multiple times.
+-// When no name[] parameters are provided, all metrics are returned.
+ func HandlerFor(reg prometheus.Gatherer, opts HandlerOpts) http.Handler {
+ 	return HandlerForTransactional(prometheus.ToTransactionalGatherer(reg), opts)
+ }
+@@ -120,10 +112,6 @@ func HandlerFor(reg prometheus.Gatherer, opts HandlerOpts) http.Handler {
+ // HandlerForTransactional is like HandlerFor, but it uses transactional gather, which
+ // can safely change in-place returned *dto.MetricFamily before call to `Gather` and after
+ // call to `done` of that `Gather`.
+-//
+-// The handler supports filtering metrics by name using the `name[]` query parameter.
+-// Multiple metric names can be specified by providing the parameter multiple times.
+-// When no name[] parameters are provided, all metrics are returned.
+ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerOpts) http.Handler {
+ 	var (
+ 		inFlightSem chan struct{}
+@@ -257,21 +245,7 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
+ 			return false
+ 		}
+ 
+-		// Build metric name filter set from query params (if any)
+-		var metricFilter map[string]struct{}
+-		if metricNames := req.URL.Query()["name[]"]; len(metricNames) > 0 {
+-			metricFilter = make(map[string]struct{}, len(metricNames))
+-			for _, name := range metricNames {
+-				metricFilter[name] = struct{}{}
+-			}
+-		}
+-
+ 		for _, mf := range mfs {
+-			if metricFilter != nil {
+-				if _, ok := metricFilter[mf.GetName()]; !ok {
+-					continue
+-				}
+-			}
+ 			if handleError(enc.Encode(mf)) {
+ 				return
+ 			}
+diff --git a/prometheus/promhttp/http_test.go b/prometheus/promhttp/http_test.go
+index 60bed42..189ee35 100644
+--- a/prometheus/promhttp/http_test.go
++++ b/prometheus/promhttp/http_test.go
+@@ -640,110 +640,3 @@ func BenchmarkCompression(b *testing.B) {
+ 		}
+ 	}
+ }
+-
+-func TestHandlerWithMetricFilter(t *testing.T) {
+-	reg := prometheus.NewRegistry()
+-
+-	counter := prometheus.NewCounter(prometheus.CounterOpts{
+-		Name: "test_counter",
+-		Help: "A test counter.",
+-	})
+-	gauge := prometheus.NewGauge(prometheus.GaugeOpts{
+-		Name: "test_gauge",
+-		Help: "A test gauge.",
+-	})
+-	histogram := prometheus.NewHistogram(prometheus.HistogramOpts{
+-		Name: "test_histogram",
+-		Help: "A test histogram.",
+-	})
+-
+-	reg.MustRegister(counter, gauge, histogram)
+-	counter.Inc()
+-	gauge.Set(42)
+-	histogram.Observe(3.14)
+-
+-	testCases := []struct {
+-		name             string
+-		url              string
+-		shouldContain    []string
+-		shouldNotContain []string
+-	}{
+-		{
+-			name:             "single metric filter",
+-			url:              "/?name[]=test_counter",
+-			shouldContain:    []string{"test_counter"},
+-			shouldNotContain: []string{"test_gauge", "test_histogram"},
+-		},
+-		{
+-			name:             "multiple metric filters",
+-			url:              "/?name[]=test_counter&name[]=test_gauge",
+-			shouldContain:    []string{"test_counter", "test_gauge"},
+-			shouldNotContain: []string{"test_histogram"},
+-		},
+-		{
+-			name:             "no filter returns all metrics",
+-			url:              "/",
+-			shouldContain:    []string{"test_counter", "test_gauge", "test_histogram"},
+-			shouldNotContain: []string{},
+-		},
+-		{
+-			name:             "non-matching filter returns empty",
+-			url:              "/?name[]=nonexistent_metric",
+-			shouldContain:    []string{},
+-			shouldNotContain: []string{"test_counter", "test_gauge", "test_histogram"},
+-		},
+-		{
+-			name:             "empty name[] value",
+-			url:              "/?name[]=",
+-			shouldContain:    []string{},
+-			shouldNotContain: []string{"test_counter", "test_gauge", "test_histogram"},
+-		},
+-		{
+-			name:             "duplicate name[] values",
+-			url:              "/?name[]=test_counter&name[]=test_counter",
+-			shouldContain:    []string{"test_counter"},
+-			shouldNotContain: []string{"test_gauge", "test_histogram"},
+-		},
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.name, func(t *testing.T) {
+-			mReg := &mockTransactionGatherer{g: reg}
+-
+-			writer := httptest.NewRecorder()
+-			request, err := http.NewRequest(http.MethodGet, tc.url, nil)
+-			if err != nil {
+-				t.Fatal(err)
+-			}
+-
+-			request.Header.Add(acceptHeader, acceptTextPlain)
+-
+-			handler := HandlerForTransactional(mReg, HandlerOpts{})
+-			handler.ServeHTTP(writer, request)
+-
+-			if got, want := writer.Code, http.StatusOK; got != want {
+-				t.Errorf("got HTTP status code %d, want %d", got, want)
+-			}
+-
+-			body := writer.Body.String()
+-			for _, expected := range tc.shouldContain {
+-				if !strings.Contains(body, expected) {
+-					t.Errorf("expected body to contain %q, got: %s", expected, body)
+-				}
+-			}
+-			for _, notExpected := range tc.shouldNotContain {
+-				if strings.Contains(body, notExpected) {
+-					t.Errorf("expected body to NOT contain %q, got: %s", notExpected, body)
+-				}
+-			}
+-
+-			// Verify that Gather and done are called even with filtering.
+-			if got := mReg.gatherInvoked; got != 1 {
+-				t.Errorf("unexpected number of gather invokes, want 1, got %d", got)
+-			}
+-			if got := mReg.doneInvoked; got != 1 {
+-				t.Errorf("unexpected number of done invokes, want 1, got %d", got)
+-			}
+-		})
+-	}
+-}

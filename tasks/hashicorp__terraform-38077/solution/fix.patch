@@ -1,0 +1,202 @@
+diff --git a/.changes/v1.15/ENHANCEMENTS-20260120-172831.yaml b/.changes/v1.15/ENHANCEMENTS-20260120-172831.yaml
+new file mode 100644
+index 0000000000..a3d9aebb2f
+--- /dev/null
++++ b/.changes/v1.15/ENHANCEMENTS-20260120-172831.yaml
+@@ -0,0 +1,5 @@
++kind: ENHANCEMENTS
++body: improve detection of deprecated resource attributes / blocks
++time: 2026-01-20T17:28:31.861321+01:00
++custom:
++    Issue: "38077"
+diff --git a/internal/configs/configschema/validate_traversal.go b/internal/configs/configschema/validate_traversal.go
+index 9178768a91..06d9e01075 100644
+--- a/internal/configs/configschema/validate_traversal.go
++++ b/internal/configs/configschema/validate_traversal.go
+@@ -77,27 +77,6 @@ func (b *Block) StaticValidateTraversal(traversal hcl.Traversal) tfdiags.Diagnos
+ 	}
+ 
+ 	if attrS, exists := b.Attributes[name]; exists {
+-		// Check for Deprecated status of this attribute.
+-		// We currently can't provide the user with any useful guidance because
+-		// the deprecation string is not part of the schema, but we can at
+-		// least warn them.
+-		//
+-		// This purposely does not attempt to recurse into nested attribute
+-		// types. Because nested attribute values are often not accessed via a
+-		// direct traversal to the leaf attributes, we cannot reliably detect
+-		// if a nested, deprecated attribute value is actually used from the
+-		// traversal alone. More precise detection of deprecated attributes
+-		// would require adding metadata like marks to the cty value itself, to
+-		// be caught during evaluation.
+-		if attrS.Deprecated {
+-			diags = diags.Append(&hcl.Diagnostic{
+-				Severity: hcl.DiagWarning,
+-				Summary:  `Deprecated attribute`,
+-				Detail:   fmt.Sprintf(`The attribute %q is deprecated. Refer to the provider documentation for details.`, name),
+-				Subject:  next.SourceRange().Ptr(),
+-			})
+-		}
+-
+ 		// For attribute validation we will just apply the rest of the
+ 		// traversal to an unknown value of the attribute type and pass
+ 		// through HCL's own errors, since we don't want to replicate all
+diff --git a/internal/deprecation/deprecation.go b/internal/deprecation/deprecation.go
+index aa808e0693..956da60b47 100644
+--- a/internal/deprecation/deprecation.go
++++ b/internal/deprecation/deprecation.go
+@@ -133,3 +133,7 @@ func (d *Deprecations) IsModuleCallDeprecationSuppressed(addr addrs.Module) bool
+ 	}
+ 	return false
+ }
++
++func (d *Deprecations) DiagnosticsForValueMarks(valueMarks cty.ValueMarks, module addrs.Module, rng *hcl.Range) tfdiags.Diagnostics {
++	return d.deprecationMarksToDiagnostics(marks.FilterDeprecationMarks(valueMarks), module, rng)
++}
+diff --git a/internal/deprecation/schema.go b/internal/deprecation/schema.go
+new file mode 100644
+index 0000000000..79bca750e5
+--- /dev/null
++++ b/internal/deprecation/schema.go
+@@ -0,0 +1,56 @@
++// Copyright (c) HashiCorp, Inc.
++// SPDX-License-Identifier: BUSL-1.1
++
++package deprecation
++
++import (
++	"fmt"
++	"strings"
++
++	"github.com/hashicorp/terraform/internal/configs/configschema"
++	"github.com/hashicorp/terraform/internal/lang/format"
++	"github.com/hashicorp/terraform/internal/lang/marks"
++	"github.com/zclconf/go-cty/cty"
++)
++
++// MarkDeprecatedValues inspects the given cty.Value according to the given
++// configschema.Block schema, and marks any deprecated attributes or blocks
++// found within the value with deprecation marks.
++// It works based on the given cty.Value's structure matching the given schema.
++func MarkDeprecatedValues(val cty.Value, schema *configschema.Block, origin string) cty.Value {
++	if schema == nil {
++		return val
++	}
++	newVal := val
++
++	// Check if the block is deprecated
++	if schema.Deprecated {
++		newVal = newVal.Mark(marks.NewDeprecation("Deprecated resource used as value", origin))
++	}
++
++	if !newVal.IsKnown() {
++		return newVal
++	}
++
++	// Even if the block itself is not deprecated, its attributes might be
++	// deprecated as well
++	if val.Type().IsObjectType() || val.Type().IsMapType() || val.Type().IsCollectionType() {
++		// We ignore the error, so errors are not allowed in the transform function
++		newVal, _ = cty.Transform(newVal, func(p cty.Path, v cty.Value) (cty.Value, error) {
++
++			attr := schema.AttributeByPath(p)
++			if attr != nil && attr.Deprecated {
++				v = v.Mark(marks.NewDeprecation(fmt.Sprintf("Deprecated resource attribute %q used", strings.TrimPrefix(format.CtyPath(p), ".")), fmt.Sprintf("%s%s", origin, format.CtyPath(p))))
++			}
++
++			block := schema.BlockByPath(p)
++			if block != nil && block.Deprecated {
++				v = v.Mark(marks.NewDeprecation(fmt.Sprintf("Deprecated resource block %q used", strings.TrimPrefix(format.CtyPath(p), ".")), fmt.Sprintf("%s%s", origin, format.CtyPath(p))))
++			}
++
++			return v, nil
++		})
++	}
++
++	return newVal
++}
+diff --git a/internal/terraform/evaluate.go b/internal/terraform/evaluate.go
+index 2c0176dd72..800ac2adc8 100644
+--- a/internal/terraform/evaluate.go
++++ b/internal/terraform/evaluate.go
+@@ -13,6 +13,7 @@ import (
+ 
+ 	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/configs"
++	"github.com/hashicorp/terraform/internal/deprecation"
+ 	"github.com/hashicorp/terraform/internal/didyoumean"
+ 	"github.com/hashicorp/terraform/internal/instances"
+ 	"github.com/hashicorp/terraform/internal/lang"
+@@ -649,9 +650,13 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
+ 		// resource has (using d.Evaluator.Instances.ResourceInstanceKeys) and
+ 		// then retrieving the value for each instance to assemble into the
+ 		// result, using some per-resource-mode logic maintained elsewhere.
+-		return d.getEphemeralResource(addr, rng)
++		val, epehemeralDiags := d.getEphemeralResource(addr, rng)
++		diags = diags.Append(epehemeralDiags)
++		return deprecation.MarkDeprecatedValues(val, schema.Body, addr.String()), diags
+ 	case addrs.ListResourceMode:
+-		return d.getListResource(config, rng)
++		val, listDiags := d.getListResource(config, rng)
++		diags = diags.Append(listDiags)
++		return deprecation.MarkDeprecatedValues(val, schema.Body, addr.String()), diags
+ 	default:
+ 		// continue with the rest of the function
+ 	}
+@@ -796,11 +801,21 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
+ 			// We should only end up here during the validate walk (or
+ 			// console/eval), since later walks should have at least partial
+ 			// states populated for all resources in the configuration.
+-			ret := cty.DynamicVal
+-			if schema.Body.Deprecated {
+-				ret = ret.Mark(marks.NewDeprecation(fmt.Sprintf("Resource %q is deprecated", addr.Type), addr.String()))
++			switch {
++			case config.Count != nil:
++				return deprecation.MarkDeprecatedValues(cty.DynamicVal, schema.Body, addr.String()), diags
++			case config.ForEach != nil:
++				return deprecation.MarkDeprecatedValues(cty.DynamicVal, schema.Body, addr.String()), diags
++			default:
++				// We don't know the values of the single resource instance, but we know the general
++				// shape these values will take.
++				content := map[string]cty.Value{}
++				for attr, attrType := range ty.AttributeTypes() {
++					content[attr] = cty.UnknownVal(attrType)
++				}
++
++				return deprecation.MarkDeprecatedValues(cty.ObjectVal(content), schema.Body, addr.String()), diags
+ 			}
+-			return ret, diags
+ 		}
+ 	}
+ 
+@@ -830,7 +845,7 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
+ 					continue
+ 				}
+ 
+-				vals[int(intKey)] = instance
++				vals[int(intKey)] = deprecation.MarkDeprecatedValues(instance, schema.Body, addr.Instance(key).String())
+ 			}
+ 
+ 			// Insert unknown values where there are any missing instances
+@@ -852,7 +867,7 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
+ 				// old key that is being dropped and not used for evaluation
+ 				continue
+ 			}
+-			vals[string(strKey)] = instance
++			vals[string(strKey)] = deprecation.MarkDeprecatedValues(instance, schema.Body, addr.Instance(key).String())
+ 		}
+ 
+ 		if len(vals) > 0 {
+@@ -872,11 +887,7 @@ func (d *evaluationStateData) GetResource(addr addrs.Resource, rng tfdiags.Sourc
+ 			val = cty.UnknownVal(ty)
+ 		}
+ 
+-		ret = val
+-	}
+-
+-	if schema.Body.Deprecated {
+-		ret = ret.Mark(marks.NewDeprecation(fmt.Sprintf("Resource %q is deprecated", addr.Type), addr.String()))
++		ret = deprecation.MarkDeprecatedValues(val, schema.Body, addr.String())
+ 	}
+ 
+ 	return ret, diags

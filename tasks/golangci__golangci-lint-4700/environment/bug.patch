@@ -1,0 +1,583 @@
+diff --git a/.golangci.next.reference.yml b/.golangci.next.reference.yml
+index 6938157d..2995ca5d 100644
+--- a/.golangci.next.reference.yml
++++ b/.golangci.next.reference.yml
+@@ -60,17 +60,7 @@ run:
+ # output configuration options
+ output:
+   # The formats used to render issues.
+-  # Formats:
+-  # - `colored-line-number`
+-  # - `line-number`
+-  # - `json`
+-  # - `colored-tab`
+-  # - `tab`
+-  # - `checkstyle`
+-  # - `code-climate`
+-  # - `junit-xml`
+-  # - `github-actions`
+-  # - `teamcity`
++  # Format: `colored-line-number`, `line-number`, `json`, `colored-tab`, `tab`, `checkstyle`, `code-climate`, `junit-xml`, `github-actions`, `teamcity`
+   # Output path can be either `stdout`, `stderr` or path to the file to write to.
+   #
+   # For the CLI flag (`--out-format`), multiple formats can be specified by separating them by comma.
+diff --git a/.golangci.reference.yml b/.golangci.reference.yml
+index 6938157d..2995ca5d 100644
+--- a/.golangci.reference.yml
++++ b/.golangci.reference.yml
+@@ -60,17 +60,7 @@ run:
+ # output configuration options
+ output:
+   # The formats used to render issues.
+-  # Formats:
+-  # - `colored-line-number`
+-  # - `line-number`
+-  # - `json`
+-  # - `colored-tab`
+-  # - `tab`
+-  # - `checkstyle`
+-  # - `code-climate`
+-  # - `junit-xml`
+-  # - `github-actions`
+-  # - `teamcity`
++  # Format: `colored-line-number`, `line-number`, `json`, `colored-tab`, `tab`, `checkstyle`, `code-climate`, `junit-xml`, `github-actions`, `teamcity`
+   # Output path can be either `stdout`, `stderr` or path to the file to write to.
+   #
+   # For the CLI flag (`--out-format`), multiple formats can be specified by separating them by comma.
+diff --git a/pkg/printers/github.go b/pkg/printers/github.go
+new file mode 100644
+index 00000000..d91353c1
+--- /dev/null
++++ b/pkg/printers/github.go
+@@ -0,0 +1,157 @@
++package printers
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++
++	"github.com/golangci/golangci-lint/pkg/result"
++)
++
++const defaultGitHubSeverity = "error"
++
++const filenameGitHubActionProblemMatchers = "golangci-lint-action-problem-matchers.json"
++
++// GitHubProblemMatchers defines the root of problem matchers.
++// - https://github.com/actions/toolkit/blob/main/docs/problem-matchers.md
++// - https://github.com/actions/toolkit/blob/main/docs/commands.md#problem-matchers
++type GitHubProblemMatchers struct {
++	Matchers []GitHubMatcher `json:"problemMatcher,omitempty"`
++}
++
++// GitHubMatcher defines a problem matcher.
++type GitHubMatcher struct {
++	// Owner an ID field that can be used to remove or replace the problem matcher.
++	// **required**
++	Owner string `json:"owner,omitempty"`
++	// Severity indicates the default severity, either 'warning' or 'error' case-insensitive.
++	// Defaults to 'error'.
++	Severity string          `json:"severity,omitempty"`
++	Pattern  []GitHubPattern `json:"pattern,omitempty"`
++}
++
++// GitHubPattern defines a pattern for a problem matcher.
++type GitHubPattern struct {
++	// Regexp the regexp pattern that provides the groups to match against.
++	// **required**
++	Regexp string `json:"regexp,omitempty"`
++	// File a group number containing the file name.
++	File int `json:"file,omitempty"`
++	// FromPath a group number containing a filepath used to root the file (e.g. a project file).
++	FromPath int `json:"fromPath,omitempty"`
++	// Line a group number containing the line number.
++	Line int `json:"line,omitempty"`
++	// Column a group number containing the column information.
++	Column int `json:"column,omitempty"`
++	// Severity a group number containing either 'warning' or 'error' case-insensitive.
++	// Defaults to `error`.
++	Severity int `json:"severity,omitempty"`
++	// Code a group number containing the error code.
++	Code int `json:"code,omitempty"`
++	// Message a group number containing the error message.
++	// **required** at least one pattern must set the message.
++	Message int `json:"message,omitempty"`
++	// Loop whether to loop until a match is not found,
++	// only valid on the last pattern of a multi-pattern matcher.
++	Loop bool `json:"loop,omitempty"`
++}
++
++type GitHub struct {
++	tempPath string
++	w        io.Writer
++}
++
++// NewGitHub output format outputs issues according to GitHub actions the problem matcher regexp.
++func NewGitHub(w io.Writer) *GitHub {
++	return &GitHub{
++		tempPath: filepath.Join(os.TempDir(), filenameGitHubActionProblemMatchers),
++		w:        w,
++	}
++}
++
++func (p *GitHub) Print(issues []result.Issue) error {
++	// Note: the file with the problem matcher definition should not be removed.
++	// A sleep can mitigate this problem but this will be flaky.
++	//
++	// Result if the file is removed prematurely:
++	// Error: Unable to process command '::add-matcher::/tmp/golangci-lint-action-problem-matchers.json' successfully.
++	// Error: Could not find file '/tmp/golangci-lint-action-problem-matchers.json'.
++	filename, err := p.storeProblemMatcher()
++	if err != nil {
++		return err
++	}
++
++	_, _ = fmt.Fprintln(p.w, "::debug::problem matcher definition file: "+filename)
++
++	_, _ = fmt.Fprintln(p.w, "::add-matcher::"+filename)
++
++	for ind := range issues {
++		_, err := fmt.Fprintln(p.w, formatIssueAsGitHub(&issues[ind]))
++		if err != nil {
++			return err
++		}
++	}
++
++	_, _ = fmt.Fprintln(p.w, "::remove-matcher owner=golangci-lint-action::")
++
++	return nil
++}
++
++func (p *GitHub) storeProblemMatcher() (string, error) {
++	file, err := os.Create(p.tempPath)
++	if err != nil {
++		return "", err
++	}
++
++	defer file.Close()
++
++	err = json.NewEncoder(file).Encode(generateProblemMatcher())
++	if err != nil {
++		return "", err
++	}
++
++	return file.Name(), nil
++}
++
++func generateProblemMatcher() GitHubProblemMatchers {
++	return GitHubProblemMatchers{
++		Matchers: []GitHubMatcher{
++			{
++				Owner:    "golangci-lint-action",
++				Severity: "error",
++				Pattern: []GitHubPattern{
++					{
++						Regexp:   `^([^\s]+)\s+([^:]+):(\d+):(?:(\d+):)?\s+(.+)$`,
++						Severity: 1,
++						File:     2,
++						Line:     3,
++						Column:   4,
++						Message:  5,
++					},
++				},
++			},
++		},
++	}
++}
++
++func formatIssueAsGitHub(issue *result.Issue) string {
++	severity := defaultGitHubSeverity
++	if issue.Severity != "" {
++		severity = issue.Severity
++	}
++
++	// Convert backslashes to forward slashes.
++	// This is needed when running on windows.
++	// Otherwise, GitHub won't be able to show the annotations pointing to the file path with backslashes.
++	file := filepath.ToSlash(issue.FilePath())
++
++	ret := fmt.Sprintf("%s\t%s:%d:", severity, file, issue.Line())
++	if issue.Pos.Column != 0 {
++		ret += fmt.Sprintf("%d:", issue.Pos.Column)
++	}
++
++	ret += fmt.Sprintf("\t%s (%s)", issue.Text, issue.FromLinter)
++	return ret
++}
+diff --git a/pkg/printers/github_test.go b/pkg/printers/github_test.go
+new file mode 100644
+index 00000000..240c1b1e
+--- /dev/null
++++ b/pkg/printers/github_test.go
+@@ -0,0 +1,197 @@
++package printers
++
++import (
++	"bytes"
++	"fmt"
++	"go/token"
++	"path/filepath"
++	"regexp"
++	"runtime"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/golangci/golangci-lint/pkg/result"
++)
++
++func TestGitHub_Print(t *testing.T) {
++	issues := []result.Issue{
++		{
++			FromLinter: "linter-a",
++			Severity:   "warning",
++			Text:       "some issue",
++			Pos: token.Position{
++				Filename: "path/to/filea.go",
++				Offset:   2,
++				Line:     10,
++				Column:   4,
++			},
++		},
++		{
++			FromLinter: "linter-b",
++			Severity:   "error",
++			Text:       "another issue",
++			SourceLines: []string{
++				"func foo() {",
++				"\tfmt.Println(\"bar\")",
++				"}",
++			},
++			Pos: token.Position{
++				Filename: "path/to/fileb.go",
++				Offset:   5,
++				Line:     300,
++				Column:   9,
++			},
++		},
++	}
++
++	buf := new(bytes.Buffer)
++
++	printer := NewGitHub(buf)
++	printer.tempPath = filepath.Join(t.TempDir(), filenameGitHubActionProblemMatchers)
++
++	err := printer.Print(issues)
++	require.NoError(t, err)
++
++	expected := `::debug::problem matcher definition file: /tmp/golangci-lint-action-problem-matchers.json
++::add-matcher::/tmp/golangci-lint-action-problem-matchers.json
++warning	path/to/filea.go:10:4:	some issue (linter-a)
++error	path/to/fileb.go:300:9:	another issue (linter-b)
++::remove-matcher owner=golangci-lint-action::
++`
++	// To support all the OS.
++	expected = strings.ReplaceAll(expected, "/tmp/golangci-lint-action-problem-matchers.json", printer.tempPath)
++
++	assert.Equal(t, expected, buf.String())
++}
++
++func Test_formatIssueAsGitHub(t *testing.T) {
++	sampleIssue := result.Issue{
++		FromLinter: "sample-linter",
++		Text:       "some issue",
++		Pos: token.Position{
++			Filename: "path/to/file.go",
++			Offset:   2,
++			Line:     10,
++			Column:   4,
++		},
++	}
++	require.Equal(t, "error\tpath/to/file.go:10:4:\tsome issue (sample-linter)", formatIssueAsGitHub(&sampleIssue))
++
++	sampleIssue.Pos.Column = 0
++	require.Equal(t, "error\tpath/to/file.go:10:\tsome issue (sample-linter)", formatIssueAsGitHub(&sampleIssue))
++}
++
++func Test_formatIssueAsGitHub_Windows(t *testing.T) {
++	if runtime.GOOS != "windows" {
++		t.Skip("Skipping test on non Windows")
++	}
++
++	sampleIssue := result.Issue{
++		FromLinter: "sample-linter",
++		Text:       "some issue",
++		Pos: token.Position{
++			Filename: "path\\to\\file.go",
++			Offset:   2,
++			Line:     10,
++			Column:   4,
++		},
++	}
++	require.Equal(t, "error\tpath/to/file.go:10:4:\tsome issue (sample-linter)", formatIssueAsGitHub(&sampleIssue))
++
++	sampleIssue.Pos.Column = 0
++	require.Equal(t, "error\tpath/to/file.go:10:\tsome issue (sample-linter)", formatIssueAsGitHub(&sampleIssue))
++}
++
++func Test_generateProblemMatcher(t *testing.T) {
++	pattern := generateProblemMatcher().Matchers[0].Pattern[0]
++
++	exp := regexp.MustCompile(pattern.Regexp)
++
++	testCases := []struct {
++		desc     string
++		line     string
++		expected string
++	}{
++		{
++			desc: "error",
++			line: "error\tpath/to/filea.go:10:4:\tsome issue (sample-linter)",
++			expected: `File: path/to/filea.go
++Line: 10
++Column: 4
++Severity: error
++Message: some issue (sample-linter)`,
++		},
++		{
++			desc: "warning",
++			line: "warning\tpath/to/fileb.go:1:4:\tsome issue (sample-linter)",
++			expected: `File: path/to/fileb.go
++Line: 1
++Column: 4
++Severity: warning
++Message: some issue (sample-linter)`,
++		},
++		{
++			desc: "no column",
++			line: "error\t \tpath/to/fileb.go:40:\t Foo bar",
++			expected: `File: path/to/fileb.go
++Line: 40
++Column: 
++Severity: error
++Message: Foo bar`,
++		},
++	}
++
++	for _, test := range testCases {
++		test := test
++		t.Run(test.desc, func(t *testing.T) {
++			t.Parallel()
++
++			assert.True(t, exp.MatchString(test.line), test.line)
++
++			actual := exp.ReplaceAllString(test.line, createReplacement(&pattern))
++
++			assert.Equal(t, test.expected, actual)
++		})
++	}
++}
++
++func createReplacement(pattern *GitHubPattern) string {
++	var repl []string
++
++	if pattern.File > 0 {
++		repl = append(repl, fmt.Sprintf("File: $%d", pattern.File))
++	}
++
++	if pattern.FromPath > 0 {
++		repl = append(repl, fmt.Sprintf("FromPath: $%d", pattern.FromPath))
++	}
++
++	if pattern.Line > 0 {
++		repl = append(repl, fmt.Sprintf("Line: $%d", pattern.Line))
++	}
++
++	if pattern.Column > 0 {
++		repl = append(repl, fmt.Sprintf("Column: $%d", pattern.Column))
++	}
++
++	if pattern.Severity > 0 {
++		repl = append(repl, fmt.Sprintf("Severity: $%d", pattern.Severity))
++	}
++
++	if pattern.Code > 0 {
++		repl = append(repl, fmt.Sprintf("Code: $%d", pattern.Code))
++	}
++
++	if pattern.Message > 0 {
++		repl = append(repl, fmt.Sprintf("Message: $%d", pattern.Message))
++	}
++
++	if pattern.Loop {
++		repl = append(repl, fmt.Sprintf("Loop: $%v", pattern.Loop))
++	}
++
++	return strings.Join(repl, "\n")
++}
+diff --git a/pkg/printers/githubaction.go b/pkg/printers/githubaction.go
+deleted file mode 100644
+index 0d71b1c9..00000000
+--- a/pkg/printers/githubaction.go
++++ /dev/null
+@@ -1,51 +0,0 @@
+-package printers
+-
+-import (
+-	"fmt"
+-	"io"
+-	"path/filepath"
+-
+-	"github.com/golangci/golangci-lint/pkg/result"
+-)
+-
+-const defaultGithubSeverity = "error"
+-
+-type GitHubAction struct {
+-	w io.Writer
+-}
+-
+-// NewGitHubAction output format outputs issues according to GitHub actions.
+-func NewGitHubAction(w io.Writer) *GitHubAction {
+-	return &GitHubAction{w: w}
+-}
+-
+-func (p *GitHubAction) Print(issues []result.Issue) error {
+-	for ind := range issues {
+-		_, err := fmt.Fprintln(p.w, formatIssueAsGitHub(&issues[ind]))
+-		if err != nil {
+-			return err
+-		}
+-	}
+-	return nil
+-}
+-
+-// print each line as: ::error file=app.js,line=10,col=15::Something went wrong
+-func formatIssueAsGitHub(issue *result.Issue) string {
+-	severity := defaultGithubSeverity
+-	if issue.Severity != "" {
+-		severity = issue.Severity
+-	}
+-
+-	// Convert backslashes to forward slashes.
+-	// This is needed when running on windows.
+-	// Otherwise, GitHub won't be able to show the annotations pointing to the file path with backslashes.
+-	file := filepath.ToSlash(issue.FilePath())
+-
+-	ret := fmt.Sprintf("::%s file=%s,line=%d", severity, file, issue.Line())
+-	if issue.Pos.Column != 0 {
+-		ret += fmt.Sprintf(",col=%d", issue.Pos.Column)
+-	}
+-
+-	ret += fmt.Sprintf("::%s (%s)", issue.Text, issue.FromLinter)
+-	return ret
+-}
+diff --git a/pkg/printers/githubaction_test.go b/pkg/printers/githubaction_test.go
+deleted file mode 100644
+index d45fdb73..00000000
+--- a/pkg/printers/githubaction_test.go
++++ /dev/null
+@@ -1,95 +0,0 @@
+-package printers
+-
+-import (
+-	"bytes"
+-	"go/token"
+-	"runtime"
+-	"testing"
+-
+-	"github.com/stretchr/testify/assert"
+-	"github.com/stretchr/testify/require"
+-
+-	"github.com/golangci/golangci-lint/pkg/result"
+-)
+-
+-func TestGitHubAction_Print(t *testing.T) {
+-	issues := []result.Issue{
+-		{
+-			FromLinter: "linter-a",
+-			Severity:   "warning",
+-			Text:       "some issue",
+-			Pos: token.Position{
+-				Filename: "path/to/filea.go",
+-				Offset:   2,
+-				Line:     10,
+-				Column:   4,
+-			},
+-		},
+-		{
+-			FromLinter: "linter-b",
+-			Severity:   "error",
+-			Text:       "another issue",
+-			SourceLines: []string{
+-				"func foo() {",
+-				"\tfmt.Println(\"bar\")",
+-				"}",
+-			},
+-			Pos: token.Position{
+-				Filename: "path/to/fileb.go",
+-				Offset:   5,
+-				Line:     300,
+-				Column:   9,
+-			},
+-		},
+-	}
+-
+-	buf := new(bytes.Buffer)
+-	printer := NewGitHubAction(buf)
+-
+-	err := printer.Print(issues)
+-	require.NoError(t, err)
+-
+-	expected := `::warning file=path/to/filea.go,line=10,col=4::some issue (linter-a)
+-::error file=path/to/fileb.go,line=300,col=9::another issue (linter-b)
+-`
+-
+-	assert.Equal(t, expected, buf.String())
+-}
+-
+-func Test_formatIssueAsGitHub(t *testing.T) {
+-	sampleIssue := result.Issue{
+-		FromLinter: "sample-linter",
+-		Text:       "some issue",
+-		Pos: token.Position{
+-			Filename: "path/to/file.go",
+-			Offset:   2,
+-			Line:     10,
+-			Column:   4,
+-		},
+-	}
+-	require.Equal(t, "::error file=path/to/file.go,line=10,col=4::some issue (sample-linter)", formatIssueAsGitHub(&sampleIssue))
+-
+-	sampleIssue.Pos.Column = 0
+-	require.Equal(t, "::error file=path/to/file.go,line=10::some issue (sample-linter)", formatIssueAsGitHub(&sampleIssue))
+-}
+-
+-func Test_formatIssueAsGitHub_Windows(t *testing.T) {
+-	if runtime.GOOS != "windows" {
+-		t.Skip("Skipping test on non Windows")
+-	}
+-
+-	sampleIssue := result.Issue{
+-		FromLinter: "sample-linter",
+-		Text:       "some issue",
+-		Pos: token.Position{
+-			Filename: "path\\to\\file.go",
+-			Offset:   2,
+-			Line:     10,
+-			Column:   4,
+-		},
+-	}
+-	require.Equal(t, "::error file=path/to/file.go,line=10,col=4::some issue (sample-linter)", formatIssueAsGitHub(&sampleIssue))
+-
+-	sampleIssue.Pos.Column = 0
+-	require.Equal(t, "::error file=path/to/file.go,line=10::some issue (sample-linter)", formatIssueAsGitHub(&sampleIssue))
+-}
+diff --git a/pkg/printers/printer.go b/pkg/printers/printer.go
+index d2944340..08c34234 100644
+--- a/pkg/printers/printer.go
++++ b/pkg/printers/printer.go
+@@ -132,7 +132,7 @@ func (c *Printer) createPrinter(format string, w io.Writer) (issuePrinter, error
+ 	case config.OutFormatJunitXML:
+ 		p = NewJunitXML(w)
+ 	case config.OutFormatGithubActions:
+-		p = NewGitHubAction(w)
++		p = NewGitHub(w)
+ 	case config.OutFormatTeamCity:
+ 		p = NewTeamCity(w)
+ 	default:

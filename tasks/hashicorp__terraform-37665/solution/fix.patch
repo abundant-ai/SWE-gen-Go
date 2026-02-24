@@ -1,0 +1,268 @@
+diff --git a/internal/command/init.go b/internal/command/init.go
+index 114ce62a29..984c6be63f 100644
+--- a/internal/command/init.go
++++ b/internal/command/init.go
+@@ -159,7 +159,7 @@ func (c *InitCommand) initCloud(ctx context.Context, root *configs.Module, extra
+ 	return back, true, diags
+ }
+ 
+-func (c *InitCommand) initBackend(ctx context.Context, root *configs.Module, extraConfig arguments.FlagNameValueSlice, viewType arguments.ViewType, view views.Init) (be backend.Backend, output bool, diags tfdiags.Diagnostics) {
++func (c *InitCommand) initBackend(ctx context.Context, root *configs.Module, extraConfig arguments.FlagNameValueSlice, viewType arguments.ViewType, configLocks *depsfile.Locks, view views.Init) (be backend.Backend, output bool, diags tfdiags.Diagnostics) {
+ 	ctx, span := tracer.Start(ctx, "initialize backend")
+ 	_ = ctx // prevent staticcheck from complaining to avoid a maintenance hazard of having the wrong ctx in scope here
+ 	defer span.End()
+@@ -187,34 +187,9 @@ func (c *InitCommand) initBackend(ctx context.Context, root *configs.Module, ext
+ 		return nil, true, diags
+ 	case root.StateStore != nil:
+ 		// state_store config present
+-		// Access provider factories
+-		ctxOpts, err := c.contextOpts()
+-		if err != nil {
+-			diags = diags.Append(err)
+-			return nil, true, diags
+-		}
+-
+-		if root.StateStore.ProviderAddr.IsZero() {
+-			// This should not happen; this data is populated when parsing config,
+-			// even for builtin providers
+-			panic(fmt.Sprintf("unknown provider while beginning to initialize state store %q from provider %q",
+-				root.StateStore.Type,
+-				root.StateStore.Provider.Name))
+-		}
+-
+-		var exists bool
+-		factory, exists := ctxOpts.Providers[root.StateStore.ProviderAddr]
+-		if !exists {
+-			diags = diags.Append(&hcl.Diagnostic{
+-				Severity: hcl.DiagError,
+-				Summary:  "Provider unavailable",
+-				Detail: fmt.Sprintf("The provider %s (%q) is required to initialize the %q state store, but the matching provider factory is missing. This is a bug in Terraform and should be reported.",
+-					root.StateStore.Provider.Name,
+-					root.StateStore.ProviderAddr,
+-					root.StateStore.Type,
+-				),
+-				Subject: &root.StateStore.TypeRange,
+-			})
++		factory, fDiags := c.Meta.GetStateStoreProviderFactory(root.StateStore, configLocks)
++		diags = diags.Append(fDiags)
++		if fDiags.HasErrors() {
+ 			return nil, true, diags
+ 		}
+ 
+diff --git a/internal/command/init_run.go b/internal/command/init_run.go
+index a030e856d9..e2f4044dca 100644
+--- a/internal/command/init_run.go
++++ b/internal/command/init_run.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/hashicorp/terraform/internal/command/arguments"
+ 	"github.com/hashicorp/terraform/internal/command/views"
+ 	"github.com/hashicorp/terraform/internal/configs"
++	"github.com/hashicorp/terraform/internal/depsfile"
+ 	"github.com/hashicorp/terraform/internal/states"
+ 	"github.com/hashicorp/terraform/internal/terraform"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+@@ -170,7 +171,10 @@ func (c *InitCommand) run(initArgs *arguments.Init, view views.Init) int {
+ 	case initArgs.Cloud && rootModEarly.CloudConfig != nil:
+ 		back, backendOutput, backDiags = c.initCloud(ctx, rootModEarly, initArgs.BackendConfig, initArgs.ViewType, view)
+ 	case initArgs.Backend:
+-		back, backendOutput, backDiags = c.initBackend(ctx, rootModEarly, initArgs.BackendConfig, initArgs.ViewType, view)
++		// initBackend has new parameters that aren't relevant to the original (unpluggable) version of the init command logic here.
++		// So for this version of the init command, we pass in empty locks intentionally.
++		emptyLocks := depsfile.NewLocks()
++		back, backendOutput, backDiags = c.initBackend(ctx, rootModEarly, initArgs.BackendConfig, initArgs.ViewType, emptyLocks, view)
+ 	default:
+ 		// load the previously-stored backend config
+ 		back, backDiags = c.Meta.backendFromState(ctx)
+diff --git a/internal/command/init_run_experiment.go b/internal/command/init_run_experiment.go
+index db97b9b40b..f546f1444f 100644
+--- a/internal/command/init_run_experiment.go
++++ b/internal/command/init_run_experiment.go
+@@ -205,9 +205,7 @@ func (c *InitCommand) runPssInit(initArgs *arguments.Init, view views.Init) int
+ 	case initArgs.Cloud && rootModEarly.CloudConfig != nil:
+ 		back, backendOutput, backDiags = c.initCloud(ctx, rootModEarly, initArgs.BackendConfig, initArgs.ViewType, view)
+ 	case initArgs.Backend:
+-		// TODO(SarahFrench/radeksimko) - pass information about config locks (`configLocks`) into initBackend to
+-		// enable PSS
+-		back, backendOutput, backDiags = c.initBackend(ctx, rootModEarly, initArgs.BackendConfig, initArgs.ViewType, view)
++		back, backendOutput, backDiags = c.initBackend(ctx, rootModEarly, initArgs.BackendConfig, initArgs.ViewType, configLocks, view)
+ 	default:
+ 		// load the previously-stored backend config
+ 		back, backDiags = c.Meta.backendFromState(ctx)
+diff --git a/internal/command/meta.go b/internal/command/meta.go
+index 1626109fbf..b7e60acc1c 100644
+--- a/internal/command/meta.go
++++ b/internal/command/meta.go
+@@ -546,7 +546,7 @@ func (m *Meta) contextOpts() (*terraform.ContextOpts, error) {
+ 		opts.Provisioners = m.testingOverrides.Provisioners
+ 	} else {
+ 		var providerFactories map[addrs.Provider]providers.Factory
+-		providerFactories, err = m.providerFactories()
++		providerFactories, err = m.ProviderFactories()
+ 		opts.Providers = providerFactories
+ 		opts.Provisioners = m.provisionerFactories()
+ 	}
+diff --git a/internal/command/meta_backend.go b/internal/command/meta_backend.go
+index 41ef334afb..059ef29937 100644
+--- a/internal/command/meta_backend.go
++++ b/internal/command/meta_backend.go
+@@ -33,6 +33,7 @@ import (
+ 	"github.com/hashicorp/terraform/internal/command/views"
+ 	"github.com/hashicorp/terraform/internal/command/workdir"
+ 	"github.com/hashicorp/terraform/internal/configs"
++	"github.com/hashicorp/terraform/internal/depsfile"
+ 	"github.com/hashicorp/terraform/internal/didyoumean"
+ 	"github.com/hashicorp/terraform/internal/plans"
+ 	"github.com/hashicorp/terraform/internal/providers"
+@@ -1746,6 +1747,57 @@ func (m *Meta) assertSupportedCloudInitOptions(mode cloud.ConfigChangeMode) tfdi
+ 	return diags
+ }
+ 
++func (m *Meta) GetStateStoreProviderFactory(config *configs.StateStore, locks *depsfile.Locks) (providers.Factory, tfdiags.Diagnostics) {
++	var diags tfdiags.Diagnostics
++
++	if config == nil || locks == nil {
++		panic(fmt.Sprintf("nil config or nil locks passed to GetStateStoreProviderFactory: config %#v, locks %#v", config, locks))
++	}
++
++	if config.ProviderAddr.IsZero() {
++		// This should not happen; this data is populated when parsing config,
++		// even for builtin providers
++		return nil, diags.Append(&hcl.Diagnostic{
++			Severity: hcl.DiagError,
++			Summary:  "Unknown provider used for state storage",
++			Detail:   "Terraform could not find the provider used with the state_store. This is a bug in Terraform and should be reported.",
++			Subject:  &config.TypeRange,
++		})
++	}
++
++	factories, err := m.ProviderFactoriesFromLocks(locks)
++	if err != nil {
++		// This may happen if the provider isn't present in the provider cache.
++		// This should be caught earlier by logic that diffs the config against the backend state file.
++		return nil, diags.Append(&hcl.Diagnostic{
++			Severity: hcl.DiagError,
++			Summary:  "Provider unavailable",
++			Detail: fmt.Sprintf("Terraform experienced an error when trying to use provider %s (%q) to initialize the %q state store: %s",
++				config.Provider.Name,
++				config.ProviderAddr,
++				config.Type,
++				err),
++			Subject: &config.TypeRange,
++		})
++	}
++
++	factory, exists := factories[config.ProviderAddr]
++	if !exists {
++		return nil, diags.Append(&hcl.Diagnostic{
++			Severity: hcl.DiagError,
++			Summary:  "Provider unavailable",
++			Detail: fmt.Sprintf("The provider %s (%q) is required to initialize the %q state store, but the matching provider factory is missing. This is a bug in Terraform and should be reported.",
++				config.Provider.Name,
++				config.ProviderAddr,
++				config.Type,
++			),
++			Subject: &config.TypeRange,
++		})
++	}
++
++	return factory, diags
++}
++
+ //-------------------------------------------------------------------
+ // Output constants and initialization code
+ //-------------------------------------------------------------------
+diff --git a/internal/command/meta_providers.go b/internal/command/meta_providers.go
+index 9d8bd2763a..8a356b9665 100644
+--- a/internal/command/meta_providers.go
++++ b/internal/command/meta_providers.go
+@@ -16,6 +16,7 @@ import (
+ 
+ 	"github.com/hashicorp/terraform/internal/addrs"
+ 	builtinProviders "github.com/hashicorp/terraform/internal/builtin/providers"
++	"github.com/hashicorp/terraform/internal/depsfile"
+ 	"github.com/hashicorp/terraform/internal/getproviders"
+ 	"github.com/hashicorp/terraform/internal/logging"
+ 	tfplugin "github.com/hashicorp/terraform/internal/plugin"
+@@ -246,23 +247,48 @@ func (m *Meta) providerDevOverrideRuntimeWarningsRemoteExecution() tfdiags.Diagn
+ 	}
+ }
+ 
+-// providerFactories uses the selections made previously by an installer in
++// ProviderFactories uses the selections made previously by an installer in
+ // the local cache directory (m.providerLocalCacheDir) to produce a map
+-// from provider addresses to factory functions to create instances of
++// of provider addresses to factory functions to create instances of
+ // those providers.
+ //
+-// providerFactories will return an error if the installer's selections cannot
++// ProviderFactories will return an error if the installer's selections cannot
+ // be honored with what is currently in the cache, such as if a selected
+ // package has been removed from the cache or if the contents of a selected
+ // package have been modified outside of the installer. If it returns an error,
+ // the returned map may be incomplete or invalid, but will be as complete
+ // as possible given the cause of the error.
+-func (m *Meta) providerFactories() (map[addrs.Provider]providers.Factory, error) {
++func (m *Meta) ProviderFactories() (map[addrs.Provider]providers.Factory, error) {
+ 	locks, diags := m.lockedDependencies()
+ 	if diags.HasErrors() {
+ 		return nil, fmt.Errorf("failed to read dependency lock file: %s", diags.Err())
+ 	}
+ 
++	return m.providerFactoriesFromLocks(locks)
++}
++
++// ProviderFactoriesFromLocks receives in memory locks and uses them to produce a map
++// of provider addresses to factory functions to create instances of
++// those providers.
++//
++// ProviderFactoriesFromLocks should only be used if the calling code relies on locks
++// that have not yet been persisted to a dependency lock file on disk. Realistically, this
++// means only code in the init command should use this method.
++func (m *Meta) ProviderFactoriesFromLocks(configLocks *depsfile.Locks) (map[addrs.Provider]providers.Factory, error) {
++	// Ensure overrides and unmanaged providers are reflected in the returned list of factories,
++	// while avoiding mutating the in-memory
++	locks := m.annotateDependencyLocksWithOverrides(configLocks.DeepCopy())
++
++	return m.providerFactoriesFromLocks(locks)
++}
++
++// providerFactoriesFromLocks returns a map of provider factories from a given set of locks.
++//
++// In most cases, calling code should not use this method directly.
++// Instead, use:
++// * `ProviderFactoriesFromLocks` - for use when locks aren't yet persisted to a dependency lock file.
++// * `ProviderFactories` - for use when Terraform is guaranteed to read all necessary locks from a dependency lock file.
++func (m *Meta) providerFactoriesFromLocks(locks *depsfile.Locks) (map[addrs.Provider]providers.Factory, error) {
+ 	// We'll always run through all of our providers, even if one of them
+ 	// encounters an error, so that we can potentially report multiple errors
+ 	// where appropriate and so that callers can potentially make use of the
+diff --git a/internal/provider-simple-v6/provider.go b/internal/provider-simple-v6/provider.go
+index 45462d08bb..dae2e4a728 100644
+--- a/internal/provider-simple-v6/provider.go
++++ b/internal/provider-simple-v6/provider.go
+@@ -49,7 +49,9 @@ func Provider() providers.Interface {
+ 	return simple{
+ 		schema: providers.GetProviderSchemaResponse{
+ 			Provider: providers.Schema{
+-				Body: nil,
++				Body: &configschema.Block{
++					Description: "This is terraform-provider-simple v6",
++				},
+ 			},
+ 			ResourceTypes: map[string]providers.Schema{
+ 				"simple_resource": simpleResource,
+diff --git a/internal/provider-simple/provider.go b/internal/provider-simple/provider.go
+index 1da2652135..314ca9fcd5 100644
+--- a/internal/provider-simple/provider.go
++++ b/internal/provider-simple/provider.go
+@@ -47,7 +47,9 @@ func Provider() providers.Interface {
+ 	return simple{
+ 		schema: providers.GetProviderSchemaResponse{
+ 			Provider: providers.Schema{
+-				Body: nil,
++				Body: &configschema.Block{
++					Description: "This is terraform-provider-simple v5",
++				},
+ 			},
+ 			ResourceTypes: map[string]providers.Schema{
+ 				"simple_resource": simpleResource,

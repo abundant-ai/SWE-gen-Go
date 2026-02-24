@@ -1,0 +1,136 @@
+diff --git a/error.go b/error.go
+index 8013de44..8c811966 100644
+--- a/error.go
++++ b/error.go
+@@ -22,12 +22,6 @@ var ErrPoolExhausted = pool.ErrPoolExhausted
+ // ErrPoolTimeout timed out waiting to get a connection from the connection pool.
+ var ErrPoolTimeout = pool.ErrPoolTimeout
+ 
+-// ErrCrossSlot is returned when keys are used in the same Redis command and
+-// the keys are not in the same hash slot. This error is returned by Redis
+-// Cluster and will be returned by the client when TxPipeline or TxPipelined
+-// is used on a ClusterClient with keys in different slots.
+-var ErrCrossSlot = proto.RedisError("CROSSSLOT Keys in request don't hash to the same slot")
+-
+ // HasErrorPrefix checks if the err is a Redis error and the message contains a prefix.
+ func HasErrorPrefix(err error, prefix string) bool {
+ 	var rErr Error
+diff --git a/osscluster.go b/osscluster.go
+index 0dce50a4..a68f7eab 100644
+--- a/osscluster.go
++++ b/osscluster.go
+@@ -1497,10 +1497,6 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
+ 	// Trim multi .. exec.
+ 	cmds = cmds[1 : len(cmds)-1]
+ 
+-	if len(cmds) == 0 {
+-		return nil
+-	}
+-
+ 	state, err := c.state.Get(ctx)
+ 	if err != nil {
+ 		setCmdsErr(cmds, err)
+@@ -1508,12 +1504,6 @@ func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) err
+ 	}
+ 
+ 	cmdsMap := c.mapCmdsBySlot(cmds)
+-	// TxPipeline does not support cross slot transaction.
+-	if len(cmdsMap) > 1 {
+-		setCmdsErr(cmds, ErrCrossSlot)
+-		return ErrCrossSlot
+-	}
+-
+ 	for slot, cmds := range cmdsMap {
+ 		node, err := state.slotMasterNode(slot)
+ 		if err != nil {
+diff --git a/osscluster_test.go b/osscluster_test.go
+index 10023218..99341183 100644
+--- a/osscluster_test.go
++++ b/osscluster_test.go
+@@ -462,7 +462,8 @@ var _ = Describe("ClusterClient", func() {
+ 		Describe("pipelining", func() {
+ 			var pipe *redis.Pipeline
+ 
+-			assertPipeline := func(keys []string) {
++			assertPipeline := func() {
++				keys := []string{"A", "B", "C", "D", "E", "F", "G"}
+ 
+ 				It("follows redirects", func() {
+ 					if !failover {
+@@ -481,12 +482,13 @@ var _ = Describe("ClusterClient", func() {
+ 					Expect(err).NotTo(HaveOccurred())
+ 					Expect(cmds).To(HaveLen(14))
+ 
+-					// Check that all keys are set.
+-					for _, key := range keys {
+-						Eventually(func() string {
+-							return client.Get(ctx, key).Val()
+-						}, 30*time.Second).Should(Equal(key + "_value"))
+-					}
++					_ = client.ForEachShard(ctx, func(ctx context.Context, node *redis.Client) error {
++						defer GinkgoRecover()
++						Eventually(func() int64 {
++							return node.DBSize(ctx).Val()
++						}, 30*time.Second).ShouldNot(BeZero())
++						return nil
++					})
+ 
+ 					if !failover {
+ 						for _, key := range keys {
+@@ -515,14 +517,14 @@ var _ = Describe("ClusterClient", func() {
+ 				})
+ 
+ 				It("works with missing keys", func() {
+-					pipe.Set(ctx, "A{s}", "A_value", 0)
+-					pipe.Set(ctx, "C{s}", "C_value", 0)
++					pipe.Set(ctx, "A", "A_value", 0)
++					pipe.Set(ctx, "C", "C_value", 0)
+ 					_, err := pipe.Exec(ctx)
+ 					Expect(err).NotTo(HaveOccurred())
+ 
+-					a := pipe.Get(ctx, "A{s}")
+-					b := pipe.Get(ctx, "B{s}")
+-					c := pipe.Get(ctx, "C{s}")
++					a := pipe.Get(ctx, "A")
++					b := pipe.Get(ctx, "B")
++					c := pipe.Get(ctx, "C")
+ 					cmds, err := pipe.Exec(ctx)
+ 					Expect(err).To(Equal(redis.Nil))
+ 					Expect(cmds).To(HaveLen(3))
+@@ -545,8 +547,7 @@ var _ = Describe("ClusterClient", func() {
+ 
+ 				AfterEach(func() {})
+ 
+-				keys := []string{"A", "B", "C", "D", "E", "F", "G"}
+-				assertPipeline(keys)
++				assertPipeline()
+ 
+ 				It("doesn't fail node with context.Canceled error", func() {
+ 					ctx, cancel := context.WithCancel(context.Background())
+@@ -589,25 +590,7 @@ var _ = Describe("ClusterClient", func() {
+ 
+ 				AfterEach(func() {})
+ 
+-				// TxPipeline doesn't support cross slot commands.
+-				// Use hashtag to force all keys to the same slot.
+-				keys := []string{"A{s}", "B{s}", "C{s}", "D{s}", "E{s}", "F{s}", "G{s}"}
+-				assertPipeline(keys)
+-
+-				// make sure CrossSlot error is returned
+-				It("returns CrossSlot error", func() {
+-					pipe.Set(ctx, "A{s}", "A_value", 0)
+-					pipe.Set(ctx, "B{t}", "B_value", 0)
+-					Expect(hashtag.Slot("A{s}")).NotTo(Equal(hashtag.Slot("B{t}")))
+-					_, err := pipe.Exec(ctx)
+-					Expect(err).To(MatchError(redis.ErrCrossSlot))
+-				})
+-
+-				// doesn't fail when no commands are queued
+-				It("returns no error when there are no commands", func() {
+-					_, err := pipe.Exec(ctx)
+-					Expect(err).NotTo(HaveOccurred())
+-				})
++				assertPipeline()
+ 			})
+ 		})
+ 

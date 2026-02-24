@@ -1,0 +1,266 @@
+diff --git a/.golangci.next.reference.yml b/.golangci.next.reference.yml
+index 2a8d145e..4e32e784 100644
+--- a/.golangci.next.reference.yml
++++ b/.golangci.next.reference.yml
+@@ -4102,7 +4102,12 @@ output:
+   # Default: ""
+   path-prefix: ""
+ 
++  # Sort results by the order defined in `sort-order`.
++  # Default: false
++  sort-results: true
++
+   # Order to use when sorting results.
++  # Require `sort-results` to `true`.
+   # Possible values: `file`, `linter`, and `severity`.
+   #
+   # If the severity values are inside the following list, they are ordered in this order:
+@@ -4113,7 +4118,7 @@ output:
+   #   5. low
+   # Either they are sorted alphabetically.
+   #
+-  # Default: ["linter", "file"]
++  # Default: ["file"]
+   sort-order:
+     - linter
+     - severity
+diff --git a/jsonschema/golangci.next.jsonschema.json b/jsonschema/golangci.next.jsonschema.json
+index 25b765c2..6e8891ac 100644
+--- a/jsonschema/golangci.next.jsonschema.json
++++ b/jsonschema/golangci.next.jsonschema.json
+@@ -3890,6 +3890,11 @@
+           "items": {
+             "enum": ["linter", "severity", "file"]
+           }
++        },
++        "sort-results": {
++          "description": "Sort results by: filepath, line and column.",
++          "type": "boolean",
++          "default": true
+         }
+       }
+     },
+diff --git a/pkg/commands/flagsets.go b/pkg/commands/flagsets.go
+index aee7fd33..4260c871 100644
+--- a/pkg/commands/flagsets.go
++++ b/pkg/commands/flagsets.go
+@@ -70,6 +70,10 @@ func setupRunFlagSet(v *viper.Viper, fs *pflag.FlagSet) {
+ }
+ 
+ func setupOutputFlagSet(v *viper.Viper, fs *pflag.FlagSet) {
++	internal.AddFlagAndBind(v, fs, fs.Bool, "sort-results", "output.sort-results", false,
++		color.GreenString("Sort linter results"))
++	internal.AddFlagAndBind(v, fs, fs.StringSlice, "sort-order", "output.sort-order", nil,
++		color.GreenString("Sort order of linter results"))
+ 	internal.AddFlagAndBind(v, fs, fs.String, "path-prefix", "output.path-prefix", "",
+ 		color.GreenString("Path prefix to add to output"))
+ 	internal.AddFlagAndBind(v, fs, fs.Bool, "show-stats", "output.show-stats", false, color.GreenString("Show statistics per linter"))
+diff --git a/pkg/config/output.go b/pkg/config/output.go
+index 43dce390..a2b1eb99 100644
+--- a/pkg/config/output.go
++++ b/pkg/config/output.go
+@@ -1,19 +1,25 @@
+ package config
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"slices"
+ 	"strings"
+ )
+ 
+ type Output struct {
+-	Formats    Formats  `mapstructure:"formats"`
+-	SortOrder  []string `mapstructure:"sort-order"`
+-	PathPrefix string   `mapstructure:"path-prefix"`
+-	ShowStats  bool     `mapstructure:"show-stats"`
++	Formats     Formats  `mapstructure:"formats"`
++	SortResults bool     `mapstructure:"sort-results"`
++	SortOrder   []string `mapstructure:"sort-order"`
++	PathPrefix  string   `mapstructure:"path-prefix"`
++	ShowStats   bool     `mapstructure:"show-stats"`
+ }
+ 
+ func (o *Output) Validate() error {
++	if !o.SortResults && len(o.SortOrder) > 0 {
++		return errors.New("sort-results should be 'true' to use sort-order")
++	}
++
+ 	validOrders := []string{"linter", "file", "severity"}
+ 
+ 	all := strings.Join(o.SortOrder, " ")
+diff --git a/pkg/config/output_test.go b/pkg/config/output_test.go
+index 1e19323d..6d8aad17 100644
+--- a/pkg/config/output_test.go
++++ b/pkg/config/output_test.go
+@@ -14,25 +14,29 @@ func TestOutput_Validate(t *testing.T) {
+ 		{
+ 			desc: "file",
+ 			settings: &Output{
+-				SortOrder: []string{"file"},
++				SortResults: true,
++				SortOrder:   []string{"file"},
+ 			},
+ 		},
+ 		{
+ 			desc: "linter",
+ 			settings: &Output{
+-				SortOrder: []string{"linter"},
++				SortResults: true,
++				SortOrder:   []string{"linter"},
+ 			},
+ 		},
+ 		{
+ 			desc: "severity",
+ 			settings: &Output{
+-				SortOrder: []string{"severity"},
++				SortResults: true,
++				SortOrder:   []string{"severity"},
+ 			},
+ 		},
+ 		{
+ 			desc: "multiple",
+ 			settings: &Output{
+-				SortOrder: []string{"file", "linter", "severity"},
++				SortResults: true,
++				SortOrder:   []string{"file", "linter", "severity"},
+ 			},
+ 		},
+ 	}
+@@ -53,17 +57,26 @@ func TestOutput_Validate_error(t *testing.T) {
+ 		settings *Output
+ 		expected string
+ 	}{
++		{
++			desc: "sort-results false and sort-order",
++			settings: &Output{
++				SortOrder: []string{"file"},
++			},
++			expected: "sort-results should be 'true' to use sort-order",
++		},
+ 		{
+ 			desc: "invalid sort-order",
+ 			settings: &Output{
+-				SortOrder: []string{"a"},
++				SortResults: true,
++				SortOrder:   []string{"a"},
+ 			},
+ 			expected: `unsupported sort-order name "a"`,
+ 		},
+ 		{
+ 			desc: "duplicate",
+ 			settings: &Output{
+-				SortOrder: []string{"file", "linter", "severity", "linter"},
++				SortResults: true,
++				SortOrder:   []string{"file", "linter", "severity", "linter"},
+ 			},
+ 			expected: `the sort-order name "linter" is repeated several times`,
+ 		},
+diff --git a/pkg/result/processors/sort_results.go b/pkg/result/processors/sort_results.go
+index ecadb699..96f5574f 100644
+--- a/pkg/result/processors/sort_results.go
++++ b/pkg/result/processors/sort_results.go
+@@ -55,8 +55,12 @@ func (SortResults) Name() string { return "sort_results" }
+ 
+ // Process is performing sorting of the result issues.
+ func (p SortResults) Process(issues []result.Issue) ([]result.Issue, error) {
++	if !p.cfg.SortResults {
++		return issues, nil
++	}
++
+ 	if len(p.cfg.SortOrder) == 0 {
+-		p.cfg.SortOrder = []string{orderNameLinter, orderNameFile}
++		p.cfg.SortOrder = []string{orderNameFile}
+ 	}
+ 
+ 	var cmps []issueComparator
+diff --git a/pkg/result/processors/sort_results_test.go b/pkg/result/processors/sort_results_test.go
+index f63cf360..fe9782ab 100644
+--- a/pkg/result/processors/sort_results_test.go
++++ b/pkg/result/processors/sort_results_test.go
+@@ -209,17 +209,28 @@ func Test_numericCompare(t *testing.T) {
+ 	}
+ }
+ 
+-func TestSortResults_Process(t *testing.T) {
++func TestSortResults_Process_noSorting(t *testing.T) {
+ 	tests := make([]result.Issue, len(issues))
+ 	copy(tests, issues)
+ 
+-	cfg := &config.Output{}
++	sr := NewSortResults(&config.Output{})
++
++	results, err := sr.Process(tests)
++	require.NoError(t, err)
++	assert.Equal(t, tests, results)
++}
++
++func TestSortResults_Process_Sorting(t *testing.T) {
++	tests := make([]result.Issue, len(issues))
++	copy(tests, issues)
++
++	cfg := &config.Output{SortResults: true}
+ 
+ 	sr := NewSortResults(cfg)
+ 
+ 	results, err := sr.Process(tests)
+ 	require.NoError(t, err)
+-	assert.Equal(t, []result.Issue{issues[1], issues[0], issues[3], issues[2]}, results)
++	assert.Equal(t, []result.Issue{issues[3], issues[2], issues[1], issues[0]}, results)
+ }
+ 
+ func compToString(c int) string {
+diff --git a/test/run_test.go b/test/run_test.go
+index d607c1f6..84e6d139 100644
+--- a/test/run_test.go
++++ b/test/run_test.go
+@@ -367,19 +367,38 @@ func TestUnsafeOk(t *testing.T) {
+ }
+ 
+ func TestSortedResults(t *testing.T) {
++	testCases := []struct {
++		opt  string
++		want string
++	}{
++		{
++			opt: "--sort-results=false",
++			want: "testdata/sort_results/main.go:15:13: Error return value is not checked (errcheck)" + "\n" +
++				"testdata/sort_results/main.go:12:5: var `db` is unused (unused)",
++		},
++		{
++			opt: "--sort-results=true",
++			want: "testdata/sort_results/main.go:12:5: var `db` is unused (unused)" + "\n" +
++				"testdata/sort_results/main.go:15:13: Error return value is not checked (errcheck)",
++		},
++	}
++
+ 	binPath := testshared.InstallGolangciLint(t)
+ 
+-	testshared.NewRunnerBuilder(t).
+-		WithNoConfig().
+-		WithArgs("--output.text.print-issued-lines=false").
+-		WithTargetPath(testdataDir, "sort_results").
+-		WithBinPath(binPath).
+-		Runner().
+-		Run().
+-		ExpectExitCode(exitcodes.IssuesFound).ExpectOutputEq(
+-		"testdata/sort_results/main.go:15:13: Error return value is not checked (errcheck)" + "\n" +
+-			"testdata/sort_results/main.go:12:5: var `db` is unused (unused)" + "\n",
+-	)
++	for _, test := range testCases {
++		t.Run(test.opt, func(t *testing.T) {
++			t.Parallel()
++
++			testshared.NewRunnerBuilder(t).
++				WithNoConfig().
++				WithArgs("--output.text.print-issued-lines=false", test.opt).
++				WithTargetPath(testdataDir, "sort_results").
++				WithBinPath(binPath).
++				Runner().
++				Run().
++				ExpectExitCode(exitcodes.IssuesFound).ExpectOutputEq(test.want + "\n")
++		})
++	}
+ }
+ 
+ func TestIdentifierUsedOnlyInTests(t *testing.T) {

@@ -1,0 +1,337 @@
+diff --git a/context.go b/context.go
+index 393bf05..5567100 100644
+--- a/context.go
++++ b/context.go
+@@ -169,11 +169,7 @@ type (
+ 		// Redirect redirects the request to a provided URL with status code.
+ 		Redirect(code int, url string) error
+ 
+-		// Error invokes the registered global HTTP error handler. Generally used by middleware.
+-		// A side-effect of calling global error handler is that now Response has been committed (sent to the client) and
+-		// middlewares up in chain can not change Response status code or Response body anymore.
+-		//
+-		// Avoid using this method in handlers as no middleware will be able to effectively handle errors after that.
++		// Error invokes the registered HTTP error handler. Generally used by middleware.
+ 		Error(err error)
+ 
+ 		// Handler returns the matched handler by router.
+diff --git a/echo.go b/echo.go
+index 375fb6a..28f6565 100644
+--- a/echo.go
++++ b/echo.go
+@@ -116,7 +116,7 @@ type (
+ 	HandlerFunc func(c Context) error
+ 
+ 	// HTTPErrorHandler is a centralized HTTP error handler.
+-	HTTPErrorHandler func(err error, c Context)
++	HTTPErrorHandler func(error, Context)
+ 
+ 	// Validator is the interface that wraps the Validate function.
+ 	Validator interface {
+diff --git a/middleware/logger.go b/middleware/logger.go
+index 8bf335f..a21df8f 100644
+--- a/middleware/logger.go
++++ b/middleware/logger.go
+@@ -47,7 +47,6 @@ type (
+ 		// - header:<NAME>
+ 		// - query:<NAME>
+ 		// - form:<NAME>
+-		// - custom (see CustomTagFunc field)
+ 		//
+ 		// Example "${remote_ip} ${status}"
+ 		//
+@@ -57,11 +56,6 @@ type (
+ 		// Optional. Default value DefaultLoggerConfig.CustomTimeFormat.
+ 		CustomTimeFormat string `yaml:"custom_time_format"`
+ 
+-		// CustomTagFunc is function called for `${custom}` tag to output user implemented text by writing it to buf.
+-		// Make sure that outputted text creates valid JSON string with other logged tags.
+-		// Optional.
+-		CustomTagFunc func(c echo.Context, buf *bytes.Buffer) (int, error)
+-
+ 		// Output is a writer where logs in JSON format are written.
+ 		// Optional. Default value os.Stdout.
+ 		Output io.Writer
+@@ -132,11 +126,6 @@ func LoggerWithConfig(config LoggerConfig) echo.MiddlewareFunc {
+ 
+ 			if _, err = config.template.ExecuteFunc(buf, func(w io.Writer, tag string) (int, error) {
+ 				switch tag {
+-				case "custom":
+-					if config.CustomTagFunc == nil {
+-						return 0, nil
+-					}
+-					return config.CustomTagFunc(c, buf)
+ 				case "time_unix":
+ 					return buf.WriteString(strconv.FormatInt(time.Now().Unix(), 10))
+ 				case "time_unix_milli":
+diff --git a/middleware/logger_test.go b/middleware/logger_test.go
+index a056861..ab889bf 100644
+--- a/middleware/logger_test.go
++++ b/middleware/logger_test.go
+@@ -173,28 +173,6 @@ func TestLoggerCustomTimestamp(t *testing.T) {
+ 	assert.Error(t, err)
+ }
+ 
+-func TestLoggerCustomTagFunc(t *testing.T) {
+-	e := echo.New()
+-	buf := new(bytes.Buffer)
+-	e.Use(LoggerWithConfig(LoggerConfig{
+-		Format: `{"method":"${method}",${custom}}` + "\n",
+-		CustomTagFunc: func(c echo.Context, buf *bytes.Buffer) (int, error) {
+-			return buf.WriteString(`"tag":"my-value"`)
+-		},
+-		Output: buf,
+-	}))
+-
+-	e.GET("/", func(c echo.Context) error {
+-		return c.String(http.StatusOK, "custom time stamp test")
+-	})
+-
+-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+-	rec := httptest.NewRecorder()
+-	e.ServeHTTP(rec, req)
+-
+-	assert.Equal(t, `{"method":"GET","tag":"my-value"}`+"\n", buf.String())
+-}
+-
+ func BenchmarkLoggerWithConfig_withoutMapFields(b *testing.B) {
+ 	e := echo.New()
+ 
+diff --git a/middleware/request_logger.go b/middleware/request_logger.go
+index b9e3692..7a4d982 100644
+--- a/middleware/request_logger.go
++++ b/middleware/request_logger.go
+@@ -10,16 +10,10 @@ import (
+ 
+ // Example for `fmt.Printf`
+ // 	e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
+-//		LogStatus:   true,
+-//		LogURI:      true,
+-//		LogError:    true,
+-//		HandleError: true, // forwards error to the global error handler, so it can decide appropriate status code
++//		LogStatus: true,
++//		LogURI:    true,
+ //		LogValuesFunc: func(c echo.Context, v middleware.RequestLoggerValues) error {
+-//			if v.Error == nil {
+-//				fmt.Printf("REQUEST: uri: %v, status: %v\n", v.URI, v.Status)
+-//			} else {
+-//				fmt.Printf("REQUEST_ERROR: uri: %v, status: %v, err: %v\n", v.URI, v.Status, v.Error)
+-//			}
++//			fmt.Printf("REQUEST: uri: %v, status: %v\n", v.URI, v.Status)
+ //			return nil
+ //		},
+ //	}))
+@@ -27,23 +21,14 @@ import (
+ // Example for Zerolog (https://github.com/rs/zerolog)
+ // 	logger := zerolog.New(os.Stdout)
+ //	e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
+-//		LogURI:      true,
+-//		LogStatus:   true,
+-//		LogError:    true,
+-//		HandleError: true, // forwards error to the global error handler, so it can decide appropriate status code
++//		LogURI:    true,
++//		LogStatus: true,
+ //		LogValuesFunc: func(c echo.Context, v middleware.RequestLoggerValues) error {
+-//			if v.Error == nil {
+-//				logger.Info().
+-//					Str("URI", v.URI).
+-//					Int("status", v.Status).
+-//					Msg("request")
+-//			} else {
+-//				logger.Error().
+-//					Err(v.Error).
+-//					Str("URI", v.URI).
+-//					Int("status", v.Status).
+-//					Msg("request error")
+-//			}
++//			logger.Info().
++//				Str("URI", v.URI).
++//				Int("status", v.Status).
++//				Msg("request")
++//
+ //			return nil
+ //		},
+ //	}))
+@@ -51,47 +36,29 @@ import (
+ // Example for Zap (https://github.com/uber-go/zap)
+ // 	logger, _ := zap.NewProduction()
+ //	e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
+-//		LogURI:      true,
+-//		LogStatus:   true,
+-//		LogError:    true,
+-//		HandleError: true, // forwards error to the global error handler, so it can decide appropriate status code
++//		LogURI:    true,
++//		LogStatus: true,
+ //		LogValuesFunc: func(c echo.Context, v middleware.RequestLoggerValues) error {
+-//			if v.Error == nil {
+-//				logger.Info("request",
+-//					zap.String("URI", v.URI),
+-//					zap.Int("status", v.Status),
+-//				)
+-//			} else {
+-//				logger.Error("request error",
+-//					zap.String("URI", v.URI),
+-//					zap.Int("status", v.Status),
+-//					zap.Error(v.Error),
+-//				)
+-//			}
++//			logger.Info("request",
++//				zap.String("URI", v.URI),
++//				zap.Int("status", v.Status),
++//			)
++//
+ //			return nil
+ //		},
+ //	}))
+ //
+ // Example for Logrus (https://github.com/sirupsen/logrus)
+-//  log := logrus.New()
++// 	log := logrus.New()
+ //	e.Use(middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
+-//		LogURI:      true,
+-//		LogStatus:   true,
+-//		LogError:    true,
+-//		HandleError: true, // forwards error to the global error handler, so it can decide appropriate status code
+-//		LogValuesFunc: func(c echo.Context, v middleware.RequestLoggerValues) error {
+-//			if v.Error == nil {
+-//				log.WithFields(logrus.Fields{
+-//					"URI":    v.URI,
+-//					"status": v.Status,
+-//				}).Info("request")
+-//			} else {
+-//				log.WithFields(logrus.Fields{
+-//					"URI":    v.URI,
+-//					"status": v.Status,
+-//					"error":  v.Error,
+-//				}).Error("request error")
+-//			}
++//		LogURI:    true,
++//		LogStatus: true,
++//		LogValuesFunc: func(c echo.Context, values middleware.RequestLoggerValues) error {
++//			log.WithFields(logrus.Fields{
++//				"URI":   values.URI,
++//				"status": values.Status,
++//			}).Info("request")
++//
+ //			return nil
+ //		},
+ //	}))
+@@ -107,13 +74,6 @@ type RequestLoggerConfig struct {
+ 	// Mandatory.
+ 	LogValuesFunc func(c echo.Context, v RequestLoggerValues) error
+ 
+-	// HandleError instructs logger to call global error handler when next middleware/handler returns an error.
+-	// This is useful when you have custom error handler that can decide to use different status codes.
+-	//
+-	// A side-effect of calling global error handler is that now Response has been committed and sent to the client
+-	// and middlewares up in chain can not change Response status code or response body.
+-	HandleError bool
+-
+ 	// LogLatency instructs logger to record duration it took to execute rest of the handler chain (next(c) call).
+ 	LogLatency bool
+ 	// LogProtocol instructs logger to extract request protocol (i.e. `HTTP/1.1` or `HTTP/2`)
+@@ -257,9 +217,6 @@ func (config RequestLoggerConfig) ToMiddleware() (echo.MiddlewareFunc, error) {
+ 				config.BeforeNextFunc(c)
+ 			}
+ 			err := next(c)
+-			if config.HandleError {
+-				c.Error(err)
+-			}
+ 
+ 			v := RequestLoggerValues{
+ 				StartTime: start,
+@@ -307,9 +264,7 @@ func (config RequestLoggerConfig) ToMiddleware() (echo.MiddlewareFunc, error) {
+ 			}
+ 			if config.LogStatus {
+ 				v.Status = res.Status
+-				if err != nil && !config.HandleError {
+-					//  this block should not be executed in case of HandleError=true as the global error handler will decide
+-					//  the status code. In that case status code could be different from what err contains.
++				if err != nil {
+ 					var httpErr *echo.HTTPError
+ 					if errors.As(err, &httpErr) {
+ 						v.Status = httpErr.Code
+@@ -355,9 +310,6 @@ func (config RequestLoggerConfig) ToMiddleware() (echo.MiddlewareFunc, error) {
+ 				return errOnLog
+ 			}
+ 
+-			// in case of HandleError=true we are returning the error that we already have handled with global error handler
+-			// this is deliberate as this error could be useful for upstream middlewares and default global error handler
+-			// will ignore that error when it bubbles up in middleware chain.
+ 			return err
+ 		}
+ 	}, nil
+diff --git a/middleware/request_logger_test.go b/middleware/request_logger_test.go
+index 51d617a..5118b12 100644
+--- a/middleware/request_logger_test.go
++++ b/middleware/request_logger_test.go
+@@ -103,12 +103,12 @@ func TestRequestLogger_beforeNextFunc(t *testing.T) {
+ func TestRequestLogger_logError(t *testing.T) {
+ 	e := echo.New()
+ 
+-	var actual RequestLoggerValues
++	var expect RequestLoggerValues
+ 	e.Use(RequestLoggerWithConfig(RequestLoggerConfig{
+ 		LogError:  true,
+ 		LogStatus: true,
+ 		LogValuesFunc: func(c echo.Context, values RequestLoggerValues) error {
+-			actual = values
++			expect = values
+ 			return nil
+ 		},
+ 	}))
+@@ -123,52 +123,8 @@ func TestRequestLogger_logError(t *testing.T) {
+ 	e.ServeHTTP(rec, req)
+ 
+ 	assert.Equal(t, http.StatusNotAcceptable, rec.Code)
+-	assert.Equal(t, http.StatusNotAcceptable, actual.Status)
+-	assert.EqualError(t, actual.Error, "code=406, message=nope")
+-}
+-
+-func TestRequestLogger_HandleError(t *testing.T) {
+-	e := echo.New()
+-
+-	var actual RequestLoggerValues
+-	e.Use(RequestLoggerWithConfig(RequestLoggerConfig{
+-		timeNow: func() time.Time {
+-			return time.Unix(1631045377, 0).UTC()
+-		},
+-		HandleError: true,
+-		LogError:    true,
+-		LogStatus:   true,
+-		LogValuesFunc: func(c echo.Context, values RequestLoggerValues) error {
+-			actual = values
+-			return nil
+-		},
+-	}))
+-
+-	// to see if "HandleError" works we create custom error handler that uses its own status codes
+-	e.HTTPErrorHandler = func(err error, c echo.Context) {
+-		if c.Response().Committed {
+-			return
+-		}
+-		c.JSON(http.StatusTeapot, "custom error handler")
+-	}
+-
+-	e.GET("/test", func(c echo.Context) error {
+-		return echo.NewHTTPError(http.StatusForbidden, "nope")
+-	})
+-
+-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+-	rec := httptest.NewRecorder()
+-
+-	e.ServeHTTP(rec, req)
+-
+-	assert.Equal(t, http.StatusTeapot, rec.Code)
+-
+-	expect := RequestLoggerValues{
+-		StartTime: time.Unix(1631045377, 0).UTC(),
+-		Status:    http.StatusTeapot,
+-		Error:     echo.NewHTTPError(http.StatusForbidden, "nope"),
+-	}
+-	assert.Equal(t, expect, actual)
++	assert.Equal(t, http.StatusNotAcceptable, expect.Status)
++	assert.EqualError(t, expect.Error, "code=406, message=nope")
+ }
+ 
+ func TestRequestLogger_LogValuesFuncError(t *testing.T) {

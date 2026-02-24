@@ -1,0 +1,142 @@
+diff --git a/exp/api/remote/remote_api.go b/exp/api/remote/remote_api.go
+index d8cc86a..219a104 100644
+--- a/exp/api/remote/remote_api.go
++++ b/exp/api/remote/remote_api.go
+@@ -513,8 +513,8 @@ func SnappyDecodeMiddleware(logger *slog.Logger) func(http.Handler) http.Handler
+ 	}
+ }
+ 
+-// NewWriteHandler returns an HTTP handler that can receive the Remote Write 1.0 or Remote Write 2.0
+-// (https://prometheus.io/docs/specs/remote_write_spec_2_0/) protocol.
++// NewWriteHandler returns HTTP handler that receives Remote Write 2.0
++// protocol https://prometheus.io/docs/specs/remote_write_spec_2_0/.
+ func NewWriteHandler(store writeStorage, acceptedMessageTypes MessageTypes, opts ...WriteHandlerOption) http.Handler {
+ 	o := writeHandlerOpts{
+ 		logger:      slog.New(nopSlogHandler{}),
+@@ -603,8 +603,8 @@ func (h *writeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		writeResponse = NewWriteResponse()
+ 	}
+ 
+-	// Set any necessary response headers.
+-	writeResponse.writeHeaders(msgType, w)
++	// Set required X-Prometheus-Remote-Write-Written-* response headers, in all cases, along with any user-defined headers.
++	writeResponse.writeHeaders(w)
+ 
+ 	if storeErr != nil {
+ 		if writeResponse.statusCode == 0 {
+diff --git a/exp/api/remote/remote_api_test.go b/exp/api/remote/remote_api_test.go
+index 546702f..6217ab5 100644
+--- a/exp/api/remote/remote_api_test.go
++++ b/exp/api/remote/remote_api_test.go
+@@ -65,44 +65,6 @@ func TestRetryAfterDuration(t *testing.T) {
+ 	}
+ }
+ 
+-type defaultResponseStore struct{}
+-
+-func (m *defaultResponseStore) Store(*http.Request, WriteMessageType) (*WriteResponse, error) {
+-	return NewWriteResponse(), nil
+-}
+-
+-func Test_WriteHandler_V1HandlingDoesNotAddV2Headers(t *testing.T) {
+-	tLogger := slog.Default()
+-
+-	h := NewWriteHandler(&defaultResponseStore{}, MessageTypes{WriteV2MessageType, WriteV1MessageType}, WithWriteHandlerLogger(tLogger))
+-
+-	body := "test"
+-	bodyBytes := snappy.Encode(nil, []byte(body))
+-	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(bodyBytes))
+-	req.Header.Set("Content-Type", "application/x-protobuf")
+-	rec := httptest.NewRecorder()
+-
+-	h.ServeHTTP(rec, req)
+-
+-	if rec.Code != http.StatusNoContent {
+-		t.Fatalf("expected status code 204, got %d with body %s", rec.Code, rec.Body.String())
+-	}
+-
+-	samplesHeader := rec.Header().Get(writtenSamplesHeader)
+-	exemplarsHeader := rec.Header().Get(writtenExemplarsHeader)
+-	histogramHeader := rec.Header().Get(writtenHistogramsHeader)
+-
+-	if samplesHeader != "" {
+-		t.Fatal("expected no written samples header, got", samplesHeader)
+-	}
+-	if exemplarsHeader != "" {
+-		t.Fatal("expected no written exemplars header, got", exemplarsHeader)
+-	}
+-	if histogramHeader != "" {
+-		t.Fatal("expected no written histograms header, got", histogramHeader)
+-	}
+-}
+-
+ type mockStorage struct {
+ 	v2Reqs []*writev2.Request
+ 	protos []WriteMessageType
+diff --git a/exp/api/remote/remote_headers.go b/exp/api/remote/remote_headers.go
+index 43161bc..dfe1931 100644
+--- a/exp/api/remote/remote_headers.go
++++ b/exp/api/remote/remote_headers.go
+@@ -132,18 +132,11 @@ func (w *WriteResponse) SetExtraHeader(key, value string) {
+ 
+ // writeHeaders sets response headers in a given response writer.
+ // Make sure to use it before http.ResponseWriter.WriteHeader and .Write.
+-func (w *WriteResponse) writeHeaders(msgType WriteMessageType, rw http.ResponseWriter) {
++func (w *WriteResponse) writeHeaders(rw http.ResponseWriter) {
+ 	h := rw.Header()
+-
+-	// TODO make it easier to indicate if the stats are valid before adding the headers. WriteResponseStats.confirmed
+-	//  could be used if there was a reliable way for it to be set without parsing headers. For now ensure we don't
+-	//  add stats headers for v1 messages which can cause confusion/false positive errors logs.
+-	if msgType != WriteV1MessageType {
+-		h.Set(writtenSamplesHeader, strconv.Itoa(w.Samples))
+-		h.Set(writtenHistogramsHeader, strconv.Itoa(w.Histograms))
+-		h.Set(writtenExemplarsHeader, strconv.Itoa(w.Exemplars))
+-	}
+-
++	h.Set(writtenSamplesHeader, strconv.Itoa(w.Samples))
++	h.Set(writtenHistogramsHeader, strconv.Itoa(w.Histograms))
++	h.Set(writtenExemplarsHeader, strconv.Itoa(w.Exemplars))
+ 	for k, v := range w.extraHeaders {
+ 		for _, vv := range v {
+ 			h.Add(k, vv)
+diff --git a/exp/api/remote/remote_headers_test.go b/exp/api/remote/remote_headers_test.go
+index 0179c7c..7606448 100644
+--- a/exp/api/remote/remote_headers_test.go
++++ b/exp/api/remote/remote_headers_test.go
+@@ -71,25 +71,7 @@ func TestWriteResponse(t *testing.T) {
+ 		}
+ 	})
+ 
+-	t.Run("writeHeaders v1", func(t *testing.T) {
+-		resp := NewWriteResponse()
+-		resp.SetExtraHeader("Custom-Header", "custom-value")
+-
+-		w := httptest.NewRecorder()
+-		resp.writeHeaders(WriteV1MessageType, w)
+-
+-		expectedHeaders := map[string]string{
+-			"Custom-Header": "custom-value",
+-		}
+-
+-		for k, want := range expectedHeaders {
+-			if got := w.Header().Get(k); got != want {
+-				t.Errorf("header %q: want %q, got %q", k, want, got)
+-			}
+-		}
+-	})
+-
+-	t.Run("writeHeaders v2", func(t *testing.T) {
++	t.Run("writeHeaders", func(t *testing.T) {
+ 		resp := NewWriteResponse()
+ 		resp.Add(WriteResponseStats{
+ 			Samples:    10,
+@@ -100,7 +82,7 @@ func TestWriteResponse(t *testing.T) {
+ 		resp.SetExtraHeader("Custom-Header", "custom-value")
+ 
+ 		w := httptest.NewRecorder()
+-		resp.writeHeaders(WriteV2MessageType, w)
++		resp.writeHeaders(w)
+ 
+ 		expectedHeaders := map[string]string{
+ 			"Custom-Header": "custom-value",

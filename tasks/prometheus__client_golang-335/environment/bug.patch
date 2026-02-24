@@ -1,0 +1,439 @@
+diff --git a/prometheus/counter_test.go b/prometheus/counter_test.go
+index 8d5cd0b..67391a2 100644
+--- a/prometheus/counter_test.go
++++ b/prometheus/counter_test.go
+@@ -14,7 +14,6 @@
+ package prometheus
+ 
+ import (
+-	"fmt"
+ 	"math"
+ 	"testing"
+ 
+@@ -57,58 +56,3 @@ func decreaseCounter(c *counter) (err error) {
+ 	c.Add(-1)
+ 	return nil
+ }
+-
+-func TestCounterVecGetMetricWithInvalidLabelValues(t *testing.T) {
+-	testCases := []struct {
+-		desc   string
+-		labels Labels
+-	}{
+-		{
+-			desc:   "non utf8 label value",
+-			labels: Labels{"a": "\xFF"},
+-		},
+-		{
+-			desc:   "not enough label values",
+-			labels: Labels{},
+-		},
+-		{
+-			desc:   "too many label values",
+-			labels: Labels{"a": "1", "b": "2"},
+-		},
+-	}
+-
+-	for _, test := range testCases {
+-		counterVec := NewCounterVec(CounterOpts{
+-			Name: "test",
+-		}, []string{"a"})
+-
+-		labelValues := make([]string, len(test.labels))
+-		for _, val := range test.labels {
+-			labelValues = append(labelValues, val)
+-		}
+-
+-		expectPanic(t, func() {
+-			counterVec.WithLabelValues(labelValues...)
+-		}, fmt.Sprintf("WithLabelValues: expected panic because: %s", test.desc))
+-		expectPanic(t, func() {
+-			counterVec.With(test.labels)
+-		}, fmt.Sprintf("WithLabelValues: expected panic because: %s", test.desc))
+-
+-		if _, err := counterVec.GetMetricWithLabelValues(labelValues...); err == nil {
+-			t.Errorf("GetMetricWithLabelValues: expected error because: %s", test.desc)
+-		}
+-		if _, err := counterVec.GetMetricWith(test.labels); err == nil {
+-			t.Errorf("GetMetricWith: expected error because: %s", test.desc)
+-		}
+-	}
+-}
+-
+-func expectPanic(t *testing.T, op func(), errorMsg string) {
+-	defer func() {
+-		if err := recover(); err == nil {
+-			t.Error(errorMsg)
+-		}
+-	}()
+-
+-	op()
+-}
+diff --git a/prometheus/desc.go b/prometheus/desc.go
+index 920abc9..1835b16 100644
+--- a/prometheus/desc.go
++++ b/prometheus/desc.go
+@@ -25,6 +25,19 @@ import (
+ 	dto "github.com/prometheus/client_model/go"
+ )
+ 
++// reservedLabelPrefix is a prefix which is not legal in user-supplied
++// label names.
++const reservedLabelPrefix = "__"
++
++// Labels represents a collection of label name -> value mappings. This type is
++// commonly used with the With(Labels) and GetMetricWith(Labels) methods of
++// metric vector Collectors, e.g.:
++//     myVec.With(Labels{"code": "404", "method": "GET"}).Add(42)
++//
++// The other use-case is the specification of constant label pairs in Opts or to
++// create a Desc.
++type Labels map[string]string
++
+ // Desc is the descriptor used by every Prometheus Metric. It is essentially
+ // the immutable meta-data of a Metric. The normal Metric implementations
+ // included in this package manage their Desc under the hood. Users only have to
+@@ -109,12 +122,6 @@ func NewDesc(fqName, help string, variableLabels []string, constLabels Labels) *
+ 	for _, labelName := range labelNames {
+ 		labelValues = append(labelValues, constLabels[labelName])
+ 	}
+-	// Validate the const label values. They can't have a wrong cardinality, so
+-	// use in len(labelValues) as expectedNumberOfValues.
+-	if err := validateLabelValues(labelValues, len(labelValues)); err != nil {
+-		d.err = err
+-		return d
+-	}
+ 	// Now add the variable label names, but prefix them with something that
+ 	// cannot be in a regular label name. That prevents matching the label
+ 	// dimension with a different mix between preset and variable labels.
+@@ -130,7 +137,6 @@ func NewDesc(fqName, help string, variableLabels []string, constLabels Labels) *
+ 		d.err = errors.New("duplicate label names")
+ 		return d
+ 	}
+-
+ 	vh := hashNew()
+ 	for _, val := range labelValues {
+ 		vh = hashAdd(vh, val)
+@@ -187,3 +193,8 @@ func (d *Desc) String() string {
+ 		d.variableLabels,
+ 	)
+ }
++
++func checkLabelName(l string) bool {
++	return model.LabelName(l).IsValid() &&
++		!strings.HasPrefix(l, reservedLabelPrefix)
++}
+diff --git a/prometheus/desc_test.go b/prometheus/desc_test.go
+deleted file mode 100644
+index 2f96265..0000000
+--- a/prometheus/desc_test.go
++++ /dev/null
+@@ -1,17 +0,0 @@
+-package prometheus
+-
+-import (
+-	"testing"
+-)
+-
+-func TestNewDescInvalidLabelValues(t *testing.T) {
+-	desc := NewDesc(
+-		"sample_label",
+-		"sample label",
+-		nil,
+-		Labels{"a": "\xFF"},
+-	)
+-	if desc.err == nil {
+-		t.Errorf("NewDesc: expected error because: %s", desc.err)
+-	}
+-}
+diff --git a/prometheus/histogram.go b/prometheus/histogram.go
+index 6cc6e68..4e0a9c8 100644
+--- a/prometheus/histogram.go
++++ b/prometheus/histogram.go
+@@ -430,8 +430,8 @@ func NewConstHistogram(
+ 	buckets map[float64]uint64,
+ 	labelValues ...string,
+ ) (Metric, error) {
+-	if err := validateLabelValues(labelValues, len(desc.variableLabels)); err != nil {
+-		return nil, err
++	if len(desc.variableLabels) != len(labelValues) {
++		return nil, errInconsistentCardinality
+ 	}
+ 	return &constHistogram{
+ 		desc:       desc,
+diff --git a/prometheus/labels.go b/prometheus/labels.go
+deleted file mode 100644
+index 2502e37..0000000
+--- a/prometheus/labels.go
++++ /dev/null
+@@ -1,57 +0,0 @@
+-package prometheus
+-
+-import (
+-	"errors"
+-	"fmt"
+-	"strings"
+-	"unicode/utf8"
+-
+-	"github.com/prometheus/common/model"
+-)
+-
+-// Labels represents a collection of label name -> value mappings. This type is
+-// commonly used with the With(Labels) and GetMetricWith(Labels) methods of
+-// metric vector Collectors, e.g.:
+-//     myVec.With(Labels{"code": "404", "method": "GET"}).Add(42)
+-//
+-// The other use-case is the specification of constant label pairs in Opts or to
+-// create a Desc.
+-type Labels map[string]string
+-
+-// reservedLabelPrefix is a prefix which is not legal in user-supplied
+-// label names.
+-const reservedLabelPrefix = "__"
+-
+-var errInconsistentCardinality = errors.New("inconsistent label cardinality")
+-
+-func validateValuesInLabels(labels Labels, expectedNumberOfValues int) error {
+-	if len(labels) != expectedNumberOfValues {
+-		return errInconsistentCardinality
+-	}
+-
+-	for name, val := range labels {
+-		if !utf8.ValidString(val) {
+-			return fmt.Errorf("label %s: value %q is not valid UTF-8", name, val)
+-		}
+-	}
+-
+-	return nil
+-}
+-
+-func validateLabelValues(vals []string, expectedNumberOfValues int) error {
+-	if len(vals) != expectedNumberOfValues {
+-		return errInconsistentCardinality
+-	}
+-
+-	for _, val := range vals {
+-		if !utf8.ValidString(val) {
+-			return fmt.Errorf("label value %q is not valid UTF-8", val)
+-		}
+-	}
+-
+-	return nil
+-}
+-
+-func checkLabelName(l string) bool {
+-	return model.LabelName(l).IsValid() && !strings.HasPrefix(l, reservedLabelPrefix)
+-}
+diff --git a/prometheus/registry.go b/prometheus/registry.go
+index 8f2094c..34aa3b3 100644
+--- a/prometheus/registry.go
++++ b/prometheus/registry.go
+@@ -20,7 +20,6 @@ import (
+ 	"os"
+ 	"sort"
+ 	"sync"
+-	"unicode/utf8"
+ 
+ 	"github.com/golang/protobuf/proto"
+ 
+@@ -680,12 +679,6 @@ func checkMetricConsistency(
+ 		)
+ 	}
+ 
+-	for _, labelPair := range dtoMetric.GetLabel() {
+-		if !utf8.ValidString(*labelPair.Value) {
+-			return fmt.Errorf("collected metric's label %s is not utf8: %#v", *labelPair.Name, *labelPair.Value)
+-		}
+-	}
+-
+ 	// Is the metric unique (i.e. no other metric with the same name and the same label values)?
+ 	h := hashNew()
+ 	h = hashAdd(h, metricFamily.GetName())
+diff --git a/prometheus/registry_test.go b/prometheus/registry_test.go
+index d136bba..d016a15 100644
+--- a/prometheus/registry_test.go
++++ b/prometheus/registry_test.go
+@@ -209,34 +209,6 @@ metric: <
+ 	expectedMetricFamilyMergedWithExternalAsProtoCompactText := []byte(`name:"name" help:"docstring" type:COUNTER metric:<label:<name:"constname" value:"constvalue" > label:<name:"labelname" value:"different_val" > counter:<value:42 > > metric:<label:<name:"constname" value:"constvalue" > label:<name:"labelname" value:"val1" > counter:<value:1 > > metric:<label:<name:"constname" value:"constvalue" > label:<name:"labelname" value:"val2" > counter:<value:1 > > 
+ `)
+ 
+-	externalMetricFamilyWithInvalidLabelValue := &dto.MetricFamily{
+-		Name: proto.String("name"),
+-		Help: proto.String("docstring"),
+-		Type: dto.MetricType_COUNTER.Enum(),
+-		Metric: []*dto.Metric{
+-			{
+-				Label: []*dto.LabelPair{
+-					{
+-						Name:  proto.String("constname"),
+-						Value: proto.String("\xFF"),
+-					},
+-					{
+-						Name:  proto.String("labelname"),
+-						Value: proto.String("different_val"),
+-					},
+-				},
+-				Counter: &dto.Counter{
+-					Value: proto.Float64(42),
+-				},
+-			},
+-		},
+-	}
+-
+-	expectedMetricFamilyInvalidLabelValueAsText := []byte(`An error has occurred during metrics gathering:
+-
+-collected metric's label constname is not utf8: "\xff"
+-`)
+-
+ 	type output struct {
+ 		headers map[string]string
+ 		body    []byte
+@@ -480,22 +452,6 @@ collected metric's label constname is not utf8: "\xff"
+ 				externalMetricFamilyWithSameName,
+ 			},
+ 		},
+-		{ // 16
+-			headers: map[string]string{
+-				"Accept": "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=compact-text",
+-			},
+-			out: output{
+-				headers: map[string]string{
+-					"Content-Type": `text/plain; charset=utf-8`,
+-				},
+-				body: expectedMetricFamilyInvalidLabelValueAsText,
+-			},
+-			collector: metricVec,
+-			externalMF: []*dto.MetricFamily{
+-				externalMetricFamily,
+-				externalMetricFamilyWithInvalidLabelValue,
+-			},
+-		},
+ 	}
+ 	for i, scenario := range scenarios {
+ 		registry := prometheus.NewPedanticRegistry()
+diff --git a/prometheus/summary.go b/prometheus/summary.go
+index 56b0663..964d8cb 100644
+--- a/prometheus/summary.go
++++ b/prometheus/summary.go
+@@ -543,8 +543,8 @@ func NewConstSummary(
+ 	quantiles map[float64]float64,
+ 	labelValues ...string,
+ ) (Metric, error) {
+-	if err := validateLabelValues(labelValues, len(desc.variableLabels)); err != nil {
+-		return nil, err
++	if len(desc.variableLabels) != len(labelValues) {
++		return nil, errInconsistentCardinality
+ 	}
+ 	return &constSummary{
+ 		desc:       desc,
+diff --git a/prometheus/value.go b/prometheus/value.go
+index 4a9cca6..ff75ce5 100644
+--- a/prometheus/value.go
++++ b/prometheus/value.go
+@@ -14,6 +14,7 @@
+ package prometheus
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"math"
+ 	"sort"
+@@ -36,6 +37,8 @@ const (
+ 	UntypedValue
+ )
+ 
++var errInconsistentCardinality = errors.New("inconsistent label cardinality")
++
+ // value is a generic metric for simple values. It implements Metric, Collector,
+ // Counter, Gauge, and Untyped. Its effective type is determined by
+ // ValueType. This is a low-level building block used by the library to back the
+@@ -155,8 +158,8 @@ func (v *valueFunc) Write(out *dto.Metric) error {
+ // the Collect method. NewConstMetric returns an error if the length of
+ // labelValues is not consistent with the variable labels in Desc.
+ func NewConstMetric(desc *Desc, valueType ValueType, value float64, labelValues ...string) (Metric, error) {
+-	if err := validateLabelValues(labelValues, len(desc.variableLabels)); err != nil {
+-		return nil, err
++	if len(desc.variableLabels) != len(labelValues) {
++		return nil, errInconsistentCardinality
+ 	}
+ 	return &constMetric{
+ 		desc:       desc,
+diff --git a/prometheus/value_test.go b/prometheus/value_test.go
+deleted file mode 100644
+index eed517e..0000000
+--- a/prometheus/value_test.go
++++ /dev/null
+@@ -1,43 +0,0 @@
+-package prometheus
+-
+-import (
+-	"fmt"
+-	"testing"
+-)
+-
+-func TestNewConstMetricInvalidLabelValues(t *testing.T) {
+-	testCases := []struct {
+-		desc   string
+-		labels Labels
+-	}{
+-		{
+-			desc:   "non utf8 label value",
+-			labels: Labels{"a": "\xFF"},
+-		},
+-		{
+-			desc:   "not enough label values",
+-			labels: Labels{},
+-		},
+-		{
+-			desc:   "too many label values",
+-			labels: Labels{"a": "1", "b": "2"},
+-		},
+-	}
+-
+-	for _, test := range testCases {
+-		metricDesc := NewDesc(
+-			"sample_value",
+-			"sample value",
+-			[]string{"a"},
+-			Labels{},
+-		)
+-
+-		expectPanic(t, func() {
+-			MustNewConstMetric(metricDesc, CounterValue, 0.3, "\xFF")
+-		}, fmt.Sprintf("WithLabelValues: expected panic because: %s", test.desc))
+-
+-		if _, err := NewConstMetric(metricDesc, CounterValue, 0.3, "\xFF"); err == nil {
+-			t.Errorf("NewConstMetric: expected error because: %s", test.desc)
+-		}
+-	}
+-}
+diff --git a/prometheus/vec.go b/prometheus/vec.go
+index 65d13fe..40d92b7 100644
+--- a/prometheus/vec.go
++++ b/prometheus/vec.go
+@@ -207,10 +207,9 @@ func (m *metricVec) Reset() {
+ }
+ 
+ func (m *metricVec) hashLabelValues(vals []string) (uint64, error) {
+-	if err := validateLabelValues(vals, len(m.desc.variableLabels)); err != nil {
+-		return 0, err
++	if len(vals) != len(m.desc.variableLabels) {
++		return 0, errInconsistentCardinality
+ 	}
+-
+ 	h := hashNew()
+ 	for _, val := range vals {
+ 		h = m.hashAdd(h, val)
+@@ -220,10 +219,9 @@ func (m *metricVec) hashLabelValues(vals []string) (uint64, error) {
+ }
+ 
+ func (m *metricVec) hashLabels(labels Labels) (uint64, error) {
+-	if err := validateValuesInLabels(labels, len(m.desc.variableLabels)); err != nil {
+-		return 0, err
++	if len(labels) != len(m.desc.variableLabels) {
++		return 0, errInconsistentCardinality
+ 	}
+-
+ 	h := hashNew()
+ 	for _, label := range m.desc.variableLabels {
+ 		val, ok := labels[label]

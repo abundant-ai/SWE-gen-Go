@@ -1,0 +1,262 @@
+diff --git a/stats/opentelemetry/client_tracing.go b/stats/opentelemetry/client_tracing.go
+index 2cc974b5..075f4015 100644
+--- a/stats/opentelemetry/client_tracing.go
++++ b/stats/opentelemetry/client_tracing.go
+@@ -20,13 +20,11 @@ import (
+ 	"context"
+ 	"strings"
+ 
++	"go.opentelemetry.io/otel"
+ 	"go.opentelemetry.io/otel/trace"
+-	"google.golang.org/grpc"
+ 	otelinternaltracing "google.golang.org/grpc/stats/opentelemetry/internal/tracing"
+ )
+ 
+-const tracerName = "grpc-go"
+-
+ // traceTagRPC populates provided context with a new span using the
+ // TextMapPropagator supplied in trace options and internal itracing.carrier.
+ // It creates a new outgoing carrier which serializes information about this
+@@ -34,10 +32,10 @@ const tracerName = "grpc-go"
+ // options. if TextMapPropagator is not provided, it returns the context as is.
+ func (h *clientStatsHandler) traceTagRPC(ctx context.Context, ai *attemptInfo) (context.Context, *attemptInfo) {
+ 	mn := "Attempt." + strings.Replace(ai.method, "/", ".", -1)
+-	tracer := h.options.TraceOptions.TracerProvider.Tracer(tracerName, trace.WithInstrumentationVersion(grpc.Version))
++	tracer := otel.Tracer("grpc-open-telemetry")
+ 	ctx, span := tracer.Start(ctx, mn)
+ 	carrier := otelinternaltracing.NewOutgoingCarrier(ctx)
+-	h.options.TraceOptions.TextMapPropagator.Inject(ctx, carrier)
++	otel.GetTextMapPropagator().Inject(ctx, carrier)
+ 	ai.traceSpan = span
+ 	return carrier.Context(), ai
+ }
+@@ -50,7 +48,7 @@ func (h *clientStatsHandler) createCallTraceSpan(ctx context.Context, method str
+ 		return ctx, nil
+ 	}
+ 	mn := strings.Replace(removeLeadingSlash(method), "/", ".", -1)
+-	tracer := h.options.TraceOptions.TracerProvider.Tracer(tracerName, trace.WithInstrumentationVersion(grpc.Version))
++	tracer := otel.Tracer("grpc-open-telemetry")
+ 	ctx, span := tracer.Start(ctx, mn, trace.WithSpanKind(trace.SpanKindClient))
+ 	return ctx, span
+ }
+diff --git a/stats/opentelemetry/e2e_test.go b/stats/opentelemetry/e2e_test.go
+index f12e83d1..1250237b 100644
+--- a/stats/opentelemetry/e2e_test.go
++++ b/stats/opentelemetry/e2e_test.go
+@@ -23,6 +23,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"go.opentelemetry.io/otel"
+ 	otelcodes "go.opentelemetry.io/otel/codes"
+ 	oteltrace "go.opentelemetry.io/otel/trace"
+ 
+@@ -99,6 +100,8 @@ func defaultTraceOptions(_ *testing.T) (*experimental.TraceOptions, *tracetest.I
+ 	spanProcessor := trace.NewSimpleSpanProcessor(spanExporter)
+ 	tracerProvider := trace.NewTracerProvider(trace.WithSpanProcessor(spanProcessor))
+ 	textMapPropagator := propagation.NewCompositeTextMapPropagator(opentelemetry.GRPCTraceBinPropagator{})
++	otel.SetTextMapPropagator(textMapPropagator)
++	otel.SetTracerProvider(tracerProvider)
+ 	traceOptions := &experimental.TraceOptions{
+ 		TracerProvider:    tracerProvider,
+ 		TextMapPropagator: textMapPropagator,
+diff --git a/stats/opentelemetry/server_metrics.go b/stats/opentelemetry/server_metrics.go
+index 2976dc49..da3f60a9 100644
+--- a/stats/opentelemetry/server_metrics.go
++++ b/stats/opentelemetry/server_metrics.go
+@@ -96,7 +96,6 @@ func (h *serverStatsHandler) unaryInterceptor(ctx context.Context, req any, _ *g
+ 		metadataExchangeLabels = h.options.MetricsOptions.pluginOption.GetMetadata()
+ 	}
+ 
+-	// - Server-side: The first stats event after the RPC request is received.
+ 	sts := grpc.ServerTransportStreamFromContext(ctx)
+ 
+ 	alts := &attachLabelsTransportStream{
+diff --git a/stats/opentelemetry/server_tracing.go b/stats/opentelemetry/server_tracing.go
+index f04d28c5..c55e03dc 100644
+--- a/stats/opentelemetry/server_tracing.go
++++ b/stats/opentelemetry/server_tracing.go
+@@ -20,8 +20,8 @@ import (
+ 	"context"
+ 	"strings"
+ 
++	"go.opentelemetry.io/otel"
+ 	"go.opentelemetry.io/otel/trace"
+-	"google.golang.org/grpc"
+ 	otelinternaltracing "google.golang.org/grpc/stats/opentelemetry/internal/tracing"
+ )
+ 
+@@ -35,8 +35,8 @@ import (
+ func (h *serverStatsHandler) traceTagRPC(ctx context.Context, ai *attemptInfo) (context.Context, *attemptInfo) {
+ 	mn := strings.Replace(ai.method, "/", ".", -1)
+ 	var span trace.Span
+-	tracer := h.options.TraceOptions.TracerProvider.Tracer(tracerName, trace.WithInstrumentationVersion(grpc.Version))
+-	ctx = h.options.TraceOptions.TextMapPropagator.Extract(ctx, otelinternaltracing.NewIncomingCarrier(ctx))
++	tracer := otel.Tracer("grpc-open-telemetry")
++	ctx = otel.GetTextMapPropagator().Extract(ctx, otelinternaltracing.NewIncomingCarrier(ctx))
+ 	// If the context.Context provided in `ctx` to tracer.Start(), contains a
+ 	// span then the newly-created Span will be a child of that span,
+ 	// otherwise it will be a root span.
+diff --git a/xds/internal/xdsclient/clientimpl.go b/xds/internal/xdsclient/clientimpl.go
+index 966986d2..c30c2b45 100644
+--- a/xds/internal/xdsclient/clientimpl.go
++++ b/xds/internal/xdsclient/clientimpl.go
+@@ -113,7 +113,19 @@ func init() {
+ 	internal.TriggerXDSResourceNotFoundForTesting = triggerXDSResourceNotFoundForTesting
+ 	xdsclientinternal.ResourceWatchStateForTesting = resourceWatchStateForTesting
+ 
+-	DefaultPool = &Pool{clients: make(map[string]*clientRefCounted)}
++	// DefaultPool is initialized with bootstrap configuration from one of the
++	// supported environment variables. If the environment variables are not
++	// set, then fallback bootstrap configuration should be set before
++	// attempting to create an xDS client, else xDS client creation will fail.
++	config, err := bootstrap.GetConfiguration()
++	if err != nil {
++		if logger.V(2) {
++			logger.Infof("Failed to read xDS bootstrap config from env vars:  %v", err)
++		}
++		DefaultPool = &Pool{clients: make(map[string]*clientRefCounted)}
++		return
++	}
++	DefaultPool = &Pool{clients: make(map[string]*clientRefCounted), config: config}
+ }
+ 
+ // newClientImpl returns a new xdsClient with the given config.
+diff --git a/xds/internal/xdsclient/pool.go b/xds/internal/xdsclient/pool.go
+index 4a9c0e09..4f3ad7c4 100644
+--- a/xds/internal/xdsclient/pool.go
++++ b/xds/internal/xdsclient/pool.go
+@@ -220,25 +220,7 @@ func (p *Pool) newRefCounted(name string, watchExpiryTimeout time.Duration, stre
+ 	defer p.mu.Unlock()
+ 
+ 	if p.config == nil {
+-		if len(p.clients) != 0 || p != DefaultPool {
+-			// If the current pool `p` already contains xDS clients or it is not
+-			// the `DefaultPool`, the bootstrap config should have been already
+-			// present in the pool.
+-			return nil, nil, fmt.Errorf("xds: bootstrap configuration not set in the pool")
+-		}
+-		// If the current pool `p` is the `DefaultPool` and has no clients, it
+-		// might be the first time an xDS client is being created on it. So,
+-		// the bootstrap configuration is read from environment variables.
+-		//
+-		// DefaultPool is initialized with bootstrap configuration from one of the
+-		// supported environment variables. If the environment variables are not
+-		// set, then fallback bootstrap configuration should be set before
+-		// attempting to create an xDS client, else xDS client creation will fail.
+-		config, err := bootstrap.GetConfiguration()
+-		if err != nil {
+-			return nil, nil, fmt.Errorf("xds: failed to read xDS bootstrap config from env vars:  %v", err)
+-		}
+-		p.config = config
++		return nil, nil, fmt.Errorf("xds: bootstrap configuration not set in the pool")
+ 	}
+ 
+ 	if c := p.clients[name]; c != nil {
+diff --git a/xds/internal/xdsclient/pool/pool_test.go b/xds/internal/xdsclient/pool/pool_test.go
+deleted file mode 100644
+index b12cc737..00000000
+--- a/xds/internal/xdsclient/pool/pool_test.go
++++ /dev/null
+@@ -1,88 +0,0 @@
+-/*
+- *
+- * Copyright 2025 gRPC authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- *
+- */
+-
+-package pool_test
+-
+-import (
+-	"encoding/json"
+-	"fmt"
+-	"testing"
+-
+-	"github.com/google/uuid"
+-	"google.golang.org/grpc/internal/grpctest"
+-	"google.golang.org/grpc/internal/testutils"
+-	"google.golang.org/grpc/internal/testutils/stats"
+-	"google.golang.org/grpc/internal/xds/bootstrap"
+-	"google.golang.org/grpc/xds/internal/xdsclient"
+-)
+-
+-type s struct {
+-	grpctest.Tester
+-}
+-
+-func Test(t *testing.T) {
+-	grpctest.RunSubTests(t, s{})
+-}
+-
+-// TestDefaultPool_LazyLoadBootstrapConfig verifies that the DefaultPool
+-// lazily loads the bootstrap configuration from environment variables when
+-// an xDS client is created for the first time.
+-//
+-// If tries to create the new client in DefaultPool at the start of test when
+-// none of the env vars are set. This should fail.
+-//
+-// Then it sets the env var XDSBootstrapFileName and retry creating a client
+-// in DefaultPool. This should succeed.
+-func (s) TestDefaultPool_LazyLoadBootstrapConfig(t *testing.T) {
+-	_, closeFunc, err := xdsclient.DefaultPool.NewClient(t.Name(), &stats.NoopMetricsRecorder{})
+-	if err == nil {
+-		t.Fatalf("xdsclient.DefaultPool.NewClient() succeeded without setting bootstrap config env vars, want failure")
+-	}
+-
+-	bs, err := bootstrap.NewContentsForTesting(bootstrap.ConfigOptionsForTesting{
+-		Servers: []byte(fmt.Sprintf(`[{
+-			 "server_uri": %q,
+-			 "channel_creds": [{"type": "insecure"}]
+-		 }]`, "non-existent-management-server")),
+-		Node: []byte(fmt.Sprintf(`{"id": "%s"}`, uuid.New().String())),
+-		CertificateProviders: map[string]json.RawMessage{
+-			"cert-provider-instance": json.RawMessage("{}"),
+-		},
+-	})
+-	if err != nil {
+-		t.Fatalf("Failed to create bootstrap configuration: %v", err)
+-	}
+-
+-	testutils.CreateBootstrapFileForTesting(t, bs)
+-	if cfg := xdsclient.DefaultPool.BootstrapConfigForTesting(); cfg != nil {
+-		t.Fatalf("DefaultPool.BootstrapConfigForTesting() = %v, want nil", cfg)
+-	}
+-
+-	_, closeFunc, err = xdsclient.DefaultPool.NewClient(t.Name(), &stats.NoopMetricsRecorder{})
+-	if err != nil {
+-		t.Fatalf("Failed to create xDS client: %v", err)
+-	}
+-	defer func() {
+-		closeFunc()
+-		xdsclient.DefaultPool.UnsetBootstrapConfigForTesting()
+-	}()
+-
+-	if xdsclient.DefaultPool.BootstrapConfigForTesting() == nil {
+-		t.Fatalf("DefaultPool.BootstrapConfigForTesting() = nil, want non-nil")
+-	}
+-}
+diff --git a/xds/server_test.go b/xds/server_test.go
+index 51579333..0b55f10f 100644
+--- a/xds/server_test.go
++++ b/xds/server_test.go
+@@ -178,7 +178,7 @@ func (s) TestNewServer_Failure(t *testing.T) {
+ 		{
+ 			desc:       "bootstrap env var not set",
+ 			serverOpts: []grpc.ServerOption{grpc.Creds(xdsCreds), BootstrapContentsForTesting(nil)},
+-			wantErr:    "failed to read xDS bootstrap config from env vars",
++			wantErr:    "bootstrap configuration not set in the pool",
+ 		},
+ 		{
+ 			desc: "empty bootstrap config",

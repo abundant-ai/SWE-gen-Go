@@ -1,0 +1,98 @@
+diff --git a/.changes/v1.14/BUG FIXES-20250926-113318.yaml b/.changes/v1.14/BUG FIXES-20250926-113318.yaml
+new file mode 100644
+index 0000000000..3adfd48017
+--- /dev/null
++++ b/.changes/v1.14/BUG FIXES-20250926-113318.yaml	
+@@ -0,0 +1,5 @@
++kind: BUG FIXES
++body: 'query: generate unique resource identifiers for results of expanded list resources'
++time: 2025-09-26T11:33:18.241184+02:00
++custom:
++    Issue: "37681"
+diff --git a/internal/genconfig/generate_config.go b/internal/genconfig/generate_config.go
+index 80a6f01734..746a04220d 100644
+--- a/internal/genconfig/generate_config.go
++++ b/internal/genconfig/generate_config.go
+@@ -138,6 +138,9 @@ type ResourceListElement struct {
+ 	Config cty.Value
+ 
+ 	Identity cty.Value
++
++	// ExpansionEnum is a unique enumeration of the list resource address relative to its expanded siblings.
++	ExpansionEnum int
+ }
+ 
+ func GenerateListResourceContents(addr addrs.AbsResourceInstance,
+@@ -158,12 +161,18 @@ func GenerateListResourceContents(addr addrs.AbsResourceInstance,
+ 				Resource: addrs.Resource{
+ 					Mode: addrs.ManagedResourceMode,
+ 					Type: addr.Resource.Resource.Type,
+-					Name: fmt.Sprintf("%s_%d", addr.Resource.Resource.Name, idx),
+ 				},
+-				Key: addr.Resource.Key,
+ 			},
+ 		}
+ 
++		// If the list resource instance is keyed, the expansion counter is included in the address
++		// to ensure uniqueness across the entire configuration.
++		if addr.Resource.Key == addrs.NoKey {
++			resAddr.Resource.Resource.Name = fmt.Sprintf("%s_%d", addr.Resource.Resource.Name, idx)
++		} else {
++			resAddr.Resource.Resource.Name = fmt.Sprintf("%s_%d_%d", addr.Resource.Resource.Name, res.ExpansionEnum, idx)
++		}
++
+ 		content, gDiags := GenerateResourceContents(resAddr, schema, pc, res.Config, true)
+ 		if gDiags.HasErrors() {
+ 			diags = diags.Append(gDiags)
+diff --git a/internal/instances/expander.go b/internal/instances/expander.go
+index 414ede32c5..93a38b4060 100644
+--- a/internal/instances/expander.go
++++ b/internal/instances/expander.go
+@@ -5,6 +5,7 @@ package instances
+ 
+ import (
+ 	"fmt"
++	"slices"
+ 	"sort"
+ 	"sync"
+ 
+@@ -338,6 +339,16 @@ func (e *Expander) ExpandResource(resourceAddr addrs.AbsResource) []addrs.AbsRes
+ 	return ret
+ }
+ 
++// ResourceExpansionEnum returns the expansion enum for the given resource instance address
++// within the sorted list of resource instances belonging to the same resource config within
++// the same module instance.
++func (e *Expander) ResourceExpansionEnum(resourceAddr addrs.AbsResourceInstance) int {
++	res := e.ExpandResource(resourceAddr.ContainingResource())
++	return slices.IndexFunc(res, func(addr addrs.AbsResourceInstance) bool {
++		return addr.Equal(resourceAddr)
++	})
++}
++
+ // UnknownResourceInstances finds a set of patterns that collectively cover
+ // all of the possible resource instance addresses that could appear for the
+ // given static resource once all of the intermediate module expansions are
+diff --git a/internal/terraform/node_resource_plan_instance.go b/internal/terraform/node_resource_plan_instance.go
+index f9c790837a..e4fd8e059d 100644
+--- a/internal/terraform/node_resource_plan_instance.go
++++ b/internal/terraform/node_resource_plan_instance.go
+@@ -938,6 +938,9 @@ func (n *NodePlannableResourceInstance) generateHCLListResourceDef(ctx EvalConte
+ 
+ 	var listElements []genconfig.ResourceListElement
+ 
++	expander := ctx.InstanceExpander()
++	enum := expander.ResourceExpansionEnum(addr)
++
+ 	iter := state.ElementIterator()
+ 	for iter.Next() {
+ 		_, val := iter.Element()
+@@ -955,7 +958,7 @@ func (n *NodePlannableResourceInstance) generateHCLListResourceDef(ctx EvalConte
+ 		}
+ 		idVal := val.GetAttr("identity")
+ 
+-		listElements = append(listElements, genconfig.ResourceListElement{Config: config, Identity: idVal})
++		listElements = append(listElements, genconfig.ResourceListElement{Config: config, Identity: idVal, ExpansionEnum: enum})
+ 	}
+ 
+ 	return genconfig.GenerateListResourceContents(addr, schema.Body, schema.Identity, providerAddr, listElements)

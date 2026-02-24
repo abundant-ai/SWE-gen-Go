@@ -1,0 +1,283 @@
+diff --git a/pkg/golinters/typecheck.go b/pkg/golinters/typecheck.go
+index d0eaa00d..ed403648 100644
+--- a/pkg/golinters/typecheck.go
++++ b/pkg/golinters/typecheck.go
+@@ -20,5 +20,5 @@ func NewTypecheck() *goanalysis.Linter {
+ 		"Like the front-end of a Go compiler, parses and type-checks Go code",
+ 		[]*analysis.Analyzer{analyzer},
+ 		nil,
+-	).WithLoadMode(goanalysis.LoadModeNone)
++	).WithLoadMode(goanalysis.LoadModeTypesInfo)
+ }
+diff --git a/pkg/lint/lintersdb/builder_linter.go b/pkg/lint/lintersdb/builder_linter.go
+index 397141ab..2c7c449c 100644
+--- a/pkg/lint/lintersdb/builder_linter.go
++++ b/pkg/lint/lintersdb/builder_linter.go
+@@ -751,7 +751,10 @@ func (LinterBuilder) Build(cfg *config.Config) ([]*linter.Config, error) {
+ 		linter.NewConfig(golinters.NewTypecheck()).
+ 			WithInternal().
+ 			WithEnabledByDefault().
+-			WithSince("v1.3.0"),
++			WithSince("v1.3.0").
++			WithLoadForGoAnalysis().
++			WithPresets(linter.PresetBugs).
++			WithURL(""),
+ 
+ 		linter.NewConfig(unconvert.New(&cfg.LintersSettings.Unconvert)).
+ 			WithSince("v1.0.0").
+diff --git a/pkg/lint/lintersdb/manager.go b/pkg/lint/lintersdb/manager.go
+index 19995005..0cd6cec2 100644
+--- a/pkg/lint/lintersdb/manager.go
++++ b/pkg/lint/lintersdb/manager.go
+@@ -204,30 +204,21 @@ func (m *Manager) build(enabledByDefaultLinters []*linter.Config) map[string]*li
+ }
+ 
+ func (m *Manager) combineGoAnalysisLinters(linters map[string]*linter.Config) {
+-	mlConfig := &linter.Config{}
+-
+ 	var goanalysisLinters []*goanalysis.Linter
+-
++	goanalysisPresets := map[string]bool{}
+ 	for _, lc := range linters {
+ 		lnt, ok := lc.Linter.(*goanalysis.Linter)
+ 		if !ok {
+ 			continue
+ 		}
+-
+ 		if lnt.LoadMode() == goanalysis.LoadModeWholeProgram {
+ 			// It's ineffective by CPU and memory to run whole-program and incremental analyzers at once.
+ 			continue
+ 		}
+-
+-		mlConfig.LoadMode |= lc.LoadMode
+-
+-		if lc.IsSlowLinter() {
+-			mlConfig.ConsiderSlow()
+-		}
+-
+-		mlConfig.InPresets = append(mlConfig.InPresets, lc.InPresets...)
+-
+ 		goanalysisLinters = append(goanalysisLinters, lnt)
++		for _, p := range lc.InPresets {
++			goanalysisPresets[p] = true
++		}
+ 	}
+ 
+ 	if len(goanalysisLinters) <= 1 {
+@@ -254,13 +245,22 @@ func (m *Manager) combineGoAnalysisLinters(linters map[string]*linter.Config) {
+ 		return a.Name() <= b.Name()
+ 	})
+ 
+-	mlConfig.Linter = goanalysis.NewMetaLinter(goanalysisLinters)
++	ml := goanalysis.NewMetaLinter(goanalysisLinters)
+ 
+-	sort.Strings(mlConfig.InPresets)
+-	mlConfig.InPresets = slices.Compact(mlConfig.InPresets)
++	presets := maps.Keys(goanalysisPresets)
++	sort.Strings(presets)
++
++	mlConfig := &linter.Config{
++		Linter:           ml,
++		EnabledByDefault: false,
++		InPresets:        presets,
++		AlternativeNames: nil,
++		OriginalURL:      "",
++	}
+ 
+-	linters[mlConfig.Linter.Name()] = mlConfig
++	mlConfig = mlConfig.WithLoadForGoAnalysis()
+ 
++	linters[ml.Name()] = mlConfig
+ 	m.debugf("Combined %d go/analysis linters into one metalinter", len(goanalysisLinters))
+ }
+ 
+diff --git a/pkg/lint/lintersdb/manager_test.go b/pkg/lint/lintersdb/manager_test.go
+index 227a0ca6..856f4155 100644
+--- a/pkg/lint/lintersdb/manager_test.go
++++ b/pkg/lint/lintersdb/manager_test.go
+@@ -5,7 +5,6 @@ import (
+ 
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+-	"golang.org/x/tools/go/packages"
+ 
+ 	"github.com/golangci/golangci-lint/pkg/config"
+ 	"github.com/golangci/golangci-lint/pkg/goanalysis"
+@@ -56,10 +55,10 @@ func TestManager_GetOptimizedLinters(t *testing.T) {
+ 
+ 	mlConfig := &linter.Config{
+ 		Linter:    goanalysis.NewMetaLinter(gaLinters),
+-		InPresets: []string{"format"},
++		InPresets: []string{"bugs", "format"},
+ 	}
+ 
+-	expected := []*linter.Config{mlConfig.WithLoadFiles()}
++	expected := []*linter.Config{mlConfig.WithLoadForGoAnalysis()}
+ 
+ 	assert.Equal(t, expected, optimizedLinters)
+ }
+@@ -177,11 +176,8 @@ func TestManager_combineGoAnalysisLinters(t *testing.T) {
+ 	m, err := NewManager(nil, nil)
+ 	require.NoError(t, err)
+ 
+-	fooTyped := goanalysis.NewLinter("foo", "example foo", nil, nil).WithLoadMode(goanalysis.LoadModeTypesInfo)
+-	barTyped := goanalysis.NewLinter("bar", "example bar", nil, nil).WithLoadMode(goanalysis.LoadModeTypesInfo)
+-
+-	fooSyntax := goanalysis.NewLinter("foo", "example foo", nil, nil).WithLoadMode(goanalysis.LoadModeSyntax)
+-	barSyntax := goanalysis.NewLinter("bar", "example bar", nil, nil).WithLoadMode(goanalysis.LoadModeSyntax)
++	foo := goanalysis.NewLinter("foo", "example foo", nil, nil).WithLoadMode(goanalysis.LoadModeTypesInfo)
++	bar := goanalysis.NewLinter("bar", "example bar", nil, nil).WithLoadMode(goanalysis.LoadModeTypesInfo)
+ 
+ 	testCases := []struct {
+ 		desc     string
+@@ -192,112 +188,37 @@ func TestManager_combineGoAnalysisLinters(t *testing.T) {
+ 			desc: "no combined, one linter",
+ 			linters: map[string]*linter.Config{
+ 				"foo": {
+-					Linter:    fooTyped,
++					Linter:    foo,
+ 					InPresets: []string{"A"},
+ 				},
+ 			},
+ 			expected: map[string]*linter.Config{
+ 				"foo": {
+-					Linter:    fooTyped,
+-					InPresets: []string{"A"},
+-				},
+-			},
+-		},
+-		{
+-			desc: "combined, several linters (typed)",
+-			linters: map[string]*linter.Config{
+-				"foo": {
+-					Linter:    fooTyped,
++					Linter:    foo,
+ 					InPresets: []string{"A"},
+ 				},
+-				"bar": {
+-					Linter:    barTyped,
+-					InPresets: []string{"B"},
+-				},
+ 			},
+-			expected: func() map[string]*linter.Config {
+-				mlConfig := &linter.Config{
+-					Linter:    goanalysis.NewMetaLinter([]*goanalysis.Linter{barTyped, fooTyped}),
+-					InPresets: []string{"A", "B"},
+-				}
+-
+-				return map[string]*linter.Config{
+-					"goanalysis_metalinter": mlConfig,
+-				}
+-			}(),
+-		},
+-		{
+-			desc: "combined, several linters (different LoadMode)",
+-			linters: map[string]*linter.Config{
+-				"foo": {
+-					Linter:    fooTyped,
+-					InPresets: []string{"A"},
+-					LoadMode:  packages.NeedName,
+-				},
+-				"bar": {
+-					Linter:    barTyped,
+-					InPresets: []string{"B"},
+-					LoadMode:  packages.NeedTypesSizes,
+-				},
+-			},
+-			expected: func() map[string]*linter.Config {
+-				mlConfig := &linter.Config{
+-					Linter:    goanalysis.NewMetaLinter([]*goanalysis.Linter{barTyped, fooTyped}),
+-					InPresets: []string{"A", "B"},
+-					LoadMode:  packages.NeedName | packages.NeedTypesSizes,
+-				}
+-
+-				return map[string]*linter.Config{
+-					"goanalysis_metalinter": mlConfig,
+-				}
+-			}(),
+-		},
+-		{
+-			desc: "combined, several linters (same LoadMode)",
+-			linters: map[string]*linter.Config{
+-				"foo": {
+-					Linter:    fooTyped,
+-					InPresets: []string{"A"},
+-					LoadMode:  packages.NeedName,
+-				},
+-				"bar": {
+-					Linter:    barTyped,
+-					InPresets: []string{"B"},
+-					LoadMode:  packages.NeedName,
+-				},
+-			},
+-			expected: func() map[string]*linter.Config {
+-				mlConfig := &linter.Config{
+-					Linter:    goanalysis.NewMetaLinter([]*goanalysis.Linter{barTyped, fooTyped}),
+-					InPresets: []string{"A", "B"},
+-					LoadMode:  packages.NeedName,
+-				}
+-
+-				return map[string]*linter.Config{
+-					"goanalysis_metalinter": mlConfig,
+-				}
+-			}(),
+ 		},
+ 		{
+-			desc: "combined, several linters (syntax)",
++			desc: "combined, several linters",
+ 			linters: map[string]*linter.Config{
+ 				"foo": {
+-					Linter:    fooSyntax,
++					Linter:    foo,
+ 					InPresets: []string{"A"},
+ 				},
+ 				"bar": {
+-					Linter:    barSyntax,
++					Linter:    bar,
+ 					InPresets: []string{"B"},
+ 				},
+ 			},
+ 			expected: func() map[string]*linter.Config {
+ 				mlConfig := &linter.Config{
+-					Linter:    goanalysis.NewMetaLinter([]*goanalysis.Linter{barSyntax, fooSyntax}),
++					Linter:    goanalysis.NewMetaLinter([]*goanalysis.Linter{bar, foo}),
+ 					InPresets: []string{"A", "B"},
+ 				}
+ 
+ 				return map[string]*linter.Config{
+-					"goanalysis_metalinter": mlConfig,
++					"goanalysis_metalinter": mlConfig.WithLoadForGoAnalysis(),
+ 				}
+ 			}(),
+ 		},
+diff --git a/test/enabled_linters_test.go b/test/enabled_linters_test.go
+index 6044e9c6..1c61b996 100644
+--- a/test/enabled_linters_test.go
++++ b/test/enabled_linters_test.go
+@@ -148,7 +148,7 @@ func getEnabledByDefaultFastLintersExcept(t *testing.T, except ...string) []stri
+ 	ebdl := m.GetAllEnabledByDefaultLinters()
+ 	var ret []string
+ 	for _, lc := range ebdl {
+-		if lc.IsSlowLinter() || lc.Internal {
++		if lc.IsSlowLinter() {
+ 			continue
+ 		}
+ 
+@@ -169,7 +169,7 @@ func getAllFastLintersWith(t *testing.T, with ...string) []string {
+ 	linters := dbManager.GetAllSupportedLinterConfigs()
+ 	ret := append([]string{}, with...)
+ 	for _, lc := range linters {
+-		if lc.IsSlowLinter() || lc.Internal {
++		if lc.IsSlowLinter() {
+ 			continue
+ 		}
+ 		ret = append(ret, lc.Name())
+@@ -206,7 +206,7 @@ func getEnabledByDefaultFastLintersWith(t *testing.T, with ...string) []string {
+ 	ebdl := dbManager.GetAllEnabledByDefaultLinters()
+ 	ret := append([]string{}, with...)
+ 	for _, lc := range ebdl {
+-		if lc.IsSlowLinter() || lc.Internal {
++		if lc.IsSlowLinter() {
+ 			continue
+ 		}
+ 

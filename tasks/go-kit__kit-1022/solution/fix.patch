@@ -1,0 +1,290 @@
+diff --git a/tracing/opencensus/jsonrpc.go b/tracing/opencensus/jsonrpc.go
+new file mode 100644
+index 0000000..ea2b018
+--- /dev/null
++++ b/tracing/opencensus/jsonrpc.go
+@@ -0,0 +1,180 @@
++package opencensus
++
++import (
++	"context"
++	"net/http"
++
++	"go.opencensus.io/plugin/ochttp"
++	"go.opencensus.io/plugin/ochttp/propagation/b3"
++	"go.opencensus.io/trace"
++
++	kithttp "github.com/go-kit/kit/transport/http"
++	jsonrpc "github.com/go-kit/kit/transport/http/jsonrpc"
++)
++
++// JSONRPCClientTrace enables OpenCensus tracing of a Go kit JSONRPC transport client.
++func JSONRPCClientTrace(options ...TracerOption) jsonrpc.ClientOption {
++	cfg := TracerOptions{}
++
++	for _, option := range options {
++		option(&cfg)
++	}
++
++	if !cfg.Public && cfg.HTTPPropagate == nil {
++		cfg.HTTPPropagate = &b3.HTTPFormat{}
++	}
++
++	clientBefore := jsonrpc.ClientBefore(
++		func(ctx context.Context, req *http.Request) context.Context {
++			var name string
++
++			if cfg.Name != "" {
++				name = cfg.Name
++			} else {
++				// OpenCensus states Path being default naming for a client span
++				name = ctx.Value(jsonrpc.ContextKeyRequestMethod).(string)
++			}
++
++			ctx, span := trace.StartSpan(
++				ctx,
++				name,
++				trace.WithSampler(cfg.Sampler),
++				trace.WithSpanKind(trace.SpanKindClient),
++			)
++
++			span.AddAttributes(
++				trace.StringAttribute(ochttp.HostAttribute, req.URL.Host),
++				trace.StringAttribute(ochttp.MethodAttribute, req.Method),
++				trace.StringAttribute(ochttp.PathAttribute, req.URL.Path),
++				trace.StringAttribute(ochttp.UserAgentAttribute, req.UserAgent()),
++			)
++
++			if !cfg.Public {
++				cfg.HTTPPropagate.SpanContextToRequest(span.SpanContext(), req)
++			}
++
++			return ctx
++		},
++	)
++
++	clientAfter := jsonrpc.ClientAfter(
++		func(ctx context.Context, res *http.Response) context.Context {
++			if span := trace.FromContext(ctx); span != nil {
++				span.SetStatus(ochttp.TraceStatus(res.StatusCode, http.StatusText(res.StatusCode)))
++				span.AddAttributes(
++					trace.Int64Attribute(ochttp.StatusCodeAttribute, int64(res.StatusCode)),
++				)
++			}
++			return ctx
++		},
++	)
++
++	clientFinalizer := jsonrpc.ClientFinalizer(
++		func(ctx context.Context, err error) {
++			if span := trace.FromContext(ctx); span != nil {
++				if err != nil {
++					span.SetStatus(trace.Status{
++						Code:    trace.StatusCodeUnknown,
++						Message: err.Error(),
++					})
++				}
++				span.End()
++			}
++		},
++	)
++
++	return func(c *jsonrpc.Client) {
++		clientBefore(c)
++		clientAfter(c)
++		clientFinalizer(c)
++	}
++}
++
++// JSONRPCServerTrace enables OpenCensus tracing of a Go kit JSONRPC transport server.
++func JSONRPCServerTrace(options ...TracerOption) jsonrpc.ServerOption {
++	cfg := TracerOptions{}
++
++	for _, option := range options {
++		option(&cfg)
++	}
++
++	if !cfg.Public && cfg.HTTPPropagate == nil {
++		cfg.HTTPPropagate = &b3.HTTPFormat{}
++	}
++
++	serverBeforeCodec := jsonrpc.ServerBeforeCodec(
++		func(ctx context.Context, httpReq *http.Request, req jsonrpc.Request) context.Context {
++			var (
++				spanContext trace.SpanContext
++				span        *trace.Span
++				name        string
++				ok          bool
++			)
++
++			if cfg.Name != "" {
++				name = cfg.Name
++			} else {
++				name = ctx.Value(jsonrpc.ContextKeyRequestMethod).(string)
++				if name == "" {
++					// we can't find the rpc method. probably the
++					// unaryInterceptor was not wired up.
++					name = "unknown jsonrpc method"
++				}
++			}
++
++			spanContext, ok = cfg.HTTPPropagate.SpanContextFromRequest(httpReq)
++			if ok && !cfg.Public {
++				ctx, span = trace.StartSpanWithRemoteParent(
++					ctx,
++					name,
++					spanContext,
++					trace.WithSpanKind(trace.SpanKindServer),
++					trace.WithSampler(cfg.Sampler),
++				)
++			} else {
++				ctx, span = trace.StartSpan(
++					ctx,
++					name,
++					trace.WithSpanKind(trace.SpanKindServer),
++					trace.WithSampler(cfg.Sampler),
++				)
++				if ok {
++					span.AddLink(trace.Link{
++						TraceID:    spanContext.TraceID,
++						SpanID:     spanContext.SpanID,
++						Type:       trace.LinkTypeChild,
++						Attributes: nil,
++					})
++				}
++			}
++
++			span.AddAttributes(
++				trace.StringAttribute(ochttp.MethodAttribute, httpReq.Method),
++				trace.StringAttribute(ochttp.PathAttribute, httpReq.URL.Path),
++			)
++
++			return ctx
++		},
++	)
++
++	serverFinalizer := jsonrpc.ServerFinalizer(
++		func(ctx context.Context, code int, r *http.Request) {
++			if span := trace.FromContext(ctx); span != nil {
++				span.SetStatus(ochttp.TraceStatus(code, http.StatusText(code)))
++
++				if rs, ok := ctx.Value(kithttp.ContextKeyResponseSize).(int64); ok {
++					span.AddAttributes(
++						trace.Int64Attribute("http.response_size", rs),
++					)
++				}
++
++				span.End()
++			}
++		},
++	)
++
++	return func(s *jsonrpc.Server) {
++		serverBeforeCodec(s)
++		serverFinalizer(s)
++	}
++}
+diff --git a/transport/http/jsonrpc/client.go b/transport/http/jsonrpc/client.go
+index 86e4123..14105aa 100644
+--- a/transport/http/jsonrpc/client.go
++++ b/transport/http/jsonrpc/client.go
+@@ -159,6 +159,8 @@ func (c Client) Endpoint() endpoint.Endpoint {
+ 			}()
+ 		}
+ 
++		ctx = context.WithValue(ctx, ContextKeyRequestMethod, c.method)
++
+ 		var params json.RawMessage
+ 		if params, err = c.enc(ctx, request); err != nil {
+ 			return nil, err
+@@ -207,7 +209,12 @@ func (c Client) Endpoint() endpoint.Endpoint {
+ 			return nil, err
+ 		}
+ 
+-		return c.dec(ctx, rpcRes)
++		response, err := c.dec(ctx, rpcRes)
++		if err != nil {
++			return nil, err
++		}
++
++		return response, nil
+ 	}
+ }
+ 
+diff --git a/transport/http/jsonrpc/request_response_types.go b/transport/http/jsonrpc/request_response_types.go
+index 1c6630b..ffae404 100644
+--- a/transport/http/jsonrpc/request_response_types.go
++++ b/transport/http/jsonrpc/request_response_types.go
+@@ -1,6 +1,10 @@
+ package jsonrpc
+ 
+-import "encoding/json"
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++)
+ 
+ // Request defines a JSON RPC request from the spec
+ // http://www.jsonrpc.org/specification#request_object
+@@ -26,6 +30,11 @@ type RequestID struct {
+ 	stringError error
+ }
+ 
++// RequestFunc may take information from decoded json body and place in
++// request context. In Servers, RequestFuncs are executed after json is parsed
++// but prior to invoking the codec
++type RequestFunc func(context.Context, *http.Request, Request) context.Context
++
+ // UnmarshalJSON satisfies json.Unmarshaler
+ func (id *RequestID) UnmarshalJSON(b []byte) error {
+ 	id.intError = json.Unmarshal(b, &id.intValue)
+@@ -79,3 +88,9 @@ const (
+ 	// ContentType defines the content type to be served.
+ 	ContentType string = "application/json; charset=utf-8"
+ )
++
++type contextKey int
++
++const (
++	ContextKeyRequestMethod contextKey = iota
++)
+diff --git a/transport/http/jsonrpc/server.go b/transport/http/jsonrpc/server.go
+index 75666e4..3250275 100644
+--- a/transport/http/jsonrpc/server.go
++++ b/transport/http/jsonrpc/server.go
+@@ -19,6 +19,7 @@ var requestIDKey requestIDKeyType
+ type Server struct {
+ 	ecm          EndpointCodecMap
+ 	before       []httptransport.RequestFunc
++	beforeCodec  []RequestFunc
+ 	after        []httptransport.ServerResponseFunc
+ 	errorEncoder httptransport.ErrorEncoder
+ 	finalizer    httptransport.ServerFinalizerFunc
+@@ -50,6 +51,14 @@ func ServerBefore(before ...httptransport.RequestFunc) ServerOption {
+ 	return func(s *Server) { s.before = append(s.before, before...) }
+ }
+ 
++// ServerBeforeCodec functions are executed after the JSON request body has been
++// decoded, but before the method's decoder is called. This provides an opportunity
++// for middleware to inspect the contents of the rpc request before being passed
++// to the codec.
++func ServerBeforeCodec(beforeCodec ...RequestFunc) ServerOption {
++	return func(s *Server) { s.beforeCodec = append(s.beforeCodec, beforeCodec...) }
++}
++
+ // ServerAfter functions are executed on the HTTP response writer after the
+ // endpoint is invoked, but before anything is written to the client.
+ func ServerAfter(after ...httptransport.ServerResponseFunc) ServerOption {
+@@ -110,6 +119,11 @@ func (s Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	ctx = context.WithValue(ctx, requestIDKey, req.ID)
++	ctx = context.WithValue(ctx, ContextKeyRequestMethod, req.Method)
++
++	for _, f := range s.beforeCodec {
++		ctx = f(ctx, r, req)
++	}
+ 
+ 	// Get the endpoint and codecs from the map using the method
+ 	// defined in the JSON  object

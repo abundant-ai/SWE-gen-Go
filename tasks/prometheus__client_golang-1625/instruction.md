@@ -1,0 +1,14 @@
+The process metrics collector exposes an inconsistent and sometimes incorrect set of metric descriptors via `(*processCollector).Describe`, depending on the platform. Today `Describe` is effectively “one size fits all”, but the metrics actually emitted by `processCollector` during collection differ by OS (e.g., Linux emits additional process network metrics; other platforms may not support particular metrics at all). This can lead to two classes of problems:
+
+1) On supported platforms, `Describe` can become out of sync with what `Collect`/`ProcessCollect` actually produces. When `Describe` does not include every metric descriptor that might be collected, registration with strict registries (e.g. pedantic validation) can fail, or users can hit confusing runtime behavior where some collected metrics were never described.
+
+2) On unsupported or partially supported platforms (notably platforms that currently fall back to a generic/"other" implementation), the collector may error out inconsistently, including cases where failures are effectively silent when `ProcessCollectorOpts.ReportErrors` is false. This behavior is inconsistent across platforms (some have explicit no-op implementations, others attempt to work and then fail).
+
+Fix `processCollector` so that `Describe` is platform-specific and accurately reflects the maximum set of metrics that the collector can emit on that platform, matching the metrics produced by `Collect`/`ProcessCollect`.
+
+Specifically:
+- Ensure `(*processCollector).Describe(ch)` enumerates descriptors for exactly the metrics that can be collected on that OS. For example, on Linux it must include descriptors for the standard process metrics plus process network receive/transmit byte counters; on Windows it must include the standard set supported there (CPU seconds, open/max fds, virtual memory, resident memory, start time) and must not claim to describe metrics that are never produced.
+- Ensure `Describe` and the collection path stay aligned: any metric that can be emitted by collection for a given platform must have its `*Desc` sent by `Describe` for that same platform.
+- Standardize unsupported-platform behavior via a consistent default collection/describe behavior. Unsupported platforms should either behave as a true no-op collector (describe/collect nothing), or should report errors consistently based on `ProcessCollectorOpts.ReportErrors` (silent when false, surfaced when true). The behavior must be consistent across all unsupported platforms rather than varying by build-tag fallbacks.
+
+After this change, registering a `NewProcessCollector(ProcessCollectorOpts{})` (and also one with a custom `PidFn`, non-empty `Namespace`, and `ReportErrors: true`) should reliably gather expected process metrics on Linux and Windows. In addition, the collector must not describe metrics that it will never emit on a given OS, and it must not emit metrics that it did not describe.

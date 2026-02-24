@@ -1,0 +1,265 @@
+diff --git a/util.go b/util.go
+index aec8a99..b0903fb 100644
+--- a/util.go
++++ b/util.go
+@@ -41,23 +41,15 @@ func (pe ConfigParseError) Error() string {
+ 
+ func insensitiviseMap(m map[string]interface{}) {
+ 	for key, val := range m {
+-		switch val.(type) {
+-		case map[interface{}]interface{}:
+-			// nested map: cast and recursively insensitivise
+-			val = cast.ToStringMap(val)
+-			insensitiviseMap(val.(map[string]interface{}))
+-		case map[string]interface{}:
+-			// nested map: recursively insensitivise
+-			insensitiviseMap(val.(map[string]interface{}))
+-		}
+-
+ 		lower := strings.ToLower(key)
+ 		if key != lower {
+-			// remove old key (not lower-cased)
+ 			delete(m, key)
++			m[lower] = val
++			if m2, ok := val.(map[string]interface{}); ok {
++				// nested map: recursively insensitivise
++				insensitiviseMap(m2)
++			}
+ 		}
+-		// update map
+-		m[lower] = val
+ 	}
+ }
+ 
+diff --git a/viper.go b/viper.go
+index 1bb4d43..a03540c 100644
+--- a/viper.go
++++ b/viper.go
+@@ -399,22 +399,49 @@ func (v *Viper) providerPathExists(p *defaultRemoteProvider) bool {
+ 	return false
+ }
+ 
++// searchMapForKey may end up traversing the map if the key references a nested
++// item (foo.bar), but will use a fast path for the common case.
++// Note: This assumes that the key given is already lowercase.
++func (v *Viper) searchMapForKey(source map[string]interface{}, lcaseKey string) interface{} {
++	if !strings.Contains(lcaseKey, v.keyDelim) {
++		v, ok := source[lcaseKey]
++		if ok {
++			return v
++		}
++		return nil
++	}
++
++	path := strings.Split(lcaseKey, v.keyDelim)
++	return v.searchMap(source, path)
++}
++
+ // searchMap recursively searches for a value for path in source map.
+ // Returns nil if not found.
+-// Note: This assumes that the path entries and map keys are lower cased.
++// Note: This assumes that the path entries are lower cased.
+ func (v *Viper) searchMap(source map[string]interface{}, path []string) interface{} {
+ 	if len(path) == 0 {
+ 		return source
+ 	}
+ 
+-	next, ok := source[path[0]]
+-	if ok {
+-		// Fast path
+-		if len(path) == 1 {
+-			return next
++	// Fast path
++	if len(path) == 1 {
++		if v, ok := source[path[0]]; ok {
++			return v
+ 		}
++		return nil
++	}
+ 
+-		// Nested case
++	var ok bool
++	var next interface{}
++	for k, v := range source {
++		if k == path[0] {
++			ok = true
++			next = v
++			break
++		}
++	}
++
++	if ok {
+ 		switch next.(type) {
+ 		case map[interface{}]interface{}:
+ 			return v.searchMap(cast.ToStringMap(next), path[1:])
+@@ -423,6 +450,9 @@ func (v *Viper) searchMap(source map[string]interface{}, path []string) interfac
+ 			// if the type of `next` is the same as the type being asserted
+ 			return v.searchMap(next.(map[string]interface{}), path[1:])
+ 		default:
++			if len(path) == 1 {
++				return next
++			}
+ 			// got a value but nested key expected, return "nil" for not found
+ 			return nil
+ 		}
+@@ -439,8 +469,6 @@ func (v *Viper) searchMap(source map[string]interface{}, path []string) interfac
+ //
+ // This should be useful only at config level (other maps may not contain dots
+ // in their keys).
+-//
+-// Note: This assumes that the path entries and map keys are lower cased.
+ func (v *Viper) searchMapWithPathPrefixes(source map[string]interface{}, path []string) interface{} {
+ 	if len(path) == 0 {
+ 		return source
+@@ -450,14 +478,17 @@ func (v *Viper) searchMapWithPathPrefixes(source map[string]interface{}, path []
+ 	for i := len(path); i > 0; i-- {
+ 		prefixKey := strings.ToLower(strings.Join(path[0:i], v.keyDelim))
+ 
+-		next, ok := source[prefixKey]
+-		if ok {
+-			// Fast path
+-			if i == len(path) {
+-				return next
++		var ok bool
++		var next interface{}
++		for k, v := range source {
++			if strings.ToLower(k) == prefixKey {
++				ok = true
++				next = v
++				break
+ 			}
++		}
+ 
+-			// Nested case
++		if ok {
+ 			var val interface{}
+ 			switch next.(type) {
+ 			case map[interface{}]interface{}:
+@@ -467,6 +498,9 @@ func (v *Viper) searchMapWithPathPrefixes(source map[string]interface{}, path []
+ 				// if the type of `next` is the same as the type being asserted
+ 				val = v.searchMapWithPathPrefixes(next.(map[string]interface{}), path[i:])
+ 			default:
++				if len(path) == i {
++					val = next
++				}
+ 				// got a value but nested key expected, do nothing and look for next prefix
+ 			}
+ 			if val != nil {
+@@ -586,8 +620,7 @@ func (v *Viper) Get(key string) interface{} {
+ 	valType := val
+ 	if v.typeByDefValue {
+ 		// TODO(bep) this branch isn't covered by a single test.
+-		path := strings.Split(lcaseKey, v.keyDelim)
+-		defVal := v.searchMap(v.defaults, path)
++		defVal := v.searchMapForKey(v.defaults, lcaseKey)
+ 		if defVal != nil {
+ 			valType = defVal
+ 		}
+@@ -850,14 +883,16 @@ func (v *Viper) find(lcaseKey string) interface{} {
+ 
+ 	// if the requested key is an alias, then return the proper key
+ 	lcaseKey = v.realKey(lcaseKey)
+-	path = strings.Split(lcaseKey, v.keyDelim)
+-	nested = len(path) > 1
+ 
+ 	// Set() override first
+-	val = v.searchMap(v.override, path)
++	val = v.searchMapForKey(v.override, lcaseKey)
+ 	if val != nil {
+ 		return val
+ 	}
++
++	path = strings.Split(lcaseKey, v.keyDelim)
++	nested = len(path) > 1
++
+ 	if nested && v.isPathShadowedInDeepMap(path, v.override) != "" {
+ 		return nil
+ 	}
+@@ -877,6 +912,7 @@ func (v *Viper) find(lcaseKey string) interface{} {
+ 			return flag.ValueString()
+ 		}
+ 	}
++
+ 	if nested && v.isPathShadowedInFlatMap(path, v.pflags) != "" {
+ 		return nil
+ 	}
+@@ -898,7 +934,7 @@ func (v *Viper) find(lcaseKey string) interface{} {
+ 			return val
+ 		}
+ 	}
+-	if nested && v.isPathShadowedInFlatMap(path, v.env) != "" {
++	if shadow := v.isPathShadowedInFlatMap(path, v.env); shadow != "" {
+ 		return nil
+ 	}
+ 
+@@ -907,7 +943,7 @@ func (v *Viper) find(lcaseKey string) interface{} {
+ 	if val != nil {
+ 		return val
+ 	}
+-	if nested && v.isPathShadowedInDeepMap(path, v.config) != "" {
++	if shadow := v.isPathShadowedInDeepMap(path, v.config); shadow != "" {
+ 		return nil
+ 	}
+ 
+@@ -916,7 +952,7 @@ func (v *Viper) find(lcaseKey string) interface{} {
+ 	if val != nil {
+ 		return val
+ 	}
+-	if nested && v.isPathShadowedInDeepMap(path, v.kvstore) != "" {
++	if shadow := v.isPathShadowedInDeepMap(path, v.kvstore); shadow != "" {
+ 		return nil
+ 	}
+ 
+@@ -925,7 +961,7 @@ func (v *Viper) find(lcaseKey string) interface{} {
+ 	if val != nil {
+ 		return val
+ 	}
+-	if nested && v.isPathShadowedInDeepMap(path, v.defaults) != "" {
++	if shadow := v.isPathShadowedInDeepMap(path, v.defaults); shadow != "" {
+ 		return nil
+ 	}
+ 
+diff --git a/viper_test.go b/viper_test.go
+index 81c6333..963c3ce 100644
+--- a/viper_test.go
++++ b/viper_test.go
+@@ -269,7 +269,7 @@ func TestUnmarshalling(t *testing.T) {
+ 	assert.False(t, InConfig("state"))
+ 	assert.Equal(t, "steve", Get("name"))
+ 	assert.Equal(t, []interface{}{"skateboarding", "snowboarding", "go"}, Get("hobbies"))
+-	assert.Equal(t, map[string]interface{}{"jacket": "leather", "trousers": "denim", "pants": map[string]interface{}{"size": "large"}}, Get("clothing"))
++	assert.Equal(t, map[string]interface{}{"jacket": "leather", "trousers": "denim", "pants": map[interface{}]interface{}{"size": "large"}}, Get("clothing"))
+ 	assert.Equal(t, 35, Get("age"))
+ }
+ 
+@@ -637,10 +637,10 @@ func TestFindsNestedKeys(t *testing.T) {
+ 		"age":  35,
+ 		"owner": map[string]interface{}{
+ 			"organization": "MongoDB",
+-			"bio":          "MongoDB Chief Developer Advocate & Hacker at Large",
++			"Bio":          "MongoDB Chief Developer Advocate & Hacker at Large",
+ 			"dob":          dob,
+ 		},
+-		"owner.bio": "MongoDB Chief Developer Advocate & Hacker at Large",
++		"owner.Bio": "MongoDB Chief Developer Advocate & Hacker at Large",
+ 		"type":      "donut",
+ 		"id":        "0001",
+ 		"name":      "Cake",
+@@ -649,7 +649,7 @@ func TestFindsNestedKeys(t *testing.T) {
+ 		"clothing": map[string]interface{}{
+ 			"jacket":   "leather",
+ 			"trousers": "denim",
+-			"pants": map[string]interface{}{
++			"pants": map[interface{}]interface{}{
+ 				"size": "large",
+ 			},
+ 		},
+@@ -695,7 +695,7 @@ func TestReadBufConfig(t *testing.T) {
+ 	assert.False(t, v.InConfig("state"))
+ 	assert.Equal(t, "steve", v.Get("name"))
+ 	assert.Equal(t, []interface{}{"skateboarding", "snowboarding", "go"}, v.Get("hobbies"))
+-	assert.Equal(t, map[string]interface{}{"jacket": "leather", "trousers": "denim", "pants": map[string]interface{}{"size": "large"}}, v.Get("clothing"))
++	assert.Equal(t, map[string]interface{}{"jacket": "leather", "trousers": "denim", "pants": map[interface{}]interface{}{"size": "large"}}, v.Get("clothing"))
+ 	assert.Equal(t, 35, v.Get("age"))
+ }
+ 

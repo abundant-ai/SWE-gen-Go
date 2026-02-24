@@ -1,0 +1,238 @@
+diff --git a/context.go b/context.go
+index ffde151..12b2322 100644
+--- a/context.go
++++ b/context.go
+@@ -3,17 +3,23 @@ package chi
+ import (
+ 	"context"
+ 	"net/http"
++	"time"
+ )
+ 
+ var (
+ 	RouteCtxKey = &contextKey{"RouteContext"}
+ )
+ 
++var _ context.Context = &Context{}
++
+ // Context is the default routing context set on the root node of a
+ // request context to track URL parameters and an optional routing path.
+ type Context struct {
++	// Parent context
++	parent context.Context
++
+ 	// URL routing parameter key and values.
+-	URLParams params
++	Params params
+ 
+ 	// Routing path override used by subrouters.
+ 	RoutePath string
+@@ -33,12 +39,32 @@ func NewRouteContext() *Context {
+ 
+ // reset a routing context to its initial state.
+ func (x *Context) reset() {
+-	x.URLParams = x.URLParams[:0]
++	x.parent = nil
++	x.Params = x.Params[:0]
+ 	x.RoutePath = ""
+ 	x.RoutePattern = ""
+ 	x.RoutePatterns = x.RoutePatterns[:0]
+ }
+ 
++func (ctx *Context) Deadline() (deadline time.Time, ok bool) {
++	return ctx.parent.Deadline()
++}
++
++func (ctx *Context) Done() <-chan struct{} {
++	return ctx.parent.Done()
++}
++
++func (ctx *Context) Err() error {
++	return ctx.parent.Err()
++}
++
++func (ctx *Context) Value(key interface{}) interface{} {
++	if key == RouteCtxKey {
++		return ctx
++	}
++	return ctx.parent.Value(key)
++}
++
+ // RouteContext returns chi's routing Context object from a
+ // http.Request Context.
+ func RouteContext(ctx context.Context) *Context {
+@@ -48,7 +74,7 @@ func RouteContext(ctx context.Context) *Context {
+ // URLParam returns the url parameter from a http.Request object.
+ func URLParam(r *http.Request, key string) string {
+ 	if rctx := RouteContext(r.Context()); rctx != nil {
+-		return rctx.URLParams.Get(key)
++		return rctx.Params.Get(key)
+ 	}
+ 	return ""
+ }
+@@ -56,7 +82,7 @@ func URLParam(r *http.Request, key string) string {
+ // URLParam returns the url parameter from a http.Request Context.
+ func URLParamFromCtx(ctx context.Context, key string) string {
+ 	if rctx := RouteContext(ctx); rctx != nil {
+-		return rctx.URLParams.Get(key)
++		return rctx.Params.Get(key)
+ 	}
+ 	return ""
+ }
+diff --git a/mux.go b/mux.go
+index be335ec..7059d34 100644
+--- a/mux.go
++++ b/mux.go
+@@ -1,7 +1,6 @@
+ package chi
+ 
+ import (
+-	"context"
+ 	"fmt"
+ 	"net/http"
+ 	"strings"
+@@ -72,8 +71,8 @@ func (mx *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	// into the pool for reuse from another request.
+ 	rctx = mx.pool.Get().(*Context)
+ 	rctx.reset()
+-	r = r.WithContext(context.WithValue(r.Context(), RouteCtxKey, rctx))
+-	mx.handler.ServeHTTP(w, r)
++	rctx.parent = r.Context()
++	mx.handler.ServeHTTP(w, r.WithContext(rctx))
+ 	mx.pool.Put(rctx)
+ }
+ 
+@@ -222,7 +221,7 @@ func (mx *Mux) Mount(pattern string, handler http.Handler) {
+ 	// Wrap the sub-router in a handlerFunc to scope the request path for routing.
+ 	subHandler := func(w http.ResponseWriter, r *http.Request) {
+ 		rctx := RouteContext(r.Context())
+-		rctx.RoutePath = "/" + rctx.URLParams.Del("*")
++		rctx.RoutePath = "/" + rctx.Params.Del("*")
+ 		handler.ServeHTTP(w, r)
+ 	}
+ 
+diff --git a/mux_test.go b/mux_test.go
+index 96b9b39..125d27f 100644
+--- a/mux_test.go
++++ b/mux_test.go
+@@ -10,7 +10,6 @@ import (
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
+-	"sync"
+ 	"testing"
+ 	"time"
+ )
+@@ -756,9 +755,8 @@ func TestMuxSubroutes(t *testing.T) {
+ 	// Test that we're building the routingPatterns properly
+ 	router := r
+ 	req, _ := http.NewRequest("GET", "/accounts/44/hi", nil)
+-
+ 	rctx := NewRouteContext()
+-	req = req.WithContext(context.WithValue(req.Context(), RouteCtxKey, rctx))
++	req = req.WithContext(rctx)
+ 
+ 	w := httptest.NewRecorder()
+ 	router.ServeHTTP(w, req)
+@@ -796,8 +794,8 @@ func TestSingleHandler(t *testing.T) {
+ 
+ 	r, _ := http.NewRequest("GET", "/", nil)
+ 	rctx := NewRouteContext()
+-	r = r.WithContext(context.WithValue(r.Context(), RouteCtxKey, rctx))
+-	rctx.URLParams.Set("name", "joe")
++	r = r.WithContext(rctx)
++	rctx.Params.Set("name", "joe")
+ 
+ 	w := httptest.NewRecorder()
+ 	h.ServeHTTP(w, r)
+@@ -973,41 +971,6 @@ func TestMountingExistingPath(t *testing.T) {
+ 	r.Mount("/hi", http.HandlerFunc(handler))
+ }
+ 
+-func TestMuxContextIsThreadSafe(t *testing.T) {
+-	router := NewRouter()
+-	router.Get("/:id", func(w http.ResponseWriter, r *http.Request) {
+-		ctx, cancel := context.WithTimeout(r.Context(), 1*time.Millisecond)
+-		defer cancel()
+-
+-		<-ctx.Done()
+-	})
+-
+-	wg := sync.WaitGroup{}
+-
+-	for i := 0; i < 100; i++ {
+-		wg.Add(1)
+-		go func() {
+-			defer wg.Done()
+-			for j := 0; j < 10000; j++ {
+-				w := httptest.NewRecorder()
+-				r, err := http.NewRequest("GET", "/ok", nil)
+-				if err != nil {
+-					t.Fatal(err)
+-				}
+-
+-				ctx, cancel := context.WithCancel(r.Context())
+-				r = r.WithContext(ctx)
+-
+-				go func() {
+-					cancel()
+-				}()
+-				router.ServeHTTP(w, r)
+-			}
+-		}()
+-	}
+-	wg.Wait()
+-}
+-
+ func TestMuxFileServer(t *testing.T) {
+ 	fixtures := map[string]http.File{
+ 		"index.html": &testFile{"index.html", []byte("index\n")},
+@@ -1087,12 +1050,15 @@ func TestMuxFileServer(t *testing.T) {
+ 	// }
+ }
+ 
+-func urlParams(rctx *Context) map[string]string {
+-	m := make(map[string]string, 0)
+-	for _, p := range rctx.URLParams {
+-		m[p.Key] = p.Value
++func urlParams(ctx context.Context) map[string]string {
++	if rctx := RouteContext(ctx); rctx != nil {
++		m := make(map[string]string, 0)
++		for _, p := range rctx.Params {
++			m[p.Key] = p.Value
++		}
++		return m
+ 	}
+-	return m
++	return nil
+ }
+ 
+ func testRequest(t *testing.T, ts *httptest.Server, method, path string, body io.Reader) (*http.Response, string) {
+diff --git a/tree.go b/tree.go
+index ecd00e2..d6e22dd 100644
+--- a/tree.go
++++ b/tree.go
+@@ -360,9 +360,9 @@ func (n *node) findRoute(rctx *Context, path string) *node {
+ 			}
+ 
+ 			if xn.typ == ntCatchAll {
+-				rctx.URLParams.Add("*", xsearch)
++				rctx.Params.Add("*", xsearch)
+ 			} else {
+-				rctx.URLParams.Add(xn.prefix[1:], xsearch[:p])
++				rctx.Params.Add(xn.prefix[1:], xsearch[:p])
+ 			}
+ 
+ 			xsearch = xsearch[p:]
+@@ -389,9 +389,9 @@ func (n *node) findRoute(rctx *Context, path string) *node {
+ 		// Did not found final handler, let's remove the param here if it was set
+ 		if xn.typ > ntStatic {
+ 			if xn.typ == ntCatchAll {
+-				rctx.URLParams.Del("*")
++				rctx.Params.Del("*")
+ 			} else {
+-				rctx.URLParams.Del(xn.prefix[1:])
++				rctx.Params.Del(xn.prefix[1:])
+ 			}
+ 		}
+ 	}

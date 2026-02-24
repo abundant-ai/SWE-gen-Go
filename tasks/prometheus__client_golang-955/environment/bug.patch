@@ -1,0 +1,1964 @@
+diff --git a/prometheus/build_info_collector.go b/prometheus/build_info_collector.go
+deleted file mode 100644
+index 450189f..0000000
+--- a/prometheus/build_info_collector.go
++++ /dev/null
+@@ -1,38 +0,0 @@
+-// Copyright 2021 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package prometheus
+-
+-import "runtime/debug"
+-
+-// NewBuildInfoCollector is the obsolete version of collectors.NewBuildInfoCollector.
+-// See there for documentation.
+-//
+-// Deprecated: Use collectors.NewBuildInfoCollector instead.
+-func NewBuildInfoCollector() Collector {
+-	path, version, sum := "unknown", "unknown", "unknown"
+-	if bi, ok := debug.ReadBuildInfo(); ok {
+-		path = bi.Main.Path
+-		version = bi.Main.Version
+-		sum = bi.Main.Sum
+-	}
+-	c := &selfCollector{MustNewConstMetric(
+-		NewDesc(
+-			"go_build_info",
+-			"Build information about the main Go module.",
+-			nil, Labels{"path": path, "version": version, "checksum": sum},
+-		),
+-		GaugeValue, 1)}
+-	c.init(c.self)
+-	return c
+-}
+diff --git a/prometheus/counter.go b/prometheus/counter.go
+index 00d70f0..3f8fd79 100644
+--- a/prometheus/counter.go
++++ b/prometheus/counter.go
+@@ -133,14 +133,10 @@ func (c *counter) Inc() {
+ 	atomic.AddUint64(&c.valInt, 1)
+ }
+ 
+-func (c *counter) get() float64 {
++func (c *counter) Write(out *dto.Metric) error {
+ 	fval := math.Float64frombits(atomic.LoadUint64(&c.valBits))
+ 	ival := atomic.LoadUint64(&c.valInt)
+-	return fval + float64(ival)
+-}
+-
+-func (c *counter) Write(out *dto.Metric) error {
+-	val := c.get()
++	val := fval + float64(ival)
+ 
+ 	var exemplar *dto.Exemplar
+ 	if e := c.exemplar.Load(); e != nil {
+diff --git a/prometheus/gen_go_collector_metrics_set.go b/prometheus/gen_go_collector_metrics_set.go
+deleted file mode 100644
+index ac63777..0000000
+--- a/prometheus/gen_go_collector_metrics_set.go
++++ /dev/null
+@@ -1,115 +0,0 @@
+-// Copyright 2021 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-//go:build ignore
+-// +build ignore
+-
+-package main
+-
+-import (
+-	"bytes"
+-	"fmt"
+-	"go/format"
+-	"log"
+-	"os"
+-	"runtime/metrics"
+-	"strconv"
+-	"strings"
+-	"text/template"
+-
+-	"github.com/prometheus/client_golang/prometheus"
+-	"github.com/prometheus/client_golang/prometheus/internal"
+-)
+-
+-func main() {
+-	if len(os.Args) != 2 {
+-		log.Fatal("requires Go version (e.g. go1.17) as an argument")
+-	}
+-	version, err := parseVersion(os.Args[1])
+-	if err != nil {
+-		log.Fatalf("parsing Go version: %v", err)
+-	}
+-
+-	// Generate code.
+-	var buf bytes.Buffer
+-	err = testFile.Execute(&buf, struct {
+-		Descriptions []metrics.Description
+-		GoVersion    goVersion
+-	}{
+-		Descriptions: metrics.All(),
+-		GoVersion:    version,
+-	})
+-	if err != nil {
+-		log.Fatalf("executing template: %v", err)
+-	}
+-
+-	// Format it.
+-	result, err := format.Source(buf.Bytes())
+-	if err != nil {
+-		log.Fatalf("formatting code: %v", err)
+-	}
+-
+-	// Write it to a file.
+-	fname := fmt.Sprintf("go_collector_metrics_%s_test.go", version.Abbr())
+-	if err := os.WriteFile(fname, result, 0o644); err != nil {
+-		log.Fatalf("writing file: %v", err)
+-	}
+-}
+-
+-type goVersion int
+-
+-func (g goVersion) String() string {
+-	return fmt.Sprintf("go1.%d", g)
+-}
+-
+-func (g goVersion) Abbr() string {
+-	return fmt.Sprintf("go1%d", g)
+-}
+-
+-func parseVersion(s string) (goVersion, error) {
+-	i := strings.IndexRune(s, '.')
+-	if i < 0 {
+-		return goVersion(-1), fmt.Errorf("bad Go version format")
+-	}
+-	i, err := strconv.Atoi(s[i+1:])
+-	return goVersion(i), err
+-}
+-
+-var testFile = template.Must(template.New("testFile").Funcs(map[string]interface{}{
+-	"rm2prom": func(d metrics.Description) string {
+-		ns, ss, n, ok := internal.RuntimeMetricsToProm(&d)
+-		if !ok {
+-			return ""
+-		}
+-		return prometheus.BuildFQName(ns, ss, n)
+-	},
+-	"nextVersion": func(version goVersion) string {
+-		return (version + goVersion(1)).String()
+-	},
+-}).Parse(`// Code generated by gen_go_collector_metrics_set.go; DO NOT EDIT.
+-//go:generate go run gen_go_collector_metrics_set.go {{.GoVersion}}
+-
+-//go:build {{.GoVersion}} && !{{nextVersion .GoVersion}}
+-// +build {{.GoVersion}},!{{nextVersion .GoVersion}}
+-
+-package prometheus
+-
+-var expectedRuntimeMetrics = map[string]string{
+-{{- range .Descriptions -}}
+-	{{- $trans := rm2prom . -}}
+-	{{- if ne $trans "" }}
+-	{{.Name | printf "%q"}}: {{$trans | printf "%q"}},
+-	{{- end -}}
+-{{end}}
+-}
+-`))
+diff --git a/prometheus/go_collector.go b/prometheus/go_collector.go
+index 08195b4..a96ed1c 100644
+--- a/prometheus/go_collector.go
++++ b/prometheus/go_collector.go
+@@ -16,209 +16,32 @@ package prometheus
+ import (
+ 	"runtime"
+ 	"runtime/debug"
++	"sync"
+ 	"time"
+ )
+ 
+-func goRuntimeMemStats() memStatsMetrics {
+-	return memStatsMetrics{
+-		{
+-			desc: NewDesc(
+-				memstatNamespace("alloc_bytes"),
+-				"Number of bytes allocated and still in use.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.Alloc) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("alloc_bytes_total"),
+-				"Total number of bytes allocated, even if freed.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.TotalAlloc) },
+-			valType: CounterValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("sys_bytes"),
+-				"Number of bytes obtained from system.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.Sys) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("lookups_total"),
+-				"Total number of pointer lookups.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.Lookups) },
+-			valType: CounterValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("mallocs_total"),
+-				"Total number of mallocs.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.Mallocs) },
+-			valType: CounterValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("frees_total"),
+-				"Total number of frees.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.Frees) },
+-			valType: CounterValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("heap_alloc_bytes"),
+-				"Number of heap bytes allocated and still in use.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.HeapAlloc) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("heap_sys_bytes"),
+-				"Number of heap bytes obtained from system.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.HeapSys) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("heap_idle_bytes"),
+-				"Number of heap bytes waiting to be used.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.HeapIdle) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("heap_inuse_bytes"),
+-				"Number of heap bytes that are in use.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.HeapInuse) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("heap_released_bytes"),
+-				"Number of heap bytes released to OS.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.HeapReleased) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("heap_objects"),
+-				"Number of allocated objects.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.HeapObjects) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("stack_inuse_bytes"),
+-				"Number of bytes in use by the stack allocator.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.StackInuse) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("stack_sys_bytes"),
+-				"Number of bytes obtained from system for stack allocator.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.StackSys) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("mspan_inuse_bytes"),
+-				"Number of bytes in use by mspan structures.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.MSpanInuse) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("mspan_sys_bytes"),
+-				"Number of bytes used for mspan structures obtained from system.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.MSpanSys) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("mcache_inuse_bytes"),
+-				"Number of bytes in use by mcache structures.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.MCacheInuse) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("mcache_sys_bytes"),
+-				"Number of bytes used for mcache structures obtained from system.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.MCacheSys) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("buck_hash_sys_bytes"),
+-				"Number of bytes used by the profiling bucket hash table.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.BuckHashSys) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("gc_sys_bytes"),
+-				"Number of bytes used for garbage collection system metadata.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.GCSys) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("other_sys_bytes"),
+-				"Number of bytes used for other system allocations.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.OtherSys) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("next_gc_bytes"),
+-				"Number of heap bytes when next garbage collection will take place.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return float64(ms.NextGC) },
+-			valType: GaugeValue,
+-		}, {
+-			desc: NewDesc(
+-				memstatNamespace("gc_cpu_fraction"),
+-				"The fraction of this program's available CPU time used by the GC since the program started.",
+-				nil, nil,
+-			),
+-			eval:    func(ms *runtime.MemStats) float64 { return ms.GCCPUFraction },
+-			valType: GaugeValue,
+-		},
+-	}
+-}
+-
+-type baseGoCollector struct {
++type goCollector struct {
+ 	goroutinesDesc *Desc
+ 	threadsDesc    *Desc
+ 	gcDesc         *Desc
+-	gcLastTimeDesc *Desc
+ 	goInfoDesc     *Desc
++
++	// ms... are memstats related.
++	msLast          *runtime.MemStats // Previously collected memstats.
++	msLastTimestamp time.Time
++	msMtx           sync.Mutex // Protects msLast and msLastTimestamp.
++	msMetrics       memStatsMetrics
++	msRead          func(*runtime.MemStats) // For mocking in tests.
++	msMaxWait       time.Duration           // Wait time for fresh memstats.
++	msMaxAge        time.Duration           // Maximum allowed age of old memstats.
+ }
+ 
+-func newBaseGoCollector() baseGoCollector {
+-	return baseGoCollector{
++// NewGoCollector is the obsolete version of collectors.NewGoCollector.
++// See there for documentation.
++//
++// Deprecated: Use collectors.NewGoCollector instead.
++func NewGoCollector() Collector {
++	return &goCollector{
+ 		goroutinesDesc: NewDesc(
+ 			"go_goroutines",
+ 			"Number of goroutines that currently exist.",
+@@ -231,28 +54,243 @@ func newBaseGoCollector() baseGoCollector {
+ 			"go_gc_duration_seconds",
+ 			"A summary of the pause duration of garbage collection cycles.",
+ 			nil, nil),
+-		gcLastTimeDesc: NewDesc(
+-			memstatNamespace("last_gc_time_seconds"),
+-			"Number of seconds since 1970 of last garbage collection.",
+-			nil, nil),
+ 		goInfoDesc: NewDesc(
+ 			"go_info",
+ 			"Information about the Go environment.",
+ 			nil, Labels{"version": runtime.Version()}),
++		msLast:    &runtime.MemStats{},
++		msRead:    runtime.ReadMemStats,
++		msMaxWait: time.Second,
++		msMaxAge:  5 * time.Minute,
++		msMetrics: memStatsMetrics{
++			{
++				desc: NewDesc(
++					memstatNamespace("alloc_bytes"),
++					"Number of bytes allocated and still in use.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.Alloc) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("alloc_bytes_total"),
++					"Total number of bytes allocated, even if freed.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.TotalAlloc) },
++				valType: CounterValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("sys_bytes"),
++					"Number of bytes obtained from system.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.Sys) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("lookups_total"),
++					"Total number of pointer lookups.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.Lookups) },
++				valType: CounterValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("mallocs_total"),
++					"Total number of mallocs.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.Mallocs) },
++				valType: CounterValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("frees_total"),
++					"Total number of frees.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.Frees) },
++				valType: CounterValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("heap_alloc_bytes"),
++					"Number of heap bytes allocated and still in use.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.HeapAlloc) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("heap_sys_bytes"),
++					"Number of heap bytes obtained from system.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.HeapSys) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("heap_idle_bytes"),
++					"Number of heap bytes waiting to be used.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.HeapIdle) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("heap_inuse_bytes"),
++					"Number of heap bytes that are in use.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.HeapInuse) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("heap_released_bytes"),
++					"Number of heap bytes released to OS.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.HeapReleased) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("heap_objects"),
++					"Number of allocated objects.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.HeapObjects) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("stack_inuse_bytes"),
++					"Number of bytes in use by the stack allocator.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.StackInuse) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("stack_sys_bytes"),
++					"Number of bytes obtained from system for stack allocator.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.StackSys) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("mspan_inuse_bytes"),
++					"Number of bytes in use by mspan structures.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.MSpanInuse) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("mspan_sys_bytes"),
++					"Number of bytes used for mspan structures obtained from system.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.MSpanSys) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("mcache_inuse_bytes"),
++					"Number of bytes in use by mcache structures.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.MCacheInuse) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("mcache_sys_bytes"),
++					"Number of bytes used for mcache structures obtained from system.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.MCacheSys) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("buck_hash_sys_bytes"),
++					"Number of bytes used by the profiling bucket hash table.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.BuckHashSys) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("gc_sys_bytes"),
++					"Number of bytes used for garbage collection system metadata.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.GCSys) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("other_sys_bytes"),
++					"Number of bytes used for other system allocations.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.OtherSys) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("next_gc_bytes"),
++					"Number of heap bytes when next garbage collection will take place.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.NextGC) },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("last_gc_time_seconds"),
++					"Number of seconds since 1970 of last garbage collection.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return float64(ms.LastGC) / 1e9 },
++				valType: GaugeValue,
++			}, {
++				desc: NewDesc(
++					memstatNamespace("gc_cpu_fraction"),
++					"The fraction of this program's available CPU time used by the GC since the program started.",
++					nil, nil,
++				),
++				eval:    func(ms *runtime.MemStats) float64 { return ms.GCCPUFraction },
++				valType: GaugeValue,
++			},
++		},
+ 	}
+ }
+ 
++func memstatNamespace(s string) string {
++	return "go_memstats_" + s
++}
++
+ // Describe returns all descriptions of the collector.
+-func (c *baseGoCollector) Describe(ch chan<- *Desc) {
++func (c *goCollector) Describe(ch chan<- *Desc) {
+ 	ch <- c.goroutinesDesc
+ 	ch <- c.threadsDesc
+ 	ch <- c.gcDesc
+-	ch <- c.gcLastTimeDesc
+ 	ch <- c.goInfoDesc
++	for _, i := range c.msMetrics {
++		ch <- i.desc
++	}
+ }
+ 
+ // Collect returns the current state of all metrics of the collector.
+-func (c *baseGoCollector) Collect(ch chan<- Metric) {
++func (c *goCollector) Collect(ch chan<- Metric) {
++	var (
++		ms   = &runtime.MemStats{}
++		done = make(chan struct{})
++	)
++	// Start reading memstats first as it might take a while.
++	go func() {
++		c.msRead(ms)
++		c.msMtx.Lock()
++		c.msLast = ms
++		c.msLastTimestamp = time.Now()
++		c.msMtx.Unlock()
++		close(done)
++	}()
++
+ 	ch <- MustNewConstMetric(c.goroutinesDesc, GaugeValue, float64(runtime.NumGoroutine()))
+ 	n, _ := runtime.ThreadCreateProfile(nil)
+ 	ch <- MustNewConstMetric(c.threadsDesc, GaugeValue, float64(n))
+@@ -267,19 +305,63 @@ func (c *baseGoCollector) Collect(ch chan<- Metric) {
+ 	}
+ 	quantiles[0.0] = stats.PauseQuantiles[0].Seconds()
+ 	ch <- MustNewConstSummary(c.gcDesc, uint64(stats.NumGC), stats.PauseTotal.Seconds(), quantiles)
+-	ch <- MustNewConstMetric(c.gcLastTimeDesc, GaugeValue, float64(stats.LastGC.UnixNano())/1e9)
+ 
+ 	ch <- MustNewConstMetric(c.goInfoDesc, GaugeValue, 1)
++
++	timer := time.NewTimer(c.msMaxWait)
++	select {
++	case <-done: // Our own ReadMemStats succeeded in time. Use it.
++		timer.Stop() // Important for high collection frequencies to not pile up timers.
++		c.msCollect(ch, ms)
++		return
++	case <-timer.C: // Time out, use last memstats if possible. Continue below.
++	}
++	c.msMtx.Lock()
++	if time.Since(c.msLastTimestamp) < c.msMaxAge {
++		// Last memstats are recent enough. Collect from them under the lock.
++		c.msCollect(ch, c.msLast)
++		c.msMtx.Unlock()
++		return
++	}
++	// If we are here, the last memstats are too old or don't exist. We have
++	// to wait until our own ReadMemStats finally completes. For that to
++	// happen, we have to release the lock.
++	c.msMtx.Unlock()
++	<-done
++	c.msCollect(ch, ms)
+ }
+ 
+-func memstatNamespace(s string) string {
+-	return "go_memstats_" + s
++func (c *goCollector) msCollect(ch chan<- Metric, ms *runtime.MemStats) {
++	for _, i := range c.msMetrics {
++		ch <- MustNewConstMetric(i.desc, i.valType, i.eval(ms))
++	}
+ }
+ 
+-// memStatsMetrics provide description, evaluator, runtime/metrics name, and
+-// value type for memstat metrics.
++// memStatsMetrics provide description, value, and value type for memstat metrics.
+ type memStatsMetrics []struct {
+ 	desc    *Desc
+ 	eval    func(*runtime.MemStats) float64
+ 	valType ValueType
+ }
++
++// NewBuildInfoCollector is the obsolete version of collectors.NewBuildInfoCollector.
++// See there for documentation.
++//
++// Deprecated: Use collectors.NewBuildInfoCollector instead.
++func NewBuildInfoCollector() Collector {
++	path, version, sum := "unknown", "unknown", "unknown"
++	if bi, ok := debug.ReadBuildInfo(); ok {
++		path = bi.Main.Path
++		version = bi.Main.Version
++		sum = bi.Main.Sum
++	}
++	c := &selfCollector{MustNewConstMetric(
++		NewDesc(
++			"go_build_info",
++			"Build information about the main Go module.",
++			nil, Labels{"path": path, "version": version, "checksum": sum},
++		),
++		GaugeValue, 1)}
++	c.init(c.self)
++	return c
++}
+diff --git a/prometheus/go_collector_go116.go b/prometheus/go_collector_go116.go
+deleted file mode 100644
+index 2452613..0000000
+--- a/prometheus/go_collector_go116.go
++++ /dev/null
+@@ -1,107 +0,0 @@
+-// Copyright 2021 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-//go:build !go1.17
+-// +build !go1.17
+-
+-package prometheus
+-
+-import (
+-	"runtime"
+-	"sync"
+-	"time"
+-)
+-
+-type goCollector struct {
+-	base baseGoCollector
+-
+-	// ms... are memstats related.
+-	msLast          *runtime.MemStats // Previously collected memstats.
+-	msLastTimestamp time.Time
+-	msMtx           sync.Mutex // Protects msLast and msLastTimestamp.
+-	msMetrics       memStatsMetrics
+-	msRead          func(*runtime.MemStats) // For mocking in tests.
+-	msMaxWait       time.Duration           // Wait time for fresh memstats.
+-	msMaxAge        time.Duration           // Maximum allowed age of old memstats.
+-}
+-
+-// NewGoCollector is the obsolete version of collectors.NewGoCollector.
+-// See there for documentation.
+-//
+-// Deprecated: Use collectors.NewGoCollector instead.
+-func NewGoCollector() Collector {
+-	return &goCollector{
+-		base:      newBaseGoCollector(),
+-		msLast:    &runtime.MemStats{},
+-		msRead:    runtime.ReadMemStats,
+-		msMaxWait: time.Second,
+-		msMaxAge:  5 * time.Minute,
+-		msMetrics: goRuntimeMemStats(),
+-	}
+-}
+-
+-// Describe returns all descriptions of the collector.
+-func (c *goCollector) Describe(ch chan<- *Desc) {
+-	c.base.Describe(ch)
+-	for _, i := range c.msMetrics {
+-		ch <- i.desc
+-	}
+-}
+-
+-// Collect returns the current state of all metrics of the collector.
+-func (c *goCollector) Collect(ch chan<- Metric) {
+-	var (
+-		ms   = &runtime.MemStats{}
+-		done = make(chan struct{})
+-	)
+-	// Start reading memstats first as it might take a while.
+-	go func() {
+-		c.msRead(ms)
+-		c.msMtx.Lock()
+-		c.msLast = ms
+-		c.msLastTimestamp = time.Now()
+-		c.msMtx.Unlock()
+-		close(done)
+-	}()
+-
+-	// Collect base non-memory metrics.
+-	c.base.Collect(ch)
+-
+-	timer := time.NewTimer(c.msMaxWait)
+-	select {
+-	case <-done: // Our own ReadMemStats succeeded in time. Use it.
+-		timer.Stop() // Important for high collection frequencies to not pile up timers.
+-		c.msCollect(ch, ms)
+-		return
+-	case <-timer.C: // Time out, use last memstats if possible. Continue below.
+-	}
+-	c.msMtx.Lock()
+-	if time.Since(c.msLastTimestamp) < c.msMaxAge {
+-		// Last memstats are recent enough. Collect from them under the lock.
+-		c.msCollect(ch, c.msLast)
+-		c.msMtx.Unlock()
+-		return
+-	}
+-	// If we are here, the last memstats are too old or don't exist. We have
+-	// to wait until our own ReadMemStats finally completes. For that to
+-	// happen, we have to release the lock.
+-	c.msMtx.Unlock()
+-	<-done
+-	c.msCollect(ch, ms)
+-}
+-
+-func (c *goCollector) msCollect(ch chan<- Metric, ms *runtime.MemStats) {
+-	for _, i := range c.msMetrics {
+-		ch <- MustNewConstMetric(i.desc, i.valType, i.eval(ms))
+-	}
+-}
+diff --git a/prometheus/go_collector_go116_test.go b/prometheus/go_collector_go116_test.go
+deleted file mode 100644
+index 8969f38..0000000
+--- a/prometheus/go_collector_go116_test.go
++++ /dev/null
+@@ -1,118 +0,0 @@
+-// Copyright 2021 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-//go:build !go1.17
+-// +build !go1.17
+-
+-package prometheus
+-
+-import (
+-	"runtime"
+-	"testing"
+-	"time"
+-
+-	dto "github.com/prometheus/client_model/go"
+-)
+-
+-func TestGoCollectorMemStats(t *testing.T) {
+-	var (
+-		c   = NewGoCollector().(*goCollector)
+-		got uint64
+-	)
+-
+-	checkCollect := func(want uint64) {
+-		metricCh := make(chan Metric)
+-		endCh := make(chan struct{})
+-
+-		go func() {
+-			c.Collect(metricCh)
+-			close(endCh)
+-		}()
+-	Collect:
+-		for {
+-			select {
+-			case metric := <-metricCh:
+-				if metric.Desc().fqName != "go_memstats_alloc_bytes" {
+-					continue Collect
+-				}
+-				pb := &dto.Metric{}
+-				metric.Write(pb)
+-				got = uint64(pb.GetGauge().GetValue())
+-			case <-endCh:
+-				break Collect
+-			}
+-		}
+-		if want != got {
+-			t.Errorf("unexpected value of go_memstats_alloc_bytes, want %d, got %d", want, got)
+-		}
+-	}
+-
+-	// Speed up the timing to make the test faster.
+-	c.msMaxWait = 5 * time.Millisecond
+-	c.msMaxAge = 50 * time.Millisecond
+-
+-	// Scenario 1: msRead responds slowly, no previous memstats available,
+-	// msRead is executed anyway.
+-	c.msRead = func(ms *runtime.MemStats) {
+-		time.Sleep(20 * time.Millisecond)
+-		ms.Alloc = 1
+-	}
+-	checkCollect(1)
+-	// Now msLast is set.
+-	c.msMtx.Lock()
+-	if want, got := uint64(1), c.msLast.Alloc; want != got {
+-		t.Errorf("unexpected of msLast.Alloc, want %d, got %d", want, got)
+-	}
+-	c.msMtx.Unlock()
+-
+-	// Scenario 2: msRead responds fast, previous memstats available, new
+-	// value collected.
+-	c.msRead = func(ms *runtime.MemStats) {
+-		ms.Alloc = 2
+-	}
+-	checkCollect(2)
+-	// msLast is set, too.
+-	c.msMtx.Lock()
+-	if want, got := uint64(2), c.msLast.Alloc; want != got {
+-		t.Errorf("unexpected of msLast.Alloc, want %d, got %d", want, got)
+-	}
+-	c.msMtx.Unlock()
+-
+-	// Scenario 3: msRead responds slowly, previous memstats available, old
+-	// value collected.
+-	c.msRead = func(ms *runtime.MemStats) {
+-		time.Sleep(20 * time.Millisecond)
+-		ms.Alloc = 3
+-	}
+-	checkCollect(2)
+-	// After waiting, new value is still set in msLast.
+-	time.Sleep(80 * time.Millisecond)
+-	c.msMtx.Lock()
+-	if want, got := uint64(3), c.msLast.Alloc; want != got {
+-		t.Errorf("unexpected of msLast.Alloc, want %d, got %d", want, got)
+-	}
+-	c.msMtx.Unlock()
+-
+-	// Scenario 4: msRead responds slowly, previous memstats is too old, new
+-	// value collected.
+-	c.msRead = func(ms *runtime.MemStats) {
+-		time.Sleep(20 * time.Millisecond)
+-		ms.Alloc = 4
+-	}
+-	checkCollect(4)
+-	c.msMtx.Lock()
+-	if want, got := uint64(4), c.msLast.Alloc; want != got {
+-		t.Errorf("unexpected of msLast.Alloc, want %d, got %d", want, got)
+-	}
+-	c.msMtx.Unlock()
+-}
+diff --git a/prometheus/go_collector_go117.go b/prometheus/go_collector_go117.go
+deleted file mode 100644
+index d534742..0000000
+--- a/prometheus/go_collector_go117.go
++++ /dev/null
+@@ -1,364 +0,0 @@
+-// Copyright 2021 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-//go:build go1.17
+-// +build go1.17
+-
+-package prometheus
+-
+-import (
+-	"math"
+-	"runtime"
+-	"runtime/metrics"
+-	"sync"
+-
+-	//nolint:staticcheck // Ignore SA1019. Need to keep deprecated package for compatibility.
+-	"github.com/golang/protobuf/proto"
+-	"github.com/prometheus/client_golang/prometheus/internal"
+-	dto "github.com/prometheus/client_model/go"
+-)
+-
+-type goCollector struct {
+-	base baseGoCollector
+-
+-	// rm... fields all pertain to the runtime/metrics package.
+-	rmSampleBuf []metrics.Sample
+-	rmSampleMap map[string]*metrics.Sample
+-	rmMetrics   []Metric
+-
+-	// With Go 1.17, the runtime/metrics package was introduced.
+-	// From that point on, metric names produced by the runtime/metrics
+-	// package could be generated from runtime/metrics names. However,
+-	// these differ from the old names for the same values.
+-	//
+-	// This field exist to export the same values under the old names
+-	// as well.
+-	msMetrics memStatsMetrics
+-}
+-
+-// NewGoCollector is the obsolete version of collectors.NewGoCollector.
+-// See there for documentation.
+-//
+-// Deprecated: Use collectors.NewGoCollector instead.
+-func NewGoCollector() Collector {
+-	descriptions := metrics.All()
+-	descMap := make(map[string]*metrics.Description)
+-	for i := range descriptions {
+-		descMap[descriptions[i].Name] = &descriptions[i]
+-	}
+-
+-	// Generate a Desc and ValueType for each runtime/metrics metric.
+-	metricSet := make([]Metric, 0, len(descriptions))
+-	sampleBuf := make([]metrics.Sample, 0, len(descriptions))
+-	sampleMap := make(map[string]*metrics.Sample, len(descriptions))
+-	for i := range descriptions {
+-		d := &descriptions[i]
+-		namespace, subsystem, name, ok := internal.RuntimeMetricsToProm(d)
+-		if !ok {
+-			// Just ignore this metric; we can't do anything with it here.
+-			// If a user decides to use the latest version of Go, we don't want
+-			// to fail here. This condition is tested elsewhere.
+-			continue
+-		}
+-
+-		// Set up sample buffer for reading, and a map
+-		// for quick lookup of sample values.
+-		sampleBuf = append(sampleBuf, metrics.Sample{Name: d.Name})
+-		sampleMap[d.Name] = &sampleBuf[len(sampleBuf)-1]
+-
+-		var m Metric
+-		if d.Kind == metrics.KindFloat64Histogram {
+-			_, hasSum := rmExactSumMap[d.Name]
+-			m = newBatchHistogram(
+-				NewDesc(
+-					BuildFQName(namespace, subsystem, name),
+-					d.Description,
+-					nil,
+-					nil,
+-				),
+-				hasSum,
+-			)
+-		} else if d.Cumulative {
+-			m = NewCounter(CounterOpts{
+-				Namespace: namespace,
+-				Subsystem: subsystem,
+-				Name:      name,
+-				Help:      d.Description,
+-			})
+-		} else {
+-			m = NewGauge(GaugeOpts{
+-				Namespace: namespace,
+-				Subsystem: subsystem,
+-				Name:      name,
+-				Help:      d.Description,
+-			})
+-		}
+-		metricSet = append(metricSet, m)
+-	}
+-	return &goCollector{
+-		base:        newBaseGoCollector(),
+-		rmSampleBuf: sampleBuf,
+-		rmSampleMap: sampleMap,
+-		rmMetrics:   metricSet,
+-		msMetrics:   goRuntimeMemStats(),
+-	}
+-}
+-
+-// Describe returns all descriptions of the collector.
+-func (c *goCollector) Describe(ch chan<- *Desc) {
+-	c.base.Describe(ch)
+-	for _, i := range c.msMetrics {
+-		ch <- i.desc
+-	}
+-	for _, m := range c.rmMetrics {
+-		ch <- m.Desc()
+-	}
+-}
+-
+-// Collect returns the current state of all metrics of the collector.
+-func (c *goCollector) Collect(ch chan<- Metric) {
+-	// Collect base non-memory metrics.
+-	c.base.Collect(ch)
+-
+-	// Populate runtime/metrics sample buffer.
+-	metrics.Read(c.rmSampleBuf)
+-
+-	for i, sample := range c.rmSampleBuf {
+-		// N.B. switch on concrete type because it's significantly more efficient
+-		// than checking for the Counter and Gauge interface implementations. In
+-		// this case, we control all the types here.
+-		switch m := c.rmMetrics[i].(type) {
+-		case *counter:
+-			// Guard against decreases. This should never happen, but a failure
+-			// to do so will result in a panic, which is a harsh consequence for
+-			// a metrics collection bug.
+-			v0, v1 := m.get(), unwrapScalarRMValue(sample.Value)
+-			if v1 > v0 {
+-				m.Add(unwrapScalarRMValue(sample.Value) - m.get())
+-			}
+-			m.Collect(ch)
+-		case *gauge:
+-			m.Set(unwrapScalarRMValue(sample.Value))
+-			m.Collect(ch)
+-		case *batchHistogram:
+-			m.update(sample.Value.Float64Histogram(), c.exactSumFor(sample.Name))
+-			m.Collect(ch)
+-		default:
+-			panic("unexpected metric type")
+-		}
+-	}
+-
+-	// ms is a dummy MemStats that we populate ourselves so that we can
+-	// populate the old metrics from it.
+-	var ms runtime.MemStats
+-	memStatsFromRM(&ms, c.rmSampleMap)
+-	for _, i := range c.msMetrics {
+-		ch <- MustNewConstMetric(i.desc, i.valType, i.eval(&ms))
+-	}
+-}
+-
+-// unwrapScalarRMValue unwraps a runtime/metrics value that is assumed
+-// to be scalar and returns the equivalent float64 value. Panics if the
+-// value is not scalar.
+-func unwrapScalarRMValue(v metrics.Value) float64 {
+-	switch v.Kind() {
+-	case metrics.KindUint64:
+-		return float64(v.Uint64())
+-	case metrics.KindFloat64:
+-		return v.Float64()
+-	case metrics.KindBad:
+-		// Unsupported metric.
+-		//
+-		// This should never happen because we always populate our metric
+-		// set from the runtime/metrics package.
+-		panic("unexpected unsupported metric")
+-	default:
+-		// Unsupported metric kind.
+-		//
+-		// This should never happen because we check for this during initialization
+-		// and flag and filter metrics whose kinds we don't understand.
+-		panic("unexpected unsupported metric kind")
+-	}
+-}
+-
+-var rmExactSumMap = map[string]string{
+-	"/gc/heap/allocs-by-size:bytes": "/gc/heap/allocs:bytes",
+-	"/gc/heap/frees-by-size:bytes":  "/gc/heap/frees:bytes",
+-}
+-
+-// exactSumFor takes a runtime/metrics metric name (that is assumed to
+-// be of kind KindFloat64Histogram) and returns its exact sum and whether
+-// its exact sum exists.
+-//
+-// The runtime/metrics API for histograms doesn't currently expose exact
+-// sums, but some of the other metrics are in fact exact sums of histograms.
+-func (c *goCollector) exactSumFor(rmName string) float64 {
+-	sumName, ok := rmExactSumMap[rmName]
+-	if !ok {
+-		return 0
+-	}
+-	s, ok := c.rmSampleMap[sumName]
+-	if !ok {
+-		return 0
+-	}
+-	return unwrapScalarRMValue(s.Value)
+-}
+-
+-func memStatsFromRM(ms *runtime.MemStats, rm map[string]*metrics.Sample) {
+-	lookupOrZero := func(name string) uint64 {
+-		if s, ok := rm[name]; ok {
+-			return s.Value.Uint64()
+-		}
+-		return 0
+-	}
+-
+-	// Currently, MemStats adds tiny alloc count to both Mallocs AND Frees.
+-	// The reason for this is because MemStats couldn't be extended at the time
+-	// but there was a desire to have Mallocs at least be a little more representative,
+-	// while having Mallocs - Frees still represent a live object count.
+-	// Unfortunately, MemStats doesn't actually export a large allocation count,
+-	// so it's impossible to pull this number out directly.
+-	tinyAllocs := lookupOrZero("/gc/heap/tiny/allocs:objects")
+-	ms.Mallocs = lookupOrZero("/gc/heap/allocs:objects") + tinyAllocs
+-	ms.Frees = lookupOrZero("/gc/heap/frees:objects") + tinyAllocs
+-
+-	ms.TotalAlloc = lookupOrZero("/gc/heap/allocs:bytes")
+-	ms.Sys = lookupOrZero("/memory/classes/total:bytes")
+-	ms.Lookups = 0 // Already always zero.
+-	ms.HeapAlloc = lookupOrZero("/memory/classes/heap/objects:bytes")
+-	ms.Alloc = ms.HeapAlloc
+-	ms.HeapInuse = ms.HeapAlloc + lookupOrZero("/memory/classes/heap/unused:bytes")
+-	ms.HeapReleased = lookupOrZero("/memory/classes/heap/released:bytes")
+-	ms.HeapIdle = ms.HeapReleased + lookupOrZero("/memory/classes/heap/free:bytes")
+-	ms.HeapSys = ms.HeapInuse + ms.HeapIdle
+-	ms.HeapObjects = lookupOrZero("/gc/heap/objects:objects")
+-	ms.StackInuse = lookupOrZero("/memory/classes/heap/stacks:bytes")
+-	ms.StackSys = ms.StackInuse + lookupOrZero("/memory/classes/os-stacks:bytes")
+-	ms.MSpanInuse = lookupOrZero("/memory/classes/metadata/mspan/inuse:bytes")
+-	ms.MSpanSys = ms.MSpanInuse + lookupOrZero("/memory/classes/metadata/mspan/free:bytes")
+-	ms.MCacheInuse = lookupOrZero("/memory/classes/metadata/mcache/inuse:bytes")
+-	ms.MCacheSys = ms.MCacheInuse + lookupOrZero("/memory/classes/metadata/mcache/free:bytes")
+-	ms.BuckHashSys = lookupOrZero("/memory/classes/profiling/buckets:bytes")
+-	ms.GCSys = lookupOrZero("/memory/classes/metadata/other:bytes")
+-	ms.OtherSys = lookupOrZero("/memory/classes/other:bytes")
+-	ms.NextGC = lookupOrZero("/gc/heap/goal:bytes")
+-
+-	// N.B. LastGC is omitted because runtime.GCStats already has this.
+-	// See https://github.com/prometheus/client_golang/issues/842#issuecomment-861812034
+-	// for more details.
+-	ms.LastGC = 0
+-
+-	// N.B. GCCPUFraction is intentionally omitted. This metric is not useful,
+-	// and often misleading due to the fact that it's an average over the lifetime
+-	// of the process.
+-	// See https://github.com/prometheus/client_golang/issues/842#issuecomment-861812034
+-	// for more details.
+-	ms.GCCPUFraction = 0
+-}
+-
+-// batchHistogram is a mutable histogram that is updated
+-// in batches.
+-type batchHistogram struct {
+-	selfCollector
+-
+-	// Static fields updated only once.
+-	desc   *Desc
+-	hasSum bool
+-
+-	// Because this histogram operates in batches, it just uses a
+-	// single mutex for everything. updates are always serialized
+-	// but Write calls may operate concurrently with updates.
+-	// Contention between these two sources should be rare.
+-	mu      sync.Mutex
+-	buckets []float64 // Inclusive lower bounds.
+-	counts  []uint64
+-	sum     float64 // Used if hasSum is true.
+-}
+-
+-func newBatchHistogram(desc *Desc, hasSum bool) *batchHistogram {
+-	h := &batchHistogram{desc: desc, hasSum: hasSum}
+-	h.init(h)
+-	return h
+-}
+-
+-// update updates the batchHistogram from a runtime/metrics histogram.
+-//
+-// sum must be provided if the batchHistogram was created to have an exact sum.
+-func (h *batchHistogram) update(his *metrics.Float64Histogram, sum float64) {
+-	counts, buckets := his.Counts, his.Buckets
+-	// Skip a -Inf bucket altogether. It's not clear how to represent that.
+-	if math.IsInf(buckets[0], -1) {
+-		buckets = buckets[1:]
+-		counts = counts[1:]
+-	}
+-
+-	h.mu.Lock()
+-	defer h.mu.Unlock()
+-
+-	// Check if we're initialized.
+-	if h.buckets == nil {
+-		// Make copies of counts and buckets. It's really important
+-		// that we don't retain his.Counts or his.Buckets anywhere since
+-		// it's going to get reused.
+-		h.buckets = make([]float64, len(buckets))
+-		copy(h.buckets, buckets)
+-
+-		h.counts = make([]uint64, len(counts))
+-	}
+-	copy(h.counts, counts)
+-	if h.hasSum {
+-		h.sum = sum
+-	}
+-}
+-
+-func (h *batchHistogram) Desc() *Desc {
+-	return h.desc
+-}
+-
+-func (h *batchHistogram) Write(out *dto.Metric) error {
+-	h.mu.Lock()
+-	defer h.mu.Unlock()
+-
+-	sum := float64(0)
+-	if h.hasSum {
+-		sum = h.sum
+-	}
+-	dtoBuckets := make([]*dto.Bucket, 0, len(h.counts))
+-	totalCount := uint64(0)
+-	for i, count := range h.counts {
+-		totalCount += count
+-		if !h.hasSum {
+-			// N.B. This computed sum is an underestimate.
+-			sum += h.buckets[i] * float64(count)
+-		}
+-
+-		// Skip the +Inf bucket, but only for the bucket list.
+-		// It must still count for sum and totalCount.
+-		if math.IsInf(h.buckets[i+1], 1) {
+-			break
+-		}
+-		// Float64Histogram's upper bound is exclusive, so make it inclusive
+-		// by obtaining the next float64 value down, in order.
+-		upperBound := math.Nextafter(h.buckets[i+1], h.buckets[i])
+-		dtoBuckets = append(dtoBuckets, &dto.Bucket{
+-			CumulativeCount: proto.Uint64(totalCount),
+-			UpperBound:      proto.Float64(upperBound),
+-		})
+-	}
+-	out.Histogram = &dto.Histogram{
+-		Bucket:      dtoBuckets,
+-		SampleCount: proto.Uint64(totalCount),
+-		SampleSum:   proto.Float64(sum),
+-	}
+-	return nil
+-}
+diff --git a/prometheus/go_collector_go117_test.go b/prometheus/go_collector_go117_test.go
+deleted file mode 100644
+index 653e332..0000000
+--- a/prometheus/go_collector_go117_test.go
++++ /dev/null
+@@ -1,282 +0,0 @@
+-// Copyright 2021 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-//go:build go1.17
+-// +build go1.17
+-
+-package prometheus
+-
+-import (
+-	"math"
+-	"reflect"
+-	"runtime"
+-	"runtime/metrics"
+-	"sync"
+-	"testing"
+-
+-	"github.com/prometheus/client_golang/prometheus/internal"
+-	dto "github.com/prometheus/client_model/go"
+-)
+-
+-func TestGoCollectorRuntimeMetrics(t *testing.T) {
+-	metrics := collectGoMetrics(t)
+-
+-	msChecklist := make(map[string]bool)
+-	for _, m := range goRuntimeMemStats() {
+-		msChecklist[m.desc.fqName] = false
+-	}
+-
+-	if len(metrics) == 0 {
+-		t.Fatal("no metrics created by Collect")
+-	}
+-
+-	// Check a few specific metrics.
+-	//
+-	// Checking them all is somewhat pointless because the runtime/metrics
+-	// metrics are going to shift underneath us. Also if we try to check
+-	// against the runtime/metrics package in an automated fashion we're kind
+-	// of missing the point, because we have to do all the same work the code
+-	// has to do to perform the translation. Same for supporting old metric
+-	// names (the best we can do here is make sure they're all accounted for).
+-	var sysBytes, allocs float64
+-	for _, m := range metrics {
+-		name := m.Desc().fqName
+-		switch name {
+-		case "go_memory_classes_total_bytes":
+-			checkMemoryMetric(t, m, &sysBytes)
+-		case "go_sys_bytes":
+-			checkMemoryMetric(t, m, &sysBytes)
+-		case "go_gc_heap_allocs_bytes_total":
+-			checkMemoryMetric(t, m, &allocs)
+-		case "go_alloc_bytes_total":
+-			checkMemoryMetric(t, m, &allocs)
+-		}
+-		if present, ok := msChecklist[name]; ok {
+-			if present {
+-				t.Errorf("memstats metric %s found more than once", name)
+-			}
+-			msChecklist[name] = true
+-		}
+-	}
+-	for name := range msChecklist {
+-		if present := msChecklist[name]; !present {
+-			t.Errorf("memstats metric %s not collected", name)
+-		}
+-	}
+-}
+-
+-func checkMemoryMetric(t *testing.T, m Metric, expValue *float64) {
+-	t.Helper()
+-
+-	pb := &dto.Metric{}
+-	m.Write(pb)
+-	var value float64
+-	if g := pb.GetGauge(); g != nil {
+-		value = g.GetValue()
+-	} else {
+-		value = pb.GetCounter().GetValue()
+-	}
+-	if value <= 0 {
+-		t.Error("bad value for total memory")
+-	}
+-	if *expValue == 0 {
+-		*expValue = value
+-	} else if value != *expValue {
+-		t.Errorf("legacy metric and runtime/metrics metric do not match: want %d, got %d", int64(*expValue), int64(value))
+-	}
+-}
+-
+-var sink interface{}
+-
+-func TestBatchHistogram(t *testing.T) {
+-	goMetrics := collectGoMetrics(t)
+-
+-	var mhist Metric
+-	for _, m := range goMetrics {
+-		if m.Desc().fqName == "go_gc_heap_allocs_by_size_bytes_total" {
+-			mhist = m
+-			break
+-		}
+-	}
+-	if mhist == nil {
+-		t.Fatal("failed to find metric to test")
+-	}
+-	hist, ok := mhist.(*batchHistogram)
+-	if !ok {
+-		t.Fatal("found metric is not a runtime/metrics histogram")
+-	}
+-
+-	// Make a bunch of allocations then do another collection.
+-	//
+-	// The runtime/metrics API tries to reuse memory where possible,
+-	// so make sure that we didn't hang on to any of that memory in
+-	// hist.
+-	countsCopy := make([]uint64, len(hist.counts))
+-	copy(countsCopy, hist.counts)
+-	for i := 0; i < 100; i++ {
+-		sink = make([]byte, 128)
+-	}
+-	collectGoMetrics(t)
+-	for i, v := range hist.counts {
+-		if v != countsCopy[i] {
+-			t.Error("counts changed during new collection")
+-			break
+-		}
+-	}
+-
+-	// Get the runtime/metrics copy.
+-	s := []metrics.Sample{
+-		{Name: "/gc/heap/allocs-by-size:bytes"},
+-	}
+-	metrics.Read(s)
+-	rmHist := s[0].Value.Float64Histogram()
+-	// runtime/metrics histograms always have -Inf and +Inf buckets.
+-	// We never handle -Inf and +Inf is implicit.
+-	wantBuckets := len(rmHist.Buckets) - 2
+-
+-	// Check to make sure the output proto makes sense.
+-	pb := &dto.Metric{}
+-	hist.Write(pb)
+-
+-	if math.IsInf(pb.Histogram.Bucket[len(pb.Histogram.Bucket)-1].GetUpperBound(), +1) {
+-		t.Errorf("found +Inf bucket")
+-	}
+-	if got := len(pb.Histogram.Bucket); got != wantBuckets {
+-		t.Errorf("got %d buckets in protobuf, want %d", got, wantBuckets)
+-	}
+-	for i, bucket := range pb.Histogram.Bucket {
+-		// runtime/metrics histograms are lower-bound inclusive, but we're
+-		// upper-bound inclusive. So just make sure the new inclusive upper
+-		// bound is somewhere close by (in some cases it's equal).
+-		wantBound := rmHist.Buckets[i+1]
+-		if gotBound := *bucket.UpperBound; (wantBound-gotBound)/wantBound > 0.001 {
+-			t.Errorf("got bound %f, want within 0.1%% of %f", gotBound, wantBound)
+-		}
+-		// Make sure counts are cumulative. Because of the consistency guarantees
+-		// made by the runtime/metrics package, we're really not guaranteed to get
+-		// anything even remotely the same here.
+-		if i > 0 && *bucket.CumulativeCount < *pb.Histogram.Bucket[i-1].CumulativeCount {
+-			t.Error("cumulative counts are non-monotonic")
+-		}
+-	}
+-}
+-
+-func collectGoMetrics(t *testing.T) []Metric {
+-	t.Helper()
+-
+-	c := NewGoCollector().(*goCollector)
+-
+-	// Collect all metrics.
+-	ch := make(chan Metric)
+-	var wg sync.WaitGroup
+-	var metrics []Metric
+-	wg.Add(1)
+-	go func() {
+-		defer wg.Done()
+-		for metric := range ch {
+-			metrics = append(metrics, metric)
+-		}
+-	}()
+-	c.Collect(ch)
+-	close(ch)
+-
+-	wg.Wait()
+-
+-	return metrics
+-}
+-
+-func TestMemStatsEquivalence(t *testing.T) {
+-	var msReal, msFake runtime.MemStats
+-	descs := metrics.All()
+-	samples := make([]metrics.Sample, len(descs))
+-	samplesMap := make(map[string]*metrics.Sample)
+-	for i := range descs {
+-		samples[i].Name = descs[i].Name
+-		samplesMap[descs[i].Name] = &samples[i]
+-	}
+-
+-	// Force a GC cycle to try to reach a clean slate.
+-	runtime.GC()
+-
+-	// Populate msReal.
+-	runtime.ReadMemStats(&msReal)
+-
+-	// Populate msFake.
+-	metrics.Read(samples)
+-	memStatsFromRM(&msFake, samplesMap)
+-
+-	// Iterate over them and make sure they're somewhat close.
+-	msRealValue := reflect.ValueOf(msReal)
+-	msFakeValue := reflect.ValueOf(msFake)
+-
+-	typ := msRealValue.Type()
+-	for i := 0; i < msRealValue.NumField(); i++ {
+-		fr := msRealValue.Field(i)
+-		ff := msFakeValue.Field(i)
+-		switch typ.Kind() {
+-		case reflect.Uint64:
+-			// N.B. Almost all fields of MemStats are uint64s.
+-			vr := fr.Interface().(uint64)
+-			vf := ff.Interface().(uint64)
+-			if float64(vr-vf)/float64(vf) > 0.05 {
+-				t.Errorf("wrong value for %s: got %d, want %d", typ.Field(i).Name, vf, vr)
+-			}
+-		}
+-	}
+-}
+-
+-func TestExpectedRuntimeMetrics(t *testing.T) {
+-	goMetrics := collectGoMetrics(t)
+-	goMetricSet := make(map[string]Metric)
+-	for _, m := range goMetrics {
+-		goMetricSet[m.Desc().fqName] = m
+-	}
+-
+-	descs := metrics.All()
+-	rmSet := make(map[string]struct{})
+-	for i := range descs {
+-		rmName := descs[i].Name
+-		rmSet[rmName] = struct{}{}
+-
+-		expFQName, ok := expectedRuntimeMetrics[rmName]
+-		if !ok {
+-			t.Errorf("found new runtime/metrics metric %s", rmName)
+-			_, _, _, ok := internal.RuntimeMetricsToProm(&descs[i])
+-			if !ok {
+-				t.Errorf("new metric has name that can't be converted, or has an unsupported Kind")
+-			}
+-			continue
+-		}
+-		_, ok = goMetricSet[expFQName]
+-		if !ok {
+-			t.Errorf("existing runtime/metrics metric %s (expected fq name %s) not collected", rmName, expFQName)
+-			continue
+-		}
+-	}
+-	for rmName, fqName := range expectedRuntimeMetrics {
+-		if _, ok := rmSet[rmName]; !ok {
+-			t.Errorf("runtime/metrics metric %s removed", rmName)
+-			continue
+-		}
+-		if _, ok := goMetricSet[fqName]; !ok {
+-			t.Errorf("runtime/metrics metric %s not appearing under expected name %s", rmName, fqName)
+-			continue
+-		}
+-	}
+-
+-	if t.Failed() {
+-		t.Log("a new Go version may have been detected, please run")
+-		t.Log("\tgo run gen_go_collector_metrics_set.go go1.X")
+-		t.Log("where X is the Go version you are currently using")
+-	}
+-}
+diff --git a/prometheus/go_collector_metrics_go117_test.go b/prometheus/go_collector_metrics_go117_test.go
+deleted file mode 100644
+index 6c0a693..0000000
+--- a/prometheus/go_collector_metrics_go117_test.go
++++ /dev/null
+@@ -1,39 +0,0 @@
+-// Code generated by gen_go_collector_metrics_set.go; DO NOT EDIT.
+-//go:generate go run gen_go_collector_metrics_set.go go1.17
+-
+-//go:build go1.17 && !go1.18
+-// +build go1.17,!go1.18
+-
+-package prometheus
+-
+-var expectedRuntimeMetrics = map[string]string{
+-	"/gc/cycles/automatic:gc-cycles":              "go_gc_cycles_automatic_gc_cycles_total",
+-	"/gc/cycles/forced:gc-cycles":                 "go_gc_cycles_forced_gc_cycles_total",
+-	"/gc/cycles/total:gc-cycles":                  "go_gc_cycles_total_gc_cycles_total",
+-	"/gc/heap/allocs-by-size:bytes":               "go_gc_heap_allocs_by_size_bytes_total",
+-	"/gc/heap/allocs:bytes":                       "go_gc_heap_allocs_bytes_total",
+-	"/gc/heap/allocs:objects":                     "go_gc_heap_allocs_objects_total",
+-	"/gc/heap/frees-by-size:bytes":                "go_gc_heap_frees_by_size_bytes_total",
+-	"/gc/heap/frees:bytes":                        "go_gc_heap_frees_bytes_total",
+-	"/gc/heap/frees:objects":                      "go_gc_heap_frees_objects_total",
+-	"/gc/heap/goal:bytes":                         "go_gc_heap_goal_bytes",
+-	"/gc/heap/objects:objects":                    "go_gc_heap_objects_objects",
+-	"/gc/heap/tiny/allocs:objects":                "go_gc_heap_tiny_allocs_objects_total",
+-	"/gc/pauses:seconds":                          "go_gc_pauses_seconds_total",
+-	"/memory/classes/heap/free:bytes":             "go_memory_classes_heap_free_bytes",
+-	"/memory/classes/heap/objects:bytes":          "go_memory_classes_heap_objects_bytes",
+-	"/memory/classes/heap/released:bytes":         "go_memory_classes_heap_released_bytes",
+-	"/memory/classes/heap/stacks:bytes":           "go_memory_classes_heap_stacks_bytes",
+-	"/memory/classes/heap/unused:bytes":           "go_memory_classes_heap_unused_bytes",
+-	"/memory/classes/metadata/mcache/free:bytes":  "go_memory_classes_metadata_mcache_free_bytes",
+-	"/memory/classes/metadata/mcache/inuse:bytes": "go_memory_classes_metadata_mcache_inuse_bytes",
+-	"/memory/classes/metadata/mspan/free:bytes":   "go_memory_classes_metadata_mspan_free_bytes",
+-	"/memory/classes/metadata/mspan/inuse:bytes":  "go_memory_classes_metadata_mspan_inuse_bytes",
+-	"/memory/classes/metadata/other:bytes":        "go_memory_classes_metadata_other_bytes",
+-	"/memory/classes/os-stacks:bytes":             "go_memory_classes_os_stacks_bytes",
+-	"/memory/classes/other:bytes":                 "go_memory_classes_other_bytes",
+-	"/memory/classes/profiling/buckets:bytes":     "go_memory_classes_profiling_buckets_bytes",
+-	"/memory/classes/total:bytes":                 "go_memory_classes_total_bytes",
+-	"/sched/goroutines:goroutines":                "go_sched_goroutines_goroutines",
+-	"/sched/latencies:seconds":                    "go_sched_latencies_seconds",
+-}
+diff --git a/prometheus/go_collector_test.go b/prometheus/go_collector_test.go
+index 9cc1b2e..a929acf 100644
+--- a/prometheus/go_collector_test.go
++++ b/prometheus/go_collector_test.go
+@@ -154,3 +154,96 @@ func TestGoCollectorGC(t *testing.T) {
+ 		break
+ 	}
+ }
++
++func TestGoCollectorMemStats(t *testing.T) {
++	var (
++		c   = NewGoCollector().(*goCollector)
++		got uint64
++	)
++
++	checkCollect := func(want uint64) {
++		metricCh := make(chan Metric)
++		endCh := make(chan struct{})
++
++		go func() {
++			c.Collect(metricCh)
++			close(endCh)
++		}()
++	Collect:
++		for {
++			select {
++			case metric := <-metricCh:
++				if metric.Desc().fqName != "go_memstats_alloc_bytes" {
++					continue Collect
++				}
++				pb := &dto.Metric{}
++				metric.Write(pb)
++				got = uint64(pb.GetGauge().GetValue())
++			case <-endCh:
++				break Collect
++			}
++		}
++		if want != got {
++			t.Errorf("unexpected value of go_memstats_alloc_bytes, want %d, got %d", want, got)
++		}
++	}
++
++	// Speed up the timing to make the test faster.
++	c.msMaxWait = 5 * time.Millisecond
++	c.msMaxAge = 50 * time.Millisecond
++
++	// Scenario 1: msRead responds slowly, no previous memstats available,
++	// msRead is executed anyway.
++	c.msRead = func(ms *runtime.MemStats) {
++		time.Sleep(20 * time.Millisecond)
++		ms.Alloc = 1
++	}
++	checkCollect(1)
++	// Now msLast is set.
++	c.msMtx.Lock()
++	if want, got := uint64(1), c.msLast.Alloc; want != got {
++		t.Errorf("unexpected of msLast.Alloc, want %d, got %d", want, got)
++	}
++	c.msMtx.Unlock()
++
++	// Scenario 2: msRead responds fast, previous memstats available, new
++	// value collected.
++	c.msRead = func(ms *runtime.MemStats) {
++		ms.Alloc = 2
++	}
++	checkCollect(2)
++	// msLast is set, too.
++	c.msMtx.Lock()
++	if want, got := uint64(2), c.msLast.Alloc; want != got {
++		t.Errorf("unexpected of msLast.Alloc, want %d, got %d", want, got)
++	}
++	c.msMtx.Unlock()
++
++	// Scenario 3: msRead responds slowly, previous memstats available, old
++	// value collected.
++	c.msRead = func(ms *runtime.MemStats) {
++		time.Sleep(20 * time.Millisecond)
++		ms.Alloc = 3
++	}
++	checkCollect(2)
++	// After waiting, new value is still set in msLast.
++	time.Sleep(80 * time.Millisecond)
++	c.msMtx.Lock()
++	if want, got := uint64(3), c.msLast.Alloc; want != got {
++		t.Errorf("unexpected of msLast.Alloc, want %d, got %d", want, got)
++	}
++	c.msMtx.Unlock()
++
++	// Scenario 4: msRead responds slowly, previous memstats is too old, new
++	// value collected.
++	c.msRead = func(ms *runtime.MemStats) {
++		time.Sleep(20 * time.Millisecond)
++		ms.Alloc = 4
++	}
++	checkCollect(4)
++	c.msMtx.Lock()
++	if want, got := uint64(4), c.msLast.Alloc; want != got {
++		t.Errorf("unexpected of msLast.Alloc, want %d, got %d", want, got)
++	}
++	c.msMtx.Unlock()
++}
+diff --git a/prometheus/internal/go_runtime_metrics.go b/prometheus/internal/go_runtime_metrics.go
+deleted file mode 100644
+index afc8dff..0000000
+--- a/prometheus/internal/go_runtime_metrics.go
++++ /dev/null
+@@ -1,77 +0,0 @@
+-// Copyright 2021 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-//go:build go1.17
+-// +build go1.17
+-
+-package internal
+-
+-import (
+-	"path"
+-	"runtime/metrics"
+-	"strings"
+-
+-	"github.com/prometheus/common/model"
+-)
+-
+-// RuntimeMetricsToProm produces a Prometheus metric name from a runtime/metrics
+-// metric description and validates whether the metric is suitable for integration
+-// with Prometheus.
+-//
+-// Returns false if a name could not be produced, or if Prometheus does not understand
+-// the runtime/metrics Kind.
+-//
+-// Note that the main reason a name couldn't be produced is if the runtime/metrics
+-// package exports a name with characters outside the valid Prometheus metric name
+-// character set. This is theoretically possible, but should never happen in practice.
+-// Still, don't rely on it.
+-func RuntimeMetricsToProm(d *metrics.Description) (string, string, string, bool) {
+-	namespace := "go"
+-
+-	comp := strings.SplitN(d.Name, ":", 2)
+-	key := comp[0]
+-	unit := comp[1]
+-
+-	// The last path element in the key is the name,
+-	// the rest is the subsystem.
+-	subsystem := path.Dir(key[1:] /* remove leading / */)
+-	name := path.Base(key)
+-
+-	// subsystem is translated by replacing all / and - with _.
+-	subsystem = strings.ReplaceAll(subsystem, "/", "_")
+-	subsystem = strings.ReplaceAll(subsystem, "-", "_")
+-
+-	// unit is translated assuming that the unit contains no
+-	// non-ASCII characters.
+-	unit = strings.ReplaceAll(unit, "-", "_")
+-	unit = strings.ReplaceAll(unit, "*", "_")
+-	unit = strings.ReplaceAll(unit, "/", "_per_")
+-
+-	// name has - replaced with _ and is concatenated with the unit and
+-	// other data.
+-	name = strings.ReplaceAll(name, "-", "_")
+-	name = name + "_" + unit
+-	if d.Cumulative {
+-		name = name + "_total"
+-	}
+-
+-	valid := model.IsValidMetricName(model.LabelValue(namespace + "_" + subsystem + "_" + name))
+-	switch d.Kind {
+-	case metrics.KindUint64:
+-	case metrics.KindFloat64:
+-	case metrics.KindFloat64Histogram:
+-	default:
+-		valid = false
+-	}
+-	return namespace, subsystem, name, valid
+-}
+diff --git a/prometheus/internal/go_runtime_metrics_test.go b/prometheus/internal/go_runtime_metrics_test.go
+deleted file mode 100644
+index 2020a2d..0000000
+--- a/prometheus/internal/go_runtime_metrics_test.go
++++ /dev/null
+@@ -1,97 +0,0 @@
+-// Copyright 2021 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-//go:build go1.17
+-// +build go1.17
+-
+-package internal
+-
+-import (
+-	"runtime/metrics"
+-	"testing"
+-)
+-
+-func TestRuntimeMetricsToProm(t *testing.T) {
+-	tests := []struct {
+-		got    metrics.Description
+-		expect string
+-	}{
+-		{
+-			metrics.Description{
+-				Name: "/memory/live:bytes",
+-				Kind: metrics.KindUint64,
+-			},
+-			"go_memory_live_bytes",
+-		},
+-		{
+-			metrics.Description{
+-				Name:       "/memory/allocs:bytes",
+-				Kind:       metrics.KindUint64,
+-				Cumulative: true,
+-			},
+-			"go_memory_allocs_bytes_total",
+-		},
+-		{
+-			metrics.Description{
+-				Name: "/memory/alloc-rate:bytes/second",
+-				Kind: metrics.KindFloat64,
+-			},
+-			"go_memory_alloc_rate_bytes_per_second",
+-		},
+-		{
+-			metrics.Description{
+-				Name:       "/gc/time:cpu*seconds",
+-				Kind:       metrics.KindFloat64,
+-				Cumulative: true,
+-			},
+-			"go_gc_time_cpu_seconds_total",
+-		},
+-		{
+-			metrics.Description{
+-				Name: "/this/is/a/very/deep/metric:metrics",
+-				Kind: metrics.KindFloat64,
+-			},
+-			"go_this_is_a_very_deep_metric_metrics",
+-		},
+-		{
+-			metrics.Description{
+-				Name: "/this*is*an*invalid...:µname",
+-				Kind: metrics.KindUint64,
+-			},
+-			"",
+-		},
+-		{
+-			metrics.Description{
+-				Name: "/this/is/a/valid/name:objects",
+-				Kind: metrics.KindBad,
+-			},
+-			"",
+-		},
+-	}
+-	for _, test := range tests {
+-		ns, ss, n, ok := RuntimeMetricsToProm(&test.got)
+-		name := ns + "_" + ss + "_" + n
+-		if test.expect == "" && ok {
+-			t.Errorf("bad input expected a bad output: input %s, got %s", test.got.Name, name)
+-			continue
+-		}
+-		if test.expect != "" && !ok {
+-			t.Errorf("unexpected bad output on good input: input %s", test.got.Name)
+-			continue
+-		}
+-		if test.expect != "" && name != test.expect {
+-			t.Errorf("expected %s, got %s", test.expect, name)
+-			continue
+-		}
+-	}
+-}

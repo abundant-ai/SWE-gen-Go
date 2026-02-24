@@ -1,0 +1,185 @@
+diff --git a/.changelog/22836.txt b/.changelog/22836.txt
+deleted file mode 100644
+index 91d50eb28b..0000000000
+--- a/.changelog/22836.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-```release-note:security
+-security: adding a maximum Content-Length on the event endpoint to fix denial-of-service (DoS) attacks. This resolves [CVE-2025-11375](https://nvd.nist.gov/vuln/detail/CVE-2025-11375).
+-```
+diff --git a/agent/event_endpoint.go b/agent/event_endpoint.go
+index 3e7d4b0648..da589632c7 100644
+--- a/agent/event_endpoint.go
++++ b/agent/event_endpoint.go
+@@ -5,7 +5,6 @@ package agent
+ 
+ import (
+ 	"bytes"
+-	"fmt"
+ 	"io"
+ 	"net/http"
+ 	"strconv"
+@@ -45,29 +44,12 @@ func (s *HTTPHandlers) EventFire(resp http.ResponseWriter, req *http.Request) (i
+ 	}
+ 
+ 	// Get the payload
+-	if req.ContentLength >= 0 {
+-		// The underlying gossip sets limits on the size of a user event
+-		// message. It is hard to give an exact number, as it depends on various
+-		// parameters of the event, but the payload should be kept very small
+-		// (< 100 bytes). We've multiplied this by 3 to be safe.
+-		const maxEventPayloadSize = 300
+-		if req.ContentLength > maxEventPayloadSize {
+-			return nil, HTTPError{
+-				StatusCode: http.StatusRequestEntityTooLarge,
+-				Reason: fmt.Sprintf("Event payload too large, received %d bytes, max size: %d bytes. User events should be kept small for efficient gossip propagation.",
+-					req.ContentLength, maxEventPayloadSize),
+-			}
+-		}
+-
++	if req.ContentLength > 0 {
+ 		var buf bytes.Buffer
+-		if req.Body != nil {
+-			if _, err := io.Copy(&buf, req.Body); err != nil {
+-				return nil, err
+-			}
+-			event.Payload = buf.Bytes()
++		if _, err := io.Copy(&buf, req.Body); err != nil {
++			return nil, err
+ 		}
+-	} else {
+-		return nil, HTTPError{StatusCode: http.StatusBadRequest, Reason: "Event payload size must be greater than zero"}
++		event.Payload = buf.Bytes()
+ 	}
+ 
+ 	// Try to fire the event
+diff --git a/agent/event_endpoint_test.go b/agent/event_endpoint_test.go
+index ff898c8d59..f28b913cfd 100644
+--- a/agent/event_endpoint_test.go
++++ b/agent/event_endpoint_test.go
+@@ -379,125 +379,6 @@ func TestEventList_EventBufOrder(t *testing.T) {
+ 	})
+ }
+ 
+-func TestEventFire_PayloadSizeLimit(t *testing.T) {
+-	if testing.Short() {
+-		t.Skip("too slow for testing.Short")
+-	}
+-
+-	t.Parallel()
+-	a := NewTestAgent(t, "")
+-	defer a.Shutdown()
+-	testrpc.WaitForTestAgent(t, a.RPC, "dc1")
+-
+-	const maxPayloadSize = 300
+-
+-	type expectedResponse struct {
+-		success      bool
+-		statusCode   int
+-		errorMessage string
+-		eventName    string
+-		payloadSize  int
+-	}
+-
+-	testCases := []struct {
+-		name             string
+-		payloadSize      int
+-		expectedResponse *expectedResponse
+-		description      string
+-	}{
+-		{
+-			name:        "empty payload",
+-			payloadSize: 0,
+-			expectedResponse: &expectedResponse{
+-				success:     true,
+-				eventName:   "test",
+-				payloadSize: 0,
+-			},
+-			description: "empty payload should be accepted",
+-		},
+-		{
+-			name:        "payload within limit",
+-			payloadSize: 50,
+-			expectedResponse: &expectedResponse{
+-				success:     true,
+-				eventName:   "test",
+-				payloadSize: 50,
+-			},
+-			description: "small payload should be accepted",
+-		},
+-		{
+-			name:        "payload at exact limit",
+-			payloadSize: maxPayloadSize,
+-			expectedResponse: &expectedResponse{
+-				success:     true,
+-				eventName:   "test",
+-				payloadSize: maxPayloadSize,
+-			},
+-			description: "payload at exactly 300 bytes should be accepted",
+-		},
+-		{
+-			name:        "payload exceeds limit by 1 byte",
+-			payloadSize: maxPayloadSize + 1,
+-			expectedResponse: &expectedResponse{
+-				statusCode:   http.StatusRequestEntityTooLarge,
+-				errorMessage: "Event payload too large",
+-			},
+-			description: "payload exceeding limit should be rejected",
+-		},
+-		{
+-			name:        "large payload",
+-			payloadSize: 500,
+-			expectedResponse: &expectedResponse{
+-				statusCode:   http.StatusRequestEntityTooLarge,
+-				errorMessage: "Event payload too large",
+-			},
+-			description: "large payload should be rejected",
+-		},
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.name, func(t *testing.T) {
+-			var payload []byte
+-			if tc.payloadSize <= 0 {
+-				payload = []byte{}
+-			} else {
+-				payload = bytes.Repeat([]byte("x"), tc.payloadSize)
+-			}
+-
+-			url := "/v1/event/fire/test"
+-			req, err := http.NewRequest("PUT", url, bytes.NewBuffer(payload))
+-			require.NoError(t, err)
+-
+-			resp := httptest.NewRecorder()
+-			obj, err := a.srv.EventFire(resp, req)
+-
+-			if tc.expectedResponse.success {
+-				require.NoError(t, err, tc.description)
+-				require.NotNil(t, obj, "Should return event object on success")
+-
+-				event, ok := obj.(*UserEvent)
+-				require.True(t, ok, "Expected *UserEvent, got %T", obj)
+-				require.Equal(t, tc.expectedResponse.eventName, event.Name)
+-
+-				if tc.expectedResponse.payloadSize == 0 {
+-					// Empty payload should result in nil
+-					require.Nil(t, event.Payload)
+-				} else {
+-					expectedPayload := bytes.Repeat([]byte("x"), tc.expectedResponse.payloadSize)
+-					require.Equal(t, expectedPayload, event.Payload)
+-				}
+-			} else {
+-				require.Error(t, err, tc.description)
+-				httpErr, ok := err.(HTTPError)
+-				require.True(t, ok, "Expected HTTPError, got %T", err)
+-				require.Equal(t, tc.expectedResponse.statusCode, httpErr.StatusCode)
+-				require.Contains(t, httpErr.Reason, tc.expectedResponse.errorMessage)
+-				require.Nil(t, obj, "Should not return event object on error")
+-			}
+-		})
+-	}
+-}
+-
+ func TestUUIDToUint64(t *testing.T) {
+ 	t.Parallel()
+ 	inp := "cb9a81ad-fff6-52ac-92a7-5f70687805ec"

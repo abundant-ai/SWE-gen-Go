@@ -1,0 +1,254 @@
+diff --git a/.gitignore b/.gitignore
+index 01b5c44..352a34a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -21,9 +21,4 @@ _testmain.go
+ 
+ *.exe
+ *.test
+-*.bench
+-
+-.vscode
+-
+-# exclude dependencies in the `/vendor` folder
+-vendor
++*.bench
+\ No newline at end of file
+diff --git a/viper.go b/viper.go
+index 630d9df..f657b20 100644
+--- a/viper.go
++++ b/viper.go
+@@ -30,7 +30,6 @@ import (
+ 	"path/filepath"
+ 	"reflect"
+ 	"strings"
+-	"sync"
+ 	"time"
+ 
+ 	yaml "gopkg.in/yaml.v2"
+@@ -277,73 +276,48 @@ func (v *Viper) OnConfigChange(run func(in fsnotify.Event)) {
+ }
+ 
+ func WatchConfig() { v.WatchConfig() }
+-
+ func (v *Viper) WatchConfig() {
+-	initWG := sync.WaitGroup{}
+-	initWG.Add(1)
+ 	go func() {
+ 		watcher, err := fsnotify.NewWatcher()
+ 		if err != nil {
+ 			log.Fatal(err)
+ 		}
+ 		defer watcher.Close()
++
+ 		// we have to watch the entire directory to pick up renames/atomic saves in a cross-platform way
+ 		filename, err := v.getConfigFile()
+ 		if err != nil {
+-			log.Printf("error: %v\n", err)
++			log.Println("error:", err)
+ 			return
+ 		}
+ 
+ 		configFile := filepath.Clean(filename)
+ 		configDir, _ := filepath.Split(configFile)
+-		realConfigFile, _ := filepath.EvalSymlinks(filename)
+ 
+-		eventsWG := sync.WaitGroup{}
+-		eventsWG.Add(1)
++		done := make(chan bool)
+ 		go func() {
+ 			for {
+ 				select {
+-				case event, ok := <-watcher.Events:
+-					if !ok { // 'Events' channel is closed
+-						eventsWG.Done()
+-						return
+-					}
+-					currentConfigFile, _ := filepath.EvalSymlinks(filename)
+-					// we only care about the config file with the following cases:
+-					// 1 - if the config file was modified or created
+-					// 2 - if the real path to the config file changed (eg: k8s ConfigMap replacement)
+-					const writeOrCreateMask = fsnotify.Write | fsnotify.Create
+-					if (filepath.Clean(event.Name) == configFile &&
+-						event.Op&writeOrCreateMask != 0) ||
+-						(currentConfigFile != "" && currentConfigFile != realConfigFile) {
+-						realConfigFile = currentConfigFile
+-						err := v.ReadInConfig()
+-						if err != nil {
+-							log.Printf("error reading config file: %v\n", err)
+-						}
+-						if v.onConfigChange != nil {
++				case event := <-watcher.Events:
++					// we only care about the config file
++					if filepath.Clean(event.Name) == configFile {
++						if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
++							err := v.ReadInConfig()
++							if err != nil {
++								log.Println("error:", err)
++							}
+ 							v.onConfigChange(event)
+ 						}
+-					} else if filepath.Clean(event.Name) == configFile &&
+-						event.Op&fsnotify.Remove&fsnotify.Remove != 0 {
+-						eventsWG.Done()
+-						return
+ 					}
+-
+-				case err, ok := <-watcher.Errors:
+-					if ok { // 'Errors' channel is not closed
+-						log.Printf("watcher error: %v\n", err)
+-					}
+-					eventsWG.Done()
+-					return
++				case err := <-watcher.Errors:
++					log.Println("error:", err)
+ 				}
+ 			}
+ 		}()
++
+ 		watcher.Add(configDir)
+-		initWG.Done()   // done initalizing the watch in this go routine, so the parent routine can move on...
+-		eventsWG.Wait() // now, wait for event loop to end in this go-routine...
++		<-done
+ 	}()
+-	initWG.Wait() // make sure that the go routine above fully ended before returning
+ }
+ 
+ // SetConfigFile explicitly defines the path, name and extension of the config file.
+diff --git a/viper_test.go b/viper_test.go
+index 76ec02e..be11f3e 100644
+--- a/viper_test.go
++++ b/viper_test.go
+@@ -12,24 +12,19 @@ import (
+ 	"io"
+ 	"io/ioutil"
+ 	"os"
+-	"os/exec"
+ 	"path"
+ 	"reflect"
+-	"runtime"
+ 	"sort"
+ 	"strings"
+-	"sync"
+ 	"testing"
+ 	"time"
+ 
+-	"github.com/fsnotify/fsnotify"
+ 	"github.com/mitchellh/mapstructure"
+ 	"github.com/spf13/afero"
+ 	"github.com/spf13/cast"
+ 
+ 	"github.com/spf13/pflag"
+ 	"github.com/stretchr/testify/assert"
+-	"github.com/stretchr/testify/require"
+ )
+ 
+ var yamlExample = []byte(`Hacker: true
+@@ -1419,107 +1414,6 @@ func doTestCaseInsensitive(t *testing.T, typ, config string) {
+ 
+ }
+ 
+-func newViperWithConfigFile(t *testing.T) (*Viper, string, func()) {
+-	watchDir, err := ioutil.TempDir("", "")
+-	require.Nil(t, err)
+-	configFile := path.Join(watchDir, "config.yaml")
+-	err = ioutil.WriteFile(configFile, []byte("foo: bar\n"), 0640)
+-	require.Nil(t, err)
+-	cleanup := func() {
+-		os.RemoveAll(watchDir)
+-	}
+-	v := New()
+-	v.SetConfigFile(configFile)
+-	err = v.ReadInConfig()
+-	require.Nil(t, err)
+-	require.Equal(t, "bar", v.Get("foo"))
+-	return v, configFile, cleanup
+-}
+-
+-func newViperWithSymlinkedConfigFile(t *testing.T) (*Viper, string, string, func()) {
+-	watchDir, err := ioutil.TempDir("", "")
+-	require.Nil(t, err)
+-	dataDir1 := path.Join(watchDir, "data1")
+-	err = os.Mkdir(dataDir1, 0777)
+-	require.Nil(t, err)
+-	realConfigFile := path.Join(dataDir1, "config.yaml")
+-	t.Logf("Real config file location: %s\n", realConfigFile)
+-	err = ioutil.WriteFile(realConfigFile, []byte("foo: bar\n"), 0640)
+-	require.Nil(t, err)
+-	cleanup := func() {
+-		os.RemoveAll(watchDir)
+-	}
+-	// now, symlink the tm `data1` dir to `data` in the baseDir
+-	os.Symlink(dataDir1, path.Join(watchDir, "data"))
+-	// and link the `<watchdir>/datadir1/config.yaml` to `<watchdir>/config.yaml`
+-	configFile := path.Join(watchDir, "config.yaml")
+-	os.Symlink(path.Join(watchDir, "data", "config.yaml"), configFile)
+-	fmt.Printf("Config file location: %s\n", path.Join(watchDir, "config.yaml"))
+-	// init Viper
+-	v := New()
+-	v.SetConfigFile(configFile)
+-	err = v.ReadInConfig()
+-	require.Nil(t, err)
+-	require.Equal(t, "bar", v.Get("foo"))
+-	return v, watchDir, configFile, cleanup
+-}
+-
+-func TestWatchFile(t *testing.T) {
+-
+-	t.Run("file content changed", func(t *testing.T) {
+-		// given a `config.yaml` file being watched
+-		v, configFile, cleanup := newViperWithConfigFile(t)
+-		defer cleanup()
+-		_, err := os.Stat(configFile)
+-		require.NoError(t, err)
+-		t.Logf("test config file: %s\n", configFile)
+-		wg := sync.WaitGroup{}
+-		wg.Add(1)
+-		v.OnConfigChange(func(in fsnotify.Event) {
+-			t.Logf("config file changed")
+-			wg.Done()
+-		})
+-		v.WatchConfig()
+-		// when overwriting the file and waiting for the custom change notification handler to be triggered
+-		err = ioutil.WriteFile(configFile, []byte("foo: baz\n"), 0640)
+-		wg.Wait()
+-		// then the config value should have changed
+-		require.Nil(t, err)
+-		assert.Equal(t, "baz", v.Get("foo"))
+-	})
+-
+-	t.Run("link to real file changed (à la Kubernetes)", func(t *testing.T) {
+-		// skip if not executed on Linux
+-		if runtime.GOOS != "linux" {
+-			t.Skipf("Skipping test as symlink replacements don't work on non-linux environment...")
+-		}
+-		v, watchDir, _, _ := newViperWithSymlinkedConfigFile(t)
+-		// defer cleanup()
+-		wg := sync.WaitGroup{}
+-		v.WatchConfig()
+-		v.OnConfigChange(func(in fsnotify.Event) {
+-			t.Logf("config file changed")
+-			wg.Done()
+-		})
+-		wg.Add(1)
+-		// when link to another `config.yaml` file
+-		dataDir2 := path.Join(watchDir, "data2")
+-		err := os.Mkdir(dataDir2, 0777)
+-		require.Nil(t, err)
+-		configFile2 := path.Join(dataDir2, "config.yaml")
+-		err = ioutil.WriteFile(configFile2, []byte("foo: baz\n"), 0640)
+-		require.Nil(t, err)
+-		// change the symlink using the `ln -sfn` command
+-		err = exec.Command("ln", "-sfn", dataDir2, path.Join(watchDir, "data")).Run()
+-		require.Nil(t, err)
+-		wg.Wait()
+-		// then
+-		require.Nil(t, err)
+-		assert.Equal(t, "baz", v.Get("foo"))
+-	})
+-
+-}
+-
+ func BenchmarkGetBool(b *testing.B) {
+ 	key := "BenchmarkGetBool"
+ 	v = New()

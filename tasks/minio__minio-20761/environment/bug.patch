@@ -1,0 +1,221 @@
+diff --git a/cmd/metrics-v2.go b/cmd/metrics-v2.go
+index c8a0c04c5..bcf974240 100644
+--- a/cmd/metrics-v2.go
++++ b/cmd/metrics-v2.go
+@@ -53,10 +53,6 @@ var (
+ 	bucketPeerMetricsGroups []*MetricsGroupV2
+ )
+ 
+-// v2MetricsMaxBuckets enforces a bucket count limit on metrics for v2 calls.
+-// If people hit this limit, they should move to v3, as certain calls explode with high bucket count.
+-const v2MetricsMaxBuckets = 100
+-
+ func init() {
+ 	clusterMetricsGroups := []*MetricsGroupV2{
+ 		getNodeHealthMetrics(MetricsGroupOpts{dependGlobalNotificationSys: true}),
+@@ -1836,9 +1832,9 @@ func getGoMetrics() *MetricsGroupV2 {
+ // getHistogramMetrics fetches histogram metrics and returns it in a []Metric
+ // Note: Typically used in MetricGroup.RegisterRead
+ //
+-// The toLowerAPILabels parameter is added for compatibility,
+-// if set, it lowercases the `api` label values.
+-func getHistogramMetrics(hist *prometheus.HistogramVec, desc MetricDescription, toLowerAPILabels, limitBuckets bool) []MetricV2 {
++// The last parameter is added for compatibility - if true it lowercases the
++// `api` label values.
++func getHistogramMetrics(hist *prometheus.HistogramVec, desc MetricDescription, toLowerAPILabels bool) []MetricV2 {
+ 	ch := make(chan prometheus.Metric)
+ 	go func() {
+ 		defer xioutil.SafeClose(ch)
+@@ -1848,7 +1844,6 @@ func getHistogramMetrics(hist *prometheus.HistogramVec, desc MetricDescription,
+ 
+ 	// Converts metrics received into internal []Metric type
+ 	var metrics []MetricV2
+-	buckets := make(map[string][]MetricV2, v2MetricsMaxBuckets)
+ 	for promMetric := range ch {
+ 		dtoMetric := &dto.Metric{}
+ 		err := promMetric.Write(dtoMetric)
+@@ -1875,11 +1870,7 @@ func getHistogramMetrics(hist *prometheus.HistogramVec, desc MetricDescription,
+ 				VariableLabels: labels,
+ 				Value:          float64(b.GetCumulativeCount()),
+ 			}
+-			if limitBuckets && labels["bucket"] != "" {
+-				buckets[labels["bucket"]] = append(buckets[labels["bucket"]], metric)
+-			} else {
+-				metrics = append(metrics, metric)
+-			}
++			metrics = append(metrics, metric)
+ 		}
+ 		// add metrics with +Inf label
+ 		labels1 := make(map[string]string)
+@@ -1891,26 +1882,11 @@ func getHistogramMetrics(hist *prometheus.HistogramVec, desc MetricDescription,
+ 			}
+ 		}
+ 		labels1["le"] = fmt.Sprintf("%.3f", math.Inf(+1))
+-
+-		metric := MetricV2{
++		metrics = append(metrics, MetricV2{
+ 			Description:    desc,
+ 			VariableLabels: labels1,
+ 			Value:          float64(dtoMetric.Histogram.GetSampleCount()),
+-		}
+-		if limitBuckets && labels1["bucket"] != "" {
+-			buckets[labels1["bucket"]] = append(buckets[labels1["bucket"]], metric)
+-		} else {
+-			metrics = append(metrics, metric)
+-		}
+-	}
+-
+-	// Limit bucket metrics...
+-	if limitBuckets {
+-		bucketNames := mapKeysSorted(buckets)
+-		bucketNames = bucketNames[:min(len(buckets), v2MetricsMaxBuckets)]
+-		for _, b := range bucketNames {
+-			metrics = append(metrics, buckets[b]...)
+-		}
++		})
+ 	}
+ 	return metrics
+ }
+@@ -1921,7 +1897,7 @@ func getBucketTTFBMetric() *MetricsGroupV2 {
+ 	}
+ 	mg.RegisterRead(func(ctx context.Context) []MetricV2 {
+ 		return getHistogramMetrics(bucketHTTPRequestsDuration,
+-			getBucketTTFBDistributionMD(), true, true)
++			getBucketTTFBDistributionMD(), true)
+ 	})
+ 	return mg
+ }
+@@ -1932,7 +1908,7 @@ func getS3TTFBMetric() *MetricsGroupV2 {
+ 	}
+ 	mg.RegisterRead(func(ctx context.Context) []MetricV2 {
+ 		return getHistogramMetrics(httpRequestsDuration,
+-			getS3TTFBDistributionMD(), true, true)
++			getS3TTFBDistributionMD(), true)
+ 	})
+ 	return mg
+ }
+@@ -3032,13 +3008,7 @@ func getHTTPMetrics(opts MetricsGroupOpts) *MetricsGroupV2 {
+ 			return
+ 		}
+ 
+-		// If we have too many, limit them
+-		bConnStats := globalBucketConnStats.getS3InOutBytes()
+-		buckets := mapKeysSorted(bConnStats)
+-		buckets = buckets[:min(v2MetricsMaxBuckets, len(buckets))]
+-
+-		for _, bucket := range buckets {
+-			inOut := bConnStats[bucket]
++		for bucket, inOut := range globalBucketConnStats.getS3InOutBytes() {
+ 			recvBytes := inOut.In
+ 			if recvBytes > 0 {
+ 				metrics = append(metrics, MetricV2{
+@@ -3281,12 +3251,7 @@ func getBucketUsageMetrics(opts MetricsGroupOpts) *MetricsGroupV2 {
+ 		if !globalSiteReplicationSys.isEnabled() {
+ 			bucketReplStats = globalReplicationStats.Load().getAllLatest(dataUsageInfo.BucketsUsage)
+ 		}
+-		buckets := mapKeysSorted(dataUsageInfo.BucketsUsage)
+-		if len(buckets) > v2MetricsMaxBuckets {
+-			buckets = buckets[:v2MetricsMaxBuckets]
+-		}
+-		for _, bucket := range buckets {
+-			usage := dataUsageInfo.BucketsUsage[bucket]
++		for bucket, usage := range dataUsageInfo.BucketsUsage {
+ 			quota, _ := globalBucketQuotaSys.Get(ctx, bucket)
+ 
+ 			metrics = append(metrics, MetricV2{
+diff --git a/cmd/metrics-v2_test.go b/cmd/metrics-v2_test.go
+index 1d1f4a6fa..1e5221ea3 100644
+--- a/cmd/metrics-v2_test.go
++++ b/cmd/metrics-v2_test.go
+@@ -82,13 +82,13 @@ func TestGetHistogramMetrics_BucketCount(t *testing.T) {
+ 		}
+ 	}
+ 
+-	metrics := getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), false, false)
++	metrics := getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), false)
+ 	// additional labels for +Inf for all histogram metrics
+ 	if expPoints := len(labels) * (len(histBuckets) + 1); expPoints != len(metrics) {
+ 		t.Fatalf("Expected %v data points when toLowerAPILabels=false but got %v", expPoints, len(metrics))
+ 	}
+ 
+-	metrics = getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), true, false)
++	metrics = getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), true)
+ 	// additional labels for +Inf for all histogram metrics
+ 	if expPoints := len(labels) * (len(histBuckets) + 1); expPoints != len(metrics) {
+ 		t.Fatalf("Expected %v data points when toLowerAPILabels=true but got %v", expPoints, len(metrics))
+@@ -144,7 +144,7 @@ func TestGetHistogramMetrics_Values(t *testing.T) {
+ 	}
+ 
+ 	// Accumulate regular-cased API label metrics for 'PutObject' for deeper verification
+-	metrics := getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), false, false)
++	metrics := getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), false)
+ 	capitalPutObjects := make([]MetricV2, 0, len(histBuckets)+1)
+ 	for _, metric := range metrics {
+ 		if value := metric.VariableLabels["api"]; value == "PutObject" {
+@@ -181,7 +181,7 @@ func TestGetHistogramMetrics_Values(t *testing.T) {
+ 	}
+ 
+ 	// Accumulate lower-cased API label metrics for 'copyobject' for deeper verification
+-	metrics = getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), true, false)
++	metrics = getHistogramMetrics(ttfbHist, getBucketTTFBDistributionMD(), true)
+ 	lowerCopyObjects := make([]MetricV2, 0, len(histBuckets)+1)
+ 	for _, metric := range metrics {
+ 		if value := metric.VariableLabels["api"]; value == "copyobject" {
+diff --git a/cmd/metrics-v3-types.go b/cmd/metrics-v3-types.go
+index 92004c961..0aa04efa6 100644
+--- a/cmd/metrics-v3-types.go
++++ b/cmd/metrics-v3-types.go
+@@ -267,7 +267,7 @@ func (m *MetricValues) SetHistogram(name MetricName, hist *prometheus.HistogramV
+ 		panic(fmt.Sprintf("metric has no description: %s", name))
+ 	}
+ 	dummyDesc := MetricDescription{}
+-	metricsV2 := getHistogramMetrics(hist, dummyDesc, false, false)
++	metricsV2 := getHistogramMetrics(hist, dummyDesc, false)
+ mainLoop:
+ 	for _, metric := range metricsV2 {
+ 		for label, allowedValues := range filterByLabels {
+diff --git a/cmd/tier.go b/cmd/tier.go
+index 317dd5061..953a8d100 100644
+--- a/cmd/tier.go
++++ b/cmd/tier.go
+@@ -165,7 +165,7 @@ var (
+ )
+ 
+ func (t *tierMetrics) Report() []MetricV2 {
+-	metrics := getHistogramMetrics(t.histogram, tierTTLBMD, true, true)
++	metrics := getHistogramMetrics(t.histogram, tierTTLBMD, true)
+ 	t.RLock()
+ 	defer t.RUnlock()
+ 	for tier, stat := range t.requestsCount {
+diff --git a/cmd/utils.go b/cmd/utils.go
+index 5f5208cc5..87926b93d 100644
+--- a/cmd/utils.go
++++ b/cmd/utils.go
+@@ -34,7 +34,6 @@ import (
+ 	"runtime"
+ 	"runtime/pprof"
+ 	"runtime/trace"
+-	"sort"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -1152,19 +1151,3 @@ func filterStorageClass(ctx context.Context, s string) string {
+ 	}
+ 	return s
+ }
+-
+-type ordered interface {
+-	~int | ~int8 | ~int16 | ~int32 | ~int64 | ~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr | ~float32 | ~float64 | string
+-}
+-
+-// mapKeysSorted returns the map keys as a sorted slice.
+-func mapKeysSorted[Map ~map[K]V, K ordered, V any](m Map) []K {
+-	res := make([]K, 0, len(m))
+-	for k := range m {
+-		res = append(res, k)
+-	}
+-	sort.Slice(res, func(i, j int) bool {
+-		return res[i] < res[j]
+-	})
+-	return res
+-}

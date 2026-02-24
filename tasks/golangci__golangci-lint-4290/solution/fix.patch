@@ -1,0 +1,170 @@
+diff --git a/.golangci.reference.yml b/.golangci.reference.yml
+index 4b219ee8..c21108ba 100644
+--- a/.golangci.reference.yml
++++ b/.golangci.reference.yml
+@@ -1912,6 +1912,24 @@ linters-settings:
+     # Default: false
+     args-on-sep-lines: true
+ 
++  spancheck:
++    # Checks to enable.
++    # Options include:
++    # - `end`: check that `span.End()` is called
++    # - `record-error`: check that `span.RecordError(err)` is called when an error is returned
++    # - `set-status`: check that `span.SetStatus(codes.Error, msg)` is called when an error is returned
++    # Default: ["end"]
++    checks:
++      - end
++      - record-error
++      - set-status
++    # A list of regexes for function signatures that silence `record-error` and `set-status` reports
++    # if found in the call path to a returned error.
++    # https://github.com/jjti/go-spancheck#ignore-check-signatures
++    # Default: []
++    ignore-check-signatures:
++      - "telemetry.RecordError"
++
+   staticcheck:
+     # Deprecated: use the global `run.go` instead.
+     go: "1.15"
+@@ -2442,6 +2460,7 @@ linters:
+     - rowserrcheck
+     - scopelint
+     - sloglint
++    - spancheck
+     - sqlclosecheck
+     - staticcheck
+     - structcheck
+@@ -2562,6 +2581,7 @@ linters:
+     - rowserrcheck
+     - scopelint
+     - sloglint
++    - spancheck
+     - sqlclosecheck
+     - staticcheck
+     - structcheck
+diff --git a/go.mod b/go.mod
+index 29125882..92a81fb9 100644
+--- a/go.mod
++++ b/go.mod
+@@ -57,6 +57,7 @@ require (
+ 	github.com/jgautheron/goconst v1.7.0
+ 	github.com/jingyugao/rowserrcheck v1.1.1
+ 	github.com/jirfag/go-printf-func-name v0.0.0-20200119135958-7558a9eaa5af
++	github.com/jjti/go-spancheck v0.4.2
+ 	github.com/julz/importas v0.1.0
+ 	github.com/kisielk/errcheck v1.6.3
+ 	github.com/kkHAIKE/contextcheck v1.1.4
+diff --git a/go.sum b/go.sum
+index 7d7b4121..0b979a22 100644
+--- a/go.sum
++++ b/go.sum
+@@ -310,6 +310,8 @@ github.com/jingyugao/rowserrcheck v1.1.1 h1:zibz55j/MJtLsjP1OF4bSdgXxwL1b+Vn7Tjz
+ github.com/jingyugao/rowserrcheck v1.1.1/go.mod h1:4yvlZSDb3IyDTUZJUmpZfm2Hwok+Dtp+nu2qOq+er9c=
+ github.com/jirfag/go-printf-func-name v0.0.0-20200119135958-7558a9eaa5af h1:KA9BjwUk7KlCh6S9EAGWBt1oExIUv9WyNCiRz5amv48=
+ github.com/jirfag/go-printf-func-name v0.0.0-20200119135958-7558a9eaa5af/go.mod h1:HEWGJkRDzjJY2sqdDwxccsGicWEf9BQOZsq2tV+xzM0=
++github.com/jjti/go-spancheck v0.4.2 h1:4MvJOTKRi9ClsPNTxVhHvcSyuInILLSKmstTCJ/oIZI=
++github.com/jjti/go-spancheck v0.4.2/go.mod h1:TBZ1nIcHTtCnBChHcjd+5agCxHBaW0tzw9quzCCNAts=
+ github.com/jpillora/backoff v1.0.0/go.mod h1:J/6gKK9jxlEcS3zixgDgUAsiuZ7yrSoa/FX5e0EB2j4=
+ github.com/json-iterator/go v1.1.6/go.mod h1:+SdeFBvtyEkXs7REEP0seUULqWtbJapLOCVDaaPEHmU=
+ github.com/json-iterator/go v1.1.10/go.mod h1:KdQUCv79m/52Kvf8AW2vK1V8akMuk1QjK/uOdHXbAo4=
+diff --git a/pkg/config/linters_settings.go b/pkg/config/linters_settings.go
+index a79a2a61..fd7c5f80 100644
+--- a/pkg/config/linters_settings.go
++++ b/pkg/config/linters_settings.go
+@@ -245,13 +245,14 @@ type LintersSettings struct {
+ 	Revive           ReviveSettings
+ 	RowsErrCheck     RowsErrCheckSettings
+ 	SlogLint         SlogLintSettings
++	Spancheck        SpancheckSettings
+ 	Staticcheck      StaticCheckSettings
+ 	Structcheck      StructCheckSettings
+ 	Stylecheck       StaticCheckSettings
+ 	TagAlign         TagAlignSettings
+ 	Tagliatelle      TagliatelleSettings
+-	Testifylint      TestifylintSettings
+ 	Tenv             TenvSettings
++	Testifylint      TestifylintSettings
+ 	Testpackage      TestpackageSettings
+ 	Thelper          ThelperSettings
+ 	Unparam          UnparamSettings
+@@ -773,6 +774,11 @@ type SlogLintSettings struct {
+ 	ArgsOnSepLines bool   `mapstructure:"args-on-sep-lines"`
+ }
+ 
++type SpancheckSettings struct {
++	Checks                []string `mapstructure:"checks"`
++	IgnoreCheckSignatures []string `mapstructure:"ignore-check-signatures"`
++}
++
+ type StaticCheckSettings struct {
+ 	// Deprecated: use the global `run.go` instead.
+ 	GoVersion string `mapstructure:"go"`
+diff --git a/pkg/golinters/spancheck.go b/pkg/golinters/spancheck.go
+new file mode 100644
+index 00000000..93412447
+--- /dev/null
++++ b/pkg/golinters/spancheck.go
+@@ -0,0 +1,29 @@
++package golinters
++
++import (
++	"github.com/jjti/go-spancheck"
++	"golang.org/x/tools/go/analysis"
++
++	"github.com/golangci/golangci-lint/pkg/config"
++	"github.com/golangci/golangci-lint/pkg/golinters/goanalysis"
++)
++
++func NewSpancheck(settings *config.SpancheckSettings) *goanalysis.Linter {
++	cfg := spancheck.NewDefaultConfig()
++
++	if settings != nil {
++		if settings.Checks != nil {
++			cfg.EnabledChecks = settings.Checks
++		}
++
++		if settings.IgnoreCheckSignatures != nil {
++			cfg.IgnoreChecksSignaturesSlice = settings.IgnoreCheckSignatures
++		}
++	}
++
++	a := spancheck.NewAnalyzerWithConfig(cfg)
++
++	return goanalysis.
++		NewLinter(a.Name, a.Doc, []*analysis.Analyzer{a}, nil).
++		WithLoadMode(goanalysis.LoadModeTypesInfo)
++}
+diff --git a/pkg/lint/lintersdb/manager.go b/pkg/lint/lintersdb/manager.go
+index c4e22249..e30d48e4 100644
+--- a/pkg/lint/lintersdb/manager.go
++++ b/pkg/lint/lintersdb/manager.go
+@@ -131,6 +131,7 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
+ 		reviveCfg           *config.ReviveSettings
+ 		rowserrcheckCfg     *config.RowsErrCheckSettings
+ 		sloglintCfg         *config.SlogLintSettings
++		spancheckCfg        *config.SpancheckSettings
+ 		staticcheckCfg      *config.StaticCheckSettings
+ 		structcheckCfg      *config.StructCheckSettings
+ 		stylecheckCfg       *config.StaticCheckSettings
+@@ -216,6 +217,7 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
+ 		reviveCfg = &m.cfg.LintersSettings.Revive
+ 		rowserrcheckCfg = &m.cfg.LintersSettings.RowsErrCheck
+ 		sloglintCfg = &m.cfg.LintersSettings.SlogLint
++		spancheckCfg = &m.cfg.LintersSettings.Spancheck
+ 		staticcheckCfg = &m.cfg.LintersSettings.Staticcheck
+ 		structcheckCfg = &m.cfg.LintersSettings.Structcheck
+ 		stylecheckCfg = &m.cfg.LintersSettings.Stylecheck
+@@ -782,6 +784,12 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
+ 			WithLoadForGoAnalysis().
+ 			WithURL("https://github.com/ryanrolds/sqlclosecheck"),
+ 
++		linter.NewConfig(golinters.NewSpancheck(spancheckCfg)).
++			WithSince("v1.56.0").
++			WithLoadForGoAnalysis().
++			WithPresets(linter.PresetBugs).
++			WithURL("https://github.com/jjti/go-spancheck"),
++
+ 		linter.NewConfig(golinters.NewStaticcheck(staticcheckCfg)).
+ 			WithEnabledByDefault().
+ 			WithSince("v1.0.0").

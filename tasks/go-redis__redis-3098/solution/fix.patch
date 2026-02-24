@@ -1,0 +1,263 @@
+diff --git a/README.md b/README.md
+index c7951a4d..37714a97 100644
+--- a/README.md
++++ b/README.md
+@@ -183,6 +183,9 @@ rdb := redis.NewClient(&redis.Options{
+ })
+ ```
+ 
++#### Unstable RESP3 Structures for RediSearch Commands
++When integrating Redis with application functionalities using RESP3, it's important to note that some response structures aren't final yet. This is especially true for more complex structures like search and query results. We recommend using RESP2 when using the search and query capabilities, but we plan to stabilize the RESP3-based API-s in the coming versions. You can find more guidance in the upcoming release notes.
++
+ ## Contributing
+ 
+ Please see [out contributing guidelines](CONTRIBUTING.md) to help us improve this library!
+diff --git a/command.go b/command.go
+index 9ae97a95..4ced2979 100644
+--- a/command.go
++++ b/command.go
+@@ -40,7 +40,7 @@ type Cmder interface {
+ 
+ 	readTimeout() *time.Duration
+ 	readReply(rd *proto.Reader) error
+-
++	readRawReply(rd *proto.Reader) error
+ 	SetErr(error)
+ 	Err() error
+ }
+@@ -122,11 +122,11 @@ func cmdString(cmd Cmder, val interface{}) string {
+ //------------------------------------------------------------------------------
+ 
+ type baseCmd struct {
+-	ctx    context.Context
+-	args   []interface{}
+-	err    error
+-	keyPos int8
+-
++	ctx          context.Context
++	args         []interface{}
++	err          error
++	keyPos       int8
++	rawVal       interface{}
+ 	_readTimeout *time.Duration
+ }
+ 
+@@ -197,6 +197,11 @@ func (cmd *baseCmd) setReadTimeout(d time.Duration) {
+ 	cmd._readTimeout = &d
+ }
+ 
++func (cmd *baseCmd) readRawReply(rd *proto.Reader) (err error) {
++	cmd.rawVal, err = rd.ReadReply()
++	return err
++}
++
+ //------------------------------------------------------------------------------
+ 
+ type Cmd struct {
+diff --git a/options.go b/options.go
+index 6ed693a0..8ba74ccd 100644
+--- a/options.go
++++ b/options.go
+@@ -153,6 +153,9 @@ type Options struct {
+ 
+ 	// Add suffix to client name. Default is empty.
+ 	IdentitySuffix string
++
++	// Enable Unstable mode for Redis Search module with RESP3.
++	UnstableResp3 bool
+ }
+ 
+ func (opt *Options) init() {
+diff --git a/redis.go b/redis.go
+index 527afb67..c8b50080 100644
+--- a/redis.go
++++ b/redis.go
+@@ -412,6 +412,19 @@ func (c *baseClient) process(ctx context.Context, cmd Cmder) error {
+ 	return lastErr
+ }
+ 
++func (c *baseClient) assertUnstableCommand(cmd Cmder) bool {
++	switch cmd.(type) {
++	case *AggregateCmd, *FTInfoCmd, *FTSpellCheckCmd, *FTSearchCmd, *FTSynDumpCmd:
++		if c.opt.UnstableResp3 {
++			return true
++		} else {
++			panic("RESP3 responses for this command are disabled because they may still change. Please set the flag UnstableResp3 .  See the [README](https://github.com/redis/go-redis/blob/master/README.md) and the release notes for guidance.")
++		}
++	default:
++		return false
++	}
++}
++
+ func (c *baseClient) _process(ctx context.Context, cmd Cmder, attempt int) (bool, error) {
+ 	if attempt > 0 {
+ 		if err := internal.Sleep(ctx, c.retryBackoff(attempt)); err != nil {
+@@ -427,8 +440,12 @@ func (c *baseClient) _process(ctx context.Context, cmd Cmder, attempt int) (bool
+ 			atomic.StoreUint32(&retryTimeout, 1)
+ 			return err
+ 		}
+-
+-		if err := cn.WithReader(c.context(ctx), c.cmdTimeout(cmd), cmd.readReply); err != nil {
++		readReplyFunc := cmd.readReply
++		// Apply unstable RESP3 search module.
++		if c.opt.Protocol != 2 && c.assertUnstableCommand(cmd) {
++			readReplyFunc = cmd.readRawReply
++		}
++		if err := cn.WithReader(c.context(ctx), c.cmdTimeout(cmd), readReplyFunc); err != nil {
+ 			if cmd.readTimeout() == nil {
+ 				atomic.StoreUint32(&retryTimeout, 1)
+ 			} else {
+diff --git a/ring.go b/ring.go
+index 4ae00542..b4022173 100644
+--- a/ring.go
++++ b/ring.go
+@@ -100,6 +100,7 @@ type RingOptions struct {
+ 
+ 	DisableIndentity bool
+ 	IdentitySuffix   string
++	UnstableResp3    bool
+ }
+ 
+ func (opt *RingOptions) init() {
+@@ -168,6 +169,7 @@ func (opt *RingOptions) clientOptions() *Options {
+ 
+ 		DisableIndentity: opt.DisableIndentity,
+ 		IdentitySuffix:   opt.IdentitySuffix,
++		UnstableResp3:    opt.UnstableResp3,
+ 	}
+ }
+ 
+diff --git a/search_commands.go b/search_commands.go
+index f5118c77..1a8a4cfe 100644
+--- a/search_commands.go
++++ b/search_commands.go
+@@ -638,6 +638,14 @@ func (cmd *AggregateCmd) Result() (*FTAggregateResult, error) {
+ 	return cmd.val, cmd.err
+ }
+ 
++func (cmd *AggregateCmd) RawVal() interface{} {
++	return cmd.rawVal
++}
++
++func (cmd *AggregateCmd) RawResult() (interface{}, error) {
++	return cmd.rawVal, cmd.err
++}
++
+ func (cmd *AggregateCmd) String() string {
+ 	return cmdString(cmd, cmd.val)
+ }
+@@ -1337,6 +1345,13 @@ func (cmd *FTInfoCmd) Val() FTInfoResult {
+ 	return cmd.val
+ }
+ 
++func (cmd *FTInfoCmd) RawVal() interface{} {
++	return cmd.rawVal
++}
++
++func (cmd *FTInfoCmd) RawResult() (interface{}, error) {
++	return cmd.rawVal, cmd.err
++}
+ func (cmd *FTInfoCmd) readReply(rd *proto.Reader) (err error) {
+ 	n, err := rd.ReadMapLen()
+ 	if err != nil {
+@@ -1447,6 +1462,14 @@ func (cmd *FTSpellCheckCmd) Val() []SpellCheckResult {
+ 	return cmd.val
+ }
+ 
++func (cmd *FTSpellCheckCmd) RawVal() interface{} {
++	return cmd.rawVal
++}
++
++func (cmd *FTSpellCheckCmd) RawResult() (interface{}, error) {
++	return cmd.rawVal, cmd.err
++}
++
+ func (cmd *FTSpellCheckCmd) readReply(rd *proto.Reader) (err error) {
+ 	data, err := rd.ReadSlice()
+ 	if err != nil {
+@@ -1628,6 +1651,14 @@ func (cmd *FTSearchCmd) Val() FTSearchResult {
+ 	return cmd.val
+ }
+ 
++func (cmd *FTSearchCmd) RawVal() interface{} {
++	return cmd.rawVal
++}
++
++func (cmd *FTSearchCmd) RawResult() (interface{}, error) {
++	return cmd.rawVal, cmd.err
++}
++
+ func (cmd *FTSearchCmd) readReply(rd *proto.Reader) (err error) {
+ 	data, err := rd.ReadSlice()
+ 	if err != nil {
+@@ -1904,6 +1935,14 @@ func (cmd *FTSynDumpCmd) Result() ([]FTSynDumpResult, error) {
+ 	return cmd.val, cmd.err
+ }
+ 
++func (cmd *FTSynDumpCmd) RawVal() interface{} {
++	return cmd.rawVal
++}
++
++func (cmd *FTSynDumpCmd) RawResult() (interface{}, error) {
++	return cmd.rawVal, cmd.err
++}
++
+ func (cmd *FTSynDumpCmd) readReply(rd *proto.Reader) error {
+ 	termSynonymPairs, err := rd.ReadSlice()
+ 	if err != nil {
+diff --git a/sentinel.go b/sentinel.go
+index 188f8849..31569554 100644
+--- a/sentinel.go
++++ b/sentinel.go
+@@ -82,6 +82,7 @@ type FailoverOptions struct {
+ 
+ 	DisableIndentity bool
+ 	IdentitySuffix   string
++	UnstableResp3    bool
+ }
+ 
+ func (opt *FailoverOptions) clientOptions() *Options {
+@@ -119,6 +120,7 @@ func (opt *FailoverOptions) clientOptions() *Options {
+ 
+ 		DisableIndentity: opt.DisableIndentity,
+ 		IdentitySuffix:   opt.IdentitySuffix,
++		UnstableResp3:    opt.UnstableResp3,
+ 	}
+ }
+ 
+@@ -156,6 +158,7 @@ func (opt *FailoverOptions) sentinelOptions(addr string) *Options {
+ 
+ 		DisableIndentity: opt.DisableIndentity,
+ 		IdentitySuffix:   opt.IdentitySuffix,
++		UnstableResp3:    opt.UnstableResp3,
+ 	}
+ }
+ 
+diff --git a/universal.go b/universal.go
+index 275bef3d..f4d2d759 100644
+--- a/universal.go
++++ b/universal.go
+@@ -68,6 +68,7 @@ type UniversalOptions struct {
+ 
+ 	DisableIndentity bool
+ 	IdentitySuffix   string
++	UnstableResp3    bool
+ }
+ 
+ // Cluster returns cluster options created from the universal options.
+@@ -160,6 +161,7 @@ func (o *UniversalOptions) Failover() *FailoverOptions {
+ 
+ 		DisableIndentity: o.DisableIndentity,
+ 		IdentitySuffix:   o.IdentitySuffix,
++		UnstableResp3:    o.UnstableResp3,
+ 	}
+ }
+ 
+@@ -203,6 +205,7 @@ func (o *UniversalOptions) Simple() *Options {
+ 
+ 		DisableIndentity: o.DisableIndentity,
+ 		IdentitySuffix:   o.IdentitySuffix,
++		UnstableResp3:    o.UnstableResp3,
+ 	}
+ }
+ 

@@ -1,0 +1,176 @@
+diff --git a/internal/xds/bootstrap/bootstrap.go b/internal/xds/bootstrap/bootstrap.go
+index f3960def..79fb7902 100644
+--- a/internal/xds/bootstrap/bootstrap.go
++++ b/internal/xds/bootstrap/bootstrap.go
+@@ -44,6 +44,7 @@ import (
+ 
+ const (
+ 	serverFeaturesIgnoreResourceDeletion = "ignore_resource_deletion"
++	serverFeaturesTrustedXDSServer       = "trusted_xds_server"
+ 	gRPCUserAgentName                    = "gRPC Go"
+ 	clientFeatureNoOverprovisioning      = "envoy.lb.does_not_support_overprovisioning"
+ 	clientFeatureResourceWrapper         = "xds.config.resource-in-sotw"
+@@ -256,6 +257,18 @@ func (sc *ServerConfig) ServerFeaturesIgnoreResourceDeletion() bool {
+ 	return false
+ }
+ 
++// ServerFeaturesTrustedXDSServer returns true if this server is trusted,
++// and gRPC should accept security-config-affecting fields from the server
++// as described in gRFC A81.
++func (sc *ServerConfig) ServerFeaturesTrustedXDSServer() bool {
++	for _, sf := range sc.serverFeatures {
++		if sf == serverFeaturesTrustedXDSServer {
++			return true
++		}
++	}
++	return false
++}
++
+ // SelectedChannelCreds returns the selected credentials configuration for
+ // communicating with this server.
+ func (sc *ServerConfig) SelectedChannelCreds() ChannelCreds {
+diff --git a/internal/xds/clients/xdsclient/authority.go b/internal/xds/clients/xdsclient/authority.go
+index e4425fa7..b8cb78fb 100644
+--- a/internal/xds/clients/xdsclient/authority.go
++++ b/internal/xds/clients/xdsclient/authority.go
+@@ -470,7 +470,7 @@ func (a *authority) handleADSResourceUpdate(serverConfig *ServerConfig, rType Re
+ 			// "resource-not-found" error.
+ 			continue
+ 		}
+-		if serverConfig.IgnoreResourceDeletion {
++		if serverConfig.SupportsServerFeature(ServerFeatureIgnoreResourceDeletion) {
+ 			// Per A53, resource deletions are ignored if the
+ 			// `ignore_resource_deletion` server feature is enabled through the
+ 			// xDS client configuration. If the resource deletion is to be
+diff --git a/internal/xds/clients/xdsclient/xdsconfig.go b/internal/xds/clients/xdsclient/xdsconfig.go
+index 9d376e50..14d64c1e 100644
+--- a/internal/xds/clients/xdsclient/xdsconfig.go
++++ b/internal/xds/clients/xdsclient/xdsconfig.go
+@@ -24,6 +24,20 @@ import (
+ 	"google.golang.org/grpc/internal/xds/clients"
+ )
+ 
++// ServerFeature indicates the features that will be supported by an xDS server.
++type ServerFeature uint64
++
++const (
++	// ServerFeatureIgnoreResourceDeletion indicates that the server supports a
++	// feature where the xDS client can ignore resource deletions from this server,
++	// as described in gRFC A53.
++	ServerFeatureIgnoreResourceDeletion ServerFeature = 1 << iota
++	// ServerFeatureTrustedXDSServer returns true if this server is trusted,
++	// and gRPC should accept security-config-affecting fields from the server
++	// as described in gRFC A81.
++	ServerFeatureTrustedXDSServer
++)
++
+ // Config is used to configure an xDS client. After one has been passed to the
+ // xDS client's New function, no part of it may be modified. A Config may be
+ // reused; the xdsclient package will also not modify it.
+@@ -74,17 +88,7 @@ type Config struct {
+ // ServerConfig contains configuration for an xDS management server.
+ type ServerConfig struct {
+ 	ServerIdentifier clients.ServerIdentifier
+-
+-	// IgnoreResourceDeletion is a server feature which if set to true,
+-	// indicates that resource deletion errors from xDS management servers can
+-	// be ignored and cached resource data can be used.
+-	//
+-	// This will be removed in the future once we implement gRFC A88
+-	// and two new fields FailOnDataErrors and
+-	// ResourceTimerIsTransientError will be introduced.
+-	IgnoreResourceDeletion bool
+-
+-	// TODO: Link to gRFC A88
++	ServerFeature    ServerFeature // ServerFeature stores a bitmap of supported features.
+ }
+ 
+ // Authority contains configuration for an xDS control plane authority.
+@@ -98,5 +102,11 @@ type Authority struct {
+ }
+ 
+ func isServerConfigEqual(a, b *ServerConfig) bool {
+-	return a.ServerIdentifier == b.ServerIdentifier && a.IgnoreResourceDeletion == b.IgnoreResourceDeletion
++	return a.ServerIdentifier == b.ServerIdentifier && a.ServerFeature == b.ServerFeature
++}
++
++// SupportsServerFeature returns true if the server configuration indicates that
++// the server supports the given feature.
++func (s *ServerConfig) SupportsServerFeature(feature ServerFeature) bool {
++	return s.ServerFeature&feature != 0
+ }
+diff --git a/internal/xds/xdsclient/clientimpl.go b/internal/xds/xdsclient/clientimpl.go
+index f2325e0e..b2088647 100644
+--- a/internal/xds/xdsclient/clientimpl.go
++++ b/internal/xds/xdsclient/clientimpl.go
+@@ -162,6 +162,32 @@ func (c *clientImpl) decrRef() int32 {
+ 	return atomic.AddInt32(&c.refCount, -1)
+ }
+ 
++func buildServerConfigs(bootstrapSC []*bootstrap.ServerConfig, grpcTransportConfigs map[string]grpctransport.Config, gServerCfgMap map[xdsclient.ServerConfig]*bootstrap.ServerConfig) ([]xdsclient.ServerConfig, error) {
++	var gServerCfg []xdsclient.ServerConfig
++	for _, sc := range bootstrapSC {
++		if err := populateGRPCTransportConfigsFromServerConfig(sc, grpcTransportConfigs); err != nil {
++			return nil, err
++		}
++		var serverFeatures xdsclient.ServerFeature
++		if sc.ServerFeaturesIgnoreResourceDeletion() {
++			serverFeatures = serverFeatures | xdsclient.ServerFeatureIgnoreResourceDeletion
++		}
++		if sc.ServerFeaturesTrustedXDSServer() {
++			serverFeatures = serverFeatures | xdsclient.ServerFeatureTrustedXDSServer
++		}
++		gsc := xdsclient.ServerConfig{
++			ServerIdentifier: clients.ServerIdentifier{
++				ServerURI:  sc.ServerURI(),
++				Extensions: grpctransport.ServerIdentifierExtension{ConfigName: sc.SelectedChannelCreds().Type},
++			},
++			ServerFeature: serverFeatures,
++		}
++		gServerCfg = append(gServerCfg, gsc)
++		gServerCfgMap[gsc] = sc
++	}
++	return gServerCfg, nil
++}
++
+ // buildXDSClientConfig builds the xdsclient.Config from the bootstrap.Config.
+ func buildXDSClientConfig(config *bootstrap.Config, metricsRecorder estats.MetricsRecorder, target string, watchExpiryTimeout time.Duration) (xdsclient.Config, error) {
+ 	grpcTransportConfigs := make(map[string]grpctransport.Config)
+@@ -175,30 +201,16 @@ func buildXDSClientConfig(config *bootstrap.Config, metricsRecorder estats.Metri
+ 		if len(cfg.XDSServers) >= 1 {
+ 			serverCfg = cfg.XDSServers
+ 		}
+-		var gServerCfg []xdsclient.ServerConfig
+-		for _, sc := range serverCfg {
+-			if err := populateGRPCTransportConfigsFromServerConfig(sc, grpcTransportConfigs); err != nil {
+-				return xdsclient.Config{}, err
+-			}
+-			gsc := xdsclient.ServerConfig{
+-				ServerIdentifier:       clients.ServerIdentifier{ServerURI: sc.ServerURI(), Extensions: grpctransport.ServerIdentifierExtension{ConfigName: sc.SelectedChannelCreds().Type}},
+-				IgnoreResourceDeletion: sc.ServerFeaturesIgnoreResourceDeletion()}
+-			gServerCfg = append(gServerCfg, gsc)
+-			gServerCfgMap[gsc] = sc
++		gsc, err := buildServerConfigs(serverCfg, grpcTransportConfigs, gServerCfgMap)
++		if err != nil {
++			return xdsclient.Config{}, err
+ 		}
+-		gAuthorities[name] = xdsclient.Authority{XDSServers: gServerCfg}
++		gAuthorities[name] = xdsclient.Authority{XDSServers: gsc}
+ 	}
+ 
+-	gServerCfgs := make([]xdsclient.ServerConfig, 0, len(config.XDSServers()))
+-	for _, sc := range config.XDSServers() {
+-		if err := populateGRPCTransportConfigsFromServerConfig(sc, grpcTransportConfigs); err != nil {
+-			return xdsclient.Config{}, err
+-		}
+-		gsc := xdsclient.ServerConfig{
+-			ServerIdentifier:       clients.ServerIdentifier{ServerURI: sc.ServerURI(), Extensions: grpctransport.ServerIdentifierExtension{ConfigName: sc.SelectedChannelCreds().Type}},
+-			IgnoreResourceDeletion: sc.ServerFeaturesIgnoreResourceDeletion()}
+-		gServerCfgs = append(gServerCfgs, gsc)
+-		gServerCfgMap[gsc] = sc
++	gServerCfgs, err := buildServerConfigs(config.XDSServers(), grpcTransportConfigs, gServerCfgMap)
++	if err != nil {
++		return xdsclient.Config{}, err
+ 	}
+ 
+ 	node := config.Node()

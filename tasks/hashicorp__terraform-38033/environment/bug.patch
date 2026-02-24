@@ -1,0 +1,317 @@
+diff --git a/.changes/v1.15/BUG FIXES-20251223-184516.yaml b/.changes/v1.15/BUG FIXES-20251223-184516.yaml
+index e3c65982a5..70513d121a 100644
+--- a/.changes/v1.15/BUG FIXES-20251223-184516.yaml	
++++ b/.changes/v1.15/BUG FIXES-20251223-184516.yaml	
+@@ -1,5 +1,5 @@
+ kind: BUG FIXES
+-body: 'backend: Fix nil pointer dereference crash during `terraform init` when the destination backend returns an error'
++body: 'backend: Fix nil pointer dereference crash during `terraform init -migrate-state` when the destination backend returns a permission error'
+ time: 2025-12-23T18:45:16.000000Z
+ custom:
+     Issue: "38027"
+diff --git a/internal/backend/remote-state/http/backend.go b/internal/backend/remote-state/http/backend.go
+index 0494e8dd99..dda03c06b4 100644
+--- a/internal/backend/remote-state/http/backend.go
++++ b/internal/backend/remote-state/http/backend.go
+@@ -313,13 +313,7 @@ func (b *Backend) StateMgr(name string) (statemgr.Full, tfdiags.Diagnostics) {
+ 		return nil, diags.Append(backend.ErrWorkspacesNotSupported)
+ 	}
+ 
+-	sm := &remote.State{Client: b.client}
+-
+-	if err := sm.RefreshState(); err != nil {
+-		return nil, diags.Append(err)
+-	}
+-
+-	return sm, diags
++	return &remote.State{Client: b.client}, diags
+ }
+ 
+ func (b *Backend) Workspaces() ([]string, tfdiags.Diagnostics) {
+diff --git a/internal/backend/remote-state/http/server_test.go b/internal/backend/remote-state/http/server_test.go
+index 43caf607de..2e406038bc 100644
+--- a/internal/backend/remote-state/http/server_test.go
++++ b/internal/backend/remote-state/http/server_test.go
+@@ -277,10 +277,14 @@ func TestMTLSServer_NoCertFails(t *testing.T) {
+ 	}
+ 
+ 	// Now get a state manager and check that it fails to refresh the state
+-	_, sDiags := b.StateMgr(backend.DefaultStateName)
+-	if !sDiags.HasErrors() {
++	sm, sDiags := b.StateMgr(backend.DefaultStateName)
++	if sDiags.HasErrors() {
++		t.Fatalf("unexpected error fetching StateMgr with %s: %v", backend.DefaultStateName, sDiags)
++	}
++	err = sm.RefreshState()
++	if nil == err {
+ 		t.Error("expected error when refreshing state without a client cert")
+-	} else if !strings.Contains(sDiags.Err().Error(), "remote error: tls: certificate required") {
++	} else if !strings.Contains(err.Error(), "remote error: tls: certificate required") {
+ 		t.Errorf("expected the error to report missing tls credentials: %v", err)
+ 	}
+ }
+diff --git a/internal/backend/remote-state/http/test_backend.go b/internal/backend/remote-state/http/test_backend.go
+index bd264a80a7..0b295004b4 100644
+--- a/internal/backend/remote-state/http/test_backend.go
++++ b/internal/backend/remote-state/http/test_backend.go
+@@ -10,27 +10,25 @@ import (
+ 	"reflect"
+ )
+ 
+-type TestRequestHandleFunc func(w http.ResponseWriter, r *http.Request)
+-
+ type TestHTTPBackend struct {
+ 	Data   []byte
+ 	Locked bool
+ 
+-	methodFuncs map[string]TestRequestHandleFunc
+-	methodCalls map[string]int
++	GetCalled    int
++	PutCalled    int
++	PostCalled   int
++	LockCalled   int
++	UnlockCalled int
++	DeleteCalled int
+ }
+ 
+ func (h *TestHTTPBackend) Handle(w http.ResponseWriter, r *http.Request) {
+-	h.countMethodCall(r.Method)
+-	called := h.callMethod(r.Method, w, r)
+-	if called {
+-		return
+-	}
+-
+ 	switch r.Method {
+ 	case "GET":
++		h.GetCalled++
+ 		w.Write(h.Data)
+ 	case "PUT":
++		h.PutCalled++
+ 		buf := new(bytes.Buffer)
+ 		if _, err := io.Copy(buf, r.Body); err != nil {
+ 			w.WriteHeader(500)
+@@ -38,79 +36,40 @@ func (h *TestHTTPBackend) Handle(w http.ResponseWriter, r *http.Request) {
+ 		w.WriteHeader(201)
+ 		h.Data = buf.Bytes()
+ 	case "POST":
++		h.PostCalled++
+ 		buf := new(bytes.Buffer)
+ 		if _, err := io.Copy(buf, r.Body); err != nil {
+ 			w.WriteHeader(500)
+ 		}
+ 		h.Data = buf.Bytes()
+ 	case "LOCK":
++		h.LockCalled++
+ 		if h.Locked {
+ 			w.WriteHeader(423)
+ 		} else {
+ 			h.Locked = true
+ 		}
+ 	case "UNLOCK":
++		h.UnlockCalled++
+ 		h.Locked = false
+ 	case "DELETE":
++		h.DeleteCalled++
+ 		h.Data = nil
+ 		w.WriteHeader(200)
+ 	default:
+-		w.WriteHeader(http.StatusNotImplemented)
++		w.WriteHeader(500)
+ 		w.Write([]byte(fmt.Sprintf("Unknown method: %s", r.Method)))
+ 	}
+ }
+ 
+-func (h *TestHTTPBackend) countMethodCall(method string) {
+-	if h.methodCalls == nil {
+-		h.methodCalls = make(map[string]int)
+-	}
+-	if _, ok := h.methodCalls[method]; !ok {
+-		h.methodCalls[method] = 0
+-	}
+-	h.methodCalls[method]++
+-}
+-
+-func (h *TestHTTPBackend) CallCount(method string) int {
+-	if h.methodCalls == nil {
+-		return 0
+-	}
+-	callCount, ok := h.methodCalls[method]
+-	if !ok {
+-		return 0
+-	}
+-	return callCount
+-}
+-
+-func (h *TestHTTPBackend) callMethod(method string, w http.ResponseWriter, r *http.Request) bool {
+-	if h.methodFuncs == nil {
+-		return false
+-	}
+-	f, ok := h.methodFuncs[method]
+-	if ok {
+-		f(w, r)
+-	}
+-	return ok
+-}
+-
+-func (h *TestHTTPBackend) SetMethodFunc(method string, impl TestRequestHandleFunc) {
+-	if h.methodFuncs == nil {
+-		h.methodFuncs = make(map[string]TestRequestHandleFunc)
+-	}
+-	h.methodFuncs[method] = impl
+-}
+-
+ // mod_dav-ish behavior
+ func (h *TestHTTPBackend) HandleWebDAV(w http.ResponseWriter, r *http.Request) {
+-	h.countMethodCall(r.Method)
+-	if f, ok := h.methodFuncs[r.Method]; ok {
+-		f(w, r)
+-		return
+-	}
+-
+ 	switch r.Method {
+ 	case "GET":
++		h.GetCalled++
+ 		w.Write(h.Data)
+ 	case "PUT":
++		h.PutCalled++
+ 		buf := new(bytes.Buffer)
+ 		if _, err := io.Copy(buf, r.Body); err != nil {
+ 			w.WriteHeader(500)
+@@ -123,10 +82,11 @@ func (h *TestHTTPBackend) HandleWebDAV(w http.ResponseWriter, r *http.Request) {
+ 			w.WriteHeader(201)
+ 		}
+ 	case "DELETE":
++		h.DeleteCalled++
+ 		h.Data = nil
+ 		w.WriteHeader(200)
+ 	default:
+-		w.WriteHeader(http.StatusNotImplemented)
++		w.WriteHeader(500)
+ 		w.Write([]byte(fmt.Sprintf("Unknown method: %s", r.Method)))
+ 	}
+ }
+diff --git a/internal/command/init_test.go b/internal/command/init_test.go
+index 1bb6a401d6..850fb7cc06 100644
+--- a/internal/command/init_test.go
++++ b/internal/command/init_test.go
+@@ -487,84 +487,6 @@ func TestInit_backend(t *testing.T) {
+ 	}
+ }
+ 
+-// regression test for https://github.com/hashicorp/terraform/issues/38027
+-func TestInit_backend_migration_stateMgr_error(t *testing.T) {
+-	// Create a temporary working directory that is empty
+-	td := t.TempDir()
+-	t.Chdir(td)
+-
+-	{
+-		// create some state in (implied) local backend
+-		outputCfg := `output "test" { value = "test" }
+-`
+-		if err := os.WriteFile("output.tf", []byte(outputCfg), 0644); err != nil {
+-			t.Fatalf("err: %s", err)
+-		}
+-
+-		ui := new(cli.MockUi)
+-		applyView, done := testView(t)
+-		applyCmd := &ApplyCommand{
+-			Meta: Meta{
+-				Ui:   ui,
+-				View: applyView,
+-			},
+-		}
+-		code := applyCmd.Run([]string{"-auto-approve"})
+-		testOut := done(t)
+-		if code != 0 {
+-			t.Fatalf("bad: \n%s", testOut.All())
+-		}
+-
+-		if _, err := os.Stat(DefaultStateFilename); err != nil {
+-			t.Fatalf("err: %s", err)
+-		}
+-	}
+-	{
+-		// attempt to migrate the state to a broken backend
+-		testBackend := new(httpBackend.TestHTTPBackend)
+-		testBackend.SetMethodFunc("GET", func(w http.ResponseWriter, r *http.Request) {
+-			// simulate "broken backend" in the way described in #38027
+-			// i.e. access denied
+-			w.WriteHeader(403)
+-		})
+-		ts := httptest.NewServer(http.HandlerFunc(testBackend.Handle))
+-		t.Cleanup(ts.Close)
+-
+-		backendCfg := fmt.Sprintf(`terraform {
+-  backend "http" {
+-    address = %q
+-  }
+-}
+-`, ts.URL)
+-		if err := os.WriteFile("backend.tf", []byte(backendCfg), 0644); err != nil {
+-			t.Fatalf("err: %s", err)
+-		}
+-
+-		ui := new(cli.MockUi)
+-		initView, done := testView(t)
+-		initCmd := &InitCommand{
+-			Meta: Meta{
+-				Ui:   ui,
+-				View: initView,
+-			},
+-		}
+-		code := initCmd.Run([]string{"-migrate-state"})
+-		out := done(t)
+-		if code == 0 {
+-			t.Fatalf("expected migration to fail (gracefully): %s", out.Stdout())
+-		}
+-		expectedErrMsg := "HTTP remote state endpoint invalid auth"
+-		if !strings.Contains(out.Stderr(), expectedErrMsg) {
+-			t.Fatalf("expected error %q, given: %s", expectedErrMsg, out.Stderr())
+-		}
+-
+-		getCalled := testBackend.CallCount("GET")
+-		if getCalled != 1 {
+-			t.Fatalf("expected GET to be called exactly %d, called %d times", 1, getCalled)
+-		}
+-	}
+-}
+-
+ func TestInit_backendUnset(t *testing.T) {
+ 	// Create a temporary working directory that is empty
+ 	td := t.TempDir()
+@@ -4422,6 +4344,8 @@ func TestInit_stateStore_to_backend(t *testing.T) {
+ 
+ 		testBackend := new(httpBackend.TestHTTPBackend)
+ 		ts := httptest.NewServer(http.HandlerFunc(testBackend.Handle))
++		defer ts.Close()
++
+ 		t.Cleanup(ts.Close)
+ 
+ 		// Override state store to backend
+@@ -4453,7 +4377,6 @@ func TestInit_stateStore_to_backend(t *testing.T) {
+ 
+ 		args := []string{
+ 			"-enable-pluggable-state-storage-experiment=true",
+-			"-migrate-state",
+ 			"-force-copy",
+ 		}
+ 		code := c.Run(args)
+@@ -4491,13 +4414,13 @@ func TestInit_stateStore_to_backend(t *testing.T) {
+ 			t.Fatalf("unexpected data: %s", diff)
+ 		}
+ 
+-		expectedGetCalls := 6
+-		if testBackend.CallCount("GET") != expectedGetCalls {
+-			t.Fatalf("expected %d GET calls, got %d", expectedGetCalls, testBackend.CallCount("GET"))
++		expectedGetCalls := 4
++		if testBackend.GetCalled != expectedGetCalls {
++			t.Fatalf("expected %d GET calls, got %d", expectedGetCalls, testBackend.GetCalled)
+ 		}
+ 		expectedPostCalls := 1
+-		if testBackend.CallCount("POST") != expectedPostCalls {
+-			t.Fatalf("expected %d POST calls, got %d", expectedPostCalls, testBackend.CallCount("POST"))
++		if testBackend.PostCalled != expectedPostCalls {
++			t.Fatalf("expected %d POST calls, got %d", expectedPostCalls, testBackend.PostCalled)
+ 		}
+ 	}
+ }

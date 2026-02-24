@@ -1,0 +1,977 @@
+diff --git a/xds/internal/clients/lrsclient/load_store.go b/xds/internal/clients/lrsclient/load_store.go
+index d52db0c7..fd363ad6 100644
+--- a/xds/internal/clients/lrsclient/load_store.go
++++ b/xds/internal/clients/lrsclient/load_store.go
+@@ -1,5 +1,3 @@
+-//revive:disable:unused-parameter
+-
+ /*
+  *
+  * Copyright 2025 gRPC authors.
+@@ -20,7 +18,12 @@
+ 
+ package lrsclient
+ 
+-import "context"
++import (
++	"context"
++	"sync"
++	"sync/atomic"
++	"time"
++)
+ 
+ // A LoadStore aggregates loads for multiple clusters and services that are
+ // intended to be reported via LRS.
+@@ -30,51 +33,394 @@ import "context"
+ //
+ // It is safe for concurrent use.
+ type LoadStore struct {
++	stop func(ctx context.Context) // Function to call to Stop the LoadStore
++
++	// mu only protects the map (2 layers). The read/write to
++	// *PerClusterReporter doesn't need to hold the mu.
++	mu sync.Mutex
++	// clusters is a map with cluster name as the key. The second layer is a
++	// map with service name as the key. Each value (PerClusterReporter)
++	// contains data for a (cluster, service) pair.
++	//
++	// Note that new entries are added to this map, but never removed. This is
++	// potentially a memory leak. But the memory is allocated for each new
++	// (cluster,service) pair, and the memory allocated is just pointers and
++	// maps. So this shouldn't get too bad.
++	clusters map[string]map[string]*PerClusterReporter
+ }
+ 
+-// Stop stops the LRS stream associated with this LoadStore.
++// newLoadStore creates a LoadStore.
++func newLoadStore() *LoadStore {
++	return &LoadStore{
++		clusters: make(map[string]map[string]*PerClusterReporter),
++	}
++}
++
++// Stop signals the LoadStore to stop reporting.
+ //
+-// If this LoadStore is the only one using the underlying LRS stream, the
+-// stream will be closed. If other LoadStores are also using the same stream,
+-// the reference count to the stream is decremented, and the stream remains
+-// open until all LoadStores have called Stop().
++// Before closing the underlying LRS stream, this method may block until a
++// final load report send attempt completes or the provided context `ctx` expires.
+ //
+-// If this is the last LoadStore for the stream, this method makes a last
+-// attempt to flush any unreported load data to the LRS server. It will either
+-// wait for this attempt to complete, or for the provided context to be done
+-// before canceling the LRS stream.
+-func (ls *LoadStore) Stop(ctx context.Context) error {
+-	panic("unimplemented")
++// The provided context must have a deadline or timeout set to prevent Stop
++// from blocking indefinitely if the final send attempt fails to complete.
++func (ls *LoadStore) Stop(ctx context.Context) {
++	ls.stop(ctx)
+ }
+ 
+ // ReporterForCluster returns the PerClusterReporter for the given cluster and
+ // service.
+-func (ls *LoadStore) ReporterForCluster(clusterName, serviceName string) PerClusterReporter {
+-	panic("unimplemented")
++func (ls *LoadStore) ReporterForCluster(clusterName, serviceName string) *PerClusterReporter {
++	ls.mu.Lock()
++	defer ls.mu.Unlock()
++	c, ok := ls.clusters[clusterName]
++	if !ok {
++		c = make(map[string]*PerClusterReporter)
++		ls.clusters[clusterName] = c
++	}
++
++	if p, ok := c[serviceName]; ok {
++		return p
++	}
++	p := &PerClusterReporter{
++		cluster: clusterName,
++		service: serviceName,
++	}
++	c[serviceName] = p
++	return p
++}
++
++// stats returns the load data for the given cluster names. Data is returned in
++// a slice with no specific order.
++//
++// If no clusterName is given (an empty slice), all data for all known clusters
++// is returned.
++//
++// If a cluster's loadData is empty (no load to report), it's not appended to
++// the returned slice.
++func (ls *LoadStore) stats(clusterNames []string) []*loadData {
++	ls.mu.Lock()
++	defer ls.mu.Unlock()
++
++	var ret []*loadData
++	if len(clusterNames) == 0 {
++		for _, c := range ls.clusters {
++			ret = appendClusterStats(ret, c)
++		}
++		return ret
++	}
++	for _, n := range clusterNames {
++		if c, ok := ls.clusters[n]; ok {
++			ret = appendClusterStats(ret, c)
++		}
++	}
++
++	return ret
+ }
+ 
+ // PerClusterReporter records load data pertaining to a single cluster. It
+ // provides methods to record call starts, finishes, server-reported loads,
+ // and dropped calls.
++//
++// It is safe for concurrent use.
++//
++// TODO(purnesh42h): Use regular maps with mutexes instead of sync.Map here.
++// The latter is optimized for two common use cases: (1) when the entry for a
++// given key is only ever written once but read many times, as in caches that
++// only grow, or (2) when multiple goroutines read, write, and overwrite
++// entries for disjoint sets of keys. In these two cases, use of a Map may
++// significantly reduce lock contention compared to a Go map paired with a
++// separate Mutex or RWMutex.
++// Neither of these conditions are met here, and we should transition to a
++// regular map with a mutex for better type safety.
+ type PerClusterReporter struct {
++	cluster, service string
++	drops            sync.Map // map[string]*uint64
++	localityRPCCount sync.Map // map[string]*rpcCountData
++
++	mu               sync.Mutex
++	lastLoadReportAt time.Time
+ }
+ 
+ // CallStarted records a call started in the LoadStore.
+ func (p *PerClusterReporter) CallStarted(locality string) {
+-	panic("unimplemented")
++	s, ok := p.localityRPCCount.Load(locality)
++	if !ok {
++		tp := newRPCCountData()
++		s, _ = p.localityRPCCount.LoadOrStore(locality, tp)
++	}
++	s.(*rpcCountData).incrInProgress()
++	s.(*rpcCountData).incrIssued()
+ }
+ 
+ // CallFinished records a call finished in the LoadStore.
+ func (p *PerClusterReporter) CallFinished(locality string, err error) {
+-	panic("unimplemented")
++	f, ok := p.localityRPCCount.Load(locality)
++	if !ok {
++		// The map is never cleared, only values in the map are reset. So the
++		// case where entry for call-finish is not found should never happen.
++		return
++	}
++	f.(*rpcCountData).decrInProgress()
++	if err == nil {
++		f.(*rpcCountData).incrSucceeded()
++	} else {
++		f.(*rpcCountData).incrErrored()
++	}
+ }
+ 
+ // CallServerLoad records the server load in the LoadStore.
+ func (p *PerClusterReporter) CallServerLoad(locality, name string, val float64) {
+-	panic("unimplemented")
++	s, ok := p.localityRPCCount.Load(locality)
++	if !ok {
++		// The map is never cleared, only values in the map are reset. So the
++		// case where entry for callServerLoad is not found should never happen.
++		return
++	}
++	s.(*rpcCountData).addServerLoad(name, val)
+ }
+ 
+ // CallDropped records a call dropped in the LoadStore.
+ func (p *PerClusterReporter) CallDropped(category string) {
+-	panic("unimplemented")
++	d, ok := p.drops.Load(category)
++	if !ok {
++		tp := new(uint64)
++		d, _ = p.drops.LoadOrStore(category, tp)
++	}
++	atomic.AddUint64(d.(*uint64), 1)
++}
++
++// stats returns and resets all loads reported to the store, except inProgress
++// rpc counts.
++//
++// It returns nil if the store doesn't contain any (new) data.
++func (p *PerClusterReporter) stats() *loadData {
++	sd := newLoadData(p.cluster, p.service)
++	p.drops.Range(func(key, val any) bool {
++		d := atomic.SwapUint64(val.(*uint64), 0)
++		if d == 0 {
++			return true
++		}
++		sd.totalDrops += d
++		keyStr := key.(string)
++		if keyStr != "" {
++			// Skip drops without category. They are counted in total_drops, but
++			// not in per category. One example is drops by circuit breaking.
++			sd.drops[keyStr] = d
++		}
++		return true
++	})
++	p.localityRPCCount.Range(func(key, val any) bool {
++		countData := val.(*rpcCountData)
++		succeeded := countData.loadAndClearSucceeded()
++		inProgress := countData.loadInProgress()
++		errored := countData.loadAndClearErrored()
++		issued := countData.loadAndClearIssued()
++		if succeeded == 0 && inProgress == 0 && errored == 0 && issued == 0 {
++			return true
++		}
++
++		ld := localityData{
++			requestStats: requestData{
++				succeeded:  succeeded,
++				errored:    errored,
++				inProgress: inProgress,
++				issued:     issued,
++			},
++			loadStats: make(map[string]serverLoadData),
++		}
++		countData.serverLoads.Range(func(key, val any) bool {
++			sum, count := val.(*rpcLoadData).loadAndClear()
++			if count == 0 {
++				return true
++			}
++			ld.loadStats[key.(string)] = serverLoadData{
++				count: count,
++				sum:   sum,
++			}
++			return true
++		})
++		sd.localityStats[key.(string)] = ld
++		return true
++	})
++
++	p.mu.Lock()
++	sd.reportInterval = time.Since(p.lastLoadReportAt)
++	p.lastLoadReportAt = time.Now()
++	p.mu.Unlock()
++
++	if sd.totalDrops == 0 && len(sd.drops) == 0 && len(sd.localityStats) == 0 {
++		return nil
++	}
++	return sd
++}
++
++// loadData contains all load data reported to the LoadStore since the most recent
++// call to stats().
++type loadData struct {
++	// cluster is the name of the cluster this data is for.
++	cluster string
++	// service is the name of the EDS service this data is for.
++	service string
++	// totalDrops is the total number of dropped requests.
++	totalDrops uint64
++	// drops is the number of dropped requests per category.
++	drops map[string]uint64
++	// localityStats contains load reports per locality.
++	localityStats map[string]localityData
++	// reportInternal is the duration since last time load was reported (stats()
++	// was called).
++	reportInterval time.Duration
++}
++
++// localityData contains load data for a single locality.
++type localityData struct {
++	// requestStats contains counts of requests made to the locality.
++	requestStats requestData
++	// loadStats contains server load data for requests made to the locality,
++	// indexed by the load type.
++	loadStats map[string]serverLoadData
++}
++
++// requestData contains request counts.
++type requestData struct {
++	// succeeded is the number of succeeded requests.
++	succeeded uint64
++	// errored is the number of requests which ran into errors.
++	errored uint64
++	// inProgress is the number of requests in flight.
++	inProgress uint64
++	// issued is the total number requests that were sent.
++	issued uint64
++}
++
++// serverLoadData contains server load data.
++type serverLoadData struct {
++	// count is the number of load reports.
++	count uint64
++	// sum is the total value of all load reports.
++	sum float64
++}
++
++// appendClusterStats gets the Data for all the given clusters, append to ret,
++// and return the new slice.
++//
++// Data is only appended to ret if it's not empty.
++func appendClusterStats(ret []*loadData, clusters map[string]*PerClusterReporter) []*loadData {
++	for _, d := range clusters {
++		data := d.stats()
++		if data == nil {
++			// Skip this data if it doesn't contain any information.
++			continue
++		}
++		ret = append(ret, data)
++	}
++	return ret
++}
++
++func newLoadData(cluster, service string) *loadData {
++	return &loadData{
++		cluster:       cluster,
++		service:       service,
++		drops:         make(map[string]uint64),
++		localityStats: make(map[string]localityData),
++	}
++}
++
++type rpcCountData struct {
++	// Only atomic accesses are allowed for the fields.
++	succeeded  *uint64
++	errored    *uint64
++	inProgress *uint64
++	issued     *uint64
++
++	// Map from load desc to load data (sum+count). Loading data from map is
++	// atomic, but updating data takes a lock, which could cause contention when
++	// multiple RPCs try to report loads for the same desc.
++	//
++	// To fix the contention, shard this map.
++	serverLoads sync.Map // map[string]*rpcLoadData
++}
++
++func newRPCCountData() *rpcCountData {
++	return &rpcCountData{
++		succeeded:  new(uint64),
++		errored:    new(uint64),
++		inProgress: new(uint64),
++		issued:     new(uint64),
++	}
++}
++
++func (rcd *rpcCountData) incrSucceeded() {
++	atomic.AddUint64(rcd.succeeded, 1)
++}
++
++func (rcd *rpcCountData) loadAndClearSucceeded() uint64 {
++	return atomic.SwapUint64(rcd.succeeded, 0)
++}
++
++func (rcd *rpcCountData) incrErrored() {
++	atomic.AddUint64(rcd.errored, 1)
++}
++
++func (rcd *rpcCountData) loadAndClearErrored() uint64 {
++	return atomic.SwapUint64(rcd.errored, 0)
++}
++
++func (rcd *rpcCountData) incrInProgress() {
++	atomic.AddUint64(rcd.inProgress, 1)
++}
++
++func (rcd *rpcCountData) decrInProgress() {
++	atomic.AddUint64(rcd.inProgress, ^uint64(0)) // atomic.Add(x, -1)
++}
++
++func (rcd *rpcCountData) loadInProgress() uint64 {
++	return atomic.LoadUint64(rcd.inProgress) // InProgress count is not clear when reading.
++}
++
++func (rcd *rpcCountData) incrIssued() {
++	atomic.AddUint64(rcd.issued, 1)
++}
++
++func (rcd *rpcCountData) loadAndClearIssued() uint64 {
++	return atomic.SwapUint64(rcd.issued, 0)
++}
++
++func (rcd *rpcCountData) addServerLoad(name string, d float64) {
++	loads, ok := rcd.serverLoads.Load(name)
++	if !ok {
++		tl := newRPCLoadData()
++		loads, _ = rcd.serverLoads.LoadOrStore(name, tl)
++	}
++	loads.(*rpcLoadData).add(d)
++}
++
++// rpcLoadData is data for server loads (from trailers or oob). Fields in this
++// struct must be updated consistently.
++//
++// The current solution is to hold a lock, which could cause contention. To fix,
++// shard serverLoads map in rpcCountData.
++type rpcLoadData struct {
++	mu    sync.Mutex
++	sum   float64
++	count uint64
++}
++
++func newRPCLoadData() *rpcLoadData {
++	return &rpcLoadData{}
++}
++
++func (rld *rpcLoadData) add(v float64) {
++	rld.mu.Lock()
++	rld.sum += v
++	rld.count++
++	rld.mu.Unlock()
++}
++
++func (rld *rpcLoadData) loadAndClear() (s float64, c uint64) {
++	rld.mu.Lock()
++	s, rld.sum = rld.sum, 0
++	c, rld.count = rld.count, 0
++	rld.mu.Unlock()
++	return s, c
+ }
+diff --git a/xds/internal/clients/lrsclient/logging.go b/xds/internal/clients/lrsclient/logging.go
+new file mode 100644
+index 00000000..032b56bd
+--- /dev/null
++++ b/xds/internal/clients/lrsclient/logging.go
+@@ -0,0 +1,36 @@
++/*
++ *
++ * Copyright 2025 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++package lrsclient
++
++import (
++	"fmt"
++
++	"google.golang.org/grpc/grpclog"
++	internalgrpclog "google.golang.org/grpc/internal/grpclog"
++)
++
++var logger = grpclog.Component("xds")
++
++func prefixLogger(c *LRSClient) *internalgrpclog.PrefixLogger {
++	return internalgrpclog.NewPrefixLogger(logger, clientPrefix(c))
++}
++
++func clientPrefix(c *LRSClient) string {
++	return fmt.Sprintf("[lrs-client %p] ", c)
++}
+diff --git a/xds/internal/clients/lrsclient/lrs_stream.go b/xds/internal/clients/lrsclient/lrs_stream.go
+new file mode 100644
+index 00000000..df761d40
+--- /dev/null
++++ b/xds/internal/clients/lrsclient/lrs_stream.go
+@@ -0,0 +1,318 @@
++/*
++ *
++ * Copyright 2025 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package lrsclient
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"time"
++
++	"google.golang.org/grpc/grpclog"
++	"google.golang.org/grpc/internal/backoff"
++	igrpclog "google.golang.org/grpc/internal/grpclog"
++	"google.golang.org/grpc/internal/pretty"
++	"google.golang.org/grpc/xds/internal/clients"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/durationpb"
++
++	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
++	v3endpointpb "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
++	v3lrspb "github.com/envoyproxy/go-control-plane/envoy/service/load_stats/v3"
++)
++
++// Any per-RPC level logs which print complete request or response messages
++// should be gated at this verbosity level. Other per-RPC level logs which print
++// terse output should be at `INFO` and verbosity 2.
++const perRPCVerbosityLevel = 9
++
++// streamImpl provides all the functionality associated with an LRS (Load
++// Reporting Service) stream on the client-side. It manages the lifecycle of
++// the LRS stream, including starting, stopping, and retrying the stream. It
++// also provides a LoadStore that can be used to report load, with a Stop
++// function that should be called when the load reporting is no longer
++// needed.
++type streamImpl struct {
++	// The following fields are initialized when a stream instance is created
++	// and are read-only afterwards, and hence can be accessed without a mutex.
++	transport clients.Transport       // Transport to use for LRS stream.
++	backoff   func(int) time.Duration // Backoff for retries, after stream failures.
++	nodeProto *v3corepb.Node          // Identifies the gRPC application.
++	doneCh    chan struct{}           // To notify exit of LRS goroutine.
++	logger    *igrpclog.PrefixLogger
++
++	cancelStream context.CancelFunc // Cancel the stream. If nil, the stream is not active.
++	loadStore    *LoadStore         // LoadStore returned to user for pushing loads.
++
++	finalSendRequest chan struct{} // To request for the final attempt to send loads.
++	finalSendDone    chan error    // To signal completion of the final attempt of sending loads.
++}
++
++// streamOpts holds the options for creating an lrsStream.
++type streamOpts struct {
++	transport clients.Transport       // xDS transport to create the stream on.
++	backoff   func(int) time.Duration // Backoff for retries, after stream failures.
++	nodeProto *v3corepb.Node          // Node proto to identify the gRPC application.
++	logPrefix string                  // Prefix to be used for log messages.
++}
++
++// newStreamImpl creates a new StreamImpl with the provided options.
++//
++// The actual streaming RPC call is initiated when the first call to ReportLoad
++// is made, and is terminated when the last call to ReportLoad is canceled.
++func newStreamImpl(opts streamOpts) *streamImpl {
++	ctx, cancel := context.WithCancel(context.Background())
++
++	lrs := &streamImpl{
++		transport:        opts.transport,
++		backoff:          opts.backoff,
++		nodeProto:        opts.nodeProto,
++		cancelStream:     cancel,
++		doneCh:           make(chan struct{}),
++		finalSendRequest: make(chan struct{}, 1),
++		finalSendDone:    make(chan error, 1),
++	}
++
++	l := grpclog.Component("xds")
++	lrs.logger = igrpclog.NewPrefixLogger(l, opts.logPrefix+fmt.Sprintf("[lrs-stream %p] ", lrs))
++	lrs.loadStore = newLoadStore()
++	go lrs.runner(ctx)
++	return lrs
++}
++
++// runner is responsible for managing the lifetime of an LRS streaming call. It
++// creates the stream, sends the initial LoadStatsRequest, receives the first
++// LoadStatsResponse, and then starts a goroutine to periodically send
++// LoadStatsRequests. The runner will restart the stream if it encounters any
++// errors.
++func (lrs *streamImpl) runner(ctx context.Context) {
++	defer close(lrs.doneCh)
++
++	// This feature indicates that the client supports the
++	// LoadStatsResponse.send_all_clusters field in the LRS response.
++	node := proto.Clone(lrs.nodeProto).(*v3corepb.Node)
++	node.ClientFeatures = append(node.ClientFeatures, "envoy.lrs.supports_send_all_clusters")
++
++	runLoadReportStream := func() error {
++		// streamCtx is created and canceled in case we terminate the stream
++		// early for any reason, to avoid gRPC-Go leaking the RPC's monitoring
++		// goroutine.
++		streamCtx, cancel := context.WithCancel(ctx)
++		defer cancel()
++
++		stream, err := lrs.transport.NewStream(streamCtx, "/envoy.service.load_stats.v3.LoadReportingService/StreamLoadStats")
++		if err != nil {
++			lrs.logger.Warningf("Failed to create new LRS streaming RPC: %v", err)
++			return nil
++		}
++		if lrs.logger.V(2) {
++			lrs.logger.Infof("LRS stream created")
++		}
++
++		if err := lrs.sendFirstLoadStatsRequest(stream, node); err != nil {
++			lrs.logger.Warningf("Sending first LRS request failed: %v", err)
++			return nil
++		}
++
++		clusters, interval, err := lrs.recvFirstLoadStatsResponse(stream)
++		if err != nil {
++			lrs.logger.Warningf("Reading from LRS streaming RPC failed: %v", err)
++			return nil
++		}
++
++		// We reset backoff state when we successfully receive at least one
++		// message from the server.
++		lrs.sendLoads(streamCtx, stream, clusters, interval)
++		return backoff.ErrResetBackoff
++	}
++	backoff.RunF(ctx, runLoadReportStream, lrs.backoff)
++}
++
++// sendLoads is responsible for periodically sending load reports to the LRS
++// server at the specified interval for the specified clusters, until the passed
++// in context is canceled.
++func (lrs *streamImpl) sendLoads(ctx context.Context, stream clients.Stream, clusterNames []string, interval time.Duration) {
++	tick := time.NewTicker(interval)
++	defer tick.Stop()
++	for {
++		select {
++		case <-tick.C:
++		case <-ctx.Done():
++			return
++		case <-lrs.finalSendRequest:
++			var finalSendErr error
++			if lrs.logger.V(2) {
++				lrs.logger.Infof("Final send request received. Attempting final LRS report.")
++			}
++			if err := lrs.sendLoadStatsRequest(stream, lrs.loadStore.stats(clusterNames)); err != nil {
++				lrs.logger.Warningf("Failed to send final load report. Writing to LRS stream failed: %v", err)
++				finalSendErr = err
++			}
++			if lrs.logger.V(2) {
++				lrs.logger.Infof("Successfully sent final load report.")
++			}
++			lrs.finalSendDone <- finalSendErr
++			return
++		}
++
++		if err := lrs.sendLoadStatsRequest(stream, lrs.loadStore.stats(clusterNames)); err != nil {
++			lrs.logger.Warningf("Failed to send periodic load report. Writing to LRS stream failed: %v", err)
++			return
++		}
++	}
++}
++
++func (lrs *streamImpl) sendFirstLoadStatsRequest(stream clients.Stream, node *v3corepb.Node) error {
++	req := &v3lrspb.LoadStatsRequest{Node: node}
++	if lrs.logger.V(perRPCVerbosityLevel) {
++		lrs.logger.Infof("Sending initial LoadStatsRequest: %s", pretty.ToJSON(req))
++	}
++	msg, err := proto.Marshal(req)
++	if err != nil {
++		lrs.logger.Warningf("Failed to marshal LoadStatsRequest: %v", err)
++		return err
++	}
++	err = stream.Send(msg)
++	if err == io.EOF {
++		return getStreamError(stream)
++	}
++	return err
++}
++
++// recvFirstLoadStatsResponse receives the first LoadStatsResponse from the LRS
++// server.  Returns the following:
++//   - a list of cluster names requested by the server or an empty slice if the
++//     server requested for load from all clusters
++//   - the load reporting interval, and
++//   - any error encountered
++func (lrs *streamImpl) recvFirstLoadStatsResponse(stream clients.Stream) ([]string, time.Duration, error) {
++	r, err := stream.Recv()
++	if err != nil {
++		return nil, 0, fmt.Errorf("lrs: failed to receive first LoadStatsResponse: %v", err)
++	}
++	var resp v3lrspb.LoadStatsResponse
++	if err := proto.Unmarshal(r, &resp); err != nil {
++		if lrs.logger.V(2) {
++			lrs.logger.Infof("Failed to unmarshal response to LoadStatsResponse: %v", err)
++		}
++		return nil, time.Duration(0), fmt.Errorf("lrs: unexpected message type %T", r)
++	}
++	if lrs.logger.V(perRPCVerbosityLevel) {
++		lrs.logger.Infof("Received first LoadStatsResponse: %s", pretty.ToJSON(&resp))
++	}
++
++	internal := resp.GetLoadReportingInterval()
++	if internal.CheckValid() != nil {
++		return nil, 0, fmt.Errorf("lrs: invalid load_reporting_interval: %v", err)
++	}
++	loadReportingInterval := internal.AsDuration()
++
++	clusters := resp.Clusters
++	if resp.SendAllClusters {
++		// Return an empty slice to send stats for all clusters.
++		clusters = []string{}
++	}
++
++	return clusters, loadReportingInterval, nil
++}
++
++func (lrs *streamImpl) sendLoadStatsRequest(stream clients.Stream, loads []*loadData) error {
++	clusterStats := make([]*v3endpointpb.ClusterStats, 0, len(loads))
++	for _, sd := range loads {
++		droppedReqs := make([]*v3endpointpb.ClusterStats_DroppedRequests, 0, len(sd.drops))
++		for category, count := range sd.drops {
++			droppedReqs = append(droppedReqs, &v3endpointpb.ClusterStats_DroppedRequests{
++				Category:     category,
++				DroppedCount: count,
++			})
++		}
++		localityStats := make([]*v3endpointpb.UpstreamLocalityStats, 0, len(sd.localityStats))
++		for l, localityData := range sd.localityStats {
++			lid, err := localityFromString(l)
++			if err != nil {
++				return err
++			}
++			loadMetricStats := make([]*v3endpointpb.EndpointLoadMetricStats, 0, len(localityData.loadStats))
++			for name, loadData := range localityData.loadStats {
++				loadMetricStats = append(loadMetricStats, &v3endpointpb.EndpointLoadMetricStats{
++					MetricName:                    name,
++					NumRequestsFinishedWithMetric: loadData.count,
++					TotalMetricValue:              loadData.sum,
++				})
++			}
++			localityStats = append(localityStats, &v3endpointpb.UpstreamLocalityStats{
++				Locality: &v3corepb.Locality{
++					Region:  lid.Region,
++					Zone:    lid.Zone,
++					SubZone: lid.SubZone,
++				},
++				TotalSuccessfulRequests: localityData.requestStats.succeeded,
++				TotalRequestsInProgress: localityData.requestStats.inProgress,
++				TotalErrorRequests:      localityData.requestStats.errored,
++				TotalIssuedRequests:     localityData.requestStats.issued,
++				LoadMetricStats:         loadMetricStats,
++				UpstreamEndpointStats:   nil, // TODO: populate for per endpoint loads.
++			})
++		}
++
++		clusterStats = append(clusterStats, &v3endpointpb.ClusterStats{
++			ClusterName:           sd.cluster,
++			ClusterServiceName:    sd.service,
++			UpstreamLocalityStats: localityStats,
++			TotalDroppedRequests:  sd.totalDrops,
++			DroppedRequests:       droppedReqs,
++			LoadReportInterval:    durationpb.New(sd.reportInterval),
++		})
++	}
++
++	req := &v3lrspb.LoadStatsRequest{ClusterStats: clusterStats}
++	if lrs.logger.V(perRPCVerbosityLevel) {
++		lrs.logger.Infof("Sending LRS loads: %s", pretty.ToJSON(req))
++	}
++	msg, err := proto.Marshal(req)
++	if err != nil {
++		if lrs.logger.V(2) {
++			lrs.logger.Infof("Failed to marshal LoadStatsRequest: %v", err)
++		}
++		return err
++	}
++	err = stream.Send(msg)
++	if err == io.EOF {
++		return getStreamError(stream)
++	}
++	return err
++}
++
++func getStreamError(stream clients.Stream) error {
++	for {
++		if _, err := stream.Recv(); err != nil {
++			return err
++		}
++	}
++}
++
++// localityFromString converts a json representation of locality, into a
++// clients.Locality struct.
++func localityFromString(s string) (ret clients.Locality, _ error) {
++	err := json.Unmarshal([]byte(s), &ret)
++	if err != nil {
++		return clients.Locality{}, fmt.Errorf("%s is not a well formatted locality, error: %v", s, err)
++	}
++	return ret, nil
++}
+diff --git a/xds/internal/clients/lrsclient/lrsclient.go b/xds/internal/clients/lrsclient/lrsclient.go
+index 5bd8aa60..af163e22 100644
+--- a/xds/internal/clients/lrsclient/lrsclient.go
++++ b/xds/internal/clients/lrsclient/lrsclient.go
+@@ -21,19 +21,163 @@
+ // See: https://www.envoyproxy.io/docs/envoy/latest/api-v3/service/load_stats/v3/lrs.proto
+ package lrsclient
+ 
+-import "google.golang.org/grpc/xds/internal/clients"
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync"
++	"time"
++
++	"google.golang.org/grpc/grpclog"
++	igrpclog "google.golang.org/grpc/internal/grpclog"
++	"google.golang.org/grpc/xds/internal/clients"
++	clientsinternal "google.golang.org/grpc/xds/internal/clients/internal"
++	"google.golang.org/grpc/xds/internal/clients/internal/backoff"
++)
++
++const (
++	clientFeatureNoOverprovisioning = "envoy.lb.does_not_support_overprovisioning"
++	clientFeatureResourceWrapper    = "xds.config.resource-in-sotw"
++)
++
++var (
++	defaultExponentialBackoff = backoff.DefaultExponential.Backoff
++)
+ 
+ // LRSClient is an LRS (Load Reporting Service) client.
+ type LRSClient struct {
++	transportBuilder clients.TransportBuilder
++	node             clients.Node
++	backoff          func(int) time.Duration // Backoff for LRS stream failures.
++	logger           *igrpclog.PrefixLogger
++
++	// The LRSClient owns a bunch of streams to individual LRS servers.
++	//
++	// Once all references to a stream are dropped, the stream is closed.
++	mu         sync.Mutex
++	lrsStreams map[clients.ServerIdentifier]*streamImpl // Map from server config to in-use streamImpls.
++	lrsRefs    map[clients.ServerIdentifier]int         // Map from server config to number of references.
+ }
+ 
+ // New returns a new LRS Client configured with the provided config.
+-func New(_ Config) (*LRSClient, error) {
+-	panic("unimplemented")
++func New(config Config) (*LRSClient, error) {
++	switch {
++	case config.Node.ID == "":
++		return nil, errors.New("lrsclient: node ID in node is empty")
++	case config.TransportBuilder == nil:
++		return nil, errors.New("lrsclient: transport builder is nil")
++	}
++
++	c := &LRSClient{
++		transportBuilder: config.TransportBuilder,
++		node:             config.Node,
++		backoff:          defaultExponentialBackoff,
++		lrsStreams:       make(map[clients.ServerIdentifier]*streamImpl),
++		lrsRefs:          make(map[clients.ServerIdentifier]int),
++	}
++	c.logger = prefixLogger(c)
++	return c, nil
++}
++
++// ReportLoad creates and returns a LoadStore for the caller to report loads
++// using a LoadReportingStream.
++//
++// Caller must call Stop on the returned LoadStore when they are done reporting
++// load to this server.
++func (c *LRSClient) ReportLoad(si clients.ServerIdentifier) (*LoadStore, error) {
++	lrs, err := c.getOrCreateLRSStream(si)
++	if err != nil {
++		return nil, err
++	}
++	return lrs.loadStore, nil
+ }
+ 
+-// ReportLoad creates a new load reporting stream for the provided server. It
+-// creates and returns a LoadStore for the caller to report loads.
+-func (*LRSClient) ReportLoad(_ clients.ServerIdentifier) *LoadStore {
+-	panic("unimplemented")
++// getOrCreateLRSStream returns an lrs stream for the given server identifier.
++//
++// If an active lrs stream exists for the given server identifier, it is
++// returned. Otherwise, a new lrs stream is created and returned.
++func (c *LRSClient) getOrCreateLRSStream(serverIdentifier clients.ServerIdentifier) (*streamImpl, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	if c.logger.V(2) {
++		c.logger.Infof("Received request for a reference to an lrs stream for server identifier %q", serverIdentifier)
++	}
++
++	// Use an existing stream, if one exists for this server identifier.
++	if s, ok := c.lrsStreams[serverIdentifier]; ok {
++		if c.logger.V(2) {
++			c.logger.Infof("Reusing an existing lrs stream for server identifier %q", serverIdentifier)
++		}
++		c.lrsRefs[serverIdentifier]++
++		return s, nil
++	}
++
++	if c.logger.V(2) {
++		c.logger.Infof("Creating a new lrs stream for server identifier %q", serverIdentifier)
++	}
++
++	l := grpclog.Component("xds")
++	logPrefix := clientPrefix(c)
++	c.logger = igrpclog.NewPrefixLogger(l, logPrefix)
++
++	// Create a new transport and create a new lrs stream, and add it to the
++	// map of lrs streams.
++	tr, err := c.transportBuilder.Build(serverIdentifier)
++	if err != nil {
++		return nil, fmt.Errorf("lrsclient: failed to create transport for server identifier %s: %v", serverIdentifier, err)
++	}
++
++	nodeProto := clientsinternal.NodeProto(c.node)
++	nodeProto.ClientFeatures = []string{clientFeatureNoOverprovisioning, clientFeatureResourceWrapper}
++	lrs := newStreamImpl(streamOpts{
++		transport: tr,
++		backoff:   c.backoff,
++		nodeProto: nodeProto,
++		logPrefix: logPrefix,
++	})
++
++	// Register a stop function that decrements the reference count, stops
++	// the LRS stream when the last reference is removed and closes the
++	// transport and removes the lrs stream and its references from the
++	// respective maps. Before closing the stream, it waits for the provided
++	// context to be done (timeout or cancellation).
++	stop := func(ctx context.Context) {
++		c.mu.Lock()
++		defer c.mu.Unlock()
++
++		if r, ok := c.lrsRefs[serverIdentifier]; !ok || r == 0 {
++			c.logger.Errorf("Attempting to stop already stopped StreamImpl")
++			return
++		}
++		c.lrsRefs[serverIdentifier]--
++		if c.lrsRefs[serverIdentifier] != 0 {
++			return
++		}
++
++		lrs.finalSendRequest <- struct{}{}
++
++		select {
++		case err := <-lrs.finalSendDone:
++			if err != nil {
++				c.logger.Warningf("Final send attempt failed: %v", err)
++			}
++		case <-ctx.Done():
++			c.logger.Warningf("Context canceled before finishing the final send attempt: %v", err)
++		}
++
++		lrs.cancelStream()
++		lrs.cancelStream = nil
++		lrs.logger.Infof("Stopping LRS stream")
++		<-lrs.doneCh
++
++		delete(c.lrsStreams, serverIdentifier)
++		tr.Close()
++	}
++	lrs.loadStore.stop = stop
++
++	c.lrsStreams[serverIdentifier] = lrs
++	c.lrsRefs[serverIdentifier] = 1
++
++	return lrs, nil
+ }

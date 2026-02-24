@@ -1,0 +1,175 @@
+diff --git a/dialoptions.go b/dialoptions.go
+index 050ba0f1..ec0ca89c 100644
+--- a/dialoptions.go
++++ b/dialoptions.go
+@@ -213,6 +213,7 @@ func WithReadBufferSize(s int) DialOption {
+ func WithInitialWindowSize(s int32) DialOption {
+ 	return newFuncDialOption(func(o *dialOptions) {
+ 		o.copts.InitialWindowSize = s
++		o.copts.StaticWindowSize = true
+ 	})
+ }
+ 
+@@ -222,6 +223,26 @@ func WithInitialWindowSize(s int32) DialOption {
+ func WithInitialConnWindowSize(s int32) DialOption {
+ 	return newFuncDialOption(func(o *dialOptions) {
+ 		o.copts.InitialConnWindowSize = s
++		o.copts.StaticWindowSize = true
++	})
++}
++
++// WithStaticStreamWindowSize returns a DialOption which sets the initial
++// stream window size to the value provided and disables dynamic flow control.
++func WithStaticStreamWindowSize(s int32) DialOption {
++	return newFuncDialOption(func(o *dialOptions) {
++		o.copts.InitialWindowSize = s
++		o.copts.StaticWindowSize = true
++	})
++}
++
++// WithStaticConnWindowSize returns a DialOption which sets the initial
++// connection window size to the value provided and disables dynamic flow
++// control.
++func WithStaticConnWindowSize(s int32) DialOption {
++	return newFuncDialOption(func(o *dialOptions) {
++		o.copts.InitialConnWindowSize = s
++		o.copts.StaticWindowSize = true
+ 	})
+ }
+ 
+diff --git a/internal/transport/http2_client.go b/internal/transport/http2_client.go
+index ef56592b..38e1624f 100644
+--- a/internal/transport/http2_client.go
++++ b/internal/transport/http2_client.go
+@@ -309,11 +309,9 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
+ 			scheme = "https"
+ 		}
+ 	}
+-	dynamicWindow := true
+ 	icwz := int32(initialWindowSize)
+ 	if opts.InitialConnWindowSize >= defaultWindowSize {
+ 		icwz = opts.InitialConnWindowSize
+-		dynamicWindow = false
+ 	}
+ 	writeBufSize := opts.WriteBufferSize
+ 	readBufSize := opts.ReadBufferSize
+@@ -381,9 +379,8 @@ func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts
+ 	t.controlBuf = newControlBuffer(t.ctxDone)
+ 	if opts.InitialWindowSize >= defaultWindowSize {
+ 		t.initialWindowSize = opts.InitialWindowSize
+-		dynamicWindow = false
+ 	}
+-	if dynamicWindow {
++	if !opts.StaticWindowSize {
+ 		t.bdpEst = &bdpEstimator{
+ 			bdp:               initialWindowSize,
+ 			updateFlowControl: t.updateFlowControl,
+diff --git a/internal/transport/http2_server.go b/internal/transport/http2_server.go
+index e4c3731b..c322f932 100644
+--- a/internal/transport/http2_server.go
++++ b/internal/transport/http2_server.go
+@@ -176,16 +176,13 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
+ 			Val: config.MaxStreams,
+ 		})
+ 	}
+-	dynamicWindow := true
+ 	iwz := int32(initialWindowSize)
+ 	if config.InitialWindowSize >= defaultWindowSize {
+ 		iwz = config.InitialWindowSize
+-		dynamicWindow = false
+ 	}
+ 	icwz := int32(initialWindowSize)
+ 	if config.InitialConnWindowSize >= defaultWindowSize {
+ 		icwz = config.InitialConnWindowSize
+-		dynamicWindow = false
+ 	}
+ 	if iwz != defaultWindowSize {
+ 		isettings = append(isettings, http2.Setting{
+@@ -285,7 +282,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
+ 	t.logger = prefixLoggerForServerTransport(t)
+ 
+ 	t.controlBuf = newControlBuffer(t.done)
+-	if dynamicWindow {
++	if !config.StaticWindowSize {
+ 		t.bdpEst = &bdpEstimator{
+ 			bdp:               initialWindowSize,
+ 			updateFlowControl: t.updateFlowControl,
+diff --git a/internal/transport/transport.go b/internal/transport/transport.go
+index 1730a639..7dd53e80 100644
+--- a/internal/transport/transport.go
++++ b/internal/transport/transport.go
+@@ -466,6 +466,7 @@ type ServerConfig struct {
+ 	MaxHeaderListSize     *uint32
+ 	HeaderTableSize       *uint32
+ 	BufferPool            mem.BufferPool
++	StaticWindowSize      bool
+ }
+ 
+ // ConnectOptions covers all relevant options for communicating with the server.
+@@ -504,6 +505,8 @@ type ConnectOptions struct {
+ 	MaxHeaderListSize *uint32
+ 	// The mem.BufferPool to use when reading/writing to the wire.
+ 	BufferPool mem.BufferPool
++	// StaticWindowSize controls whether dynamic window sizing is enabled.
++	StaticWindowSize bool
+ }
+ 
+ // WriteOptions provides additional hints and information for message
+diff --git a/server.go b/server.go
+index 976e70ae..70fe23f5 100644
+--- a/server.go
++++ b/server.go
+@@ -179,6 +179,7 @@ type serverOptions struct {
+ 	numServerWorkers      uint32
+ 	bufferPool            mem.BufferPool
+ 	waitForHandlers       bool
++	staticWindowSize      bool
+ }
+ 
+ var defaultServerOptions = serverOptions{
+@@ -279,6 +280,7 @@ func ReadBufferSize(s int) ServerOption {
+ func InitialWindowSize(s int32) ServerOption {
+ 	return newFuncServerOption(func(o *serverOptions) {
+ 		o.initialWindowSize = s
++		o.staticWindowSize = true
+ 	})
+ }
+ 
+@@ -287,6 +289,29 @@ func InitialWindowSize(s int32) ServerOption {
+ func InitialConnWindowSize(s int32) ServerOption {
+ 	return newFuncServerOption(func(o *serverOptions) {
+ 		o.initialConnWindowSize = s
++		o.staticWindowSize = true
++	})
++}
++
++// StaticStreamWindowSize returns a ServerOption to set the initial stream
++// window size to the value provided and disables dynamic flow control.
++// The lower bound for window size is 64K and any value smaller than that
++// will be ignored.
++func StaticStreamWindowSize(s int32) ServerOption {
++	return newFuncServerOption(func(o *serverOptions) {
++		o.initialWindowSize = s
++		o.staticWindowSize = true
++	})
++}
++
++// StaticConnWindowSize returns a ServerOption to set the initial connection
++// window size to the value provided and disables dynamic flow control.
++// The lower bound for window size is 64K and any value smaller than that
++// will be ignored.
++func StaticConnWindowSize(s int32) ServerOption {
++	return newFuncServerOption(func(o *serverOptions) {
++		o.initialConnWindowSize = s
++		o.staticWindowSize = true
+ 	})
+ }
+ 
+@@ -986,6 +1011,7 @@ func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
+ 		MaxHeaderListSize:     s.opts.maxHeaderListSize,
+ 		HeaderTableSize:       s.opts.headerTableSize,
+ 		BufferPool:            s.opts.bufferPool,
++		StaticWindowSize:      s.opts.staticWindowSize,
+ 	}
+ 	st, err := transport.NewServerTransport(c, config)
+ 	if err != nil {

@@ -1,0 +1,216 @@
+diff --git a/pkg/commands/flagsets.go b/pkg/commands/flagsets.go
+index 6ace7e8c..af5c351c 100644
+--- a/pkg/commands/flagsets.go
++++ b/pkg/commands/flagsets.go
+@@ -12,7 +12,7 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/config"
+ 	"github.com/golangci/golangci-lint/pkg/exitcodes"
+ 	"github.com/golangci/golangci-lint/pkg/lint/lintersdb"
+-	"github.com/golangci/golangci-lint/pkg/result/processors"
++	"github.com/golangci/golangci-lint/pkg/packages"
+ )
+ 
+ func setupLintersFlagSet(v *viper.Viper, fs *pflag.FlagSet) {
+@@ -129,7 +129,7 @@ func getDefaultIssueExcludeHelp() string {
+ 
+ func getDefaultDirectoryExcludeHelp() string {
+ 	parts := []string{color.GreenString("Use or not use default excluded directories:")}
+-	for _, dir := range processors.StdExcludeDirRegexps {
++	for _, dir := range packages.StdExcludeDirRegexps {
+ 		parts = append(parts, fmt.Sprintf("  - %s", color.YellowString(dir)))
+ 	}
+ 	parts = append(parts, "")
+diff --git a/pkg/lint/runner.go b/pkg/lint/runner.go
+index c5285411..77884045 100644
+--- a/pkg/lint/runner.go
++++ b/pkg/lint/runner.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/lint/linter"
+ 	"github.com/golangci/golangci-lint/pkg/lint/lintersdb"
+ 	"github.com/golangci/golangci-lint/pkg/logutils"
++	"github.com/golangci/golangci-lint/pkg/packages"
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ 	"github.com/golangci/golangci-lint/pkg/result/processors"
+ 	"github.com/golangci/golangci-lint/pkg/timeutils"
+@@ -47,10 +48,10 @@ func NewRunner(log logutils.Log, cfg *config.Config, args []string, goenv *gouti
+ 
+ 	skipDirs := cfg.Issues.ExcludeDirs
+ 	if cfg.Issues.UseDefaultExcludeDirs {
+-		skipDirs = append(skipDirs, processors.StdExcludeDirRegexps...)
++		skipDirs = append(skipDirs, packages.StdExcludeDirRegexps...)
+ 	}
+ 
+-	skipDirsProcessor, err := processors.NewSkipDirs(log.Child(logutils.DebugKeySkipDirs), skipDirs, args, cfg.Output.PathPrefix)
++	skipDirsProcessor, err := processors.NewSkipDirs(skipDirs, log.Child(logutils.DebugKeySkipDirs), args, cfg.Output.PathPrefix)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/packages/exclude.go b/pkg/packages/exclude.go
+new file mode 100644
+index 00000000..cdd327f5
+--- /dev/null
++++ b/pkg/packages/exclude.go
+@@ -0,0 +1,25 @@
++package packages
++
++import (
++	"fmt"
++	"path/filepath"
++	"regexp"
++)
++
++func pathElemReImpl(e string, sep rune) string {
++	escapedSep := regexp.QuoteMeta(string(sep)) // needed for windows sep '\\'
++	return fmt.Sprintf(`(^|%s)%s($|%s)`, escapedSep, e, escapedSep)
++}
++
++func pathElemRe(e string) string {
++	return pathElemReImpl(e, filepath.Separator)
++}
++
++var StdExcludeDirRegexps = []string{
++	pathElemRe("vendor"),
++	pathElemRe("third_party"),
++	pathElemRe("testdata"),
++	pathElemRe("examples"),
++	pathElemRe("Godeps"),
++	pathElemRe("builtin"),
++}
+diff --git a/pkg/packages/exclude_test.go b/pkg/packages/exclude_test.go
+new file mode 100644
+index 00000000..e2c1a09d
+--- /dev/null
++++ b/pkg/packages/exclude_test.go
+@@ -0,0 +1,38 @@
++package packages
++
++import (
++	"regexp"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestPathElemRe(t *testing.T) {
++	matches := [][]string{
++		{"dir"},
++		{"root", "dir"},
++		{"root", "dir", "subdir"},
++		{"dir", "subdir"},
++	}
++	noMatches := [][]string{
++		{"nodir"},
++		{"dirno"},
++		{"root", "dirno"},
++		{"root", "nodir"},
++		{"root", "dirno", "subdir"},
++		{"root", "nodir", "subdir"},
++		{"dirno", "subdir"},
++		{"nodir", "subdir"},
++	}
++	for _, sep := range []rune{'/', '\\'} {
++		reStr := pathElemReImpl("dir", sep)
++		re := regexp.MustCompile(reStr)
++		for _, m := range matches {
++			assert.Regexp(t, re, strings.Join(m, string(sep)))
++		}
++		for _, m := range noMatches {
++			assert.NotRegexp(t, re, strings.Join(m, string(sep)))
++		}
++	}
++}
+diff --git a/pkg/result/processors/skip_dirs.go b/pkg/result/processors/skip_dirs.go
+index 39dbfd1d..9ecdefbe 100644
+--- a/pkg/result/processors/skip_dirs.go
++++ b/pkg/result/processors/skip_dirs.go
+@@ -12,15 +12,6 @@ import (
+ 
+ var _ Processor = (*SkipDirs)(nil)
+ 
+-var StdExcludeDirRegexps = []string{
+-	normalizePathRegex("vendor"),
+-	normalizePathRegex("third_party"),
+-	normalizePathRegex("testdata"),
+-	normalizePathRegex("examples"),
+-	normalizePathRegex("Godeps"),
+-	normalizePathRegex("builtin"),
+-}
+-
+ type skipStat struct {
+ 	pattern string
+ 	count   int
+@@ -35,7 +26,7 @@ type SkipDirs struct {
+ 	pathPrefix       string
+ }
+ 
+-func NewSkipDirs(log logutils.Log, patterns, args []string, pathPrefix string) (*SkipDirs, error) {
++func NewSkipDirs(patterns []string, log logutils.Log, args []string, pathPrefix string) (*SkipDirs, error) {
+ 	var patternsRe []*regexp.Regexp
+ 	for _, p := range patterns {
+ 		p = fsutils.NormalizePathInRegex(p)
+@@ -161,12 +152,3 @@ func absDirs(args []string) ([]string, error) {
+ 
+ 	return absArgsDirs, nil
+ }
+-
+-func normalizePathRegex(e string) string {
+-	return createPathRegex(e, filepath.Separator)
+-}
+-
+-func createPathRegex(e string, sep rune) string {
+-	escapedSep := regexp.QuoteMeta(string(sep)) // needed for windows sep '\\'
+-	return fmt.Sprintf(`(^|%[1]s)%[2]s($|%[1]s)`, escapedSep, e)
+-}
+diff --git a/pkg/result/processors/skip_dirs_test.go b/pkg/result/processors/skip_dirs_test.go
+index 24450d98..392775a7 100644
+--- a/pkg/result/processors/skip_dirs_test.go
++++ b/pkg/result/processors/skip_dirs_test.go
+@@ -2,8 +2,6 @@ package processors
+ 
+ import (
+ 	"path/filepath"
+-	"regexp"
+-	"strings"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
+@@ -60,38 +58,6 @@ func Test_absDirs(t *testing.T) {
+ 	}
+ }
+ 
+-func Test_createPathRegex(t *testing.T) {
+-	matches := [][]string{
+-		{"dir"},
+-		{"root", "dir"},
+-		{"root", "dir", "subdir"},
+-		{"dir", "subdir"},
+-	}
+-
+-	noMatches := [][]string{
+-		{"nodir"},
+-		{"dirno"},
+-		{"root", "dirno"},
+-		{"root", "nodir"},
+-		{"root", "dirno", "subdir"},
+-		{"root", "nodir", "subdir"},
+-		{"dirno", "subdir"},
+-		{"nodir", "subdir"},
+-	}
+-
+-	for _, sep := range []rune{'/', '\\'} {
+-		exp := regexp.MustCompile(createPathRegex("dir", sep))
+-
+-		for _, m := range matches {
+-			assert.Regexp(t, exp, strings.Join(m, string(sep)))
+-		}
+-
+-		for _, m := range noMatches {
+-			assert.NotRegexp(t, exp, strings.Join(m, string(sep)))
+-		}
+-	}
+-}
+-
+ func mustAbs(t *testing.T, p string) string {
+ 	t.Helper()
+ 

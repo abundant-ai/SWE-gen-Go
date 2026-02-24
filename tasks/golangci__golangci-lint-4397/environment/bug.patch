@@ -1,0 +1,364 @@
+diff --git a/pkg/commands/executor.go b/pkg/commands/executor.go
+index a6e08a48..d241f565 100644
+--- a/pkg/commands/executor.go
++++ b/pkg/commands/executor.go
+@@ -116,18 +116,7 @@ func NewExecutor(buildInfo BuildInfo) *Executor {
+ 		e.log.Fatalf("Can't read config: %s", err)
+ 	}
+ 
+-	if commandLineCfg != nil && commandLineCfg.Run.Go != "" {
+-		// This hack allow to have the right Run information at least for the Go version (because the default value of the "go" flag is empty).
+-		// If you put a log for `m.cfg.Run.Go` inside `GetAllSupportedLinterConfigs`,
+-		// you will observe that at end (without this hack) the value will have the right value but too late,
+-		// the linters are already running with the previous uncompleted configuration.
+-		// TODO(ldez) there is a major problem with the executor:
+-		//  the parsing of the configuration and the timing to load the configuration and linters are creating unmanageable situations.
+-		//  There is no simple solution because it's spaghetti code.
+-		//  I need to completely rewrite the command line system and the executor because it's extremely time consuming to debug,
+-		//  so it's unmaintainable.
+-		e.cfg.Run.Go = commandLineCfg.Run.Go
+-	} else if e.cfg.Run.Go == "" {
++	if (commandLineCfg == nil || commandLineCfg.Run.Go == "") && e.cfg != nil && e.cfg.Run.Go == "" {
+ 		e.cfg.Run.Go = config.DetectGoVersion()
+ 	}
+ 
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 2eb82938..a5483a20 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -41,18 +41,18 @@ type Version struct {
+ 	Debug  bool   `mapstructure:"debug"`
+ }
+ 
+-func IsGoGreaterThanOrEqual(current, limit string) bool {
+-	v1, err := hcversion.NewVersion(strings.TrimPrefix(current, "go"))
++func IsGreaterThanOrEqualGo122(v string) bool {
++	v1, err := hcversion.NewVersion(strings.TrimPrefix(v, "go"))
+ 	if err != nil {
+ 		return false
+ 	}
+ 
+-	l, err := hcversion.NewVersion(limit)
++	limit, err := hcversion.NewVersion("1.22")
+ 	if err != nil {
+ 		return false
+ 	}
+ 
+-	return v1.GreaterThanOrEqual(l)
++	return v1.GreaterThanOrEqual(limit)
+ }
+ 
+ func DetectGoVersion() string {
+diff --git a/pkg/config/config_test.go b/pkg/config/config_test.go
+deleted file mode 100644
+index ac101b95..00000000
+--- a/pkg/config/config_test.go
++++ /dev/null
+@@ -1,86 +0,0 @@
+-package config
+-
+-import (
+-	"testing"
+-
+-	"github.com/stretchr/testify/assert"
+-)
+-
+-func TestIsGoGreaterThanOrEqual(t *testing.T) {
+-	testCases := []struct {
+-		desc    string
+-		current string
+-		limit   string
+-		assert  assert.BoolAssertionFunc
+-	}{
+-		{
+-			desc:    "current (with minor.major) lower than limit",
+-			current: "go1.21",
+-			limit:   "1.22",
+-			assert:  assert.False,
+-		},
+-		{
+-			desc:    "current (with 0 patch) lower than limit",
+-			current: "go1.21.0",
+-			limit:   "1.22",
+-			assert:  assert.False,
+-		},
+-		{
+-			desc:    "current (current with multiple patches) lower than limit",
+-			current: "go1.21.6",
+-			limit:   "1.22",
+-			assert:  assert.False,
+-		},
+-		{
+-			desc:    "current lower than limit (with minor.major)",
+-			current: "go1.22",
+-			limit:   "1.22",
+-			assert:  assert.True,
+-		},
+-		{
+-			desc:    "current lower than limit (with 0 patch)",
+-			current: "go1.22.0",
+-			limit:   "1.22",
+-			assert:  assert.True,
+-		},
+-		{
+-			desc:    "current lower than limit (current with multiple patches)",
+-			current: "go1.22.6",
+-			limit:   "1.22",
+-			assert:  assert.True,
+-		},
+-		{
+-			desc:    "current greater than limit",
+-			current: "go1.23.0",
+-			limit:   "1.22",
+-			assert:  assert.True,
+-		},
+-		{
+-			desc:    "current with no prefix",
+-			current: "1.22",
+-			limit:   "1.22",
+-			assert:  assert.True,
+-		},
+-		{
+-			desc:    "invalid current value",
+-			current: "go",
+-			limit:   "1.22",
+-			assert:  assert.False,
+-		},
+-		{
+-			desc:    "invalid limit value",
+-			current: "go1.22",
+-			limit:   "go",
+-			assert:  assert.False,
+-		},
+-	}
+-
+-	for _, test := range testCases {
+-		test := test
+-		t.Run(test.desc, func(t *testing.T) {
+-			t.Parallel()
+-
+-			test.assert(t, IsGoGreaterThanOrEqual(test.current, test.limit))
+-		})
+-	}
+-}
+diff --git a/pkg/golinters/govet.go b/pkg/golinters/govet.go
+index 066f7e68..e2c7d2df 100644
+--- a/pkg/golinters/govet.go
++++ b/pkg/golinters/govet.go
+@@ -173,7 +173,7 @@ func analyzersFromConfig(settings *config.GovetSettings) []*analysis.Analyzer {
+ 
+ func isAnalyzerEnabled(name string, cfg *config.GovetSettings, defaultAnalyzers []*analysis.Analyzer) bool {
+ 	// TODO(ldez) remove loopclosure when go1.23
+-	if name == loopclosure.Analyzer.Name && config.IsGoGreaterThanOrEqual(cfg.Go, "1.22") {
++	if name == loopclosure.Analyzer.Name && config.IsGreaterThanOrEqualGo122(cfg.Go) {
+ 		return false
+ 	}
+ 
+diff --git a/pkg/golinters/paralleltest.go b/pkg/golinters/paralleltest.go
+index 8215619c..5a99830b 100644
+--- a/pkg/golinters/paralleltest.go
++++ b/pkg/golinters/paralleltest.go
+@@ -18,7 +18,7 @@ func NewParallelTest(settings *config.ParallelTestSettings) *goanalysis.Linter {
+ 			"ignoremissingsubtests": settings.IgnoreMissingSubtests,
+ 		}
+ 
+-		if config.IsGoGreaterThanOrEqual(settings.Go, "1.22") {
++		if config.IsGreaterThanOrEqualGo122(settings.Go) {
+ 			d["ignoreloopVar"] = true
+ 		}
+ 
+diff --git a/pkg/lint/linter/config.go b/pkg/lint/linter/config.go
+index 8e57d6bd..ed5e5508 100644
+--- a/pkg/lint/linter/config.go
++++ b/pkg/lint/linter/config.go
+@@ -1,8 +1,7 @@
+ package linter
+ 
+ import (
+-	"fmt"
+-
++	"golang.org/x/tools/go/analysis"
+ 	"golang.org/x/tools/go/packages"
+ 
+ 	"github.com/golangci/golangci-lint/pkg/config"
+@@ -134,27 +133,23 @@ func (lc *Config) Name() string {
+ 	return lc.Linter.Name()
+ }
+ 
+-func (lc *Config) WithNoopFallback(cfg *config.Config, cond func(cfg *config.Config) error) *Config {
+-	if err := cond(cfg); err != nil {
+-		lc.Linter = NewNoop(lc.Linter, err.Error())
+-		lc.LoadMode = 0
++func (lc *Config) WithNoopFallback(cfg *config.Config) *Config {
++	if cfg != nil && config.IsGreaterThanOrEqualGo122(cfg.Run.Go) {
++		lc.Linter = &Noop{
++			name: lc.Linter.Name(),
++			desc: lc.Linter.Desc(),
++			run: func(_ *analysis.Pass) (any, error) {
++				return nil, nil
++			},
++		}
+ 
++		lc.LoadMode = 0
+ 		return lc.WithLoadFiles()
+ 	}
+ 
+ 	return lc
+ }
+ 
+-func IsGoLowerThanGo122() func(cfg *config.Config) error {
+-	return func(cfg *config.Config) error {
+-		if cfg == nil || config.IsGoGreaterThanOrEqual(cfg.Run.Go, "1.22") {
+-			return nil
+-		}
+-
+-		return fmt.Errorf("this linter is disabled because the Go version (%s) of your project is lower than Go 1.22", cfg.Run.Go)
+-	}
+-}
+-
+ func NewConfig(linter Linter) *Config {
+ 	lc := &Config{
+ 		Linter: linter,
+diff --git a/pkg/lint/linter/linter.go b/pkg/lint/linter/linter.go
+index e086bbe5..a65d6b92 100644
+--- a/pkg/lint/linter/linter.go
++++ b/pkg/lint/linter/linter.go
+@@ -3,6 +3,8 @@ package linter
+ import (
+ 	"context"
+ 
++	"golang.org/x/tools/go/analysis"
++
+ 	"github.com/golangci/golangci-lint/pkg/result"
+ )
+ 
+@@ -13,23 +15,14 @@ type Linter interface {
+ }
+ 
+ type Noop struct {
+-	name   string
+-	desc   string
+-	reason string
+-}
+-
+-func NewNoop(l Linter, reason string) Noop {
+-	return Noop{
+-		name:   l.Name(),
+-		desc:   l.Desc(),
+-		reason: reason,
+-	}
++	name string
++	desc string
++	run  func(pass *analysis.Pass) (any, error)
+ }
+ 
+ func (n Noop) Run(_ context.Context, lintCtx *Context) ([]result.Issue, error) {
+-	if n.reason != "" {
+-		lintCtx.Log.Warnf("%s: %s", n.name, n.reason)
+-	}
++	lintCtx.Log.Warnf("%s is disabled because of generics."+
++		" You can track the evolution of the generics support by following the https://github.com/golangci/golangci-lint/issues/2649.", n.name)
+ 	return nil, nil
+ }
+ 
+diff --git a/pkg/lint/lintersdb/manager.go b/pkg/lint/lintersdb/manager.go
+index e6a171f1..977ef0d1 100644
+--- a/pkg/lint/lintersdb/manager.go
++++ b/pkg/lint/lintersdb/manager.go
+@@ -303,8 +303,7 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
+ 		linter.NewConfig(golinters.NewCopyLoopVar()).
+ 			WithSince("v1.57.0").
+ 			WithPresets(linter.PresetStyle).
+-			WithURL("https://github.com/karamaru-alpha/copyloopvar").
+-			WithNoopFallback(m.cfg, linter.IsGoLowerThanGo122()),
++			WithURL("https://github.com/karamaru-alpha/copyloopvar"),
+ 
+ 		linter.NewConfig(golinters.NewCyclop(cyclopCfg)).
+ 			WithSince("v1.37.0").
+@@ -618,8 +617,7 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
+ 
+ 		linter.NewConfig(golinters.NewIntrange()).
+ 			WithSince("v1.57.0").
+-			WithURL("https://github.com/ckaznocha/intrange").
+-			WithNoopFallback(m.cfg, linter.IsGoLowerThanGo122()),
++			WithURL("https://github.com/ckaznocha/intrange"),
+ 
+ 		linter.NewConfig(golinters.NewIreturn(ireturnCfg)).
+ 			WithSince("v1.43.0").
+diff --git a/test/linters_test.go b/test/linters_test.go
+index ada3dbeb..1019a1f0 100644
+--- a/test/linters_test.go
++++ b/test/linters_test.go
+@@ -84,7 +84,7 @@ func testOneSource(t *testing.T, log *logutils.StderrLog, binPath, sourcePath st
+ 	}
+ 
+ 	args := []string{
+-		"--go=1.22", // TODO(ldez) remove this line when we will run go1.23 on the CI. (related to intrange, copyloopvar)
++		"--allow-parallel-runners",
+ 		"--disable-all",
+ 		"--out-format=json",
+ 		"--max-same-issues=100",
+@@ -99,6 +99,7 @@ func testOneSource(t *testing.T, log *logutils.StderrLog, binPath, sourcePath st
+ 
+ 		cmd := testshared.NewRunnerBuilder(t).
+ 			WithBinPath(binPath).
++			WithNoParallelRunners().
+ 			WithArgs(caseArgs...).
+ 			WithRunContext(rc).
+ 			WithTargetPath(sourcePath).
+diff --git a/test/run_test.go b/test/run_test.go
+index 9fad30e1..2ec4b642 100644
+--- a/test/run_test.go
++++ b/test/run_test.go
+@@ -133,12 +133,12 @@ func TestTestsAreLintedByDefault(t *testing.T) {
+ func TestCgoOk(t *testing.T) {
+ 	testshared.NewRunnerBuilder(t).
+ 		WithNoConfig().
+-		WithArgs("--timeout=3m",
++		WithArgs(
++			"--timeout=3m",
+ 			"--enable-all",
+ 			"-D",
+-			"nosnakecase",
++			"nosnakecase,gci",
+ 		).
+-		WithArgs("--go=1.22"). // TODO(ldez) remove this line when we will run go1.23 on the CI. (related to intrange, copyloopvar)
+ 		WithTargetPath(testdataDir, "cgo").
+ 		Runner().
+ 		Install().
+@@ -356,7 +356,6 @@ func TestUnsafeOk(t *testing.T) {
+ 	testshared.NewRunnerBuilder(t).
+ 		WithNoConfig().
+ 		WithArgs("--enable-all").
+-		WithArgs("--go=1.22"). // TODO(ldez) remove this line when we will run go1.23 on the CI. (related to intrange, copyloopvar)
+ 		WithTargetPath(testdataDir, "unsafe").
+ 		Runner().
+ 		Install().
+@@ -515,7 +514,6 @@ func TestEnableAllFastAndEnableCanCoexist(t *testing.T) {
+ 			testshared.NewRunnerBuilder(t).
+ 				WithNoConfig().
+ 				WithArgs(test.args...).
+-				WithArgs("--go=1.22"). // TODO(ldez) remove this line when we will run go1.23 on the CI. (related to intrange, copyloopvar)
+ 				WithTargetPath(testdataDir, minimalPkg).
+ 				Runner().
+ 				Run().
+diff --git a/test/testdata/copyloopvar.go b/test/testdata/copyloopvar.go
+index 7fdd2b04..a1fb4416 100644
+--- a/test/testdata/copyloopvar.go
++++ b/test/testdata/copyloopvar.go
+@@ -1,5 +1,3 @@
+-//go:build go1.22
+-
+ //golangcitest:args -Ecopyloopvar
+ package testdata
+ 
+diff --git a/test/testdata/intrange.go b/test/testdata/intrange.go
+index 2220d961..3d9b711d 100644
+--- a/test/testdata/intrange.go
++++ b/test/testdata/intrange.go
+@@ -1,5 +1,3 @@
+-//go:build go1.22
+-
+ //golangcitest:args -Eintrange
+ package testdata
+ 

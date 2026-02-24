@@ -1,0 +1,334 @@
+diff --git a/xds/internal/clients/internal/testutils/channel.go b/xds/internal/clients/internal/testutils/channel.go
+index 509adeae..ac77d559 100644
+--- a/xds/internal/clients/internal/testutils/channel.go
++++ b/xds/internal/clients/internal/testutils/channel.go
+@@ -59,6 +59,28 @@ func (c *Channel) Replace(value any) {
+ 	}
+ }
+ 
++// SendContext sends value on the underlying channel, or returns an error if
++// the context expires.
++func (c *Channel) SendContext(ctx context.Context, value any) error {
++	select {
++	case c.C <- value:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++// Drain drains the channel by repeatedly reading from it until it is empty.
++func (c *Channel) Drain() {
++	for {
++		select {
++		case <-c.C:
++		default:
++			return
++		}
++	}
++}
++
+ // NewChannelWithSize returns a new Channel with a buffer of bufSize.
+ func NewChannelWithSize(bufSize int) *Channel {
+ 	return &Channel{C: make(chan any, bufSize)}
+diff --git a/xds/internal/clients/xdsclient/ads_stream.go b/xds/internal/clients/xdsclient/ads_stream.go
+index eb371287..774f8ab2 100644
+--- a/xds/internal/clients/xdsclient/ads_stream.go
++++ b/xds/internal/clients/xdsclient/ads_stream.go
+@@ -73,39 +73,13 @@ type adsStreamEventHandler interface {
+ 	onResponse(response, func()) ([]string, error) // Called when a response is received on the ADS stream.
+ }
+ 
+-// watchState is a enum that describes the watch state of a particular
+-// resource.
+-type watchState int
+-
+-const (
+-	// resourceWatchStateStarted is the state where a watch for a resource was
+-	// started, but a request asking for that resource is yet to be sent to the
+-	// management server.
+-	resourceWatchStateStarted watchState = iota
+-	// resourceWatchStateRequested is the state when a request has been sent for
+-	// the resource being watched.
+-	resourceWatchStateRequested
+-	// ResourceWatchStateReceived is the state when a response has been received
+-	// for the resource being watched.
+-	resourceWatchStateReceived
+-	// resourceWatchStateTimeout is the state when the watch timer associated
+-	// with the resource expired because no response was received.
+-	resourceWatchStateTimeout
+-)
+-
+-// resourceWatchState is the state corresponding to a resource being watched.
+-type resourceWatchState struct {
+-	State       watchState  // Watch state of the resource.
+-	ExpiryTimer *time.Timer // Timer for the expiry of the watch.
+-}
+-
+ // state corresponding to a resource type.
+ type resourceTypeState struct {
+-	version             string                         // Last acked version. Should not be reset when the stream breaks.
+-	nonce               string                         // Last received nonce. Should be reset when the stream breaks.
+-	bufferedRequests    chan struct{}                  // Channel to buffer requests when writing is blocked.
+-	subscribedResources map[string]*resourceWatchState // Map of subscribed resource names to their state.
+-	pendingWrite        bool                           // True if there is a pending write for this resource type.
++	version             string                                     // Last acked version. Should not be reset when the stream breaks.
++	nonce               string                                     // Last received nonce. Should be reset when the stream breaks.
++	bufferedRequests    chan struct{}                              // Channel to buffer requests when writing is blocked.
++	subscribedResources map[string]*xdsresource.ResourceWatchState // Map of subscribed resource names to their state.
++	pendingWrite        bool                                       // True if there is a pending write for this resource type.
+ }
+ 
+ // adsStreamImpl provides the functionality associated with an ADS (Aggregated
+@@ -198,7 +172,7 @@ func (s *adsStreamImpl) subscribe(typ ResourceType, name string) {
+ 		// An entry in the type state map is created as part of the first
+ 		// subscription request for this type.
+ 		state = &resourceTypeState{
+-			subscribedResources: make(map[string]*resourceWatchState),
++			subscribedResources: make(map[string]*xdsresource.ResourceWatchState),
+ 			bufferedRequests:    make(chan struct{}, 1),
+ 		}
+ 		s.resourceTypeState[typ] = state
+@@ -206,7 +180,7 @@ func (s *adsStreamImpl) subscribe(typ ResourceType, name string) {
+ 
+ 	// Create state for the newly subscribed resource. The watch timer will
+ 	// be started when a request for this resource is actually sent out.
+-	state.subscribedResources[name] = &resourceWatchState{State: resourceWatchStateStarted}
++	state.subscribedResources[name] = &xdsresource.ResourceWatchState{State: xdsresource.ResourceWatchStateStarted}
+ 	state.pendingWrite = true
+ 
+ 	// Send a request for the resource type with updated subscriptions.
+@@ -616,8 +590,8 @@ func (s *adsStreamImpl) onRecv(stream clients.Stream, names []string, url, versi
+ 			s.logger.Warningf("ADS stream received a response for resource %q, but no state exists for it", name)
+ 			continue
+ 		}
+-		if ws := rs.State; ws == resourceWatchStateStarted || ws == resourceWatchStateRequested {
+-			rs.State = resourceWatchStateReceived
++		if ws := rs.State; ws == xdsresource.ResourceWatchStateStarted || ws == xdsresource.ResourceWatchStateRequested {
++			rs.State = xdsresource.ResourceWatchStateReceived
+ 			if rs.ExpiryTimer != nil {
+ 				rs.ExpiryTimer.Stop()
+ 				rs.ExpiryTimer = nil
+@@ -652,14 +626,14 @@ func (s *adsStreamImpl) onError(err error, msgReceived bool) {
+ 	s.mu.Lock()
+ 	for _, state := range s.resourceTypeState {
+ 		for _, rs := range state.subscribedResources {
+-			if rs.State != resourceWatchStateRequested {
++			if rs.State != xdsresource.ResourceWatchStateRequested {
+ 				continue
+ 			}
+ 			if rs.ExpiryTimer != nil {
+ 				rs.ExpiryTimer.Stop()
+ 				rs.ExpiryTimer = nil
+ 			}
+-			rs.State = resourceWatchStateStarted
++			rs.State = xdsresource.ResourceWatchStateStarted
+ 		}
+ 	}
+ 	s.mu.Unlock()
+@@ -691,15 +665,15 @@ func (s *adsStreamImpl) startWatchTimersLocked(typ ResourceType, names []string)
+ 		if !ok {
+ 			continue
+ 		}
+-		if resourceState.State != resourceWatchStateStarted {
++		if resourceState.State != xdsresource.ResourceWatchStateStarted {
+ 			continue
+ 		}
+-		resourceState.State = resourceWatchStateRequested
++		resourceState.State = xdsresource.ResourceWatchStateRequested
+ 
+ 		rs := resourceState
+ 		resourceState.ExpiryTimer = time.AfterFunc(s.watchExpiryTimeout, func() {
+ 			s.mu.Lock()
+-			rs.State = resourceWatchStateTimeout
++			rs.State = xdsresource.ResourceWatchStateTimeout
+ 			rs.ExpiryTimer = nil
+ 			s.mu.Unlock()
+ 			s.eventHandler.onWatchExpiry(typ, name)
+@@ -707,7 +681,22 @@ func (s *adsStreamImpl) startWatchTimersLocked(typ ResourceType, names []string)
+ 	}
+ }
+ 
+-func resourceNames(m map[string]*resourceWatchState) []string {
++func (s *adsStreamImpl) adsResourceWatchStateForTesting(rType ResourceType, resourceName string) (xdsresource.ResourceWatchState, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	state, ok := s.resourceTypeState[rType]
++	if !ok {
++		return xdsresource.ResourceWatchState{}, fmt.Errorf("unknown resource type: %v", rType)
++	}
++	resourceState, ok := state.subscribedResources[resourceName]
++	if !ok {
++		return xdsresource.ResourceWatchState{}, fmt.Errorf("unknown resource name: %v", resourceName)
++	}
++	return *resourceState, nil
++}
++
++func resourceNames(m map[string]*xdsresource.ResourceWatchState) []string {
+ 	ret := make([]string, len(m))
+ 	idx := 0
+ 	for name := range m {
+diff --git a/xds/internal/clients/xdsclient/internal/internal.go b/xds/internal/clients/xdsclient/internal/internal.go
+new file mode 100644
+index 00000000..7adb6719
+--- /dev/null
++++ b/xds/internal/clients/xdsclient/internal/internal.go
+@@ -0,0 +1,36 @@
++/*
++ *
++ * Copyright 2025 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Package internal contains functionality internal to the xdsclient package.
++package internal
++
++import "time"
++
++var (
++	// WatchExpiryTimeout is the watch expiry timeout for xDS client. It can be
++	// overridden by tests to change the default watch expiry timeout.
++	WatchExpiryTimeout time.Duration
++
++	// StreamBackoff is the stream backoff for xDS client. It can be overridden
++	// by tests to change the default backoff strategy.
++	StreamBackoff func(int) time.Duration
++
++	// ResourceWatchStateForTesting gets the watch state for the resource
++	// identified by the given resource type and resource name. Returns a
++	// non-nil error if there is no such resource being watched.
++	ResourceWatchStateForTesting any // func(*xdsclient.XDSClient, xdsclient.ResourceType, string) error
++)
+diff --git a/xds/internal/clients/xdsclient/internal/xdsresource/ads_stream.go b/xds/internal/clients/xdsclient/internal/xdsresource/ads_stream.go
+new file mode 100644
+index 00000000..87fe9ac8
+--- /dev/null
++++ b/xds/internal/clients/xdsclient/internal/xdsresource/ads_stream.go
+@@ -0,0 +1,46 @@
++/*
++ *
++ * Copyright 2021 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package xdsresource
++
++import "time"
++
++// WatchState is a enum that describes the watch state of a particular
++// resource.
++type WatchState int
++
++const (
++	// ResourceWatchStateStarted is the state where a watch for a resource was
++	// started, but a request asking for that resource is yet to be sent to the
++	// management server.
++	ResourceWatchStateStarted WatchState = iota
++	// ResourceWatchStateRequested is the state when a request has been sent for
++	// the resource being watched.
++	ResourceWatchStateRequested
++	// ResourceWatchStateReceived is the state when a response has been received
++	// for the resource being watched.
++	ResourceWatchStateReceived
++	// ResourceWatchStateTimeout is the state when the watch timer associated
++	// with the resource expired because no response was received.
++	ResourceWatchStateTimeout
++)
++
++// ResourceWatchState is the state corresponding to a resource being watched.
++type ResourceWatchState struct {
++	State       WatchState  // Watch state of the resource.
++	ExpiryTimer *time.Timer // Timer for the expiry of the watch.
++}
+diff --git a/xds/internal/clients/xdsclient/xdsclient.go b/xds/internal/clients/xdsclient/xdsclient.go
+index f0f4a678..111ef23a 100644
+--- a/xds/internal/clients/xdsclient/xdsclient.go
++++ b/xds/internal/clients/xdsclient/xdsclient.go
+@@ -43,6 +43,7 @@ import (
+ 	clientsinternal "google.golang.org/grpc/xds/internal/clients/internal"
+ 	"google.golang.org/grpc/xds/internal/clients/internal/backoff"
+ 	"google.golang.org/grpc/xds/internal/clients/internal/syncutil"
++	xdsclientinternal "google.golang.org/grpc/xds/internal/clients/xdsclient/internal"
+ 	"google.golang.org/grpc/xds/internal/clients/xdsclient/internal/xdsresource"
+ 	"google.golang.org/protobuf/proto"
+ 
+@@ -66,6 +67,12 @@ var (
+ 	defaultExponentialBackoff = backoff.DefaultExponential.Backoff
+ )
+ 
++func init() {
++	xdsclientinternal.WatchExpiryTimeout = defaultWatchExpiryTimeout
++	xdsclientinternal.StreamBackoff = defaultExponentialBackoff
++	xdsclientinternal.ResourceWatchStateForTesting = resourceWatchStateForTesting
++}
++
+ // XDSClient is a client which queries a set of discovery APIs (collectively
+ // termed as xDS) on a remote management server, to discover
+ // various dynamic resources.
+@@ -110,7 +117,7 @@ func New(config Config) (*XDSClient, error) {
+ 		return nil, errors.New("xdsclient: no servers or authorities specified")
+ 	}
+ 
+-	client, err := newClient(&config, defaultWatchExpiryTimeout, defaultExponentialBackoff, name)
++	client, err := newClient(&config, name)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -124,15 +131,15 @@ func (c *XDSClient) SetWatchExpiryTimeoutForTesting(watchExpiryTimeout time.Dura
+ }
+ 
+ // newClient returns a new XDSClient with the given config.
+-func newClient(config *Config, watchExpiryTimeout time.Duration, streamBackoff func(int) time.Duration, target string) (*XDSClient, error) {
++func newClient(config *Config, target string) (*XDSClient, error) {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	c := &XDSClient{
+ 		target:             target,
+ 		done:               syncutil.NewEvent(),
+ 		authorities:        make(map[string]*authority),
+ 		config:             config,
+-		watchExpiryTimeout: watchExpiryTimeout,
+-		backoff:            streamBackoff,
++		watchExpiryTimeout: xdsclientinternal.WatchExpiryTimeout,
++		backoff:            xdsclientinternal.StreamBackoff,
+ 		serializer:         syncutil.NewCallbackSerializer(ctx),
+ 		serializerClose:    cancel,
+ 		transportBuilder:   config.TransportBuilder,
+@@ -427,3 +434,15 @@ func (cs *channelState) adsResourceDoesNotExist(typ ResourceType, resourceName s
+ 		authority.adsResourceDoesNotExist(typ, resourceName)
+ 	}
+ }
++
++func resourceWatchStateForTesting(c *XDSClient, rType ResourceType, resourceName string) (xdsresource.ResourceWatchState, error) {
++	c.channelsMu.Lock()
++	defer c.channelsMu.Unlock()
++
++	for _, state := range c.xdsActiveChannels {
++		if st, err := state.channel.ads.adsResourceWatchStateForTesting(rType, resourceName); err == nil {
++			return st, nil
++		}
++	}
++	return xdsresource.ResourceWatchState{}, fmt.Errorf("unable to find watch state for resource type %q and name %q", rType.TypeName, resourceName)
++}

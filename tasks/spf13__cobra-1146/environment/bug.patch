@@ -1,0 +1,459 @@
+diff --git a/bash_completions.md b/bash_completions.md
+index 52919b2..130f99b 100644
+--- a/bash_completions.md
++++ b/bash_completions.md
+@@ -6,8 +6,6 @@ Please refer to [Shell Completions](shell_completions.md) for details.
+ 
+ For backward compatibility, Cobra still supports its legacy dynamic completion solution (described below).  Unlike the `ValidArgsFunction` solution, the legacy solution will only work for Bash shell-completion and not for other shells. This legacy solution can be used along-side `ValidArgsFunction` and `RegisterFlagCompletionFunc()`, as long as both solutions are not used for the same command.  This provides a path to gradually migrate from the legacy solution to the new solution.
+ 
+-**Note**: Cobra's default `completion` command uses bash completion V2.  If you are currently using Cobra's legacy dynamic completion solution, you should not use the default `completion` command but continue using your own.
+-
+ The legacy solution allows you to inject bash functions into the bash completion script.  Those bash functions are responsible for providing the completion choices for your own completions.
+ 
+ Some code that works in kubernetes:
+diff --git a/bash_completionsV2.go b/bash_completionsV2.go
+deleted file mode 100644
+index 8859b57..0000000
+--- a/bash_completionsV2.go
++++ /dev/null
+@@ -1,302 +0,0 @@
+-package cobra
+-
+-import (
+-	"bytes"
+-	"fmt"
+-	"io"
+-	"os"
+-)
+-
+-func (c *Command) genBashCompletion(w io.Writer, includeDesc bool) error {
+-	buf := new(bytes.Buffer)
+-	genBashComp(buf, c.Name(), includeDesc)
+-	_, err := buf.WriteTo(w)
+-	return err
+-}
+-
+-func genBashComp(buf io.StringWriter, name string, includeDesc bool) {
+-	compCmd := ShellCompRequestCmd
+-	if !includeDesc {
+-		compCmd = ShellCompNoDescRequestCmd
+-	}
+-
+-	WriteStringAndCheck(buf, fmt.Sprintf(`# bash completion V2 for %-36[1]s -*- shell-script -*-
+-
+-__%[1]s_debug()
+-{
+-    if [[ -n ${BASH_COMP_DEBUG_FILE:-} ]]; then
+-        echo "$*" >> "${BASH_COMP_DEBUG_FILE}"
+-    fi
+-}
+-
+-# Macs have bash3 for which the bash-completion package doesn't include
+-# _init_completion. This is a minimal version of that function.
+-__%[1]s_init_completion()
+-{
+-    COMPREPLY=()
+-    _get_comp_words_by_ref "$@" cur prev words cword
+-}
+-
+-# This function calls the %[1]s program to obtain the completion
+-# results and the directive.  It fills the 'out' and 'directive' vars.
+-__%[1]s_get_completion_results() {
+-    local requestComp lastParam lastChar args
+-
+-    # Prepare the command to request completions for the program.
+-    # Calling ${words[0]} instead of directly %[1]s allows to handle aliases
+-    args=("${words[@]:1}")
+-    requestComp="${words[0]} %[2]s ${args[*]}"
+-
+-    lastParam=${words[$((${#words[@]}-1))]}
+-    lastChar=${lastParam:$((${#lastParam}-1)):1}
+-    __%[1]s_debug "lastParam ${lastParam}, lastChar ${lastChar}"
+-
+-    if [ -z "${cur}" ] && [ "${lastChar}" != "=" ]; then
+-        # If the last parameter is complete (there is a space following it)
+-        # We add an extra empty parameter so we can indicate this to the go method.
+-        __%[1]s_debug "Adding extra empty parameter"
+-        requestComp="${requestComp} ''"
+-    fi
+-
+-    # When completing a flag with an = (e.g., %[1]s -n=<TAB>)
+-    # bash focuses on the part after the =, so we need to remove
+-    # the flag part from $cur
+-    if [[ "${cur}" == -*=* ]]; then
+-        cur="${cur#*=}"
+-    fi
+-
+-    __%[1]s_debug "Calling ${requestComp}"
+-    # Use eval to handle any environment variables and such
+-    out=$(eval "${requestComp}" 2>/dev/null)
+-
+-    # Extract the directive integer at the very end of the output following a colon (:)
+-    directive=${out##*:}
+-    # Remove the directive
+-    out=${out%%:*}
+-    if [ "${directive}" = "${out}" ]; then
+-        # There is not directive specified
+-        directive=0
+-    fi
+-    __%[1]s_debug "The completion directive is: ${directive}"
+-    __%[1]s_debug "The completions are: ${out[*]}"
+-}
+-
+-__%[1]s_process_completion_results() {
+-    local shellCompDirectiveError=%[3]d
+-    local shellCompDirectiveNoSpace=%[4]d
+-    local shellCompDirectiveNoFileComp=%[5]d
+-    local shellCompDirectiveFilterFileExt=%[6]d
+-    local shellCompDirectiveFilterDirs=%[7]d
+-
+-    if [ $((directive & shellCompDirectiveError)) -ne 0 ]; then
+-        # Error code.  No completion.
+-        __%[1]s_debug "Received error from custom completion go code"
+-        return
+-    else
+-        if [ $((directive & shellCompDirectiveNoSpace)) -ne 0 ]; then
+-            if [[ $(type -t compopt) = "builtin" ]]; then
+-                __%[1]s_debug "Activating no space"
+-                compopt -o nospace
+-            else
+-                __%[1]s_debug "No space directive not supported in this version of bash"
+-            fi
+-        fi
+-        if [ $((directive & shellCompDirectiveNoFileComp)) -ne 0 ]; then
+-            if [[ $(type -t compopt) = "builtin" ]]; then
+-                __%[1]s_debug "Activating no file completion"
+-                compopt +o default
+-            else
+-                __%[1]s_debug "No file completion directive not supported in this version of bash"
+-            fi
+-        fi
+-    fi
+-
+-    if [ $((directive & shellCompDirectiveFilterFileExt)) -ne 0 ]; then
+-        # File extension filtering
+-        local fullFilter filter filteringCmd
+-
+-        # Do not use quotes around the $out variable or else newline
+-        # characters will be kept.
+-        for filter in ${out[*]}; do
+-            fullFilter+="$filter|"
+-        done
+-
+-        filteringCmd="_filedir $fullFilter"
+-        __%[1]s_debug "File filtering command: $filteringCmd"
+-        $filteringCmd
+-    elif [ $((directive & shellCompDirectiveFilterDirs)) -ne 0 ]; then
+-        # File completion for directories only
+-
+-        # Use printf to strip any trailing newline
+-        local subdir
+-        subdir=$(printf "%%s" "${out[0]}")
+-        if [ -n "$subdir" ]; then
+-            __%[1]s_debug "Listing directories in $subdir"
+-            pushd "$subdir" >/dev/null 2>&1 && _filedir -d && popd >/dev/null 2>&1 || return
+-        else
+-            __%[1]s_debug "Listing directories in ."
+-            _filedir -d
+-        fi
+-    else
+-        __%[1]s_handle_standard_completion_case
+-    fi
+-
+-    __%[1]s_handle_special_char "$cur" :
+-    __%[1]s_handle_special_char "$cur" =
+-}
+-
+-__%[1]s_handle_standard_completion_case() {
+-    local tab comp
+-    tab=$(printf '\t')
+-
+-    local longest=0
+-    # Look for the longest completion so that we can format things nicely
+-    while IFS='' read -r comp; do
+-        # Strip any description before checking the length
+-        comp=${comp%%%%$tab*}
+-        # Only consider the completions that match
+-        comp=$(compgen -W "$comp" -- "$cur")
+-        if ((${#comp}>longest)); then
+-            longest=${#comp}
+-        fi
+-    done < <(printf "%%s\n" "${out[@]}")
+-
+-    local completions=()
+-    while IFS='' read -r comp; do
+-        if [ -z "$comp" ]; then
+-            continue
+-        fi
+-
+-        __%[1]s_debug "Original comp: $comp"
+-        comp="$(__%[1]s_format_comp_descriptions "$comp" "$longest")"
+-        __%[1]s_debug "Final comp: $comp"
+-        completions+=("$comp")
+-    done < <(printf "%%s\n" "${out[@]}")
+-
+-    while IFS='' read -r comp; do
+-        COMPREPLY+=("$comp")
+-    done < <(compgen -W "${completions[*]}" -- "$cur")
+-
+-    # If there is a single completion left, remove the description text
+-    if [ ${#COMPREPLY[*]} -eq 1 ]; then
+-        __%[1]s_debug "COMPREPLY[0]: ${COMPREPLY[0]}"
+-        comp="${COMPREPLY[0]%%%% *}"
+-        __%[1]s_debug "Removed description from single completion, which is now: ${comp}"
+-        COMPREPLY=()
+-        COMPREPLY+=("$comp")
+-    fi
+-}
+-
+-__%[1]s_handle_special_char()
+-{
+-    local comp="$1"
+-    local char=$2
+-    if [[ "$comp" == *${char}* && "$COMP_WORDBREAKS" == *${char}* ]]; then
+-        local word=${comp%%"${comp##*${char}}"}
+-        local idx=${#COMPREPLY[*]}
+-        while [[ $((--idx)) -ge 0 ]]; do
+-            COMPREPLY[$idx]=${COMPREPLY[$idx]#"$word"}
+-        done
+-    fi
+-}
+-
+-__%[1]s_format_comp_descriptions()
+-{
+-    local tab
+-    tab=$(printf '\t')
+-    local comp="$1"
+-    local longest=$2
+-
+-    # Properly format the description string which follows a tab character if there is one
+-    if [[ "$comp" == *$tab* ]]; then
+-        desc=${comp#*$tab}
+-        comp=${comp%%%%$tab*}
+-
+-        # $COLUMNS stores the current shell width.
+-        # Remove an extra 4 because we add 2 spaces and 2 parentheses.
+-        maxdesclength=$(( COLUMNS - longest - 4 ))
+-
+-        # Make sure we can fit a description of at least 8 characters
+-        # if we are to align the descriptions.
+-        if [[ $maxdesclength -gt 8 ]]; then
+-            # Add the proper number of spaces to align the descriptions
+-            for ((i = ${#comp} ; i < longest ; i++)); do
+-                comp+=" "
+-            done
+-        else
+-            # Don't pad the descriptions so we can fit more text after the completion
+-            maxdesclength=$(( COLUMNS - ${#comp} - 4 ))
+-        fi
+-
+-        # If there is enough space for any description text,
+-        # truncate the descriptions that are too long for the shell width
+-        if [ $maxdesclength -gt 0 ]; then
+-            if [ ${#desc} -gt $maxdesclength ]; then
+-                desc=${desc:0:$(( maxdesclength - 1 ))}
+-                desc+="…"
+-            fi
+-            comp+="  ($desc)"
+-        fi
+-    fi
+-
+-    # Must use printf to escape all special characters
+-    printf "%%q" "${comp}"
+-}
+-
+-__start_%[1]s()
+-{
+-    local cur prev words cword split
+-
+-    COMPREPLY=()
+-
+-    # Call _init_completion from the bash-completion package
+-    # to prepare the arguments properly
+-    if declare -F _init_completion >/dev/null 2>&1; then
+-        _init_completion -n "=:" || return
+-    else
+-        __%[1]s_init_completion -n "=:" || return
+-    fi
+-
+-    __%[1]s_debug
+-    __%[1]s_debug "========= starting completion logic =========="
+-    __%[1]s_debug "cur is ${cur}, words[*] is ${words[*]}, #words[@] is ${#words[@]}, cword is $cword"
+-
+-    # The user could have moved the cursor backwards on the command-line.
+-    # We need to trigger completion from the $cword location, so we need
+-    # to truncate the command-line ($words) up to the $cword location.
+-    words=("${words[@]:0:$cword+1}")
+-    __%[1]s_debug "Truncated words[*]: ${words[*]},"
+-
+-    local out directive
+-    __%[1]s_get_completion_results
+-    __%[1]s_process_completion_results
+-}
+-
+-if [[ $(type -t compopt) = "builtin" ]]; then
+-    complete -o default -F __start_%[1]s %[1]s
+-else
+-    complete -o default -o nospace -F __start_%[1]s %[1]s
+-fi
+-
+-# ex: ts=4 sw=4 et filetype=sh
+-`, name, compCmd,
+-		ShellCompDirectiveError, ShellCompDirectiveNoSpace, ShellCompDirectiveNoFileComp,
+-		ShellCompDirectiveFilterFileExt, ShellCompDirectiveFilterDirs))
+-}
+-
+-// GenBashCompletionFileV2 generates Bash completion version 2.
+-func (c *Command) GenBashCompletionFileV2(filename string, includeDesc bool) error {
+-	outFile, err := os.Create(filename)
+-	if err != nil {
+-		return err
+-	}
+-	defer outFile.Close()
+-
+-	return c.GenBashCompletionV2(outFile, includeDesc)
+-}
+-
+-// GenBashCompletionV2 generates Bash completion file version 2
+-// and writes it to the passed writer.
+-func (c *Command) GenBashCompletionV2(w io.Writer, includeDesc bool) error {
+-	return c.genBashCompletion(w, includeDesc)
+-}
+diff --git a/command.go b/command.go
+index 2cc1889..5c85c89 100644
+--- a/command.go
++++ b/command.go
+@@ -63,9 +63,9 @@ type Command struct {
+ 	// Example is examples of how to use the command.
+ 	Example string
+ 
+-	// ValidArgs is list of all valid non-flag arguments that are accepted in shell completions
++	// ValidArgs is list of all valid non-flag arguments that are accepted in bash completions
+ 	ValidArgs []string
+-	// ValidArgsFunction is an optional function that provides valid non-flag arguments for shell completion.
++	// ValidArgsFunction is an optional function that provides valid non-flag arguments for bash completion.
+ 	// It is a dynamic version of using ValidArgs.
+ 	// Only one of ValidArgs and ValidArgsFunction can be used for a command.
+ 	ValidArgsFunction func(cmd *Command, args []string, toComplete string) ([]string, ShellCompDirective)
+@@ -74,12 +74,11 @@ type Command struct {
+ 	Args PositionalArgs
+ 
+ 	// ArgAliases is List of aliases for ValidArgs.
+-	// These are not suggested to the user in the shell completion,
++	// These are not suggested to the user in the bash completion,
+ 	// but accepted if entered manually.
+ 	ArgAliases []string
+ 
+-	// BashCompletionFunction is custom bash functions used by the legacy bash autocompletion generator.
+-	// For portability with other shells, it is recommended to instead use ValidArgsFunction
++	// BashCompletionFunction is custom functions used by the bash autocompletion generator.
+ 	BashCompletionFunction string
+ 
+ 	// Deprecated defines, if this command is deprecated and should print this string when used.
+@@ -939,7 +938,7 @@ func (c *Command) ExecuteC() (cmd *Command, err error) {
+ 		args = os.Args[1:]
+ 	}
+ 
+-	// initialize the hidden command to be used for shell completion
++	// initialize the hidden command to be used for bash completion
+ 	c.initCompleteCmd(args)
+ 
+ 	var flags []string
+diff --git a/completions.go b/completions.go
+index 5dfea61..04dc71e 100644
+--- a/completions.go
++++ b/completions.go
+@@ -34,6 +34,7 @@ const (
+ 
+ 	// ShellCompDirectiveNoFileComp indicates that the shell should not provide
+ 	// file completion even when no completion is provided.
++	// This currently does not work for zsh or bash < 4
+ 	ShellCompDirectiveNoFileComp
+ 
+ 	// ShellCompDirectiveFilterFileExt indicates that the provided completions
+@@ -591,12 +592,9 @@ You will need to start a new shell for this setup to take effect.
+ 		DisableFlagsInUseLine: true,
+ 		ValidArgsFunction:     NoFileCompletions,
+ 		RunE: func(cmd *Command, args []string) error {
+-			return cmd.Root().GenBashCompletionV2(out, !noDesc)
++			return cmd.Root().GenBashCompletion(out)
+ 		},
+ 	}
+-	if haveNoDescFlag {
+-		bash.Flags().BoolVar(&noDesc, compCmdNoDescFlagName, compCmdNoDescFlagDefault, compCmdNoDescFlagDesc)
+-	}
+ 
+ 	zsh := &Command{
+ 		Use:   "zsh",
+diff --git a/completions_test.go b/completions_test.go
+index db363ae..9bd6a41 100644
+--- a/completions_test.go
++++ b/completions_test.go
+@@ -2097,9 +2097,9 @@ func TestDefaultCompletionCmd(t *testing.T) {
+ 	removeCompCmd(rootCmd)
+ 
+ 	var compCmd *Command
+-	// Test that the --no-descriptions flag is present on all shells
++	// Test that the --no-descriptions flag is present for the relevant shells only
+ 	assertNoErr(t, rootCmd.Execute())
+-	for _, shell := range []string{"bash", "fish", "powershell", "zsh"} {
++	for _, shell := range []string{"fish", "powershell", "zsh"} {
+ 		if compCmd, _, err = rootCmd.Find([]string{compCmdName, shell}); err != nil {
+ 			t.Errorf("Unexpected error: %v", err)
+ 		}
+@@ -2107,6 +2107,14 @@ func TestDefaultCompletionCmd(t *testing.T) {
+ 			t.Errorf("Missing --%s flag for %s shell", compCmdNoDescFlagName, shell)
+ 		}
+ 	}
++	for _, shell := range []string{"bash"} {
++		if compCmd, _, err = rootCmd.Find([]string{compCmdName, shell}); err != nil {
++			t.Errorf("Unexpected error: %v", err)
++		}
++		if flag := compCmd.Flags().Lookup(compCmdNoDescFlagName); flag != nil {
++			t.Errorf("Unexpected --%s flag for %s shell", compCmdNoDescFlagName, shell)
++		}
++	}
+ 	// Remove completion command for the next test
+ 	removeCompCmd(rootCmd)
+ 
+diff --git a/shell_completions.md b/shell_completions.md
+index b2b261d..0b51cff 100644
+--- a/shell_completions.md
++++ b/shell_completions.md
+@@ -400,36 +400,6 @@ completion     firstcommand   secondcommand
+ For backward compatibility, Cobra still supports its bash legacy dynamic completion solution.
+ Please refer to [Bash Completions](bash_completions.md) for details.
+ 
+-### Bash completion V2
+-
+-Cobra provides two versions for bash completion.  The original bash completion (which started it all!) can be used by calling
+-`GenBashCompletion()` or `GenBashCompletionFile()`.
+-
+-A new V2 bash completion version is also available.  This version can be used by calling `GenBashCompletionV2()` or
+-`GenBashCompletionFileV2()`.  The V2 version does **not** support the legacy dynamic completion (see [Bash Completions]
+-(bash_completions.md)) but instead works only with the Go dynamic completion solution described in this Readme.
+-Unless your program already uses the legacy dynamic completion solution, it is recommended that you use the bash
+-completion V2 solution which provides the following extra features:
+-- Supports completion descriptions (like the other shells)
+-- Small completion script of less than 300 lines (v1 generates scripts of thousands of lines; `kubectl` for example has a bash v1 completion script of over 13K lines)
+-- Streamlined user experience thanks to a completion behavior aligned with the other shells 
+-
+-`Bash` completion V2 supports descriptions for completions. When calling `GenBashCompletionV2()` or `GenBashCompletionFileV2()`
+-you must provide these functions with a parameter indicating if the completions should be annotated with a description; Cobra
+-will provide the description automatically based on usage information.  You can choose to make this option configurable by
+-your users.
+-
+-```
+-# With descriptions
+-$ helm s[tab][tab]
+-search  (search for a keyword in charts)           status  (display the status of the named release)
+-show    (show information of a chart)
+-
+-# Without descriptions
+-$ helm s[tab][tab]
+-search  show  status
+-```
+-**Note**: Cobra's default `completion` command uses bash completion V2.  If for some reason you need to use bash completion V1, you will need to implement your own `completion` command. 
+ ## Zsh completions
+ 
+ Cobra supports native zsh completion generated from the root `cobra.Command`.

@@ -1,0 +1,239 @@
+diff --git a/pkg/commands/run.go b/pkg/commands/run.go
+index 0e1be529..bcf4c51c 100644
+--- a/pkg/commands/run.go
++++ b/pkg/commands/run.go
+@@ -35,7 +35,6 @@ import (
+ 	"github.com/golangci/golangci-lint/pkg/golinters/goanalysis/load"
+ 	"github.com/golangci/golangci-lint/pkg/goutil"
+ 	"github.com/golangci/golangci-lint/pkg/lint"
+-	"github.com/golangci/golangci-lint/pkg/lint/linter"
+ 	"github.com/golangci/golangci-lint/pkg/lint/lintersdb"
+ 	"github.com/golangci/golangci-lint/pkg/logutils"
+ 	"github.com/golangci/golangci-lint/pkg/packages"
+@@ -187,7 +186,7 @@ func (c *runCommand) preRunE(_ *cobra.Command, _ []string) error {
+ 
+ 	c.dbManager = dbManager
+ 
+-	printer, err := printers.NewPrinter(c.log, &c.cfg.Output, c.reportData)
++	printer, err := printers.NewPrinter(c.log, c.cfg, c.reportData)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -328,24 +327,11 @@ func (c *runCommand) runAndPrint(ctx context.Context, args []string) error {
+ 		}()
+ 	}
+ 
+-	enabledLintersMap, err := c.dbManager.GetEnabledLintersMap()
+-	if err != nil {
+-		return err
+-	}
+-
+-	c.printDeprecatedLinterMessages(enabledLintersMap)
+-
+ 	issues, err := c.runAnalysis(ctx, args)
+ 	if err != nil {
+ 		return err // XXX: don't lose type
+ 	}
+ 
+-	// Fills linters information for the JSON printer.
+-	for _, lc := range c.dbManager.GetAllSupportedLinterConfigs() {
+-		isEnabled := enabledLintersMap[lc.Name()] != nil
+-		c.reportData.AddLinter(lc.Name(), isEnabled, lc.EnabledByDefault)
+-	}
+-
+ 	err = c.printer.Print(issues)
+ 	if err != nil {
+ 		return err
+@@ -369,6 +355,16 @@ func (c *runCommand) runAnalysis(ctx context.Context, args []string) ([]result.I
+ 		return nil, err
+ 	}
+ 
++	enabledLintersMap, err := c.dbManager.GetEnabledLintersMap()
++	if err != nil {
++		return nil, err
++	}
++
++	for _, lc := range c.dbManager.GetAllSupportedLinterConfigs() {
++		isEnabled := enabledLintersMap[lc.Name()] != nil
++		c.reportData.AddLinter(lc.Name(), isEnabled, lc.EnabledByDefault)
++	}
++
+ 	lintCtx, err := c.contextLoader.Load(ctx, c.log.Child(logutils.DebugKeyLintersContext), lintersToRun)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("context loading failed: %w", err)
+@@ -401,25 +397,6 @@ func (c *runCommand) setExitCodeIfIssuesFound(issues []result.Issue) {
+ 	}
+ }
+ 
+-func (c *runCommand) printDeprecatedLinterMessages(enabledLinters map[string]*linter.Config) {
+-	if c.cfg.InternalCmdTest {
+-		return
+-	}
+-
+-	for name, lc := range enabledLinters {
+-		if !lc.IsDeprecated() {
+-			continue
+-		}
+-
+-		var extra string
+-		if lc.Deprecation.Replacement != "" {
+-			extra = fmt.Sprintf("Replaced by %s.", lc.Deprecation.Replacement)
+-		}
+-
+-		c.log.Warnf("The linter '%s' is deprecated (since %s) due to: %s %s", name, lc.Deprecation.Since, lc.Deprecation.Message, extra)
+-	}
+-}
+-
+ func (c *runCommand) printStats(issues []result.Issue) {
+ 	if c.cfg.Run.ShowStats {
+ 		c.log.Warnf("The configuration option `run.show-stats` is deprecated, please use `output.show-stats`")
+diff --git a/pkg/lint/runner.go b/pkg/lint/runner.go
+index 78be9382..2362042c 100644
+--- a/pkg/lint/runner.go
++++ b/pkg/lint/runner.go
+@@ -59,6 +59,22 @@ func NewRunner(log logutils.Log, cfg *config.Config, goenv *goutil.Env,
+ 		return nil, fmt.Errorf("failed to get enabled linters: %w", err)
+ 	}
+ 
++	// print deprecated messages
++	if !cfg.InternalCmdTest {
++		for name, lc := range enabledLinters {
++			if !lc.IsDeprecated() {
++				continue
++			}
++
++			var extra string
++			if lc.Deprecation.Replacement != "" {
++				extra = fmt.Sprintf("Replaced by %s.", lc.Deprecation.Replacement)
++			}
++
++			log.Warnf("The linter '%s' is deprecated (since %s) due to: %s %s", name, lc.Deprecation.Since, lc.Deprecation.Message, extra)
++		}
++	}
++
+ 	return &Runner{
+ 		Processors: []processors.Processor{
+ 			processors.NewCgo(goenv),
+diff --git a/pkg/printers/printer.go b/pkg/printers/printer.go
+index a42fda7e..97e2b5d3 100644
+--- a/pkg/printers/printer.go
++++ b/pkg/printers/printer.go
+@@ -21,7 +21,7 @@ type issuePrinter interface {
+ 
+ // Printer prints issues
+ type Printer struct {
+-	cfg        *config.Output
++	cfg        *config.Config
+ 	reportData *report.Data
+ 
+ 	log logutils.Log
+@@ -31,7 +31,7 @@ type Printer struct {
+ }
+ 
+ // NewPrinter creates a new Printer.
+-func NewPrinter(log logutils.Log, cfg *config.Output, reportData *report.Data) (*Printer, error) {
++func NewPrinter(log logutils.Log, cfg *config.Config, reportData *report.Data) (*Printer, error) {
+ 	if log == nil {
+ 		return nil, errors.New("missing log argument in constructor")
+ 	}
+@@ -53,7 +53,7 @@ func NewPrinter(log logutils.Log, cfg *config.Output, reportData *report.Data) (
+ 
+ // Print prints issues based on the formats defined
+ func (c *Printer) Print(issues []result.Issue) error {
+-	formats := strings.Split(c.cfg.Format, ",")
++	formats := strings.Split(c.cfg.Output.Format, ",")
+ 
+ 	for _, item := range formats {
+ 		format, path, _ := strings.Cut(item, ":")
+@@ -114,11 +114,11 @@ func (c *Printer) createPrinter(format string, w io.Writer) (issuePrinter, error
+ 	case config.OutFormatJSON:
+ 		p = NewJSON(c.reportData, w)
+ 	case config.OutFormatColoredLineNumber, config.OutFormatLineNumber:
+-		p = NewText(c.cfg.PrintIssuedLine,
+-			format == config.OutFormatColoredLineNumber, c.cfg.PrintLinterName,
++		p = NewText(c.cfg.Output.PrintIssuedLine,
++			format == config.OutFormatColoredLineNumber, c.cfg.Output.PrintLinterName,
+ 			c.log.Child(logutils.DebugKeyTextPrinter), w)
+ 	case config.OutFormatTab, config.OutFormatColoredTab:
+-		p = NewTab(c.cfg.PrintLinterName,
++		p = NewTab(c.cfg.Output.PrintLinterName,
+ 			format == config.OutFormatColoredTab,
+ 			c.log.Child(logutils.DebugKeyTabPrinter), w)
+ 	case config.OutFormatCheckstyle:
+diff --git a/pkg/printers/printer_test.go b/pkg/printers/printer_test.go
+index 9170e30a..2bc50feb 100644
+--- a/pkg/printers/printer_test.go
++++ b/pkg/printers/printer_test.go
+@@ -37,20 +37,24 @@ func TestPrinter_Print_stdout(t *testing.T) {
+ 
+ 	testCases := []struct {
+ 		desc     string
+-		cfg      *config.Output
++		cfg      *config.Config
+ 		expected string
+ 	}{
+ 		{
+ 			desc: "stdout (implicit)",
+-			cfg: &config.Output{
+-				Format: "line-number",
++			cfg: &config.Config{
++				Output: config.Output{
++					Format: "line-number",
++				},
+ 			},
+ 			expected: "golden-line-number.txt",
+ 		},
+ 		{
+ 			desc: "stdout (explicit)",
+-			cfg: &config.Output{
+-				Format: "line-number:stdout",
++			cfg: &config.Config{
++				Output: config.Output{
++					Format: "line-number:stdout",
++				},
+ 			},
+ 			expected: "golden-line-number.txt",
+ 		},
+@@ -91,8 +95,10 @@ func TestPrinter_Print_stderr(t *testing.T) {
+ 	data := &report.Data{}
+ 	unmarshalFile(t, "in-report-data.json", data)
+ 
+-	cfg := &config.Output{
+-		Format: "line-number:stderr",
++	cfg := &config.Config{
++		Output: config.Output{
++			Format: "line-number:stderr",
++		},
+ 	}
+ 
+ 	p, err := NewPrinter(logger, cfg, data)
+@@ -125,8 +131,10 @@ func TestPrinter_Print_file(t *testing.T) {
+ 
+ 	outputPath := filepath.Join(t.TempDir(), "report.txt")
+ 
+-	cfg := &config.Output{
+-		Format: "line-number:" + outputPath,
++	cfg := &config.Config{
++		Output: config.Output{
++			Format: "line-number:" + outputPath,
++		},
+ 	}
+ 
+ 	p, err := NewPrinter(logger, cfg, data)
+@@ -164,10 +172,12 @@ func TestPrinter_Print_multiple(t *testing.T) {
+ 
+ 	outputPath := filepath.Join(t.TempDir(), "github-actions.txt")
+ 
+-	cfg := &config.Output{
+-		Format: "github-actions:" + outputPath +
+-			",json" +
+-			",line-number:stderr",
++	cfg := &config.Config{
++		Output: config.Output{
++			Format: "github-actions:" + outputPath +
++				",json" +
++				",line-number:stderr",
++		},
+ 	}
+ 
+ 	p, err := NewPrinter(logger, cfg, data)

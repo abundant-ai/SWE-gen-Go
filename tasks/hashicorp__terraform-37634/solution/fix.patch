@@ -1,0 +1,200 @@
+diff --git a/internal/getproviders/reattach/reattach.go b/internal/getproviders/reattach/reattach.go
+new file mode 100644
+index 0000000000..2b351a0208
+--- /dev/null
++++ b/internal/getproviders/reattach/reattach.go
+@@ -0,0 +1,99 @@
++// Copyright (c) HashiCorp, Inc.
++// SPDX-License-Identifier: BUSL-1.1
++
++package reattach
++
++import (
++	"encoding/json"
++	"fmt"
++	"net"
++
++	"github.com/hashicorp/go-plugin"
++	"github.com/hashicorp/terraform/internal/addrs"
++)
++
++// TF_REATTACH_PROVIDERS is JSON string, containing a map of provider source to reattachment config.
++//
++// E.g this corresponds to a provider with source 'registry.terraform.io/hashicorp/foobar':
++/*
++{
++"foobar": {
++	"Protocol": "grpc",
++	"ProtocolVersion": 6,
++	"Pid": 12345,
++	"Test": true,
++	"Addr": {
++		"Network": "unix",
++		"String":"/var/folders/xx/abcde12345/T/plugin12345"
++	}
++}
++*/
++const TF_REATTACH_PROVIDERS = "TF_REATTACH_PROVIDERS"
++
++// ParseReattachProviders parses information used for reattaching to unmanaged providers out of a
++// JSON-encoded environment variable (TF_REATTACH_PROVIDERS).
++//
++// Calling code is expected to pass in the value of os.Getenv("TF_REATTACH_PROVIDERS")
++func ParseReattachProviders(in string) (map[addrs.Provider]*plugin.ReattachConfig, error) {
++	unmanagedProviders := map[addrs.Provider]*plugin.ReattachConfig{}
++	if in != "" {
++		type reattachConfig struct {
++			Protocol        string
++			ProtocolVersion int
++			Addr            struct {
++				Network string
++				String  string
++			}
++			Pid  int
++			Test bool
++		}
++		var m map[string]reattachConfig
++		err := json.Unmarshal([]byte(in), &m)
++		if err != nil {
++			return unmanagedProviders, fmt.Errorf("Invalid format for %s: %w", TF_REATTACH_PROVIDERS, err)
++		}
++		for p, c := range m {
++			a, diags := addrs.ParseProviderSourceString(p)
++			if diags.HasErrors() {
++				return unmanagedProviders, fmt.Errorf("Error parsing %q as a provider address: %w", a, diags.Err())
++			}
++			var addr net.Addr
++			switch c.Addr.Network {
++			case "unix":
++				addr, err = net.ResolveUnixAddr("unix", c.Addr.String)
++				if err != nil {
++					return unmanagedProviders, fmt.Errorf("Invalid unix socket path %q for %q: %w", c.Addr.String, p, err)
++				}
++			case "tcp":
++				addr, err = net.ResolveTCPAddr("tcp", c.Addr.String)
++				if err != nil {
++					return unmanagedProviders, fmt.Errorf("Invalid TCP address %q for %q: %w", c.Addr.String, p, err)
++				}
++			default:
++				return unmanagedProviders, fmt.Errorf("Unknown address type %q for %q", c.Addr.Network, p)
++			}
++			unmanagedProviders[a] = &plugin.ReattachConfig{
++				Protocol:        plugin.Protocol(c.Protocol),
++				ProtocolVersion: c.ProtocolVersion,
++				Pid:             c.Pid,
++				Test:            c.Test,
++				Addr:            addr,
++			}
++		}
++	}
++	return unmanagedProviders, nil
++}
++
++// IsProviderReattached determines if a given provider is being supplied to Terraform via the TF_REATTACH_PROVIDERS
++// environment variable.
++//
++// Calling code is expected to pass in a provider address and the value of os.Getenv("TF_REATTACH_PROVIDERS")
++func IsProviderReattached(provider addrs.Provider, in string) (bool, error) {
++	providers, err := ParseReattachProviders(in)
++	if err != nil {
++		return false, err
++	}
++
++	_, ok := providers[provider]
++	return ok, nil
++}
+diff --git a/main.go b/main.go
+index cce3f5f998..fd4d88f137 100644
+--- a/main.go
++++ b/main.go
+@@ -5,10 +5,8 @@ package main
+ 
+ import (
+ 	"context"
+-	"encoding/json"
+ 	"fmt"
+ 	"log"
+-	"net"
+ 	"os"
+ 	"path/filepath"
+ 	"runtime"
+@@ -18,10 +16,10 @@ import (
+ 	"github.com/hashicorp/cli"
+ 	"github.com/hashicorp/go-plugin"
+ 	"github.com/hashicorp/terraform-svchost/disco"
+-	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/command/cliconfig"
+ 	"github.com/hashicorp/terraform/internal/command/format"
+ 	"github.com/hashicorp/terraform/internal/didyoumean"
++	"github.com/hashicorp/terraform/internal/getproviders/reattach"
+ 	"github.com/hashicorp/terraform/internal/httpclient"
+ 	"github.com/hashicorp/terraform/internal/logging"
+ 	"github.com/hashicorp/terraform/internal/terminal"
+@@ -204,7 +202,7 @@ func realMain() int {
+ 	// The user can declare that certain providers are being managed on
+ 	// Terraform's behalf using this environment variable. This is used
+ 	// primarily by the SDK's acceptance testing framework.
+-	unmanagedProviders, err := parseReattachProviders(os.Getenv("TF_REATTACH_PROVIDERS"))
++	unmanagedProviders, err := reattach.ParseReattachProviders(os.Getenv(reattach.TF_REATTACH_PROVIDERS))
+ 	if err != nil {
+ 		Ui.Error(err.Error())
+ 		return 1
+@@ -402,58 +400,6 @@ func mergeEnvArgs(envName string, cmd string, args []string) ([]string, error) {
+ 	return newArgs, nil
+ }
+ 
+-// parse information on reattaching to unmanaged providers out of a
+-// JSON-encoded environment variable.
+-func parseReattachProviders(in string) (map[addrs.Provider]*plugin.ReattachConfig, error) {
+-	unmanagedProviders := map[addrs.Provider]*plugin.ReattachConfig{}
+-	if in != "" {
+-		type reattachConfig struct {
+-			Protocol        string
+-			ProtocolVersion int
+-			Addr            struct {
+-				Network string
+-				String  string
+-			}
+-			Pid  int
+-			Test bool
+-		}
+-		var m map[string]reattachConfig
+-		err := json.Unmarshal([]byte(in), &m)
+-		if err != nil {
+-			return unmanagedProviders, fmt.Errorf("Invalid format for TF_REATTACH_PROVIDERS: %w", err)
+-		}
+-		for p, c := range m {
+-			a, diags := addrs.ParseProviderSourceString(p)
+-			if diags.HasErrors() {
+-				return unmanagedProviders, fmt.Errorf("Error parsing %q as a provider address: %w", a, diags.Err())
+-			}
+-			var addr net.Addr
+-			switch c.Addr.Network {
+-			case "unix":
+-				addr, err = net.ResolveUnixAddr("unix", c.Addr.String)
+-				if err != nil {
+-					return unmanagedProviders, fmt.Errorf("Invalid unix socket path %q for %q: %w", c.Addr.String, p, err)
+-				}
+-			case "tcp":
+-				addr, err = net.ResolveTCPAddr("tcp", c.Addr.String)
+-				if err != nil {
+-					return unmanagedProviders, fmt.Errorf("Invalid TCP address %q for %q: %w", c.Addr.String, p, err)
+-				}
+-			default:
+-				return unmanagedProviders, fmt.Errorf("Unknown address type %q for %q", c.Addr.Network, p)
+-			}
+-			unmanagedProviders[a] = &plugin.ReattachConfig{
+-				Protocol:        plugin.Protocol(c.Protocol),
+-				ProtocolVersion: c.ProtocolVersion,
+-				Pid:             c.Pid,
+-				Test:            c.Test,
+-				Addr:            addr,
+-			}
+-		}
+-	}
+-	return unmanagedProviders, nil
+-}
+-
+ func extractChdirOption(args []string) (string, []string, error) {
+ 	if len(args) == 0 {
+ 		return "", args, nil

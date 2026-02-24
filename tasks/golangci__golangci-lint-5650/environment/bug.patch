@@ -1,0 +1,1255 @@
+diff --git a/.golangci.next.reference.yml b/.golangci.next.reference.yml
+index 8b02677b..2667c443 100644
+--- a/.golangci.next.reference.yml
++++ b/.golangci.next.reference.yml
+@@ -335,7 +335,6 @@ linters:
+           # List of file globs that will match this list of settings to compare against.
+           # By default, if a path is relative, it is relative to the directory where the golangci-lint command is executed.
+           # The placeholder '${base-path}' is substituted with a path relative to the mode defined with `run.relative-path-mode`.
+-          # The placeholder '${config-path}' is substituted with a path relative to the configuration file.
+           # Default: $all
+           files:
+             - "!**/*_a _file.go"
+@@ -1162,7 +1161,6 @@ linters:
+           # Comma-separated list of file paths containing ruleguard rules.
+           # By default, if a path is relative, it is relative to the directory where the golangci-lint command is executed.
+           # The placeholder '${base-path}' is substituted with a path relative to the mode defined with `run.relative-path-mode`.
+-          # The placeholder '${config-path}' is substituted with a path relative to the configuration file.
+           # Glob patterns such as 'rules-*.go' may be specified.
+           # Default: ""
+           rules: '${base-path}/ruleguard/rules-*.go,${base-path}/myrule1.go'
+@@ -1258,7 +1256,6 @@ linters:
+       # Useful if you need to load the template from a specific file.
+       # By default, if a path is relative, it is relative to the directory where the golangci-lint command is executed.
+       # The placeholder '${base-path}' is substituted with a path relative to the mode defined with `run.relative-path-mode`.
+-      # The placeholder '${config-path}' is substituted with a path relative to the configuration file.
+       # Default: ""
+       template-path: /path/to/my/template.tmpl
+ 
+diff --git a/pkg/config/placeholders.go b/pkg/config/placeholders.go
+deleted file mode 100644
+index b3f35f7b..00000000
+--- a/pkg/config/placeholders.go
++++ /dev/null
+@@ -1,18 +0,0 @@
+-package config
+-
+-import "strings"
+-
+-const (
+-	// placeholderBasePath used inside linters to evaluate relative paths.
+-	placeholderBasePath = "${base-path}"
+-
+-	// placeholderConfigPath used inside linters to paths relative to configuration.
+-	placeholderConfigPath = "${config-path}"
+-)
+-
+-func NewPlaceholderReplacer(cfg *Config) *strings.Replacer {
+-	return strings.NewReplacer(
+-		placeholderBasePath, cfg.GetBasePath(),
+-		placeholderConfigPath, cfg.GetConfigDir(),
+-	)
+-}
+diff --git a/pkg/golinters/depguard/depguard.go b/pkg/golinters/depguard/depguard.go
+index c1f66b0c..ab0863d6 100644
+--- a/pkg/golinters/depguard/depguard.go
++++ b/pkg/golinters/depguard/depguard.go
+@@ -8,17 +8,18 @@ import (
+ 
+ 	"github.com/golangci/golangci-lint/v2/pkg/config"
+ 	"github.com/golangci/golangci-lint/v2/pkg/goanalysis"
++	"github.com/golangci/golangci-lint/v2/pkg/golinters/internal"
+ 	"github.com/golangci/golangci-lint/v2/pkg/lint/linter"
+ )
+ 
+-func New(settings *config.DepGuardSettings, replacer *strings.Replacer) *goanalysis.Linter {
++func New(settings *config.DepGuardSettings, basePath string) *goanalysis.Linter {
+ 	conf := depguard.LinterSettings{}
+ 
+ 	if settings != nil {
+ 		for s, rule := range settings.Rules {
+ 			var extendedPatterns []string
+ 			for _, file := range rule.Files {
+-				extendedPatterns = append(extendedPatterns, replacer.Replace(file))
++				extendedPatterns = append(extendedPatterns, strings.ReplaceAll(file, internal.PlaceholderBasePath, basePath))
+ 			}
+ 
+ 			list := &depguard.List{
+diff --git a/pkg/golinters/gocritic/gocritic.go b/pkg/golinters/gocritic/gocritic.go
+index 486303da..0a9ec056 100644
+--- a/pkg/golinters/gocritic/gocritic.go
++++ b/pkg/golinters/gocritic/gocritic.go
+@@ -5,6 +5,8 @@ import (
+ 	"fmt"
+ 	"go/ast"
+ 	"go/types"
++	"maps"
++	"reflect"
+ 	"runtime"
+ 	"slices"
+ 	"strings"
+@@ -17,6 +19,7 @@ import (
+ 
+ 	"github.com/golangci/golangci-lint/v2/pkg/config"
+ 	"github.com/golangci/golangci-lint/v2/pkg/goanalysis"
++	"github.com/golangci/golangci-lint/v2/pkg/golinters/internal"
+ 	"github.com/golangci/golangci-lint/v2/pkg/lint/linter"
+ 	"github.com/golangci/golangci-lint/v2/pkg/logutils"
+ )
+@@ -28,7 +31,7 @@ var (
+ 	isDebug = logutils.HaveDebugTag(logutils.DebugKeyGoCritic)
+ )
+ 
+-func New(settings *config.GoCriticSettings, replacer *strings.Replacer) *goanalysis.Linter {
++func New(settings *config.GoCriticSettings) *goanalysis.Linter {
+ 	wrapper := &goCriticWrapper{
+ 		sizes: types.SizesFor("gc", runtime.GOARCH),
+ 	}
+@@ -55,18 +58,23 @@ Dynamic rules are written declaratively with AST patterns, filters, report messa
+ 		nil,
+ 	).
+ 		WithContextSetter(func(context *linter.Context) {
+-			wrapper.init(context.Log, settings, replacer)
++			wrapper.replacer = strings.NewReplacer(
++				internal.PlaceholderBasePath, context.Cfg.GetBasePath(),
++			)
++
++			wrapper.init(context.Log, settings)
+ 		}).
+ 		WithLoadMode(goanalysis.LoadModeTypesInfo)
+ }
+ 
+ type goCriticWrapper struct {
+ 	settingsWrapper *settingsWrapper
++	replacer        *strings.Replacer
+ 	sizes           types.Sizes
+ 	once            sync.Once
+ }
+ 
+-func (w *goCriticWrapper) init(logger logutils.Log, settings *config.GoCriticSettings, replacer *strings.Replacer) {
++func (w *goCriticWrapper) init(logger logutils.Log, settings *config.GoCriticSettings) {
+ 	if settings == nil {
+ 		return
+ 	}
+@@ -78,9 +86,12 @@ func (w *goCriticWrapper) init(logger logutils.Log, settings *config.GoCriticSet
+ 		}
+ 	})
+ 
+-	settingsWrapper := newSettingsWrapper(logger, settings, replacer)
++	settingsWrapper := newSettingsWrapper(settings, logger)
++	settingsWrapper.InferEnabledChecks()
+ 
+-	if err := settingsWrapper.Load(); err != nil {
++	// Validate must be after InferEnabledChecks, not before.
++	// Because it uses gathered information about tags set and finally enabled checks.
++	if err := settingsWrapper.Validate(); err != nil {
+ 		logger.Fatalf("%s: invalid settings: %s", linterName, err)
+ 	}
+ 
+@@ -129,8 +140,7 @@ func (w *goCriticWrapper) buildEnabledCheckers(linterCtx *gocriticlinter.Context
+ 			continue
+ 		}
+ 
+-		err := w.settingsWrapper.setCheckerParams(info, allLowerCasedParams)
+-		if err != nil {
++		if err := w.configureCheckerInfo(info, allLowerCasedParams); err != nil {
+ 			return nil, err
+ 		}
+ 
+@@ -145,6 +155,59 @@ func (w *goCriticWrapper) buildEnabledCheckers(linterCtx *gocriticlinter.Context
+ 	return enabledCheckers, nil
+ }
+ 
++func (w *goCriticWrapper) configureCheckerInfo(
++	info *gocriticlinter.CheckerInfo,
++	allLowerCasedParams map[string]config.GoCriticCheckSettings,
++) error {
++	params := allLowerCasedParams[strings.ToLower(info.Name)]
++	if params == nil { // no config for this checker
++		return nil
++	}
++
++	// To lowercase info param keys here because golangci-lint's config parser lowercases all strings.
++	infoParams := normalizeMap(info.Params)
++	for k, p := range params {
++		v, ok := infoParams[k]
++		if ok {
++			v.Value = w.normalizeCheckerParamsValue(p)
++			continue
++		}
++
++		// param `k` isn't supported
++		if len(info.Params) == 0 {
++			return fmt.Errorf("checker %s config param %s doesn't exist: checker doesn't have params",
++				info.Name, k)
++		}
++
++		supportedKeys := slices.Sorted(maps.Keys(info.Params))
++
++		return fmt.Errorf("checker %s config param %s doesn't exist, all existing: %s",
++			info.Name, k, supportedKeys)
++	}
++
++	return nil
++}
++
++// normalizeCheckerParamsValue normalizes value types.
++// go-critic asserts that CheckerParam.Value has some specific types,
++// but the file parsers (TOML, YAML, JSON) don't create the same representation for raw type.
++// then we have to convert value types into the expected value types.
++// Maybe in the future, this kind of conversion will be done in go-critic itself.
++func (w *goCriticWrapper) normalizeCheckerParamsValue(p any) any {
++	rv := reflect.ValueOf(p)
++	switch rv.Type().Kind() {
++	case reflect.Int64, reflect.Int32, reflect.Int16, reflect.Int8, reflect.Int:
++		return int(rv.Int())
++	case reflect.Bool:
++		return rv.Bool()
++	case reflect.String:
++		// Perform variable substitution.
++		return w.replacer.Replace(rv.String())
++	default:
++		return p
++	}
++}
++
+ func runOnFile(pass *analysis.Pass, f *ast.File, checks []*gocriticlinter.Checker) {
+ 	for _, c := range checks {
+ 		// All checkers are expected to use *lint.Context
+@@ -170,3 +233,19 @@ func runOnFile(pass *analysis.Pass, f *ast.File, checks []*gocriticlinter.Checke
+ 		}
+ 	}
+ }
++
++func normalizeMap[ValueT any](in map[string]ValueT) map[string]ValueT {
++	ret := make(map[string]ValueT, len(in))
++	for k, v := range in {
++		ret[strings.ToLower(k)] = v
++	}
++	return ret
++}
++
++func isEnabledByDefaultGoCriticChecker(info *gocriticlinter.CheckerInfo) bool {
++	// https://github.com/go-critic/go-critic/blob/5b67cfd487ae9fe058b4b19321901b3131810f65/cmd/gocritic/check.go#L342-L345
++	return !info.HasTag(gocriticlinter.ExperimentalTag) &&
++		!info.HasTag(gocriticlinter.OpinionatedTag) &&
++		!info.HasTag(gocriticlinter.PerformanceTag) &&
++		!info.HasTag(gocriticlinter.SecurityTag)
++}
+diff --git a/pkg/golinters/gocritic/gocritic_settings.go b/pkg/golinters/gocritic/gocritic_settings.go
+index e3267eee..13e1f8f2 100644
+--- a/pkg/golinters/gocritic/gocritic_settings.go
++++ b/pkg/golinters/gocritic/gocritic_settings.go
+@@ -4,7 +4,6 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"maps"
+-	"reflect"
+ 	"slices"
+ 	"strings"
+ 
+@@ -17,8 +16,6 @@ import (
+ type settingsWrapper struct {
+ 	*config.GoCriticSettings
+ 
+-	replacer *strings.Replacer
+-
+ 	logger logutils.Log
+ 
+ 	allCheckers []*gocriticlinter.CheckerInfo
+@@ -34,13 +31,12 @@ type settingsWrapper struct {
+ 	inferredEnabledChecksLowerCased goCriticChecks[struct{}]
+ }
+ 
+-func newSettingsWrapper(logger logutils.Log, settings *config.GoCriticSettings, replacer *strings.Replacer) *settingsWrapper {
++func newSettingsWrapper(settings *config.GoCriticSettings, logger logutils.Log) *settingsWrapper {
+ 	allCheckers := gocriticlinter.GetCheckersInfo()
+ 
+ 	allChecks := make(goCriticChecks[struct{}], len(allCheckers))
+ 	allChecksLowerCased := make(goCriticChecks[struct{}], len(allCheckers))
+ 	allChecksByTag := make(goCriticChecks[[]string])
+-
+ 	for _, checker := range allCheckers {
+ 		allChecks[checker.Name] = struct{}{}
+ 		allChecksLowerCased[strings.ToLower(checker.Name)] = struct{}{}
+@@ -50,18 +46,17 @@ func newSettingsWrapper(logger logutils.Log, settings *config.GoCriticSettings,
+ 		}
+ 	}
+ 
+-	return &settingsWrapper{
+-		GoCriticSettings: settings,
+-		replacer:         replacer,
+-		logger:           logger,
+-
+-		allCheckers:           allCheckers,
+-		allChecks:             allChecks,
+-		allChecksByTag:        allChecksByTag,
+-		allTagsSorted:         slices.Sorted(maps.Keys(allChecksByTag)),
+-		inferredEnabledChecks: make(goCriticChecks[struct{}]),
++	allTagsSorted := slices.Sorted(maps.Keys(allChecksByTag))
+ 
++	return &settingsWrapper{
++		GoCriticSettings:                settings,
++		logger:                          logger,
++		allCheckers:                     allCheckers,
++		allChecks:                       allChecks,
+ 		allChecksLowerCased:             allChecksLowerCased,
++		allChecksByTag:                  allChecksByTag,
++		allTagsSorted:                   allTagsSorted,
++		inferredEnabledChecks:           make(goCriticChecks[struct{}]),
+ 		inferredEnabledChecksLowerCased: make(goCriticChecks[struct{}]),
+ 	}
+ }
+@@ -74,15 +69,8 @@ func (s *settingsWrapper) GetLowerCasedParams() map[string]config.GoCriticCheckS
+ 	return normalizeMap(s.SettingsPerCheck)
+ }
+ 
+-func (s *settingsWrapper) Load() error {
+-	s.inferEnabledChecks()
+-
+-	// validate must be after inferEnabledChecks, not before.
+-	// Because it uses gathered information about tags set and finally enabled checks.
+-	return s.validate()
+-}
+-
+-func (s *settingsWrapper) inferEnabledChecks() {
++// InferEnabledChecks tries to be consistent with (lintersdb.Manager).build.
++func (s *settingsWrapper) InferEnabledChecks() {
+ 	s.debugChecksInitialState()
+ 
+ 	enabledByDefaultChecks, disabledByDefaultChecks := s.buildEnabledAndDisabledByDefaultChecks()
+@@ -90,30 +78,22 @@ func (s *settingsWrapper) inferEnabledChecks() {
+ 	debugChecksListf(enabledByDefaultChecks, "Enabled by default")
+ 	debugChecksListf(disabledByDefaultChecks, "Disabled by default")
+ 
+-	var enabledChecks goCriticChecks[struct{}]
+-
+-	switch {
+-	case s.DisableAll:
+-		// disable-all revokes the default settings.
+-		enabledChecks = make(goCriticChecks[struct{}])
++	enabledChecks := make(goCriticChecks[struct{}])
+ 
+-	case s.EnableAll:
+-		// enable-all revokes the default settings.
++	if s.EnableAll {
+ 		enabledChecks = make(goCriticChecks[struct{}], len(s.allCheckers))
+-
+ 		for _, info := range s.allCheckers {
+ 			enabledChecks[info.Name] = struct{}{}
+ 		}
+-
+-	default:
++	} else if !s.DisableAll {
++		// enable-all/disable-all revokes the default settings.
+ 		enabledChecks = make(goCriticChecks[struct{}], len(enabledByDefaultChecks))
+-
+ 		for _, check := range enabledByDefaultChecks {
+ 			enabledChecks[check] = struct{}{}
+ 		}
+ 	}
+ 
+-	if len(s.EnabledTags) > 0 {
++	if len(s.EnabledTags) != 0 {
+ 		enabledFromTags := s.expandTagsToChecks(s.EnabledTags)
+ 
+ 		debugChecksListf(enabledFromTags, "Enabled by config tags %s", s.EnabledTags)
+@@ -123,7 +103,7 @@ func (s *settingsWrapper) inferEnabledChecks() {
+ 		}
+ 	}
+ 
+-	if len(s.EnabledChecks) > 0 {
++	if len(s.EnabledChecks) != 0 {
+ 		debugChecksListf(s.EnabledChecks, "Enabled by config")
+ 
+ 		for _, check := range s.EnabledChecks {
+@@ -131,12 +111,11 @@ func (s *settingsWrapper) inferEnabledChecks() {
+ 				s.logger.Warnf("%s: no need to enable check %q: it's already enabled", linterName, check)
+ 				continue
+ 			}
+-
+ 			enabledChecks[check] = struct{}{}
+ 		}
+ 	}
+ 
+-	if len(s.DisabledTags) > 0 {
++	if len(s.DisabledTags) != 0 {
+ 		disabledFromTags := s.expandTagsToChecks(s.DisabledTags)
+ 
+ 		debugChecksListf(disabledFromTags, "Disabled by config tags %s", s.DisabledTags)
+@@ -146,7 +125,7 @@ func (s *settingsWrapper) inferEnabledChecks() {
+ 		}
+ 	}
+ 
+-	if len(s.DisabledChecks) > 0 {
++	if len(s.DisabledChecks) != 0 {
+ 		debugChecksListf(s.DisabledChecks, "Disabled by config")
+ 
+ 		for _, check := range s.DisabledChecks {
+@@ -154,7 +133,6 @@ func (s *settingsWrapper) inferEnabledChecks() {
+ 				s.logger.Warnf("%s: no need to disable check %q: it's already disabled", linterName, check)
+ 				continue
+ 			}
+-
+ 			delete(enabledChecks, check)
+ 		}
+ 	}
+@@ -167,64 +145,29 @@ func (s *settingsWrapper) inferEnabledChecks() {
+ 
+ func (s *settingsWrapper) buildEnabledAndDisabledByDefaultChecks() (enabled, disabled []string) {
+ 	for _, info := range s.allCheckers {
+-		if isEnabledByDefaultGoCriticChecker(info) {
++		if enabledByDef := isEnabledByDefaultGoCriticChecker(info); enabledByDef {
+ 			enabled = append(enabled, info.Name)
+ 		} else {
+ 			disabled = append(disabled, info.Name)
+ 		}
+ 	}
+-
+ 	return enabled, disabled
+ }
+ 
+ func (s *settingsWrapper) expandTagsToChecks(tags []string) []string {
+ 	var checks []string
+-
+ 	for _, tag := range tags {
+ 		checks = append(checks, s.allChecksByTag[tag]...)
+ 	}
+-
+ 	return checks
+ }
+ 
+-func (s *settingsWrapper) setCheckerParams(
+-	info *gocriticlinter.CheckerInfo,
+-	allLowerCasedParams map[string]config.GoCriticCheckSettings,
+-) error {
+-	params := allLowerCasedParams[strings.ToLower(info.Name)]
+-	if params == nil { // no config for this checker
+-		return nil
+-	}
+-
+-	// To lowercase info param keys here because golangci-lint's config parser lowercases all strings.
+-	infoParams := normalizeMap(info.Params)
+-	for k, p := range params {
+-		v, ok := infoParams[k]
+-		if ok {
+-			v.Value = s.normalizeCheckerParamsValue(p)
+-			continue
+-		}
+-
+-		// param `k` isn't supported
+-		if len(info.Params) == 0 {
+-			return fmt.Errorf("checker %s config param %s doesn't exist: checker doesn't have params",
+-				info.Name, k)
+-		}
+-
+-		return fmt.Errorf("checker %s config param %s doesn't exist, all existing: %s",
+-			info.Name, k, slices.Sorted(maps.Keys(info.Params)))
+-	}
+-
+-	return nil
+-}
+-
+ func (s *settingsWrapper) debugChecksInitialState() {
+ 	if !isDebug {
+ 		return
+ 	}
+ 
+ 	debugf("All gocritic existing tags and checks:")
+-
+ 	for _, tag := range s.allTagsSorted {
+ 		debugChecksListf(s.allChecksByTag[tag], "  tag %q", tag)
+ 	}
+@@ -239,10 +182,11 @@ func (s *settingsWrapper) debugChecksFinalState() {
+ 	var disabledChecks []string
+ 
+ 	for _, checker := range s.allCheckers {
+-		if s.IsCheckEnabled(checker.Name) {
+-			enabledChecks = append(enabledChecks, checker.Name)
++		check := checker.Name
++		if s.inferredEnabledChecks.has(check) {
++			enabledChecks = append(enabledChecks, check)
+ 		} else {
+-			disabledChecks = append(disabledChecks, checker.Name)
++			disabledChecks = append(disabledChecks, check)
+ 		}
+ 	}
+ 
+@@ -255,32 +199,8 @@ func (s *settingsWrapper) debugChecksFinalState() {
+ 	}
+ }
+ 
+-// normalizeCheckerParamsValue normalizes value types.
+-// go-critic asserts that CheckerParam.Value has some specific types,
+-// but the file parsers (TOML, YAML, JSON) don't create the same representation for raw type.
+-// then we have to convert value types into the expected value types.
+-// Maybe in the future, this kind of conversion will be done in go-critic itself.
+-func (s *settingsWrapper) normalizeCheckerParamsValue(p any) any {
+-	rv := reflect.ValueOf(p)
+-
+-	switch rv.Type().Kind() {
+-	case reflect.Int64, reflect.Int32, reflect.Int16, reflect.Int8, reflect.Int:
+-		return int(rv.Int())
+-
+-	case reflect.Bool:
+-		return rv.Bool()
+-
+-	case reflect.String:
+-		// Perform variable substitution.
+-		return s.replacer.Replace(rv.String())
+-
+-	default:
+-		return p
+-	}
+-}
+-
+-// validate tries to be consistent with (lintersdb.Validator).validateEnabledDisabledLintersConfig.
+-func (s *settingsWrapper) validate() error {
++// Validate tries to be consistent with (lintersdb.Validator).validateEnabledDisabledLintersConfig.
++func (s *settingsWrapper) Validate() error {
+ 	for _, v := range []func() error{
+ 		s.validateOptionsCombinations,
+ 		s.validateCheckerTags,
+@@ -296,26 +216,26 @@ func (s *settingsWrapper) validate() error {
+ }
+ 
+ func (s *settingsWrapper) validateOptionsCombinations() error {
+-	if s.EnableAll && s.DisableAll {
+-		return errors.New("enable-all and disable-all options must not be combined")
+-	}
++	if s.EnableAll {
++		if s.DisableAll {
++			return errors.New("enable-all and disable-all options must not be combined")
++		}
+ 
+-	switch {
+-	case s.EnableAll:
+-		if len(s.EnabledTags) > 0 {
++		if len(s.EnabledTags) != 0 {
+ 			return errors.New("enable-all and enabled-tags options must not be combined")
+ 		}
+ 
+-		if len(s.EnabledChecks) > 0 {
++		if len(s.EnabledChecks) != 0 {
+ 			return errors.New("enable-all and enabled-checks options must not be combined")
+ 		}
++	}
+ 
+-	case s.DisableAll:
+-		if len(s.DisabledTags) > 0 {
++	if s.DisableAll {
++		if len(s.DisabledTags) != 0 {
+ 			return errors.New("disable-all and disabled-tags options must not be combined")
+ 		}
+ 
+-		if len(s.DisabledChecks) > 0 {
++		if len(s.DisabledChecks) != 0 {
+ 			return errors.New("disable-all and disabled-checks options must not be combined")
+ 		}
+ 
+@@ -358,11 +278,9 @@ func (s *settingsWrapper) validateCheckerNames() error {
+ 
+ 	for check := range s.SettingsPerCheck {
+ 		lcName := strings.ToLower(check)
+-
+ 		if !s.allChecksLowerCased.has(lcName) {
+ 			return fmt.Errorf("invalid check settings: check %q doesn't exist, see %s documentation", check, linterName)
+ 		}
+-
+ 		if !s.inferredEnabledChecksLowerCased.has(lcName) {
+ 			s.logger.Warnf("%s: settings were provided for disabled check %q", check, linterName)
+ 		}
+@@ -391,7 +309,6 @@ func (s *settingsWrapper) validateAtLeastOneCheckerEnabled() error {
+ 	if len(s.inferredEnabledChecks) == 0 {
+ 		return errors.New("eventually all checks were disabled: at least one must be enabled")
+ 	}
+-
+ 	return nil
+ }
+ 
+@@ -411,21 +328,3 @@ func debugChecksListf(checks []string, format string, args ...any) {
+ 
+ 	debugf("%s checks (%d): %s", fmt.Sprintf(format, args...), len(checks), strings.Join(v, ", "))
+ }
+-
+-func normalizeMap[ValueT any](in map[string]ValueT) map[string]ValueT {
+-	ret := make(map[string]ValueT, len(in))
+-
+-	for k, v := range in {
+-		ret[strings.ToLower(k)] = v
+-	}
+-
+-	return ret
+-}
+-
+-func isEnabledByDefaultGoCriticChecker(info *gocriticlinter.CheckerInfo) bool {
+-	// https://github.com/go-critic/go-critic/blob/5b67cfd487ae9fe058b4b19321901b3131810f65/cmd/gocritic/check.go#L342-L345
+-	return !info.HasTag(gocriticlinter.ExperimentalTag) &&
+-		!info.HasTag(gocriticlinter.OpinionatedTag) &&
+-		!info.HasTag(gocriticlinter.PerformanceTag) &&
+-		!info.HasTag(gocriticlinter.SecurityTag)
+-}
+diff --git a/pkg/golinters/gocritic/gocritic_settings_test.go b/pkg/golinters/gocritic/gocritic_test.go
+similarity index 61%
+rename from pkg/golinters/gocritic/gocritic_settings_test.go
+rename to pkg/golinters/gocritic/gocritic_test.go
+index cbb26922..b742afc9 100644
+--- a/pkg/golinters/gocritic/gocritic_settings_test.go
++++ b/pkg/golinters/gocritic/gocritic_test.go
+@@ -16,15 +16,14 @@ import (
+ )
+ 
+ // https://go-critic.com/overview.html
+-func Test_settingsWrapper_inferEnabledChecks(t *testing.T) {
++func Test_settingsWrapper_InferEnabledChecks(t *testing.T) {
+ 	err := checkers.InitEmbeddedRules()
+ 	require.NoError(t, err)
+ 
+ 	allCheckersInfo := gocriticlinter.GetCheckersInfo()
+ 
+-	allChecksByTag := make(map[string]Slicer)
+-	allChecks := make(Slicer, 0, len(allCheckersInfo))
+-
++	allChecksByTag := make(map[string][]string)
++	allChecks := make([]string, 0, len(allCheckersInfo))
+ 	for _, checker := range allCheckersInfo {
+ 		allChecks = append(allChecks, checker.Name)
+ 		for _, tag := range checker.Tags {
+@@ -32,160 +31,169 @@ func Test_settingsWrapper_inferEnabledChecks(t *testing.T) {
+ 		}
+ 	}
+ 
+-	enabledByDefaultChecks := make(Slicer, 0, len(allCheckersInfo))
+-
++	enabledByDefaultChecks := make([]string, 0, len(allCheckersInfo))
+ 	for _, info := range allCheckersInfo {
+ 		if isEnabledByDefaultGoCriticChecker(info) {
+ 			enabledByDefaultChecks = append(enabledByDefaultChecks, info.Name)
+ 		}
+ 	}
+-
+ 	t.Logf("enabled by default checks:\n%s", strings.Join(enabledByDefaultChecks, "\n"))
+ 
+-	testCases := []struct {
++	insert := func(in []string, toInsert ...string) []string {
++		return slices.Concat(in, toInsert)
++	}
++
++	remove := func(in []string, toRemove ...string) []string {
++		result := slices.Clone(in)
++		for _, v := range toRemove {
++			if i := slices.Index(result, v); i != -1 {
++				result = slices.Delete(result, i, i+1)
++			}
++		}
++		return result
++	}
++
++	uniq := func(in []string) []string {
++		return slices.Compact(slices.Sorted(slices.Values(in)))
++	}
++
++	cases := []struct {
+ 		name                  string
+-		settings              *config.GoCriticSettings
++		sett                  *config.GoCriticSettings
+ 		expectedEnabledChecks []string
+ 	}{
+ 		{
+ 			name:                  "no configuration",
+-			settings:              &config.GoCriticSettings{},
++			sett:                  &config.GoCriticSettings{},
+ 			expectedEnabledChecks: enabledByDefaultChecks,
+ 		},
+ 		{
+ 			name: "enable checks",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledChecks: []string{"assignOp", "badCall", "emptyDecl"},
+ 			},
+-			expectedEnabledChecks: enabledByDefaultChecks.add("emptyDecl"),
++			expectedEnabledChecks: insert(enabledByDefaultChecks, "emptyDecl"),
+ 		},
+ 		{
+ 			name: "disable checks",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisabledChecks: []string{"assignOp", "emptyDecl"},
+ 			},
+-			expectedEnabledChecks: enabledByDefaultChecks.remove("assignOp"),
++			expectedEnabledChecks: remove(enabledByDefaultChecks, "assignOp"),
+ 		},
+ 		{
+ 			name: "enable tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledTags: []string{"style", "experimental"},
+ 			},
+-			expectedEnabledChecks: enabledByDefaultChecks.
+-				add(allChecksByTag["style"]...).
+-				add(allChecksByTag["experimental"]...).
+-				uniq(),
++			expectedEnabledChecks: uniq(insert(insert(
++				enabledByDefaultChecks,
++				allChecksByTag["style"]...),
++				allChecksByTag["experimental"]...)),
+ 		},
+ 		{
+ 			name: "disable tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisabledTags: []string{"diagnostic"},
+ 			},
+-			expectedEnabledChecks: enabledByDefaultChecks.remove(allChecksByTag["diagnostic"]...),
++			expectedEnabledChecks: remove(enabledByDefaultChecks, allChecksByTag["diagnostic"]...),
+ 		},
+ 		{
+ 			name: "enable checks disable checks",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledChecks:  []string{"badCall", "badLock"},
+ 				DisabledChecks: []string{"assignOp", "badSorting"},
+ 			},
+-			expectedEnabledChecks: enabledByDefaultChecks.
+-				remove("assignOp").
+-				add("badLock"),
++			expectedEnabledChecks: insert(remove(enabledByDefaultChecks, "assignOp"), "badLock"),
+ 		},
+ 		{
+ 			name: "enable checks enable tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledChecks: []string{"badCall", "badLock", "hugeParam"},
+ 				EnabledTags:   []string{"diagnostic"},
+ 			},
+-			expectedEnabledChecks: enabledByDefaultChecks.
+-				add(allChecksByTag["diagnostic"]...).
+-				add("hugeParam").
+-				uniq(),
++			expectedEnabledChecks: uniq(insert(insert(enabledByDefaultChecks,
++				allChecksByTag["diagnostic"]...),
++				"hugeParam")),
+ 		},
+ 		{
+ 			name: "enable checks disable tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledChecks: []string{"badCall", "badLock", "boolExprSimplify", "hugeParam"},
+ 				DisabledTags:  []string{"style", "diagnostic"},
+ 			},
+-			expectedEnabledChecks: enabledByDefaultChecks.
+-				remove(allChecksByTag["style"]...).
+-				remove(allChecksByTag["diagnostic"]...).
+-				add("hugeParam"),
++			expectedEnabledChecks: insert(remove(remove(enabledByDefaultChecks,
++				allChecksByTag["style"]...),
++				allChecksByTag["diagnostic"]...),
++				"hugeParam"),
+ 		},
+ 		{
+ 			name: "enable all checks via tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledTags: []string{"diagnostic", "experimental", "opinionated", "performance", "style"},
+ 			},
+ 			expectedEnabledChecks: allChecks,
+ 		},
+ 		{
+ 			name: "disable checks enable tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisabledChecks: []string{"assignOp", "badCall", "badLock", "hugeParam"},
+ 				EnabledTags:    []string{"style", "diagnostic"},
+ 			},
+-			expectedEnabledChecks: enabledByDefaultChecks.
+-				add(allChecksByTag["style"]...).
+-				add(allChecksByTag["diagnostic"]...).
+-				uniq().
+-				remove("assignOp", "badCall", "badLock"),
++			expectedEnabledChecks: remove(uniq(insert(insert(enabledByDefaultChecks,
++				allChecksByTag["style"]...),
++				allChecksByTag["diagnostic"]...)),
++				"assignOp", "badCall", "badLock"),
+ 		},
+ 		{
+ 			name: "disable checks disable tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisabledChecks: []string{"badCall", "badLock", "codegenComment", "hugeParam"},
+ 				DisabledTags:   []string{"style"},
+ 			},
+-			expectedEnabledChecks: enabledByDefaultChecks.
+-				remove(allChecksByTag["style"]...).
+-				remove("badCall", "codegenComment"),
++			expectedEnabledChecks: remove(remove(enabledByDefaultChecks,
++				allChecksByTag["style"]...),
++				"badCall", "codegenComment"),
+ 		},
+ 		{
+ 			name: "enable tags disable tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledTags:  []string{"experimental"},
+ 				DisabledTags: []string{"style"},
+ 			},
+-			expectedEnabledChecks: enabledByDefaultChecks.
+-				add(allChecksByTag["experimental"]...).
+-				uniq().
+-				remove(allChecksByTag["style"]...),
++			expectedEnabledChecks: remove(uniq(insert(enabledByDefaultChecks,
++				allChecksByTag["experimental"]...)),
++				allChecksByTag["style"]...),
+ 		},
+ 		{
+ 			name: "enable checks disable checks enable tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledChecks:  []string{"badCall", "badLock", "boolExprSimplify", "indexAlloc", "hugeParam"},
+ 				DisabledChecks: []string{"deprecatedComment", "typeSwitchVar"},
+ 				EnabledTags:    []string{"experimental"},
+ 			},
+-			expectedEnabledChecks: enabledByDefaultChecks.
+-				add(allChecksByTag["experimental"]...).
+-				add("indexAlloc", "hugeParam").
+-				uniq().
+-				remove("deprecatedComment", "typeSwitchVar"),
++			expectedEnabledChecks: remove(uniq(insert(insert(enabledByDefaultChecks,
++				allChecksByTag["experimental"]...),
++				"indexAlloc", "hugeParam")),
++				"deprecatedComment", "typeSwitchVar"),
+ 		},
+ 		{
+ 			name: "enable checks disable checks enable tags disable tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledChecks:  []string{"badCall", "badCond", "badLock", "indexAlloc", "hugeParam"},
+ 				DisabledChecks: []string{"deprecatedComment", "typeSwitchVar"},
+ 				EnabledTags:    []string{"experimental"},
+ 				DisabledTags:   []string{"performance"},
+ 			},
+-			expectedEnabledChecks: enabledByDefaultChecks.
+-				add(allChecksByTag["experimental"]...).
+-				add("badCond").
+-				uniq().
+-				remove(allChecksByTag["performance"]...).
+-				remove("deprecatedComment", "typeSwitchVar"),
++			expectedEnabledChecks: remove(remove(uniq(insert(insert(enabledByDefaultChecks,
++				allChecksByTag["experimental"]...),
++				"badCond")),
++				allChecksByTag["performance"]...),
++				"deprecatedComment", "typeSwitchVar"),
+ 		},
+ 		{
+ 			name: "enable single tag only",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisableAll:  true,
+ 				EnabledTags: []string{"experimental"},
+ 			},
+@@ -193,35 +201,31 @@ func Test_settingsWrapper_inferEnabledChecks(t *testing.T) {
+ 		},
+ 		{
+ 			name: "enable two tags only",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisableAll:  true,
+ 				EnabledTags: []string{"experimental", "performance"},
+ 			},
+-			expectedEnabledChecks: allChecksByTag["experimental"].
+-				add(allChecksByTag["performance"]...).
+-				uniq(),
++			expectedEnabledChecks: uniq(insert(allChecksByTag["experimental"], allChecksByTag["performance"]...)),
+ 		},
+ 		{
+ 			name: "disable single tag only",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnableAll:    true,
+ 				DisabledTags: []string{"style"},
+ 			},
+-			expectedEnabledChecks: allChecks.remove(allChecksByTag["style"]...),
++			expectedEnabledChecks: remove(allChecks, allChecksByTag["style"]...),
+ 		},
+ 		{
+ 			name: "disable two tags only",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnableAll:    true,
+ 				DisabledTags: []string{"style", "diagnostic"},
+ 			},
+-			expectedEnabledChecks: allChecks.
+-				remove(allChecksByTag["style"]...).
+-				remove(allChecksByTag["diagnostic"]...),
++			expectedEnabledChecks: remove(remove(allChecks, allChecksByTag["style"]...), allChecksByTag["diagnostic"]...),
+ 		},
+ 		{
+ 			name: "enable some checks only",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisableAll:    true,
+ 				EnabledChecks: []string{"deferInLoop", "dupImport", "ifElseChain", "mapKey"},
+ 			},
+@@ -229,60 +233,55 @@ func Test_settingsWrapper_inferEnabledChecks(t *testing.T) {
+ 		},
+ 		{
+ 			name: "disable some checks only",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnableAll:      true,
+ 				DisabledChecks: []string{"deferInLoop", "dupImport", "ifElseChain", "mapKey"},
+ 			},
+-			expectedEnabledChecks: allChecks.
+-				remove("deferInLoop", "dupImport", "ifElseChain", "mapKey"),
++			expectedEnabledChecks: remove(allChecks, "deferInLoop", "dupImport", "ifElseChain", "mapKey"),
+ 		},
+ 		{
+ 			name: "enable single tag and some checks from another tag only",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisableAll:    true,
+ 				EnabledTags:   []string{"experimental"},
+ 				EnabledChecks: []string{"importShadow"},
+ 			},
+-			expectedEnabledChecks: allChecksByTag["experimental"].add("importShadow"),
++			expectedEnabledChecks: insert(allChecksByTag["experimental"], "importShadow"),
+ 		},
+ 		{
+ 			name: "disable single tag and some checks from another tag only",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnableAll:      true,
+ 				DisabledTags:   []string{"experimental"},
+ 				DisabledChecks: []string{"importShadow"},
+ 			},
+-			expectedEnabledChecks: allChecks.
+-				remove(allChecksByTag["experimental"]...).
+-				remove("importShadow"),
++			expectedEnabledChecks: remove(remove(allChecks, allChecksByTag["experimental"]...), "importShadow"),
+ 		},
+ 	}
+ 
+-	for _, test := range testCases {
+-		t.Run(test.name, func(t *testing.T) {
++	for _, tt := range cases {
++		t.Run(tt.name, func(t *testing.T) {
+ 			t.Parallel()
+ 
+-			lg := logutils.NewStderrLog(t.Name())
+-			wr := newSettingsWrapper(lg, test.settings, nil)
+-
+-			wr.inferEnabledChecks()
+-
+-			assert.ElementsMatch(t, test.expectedEnabledChecks, slices.Collect(maps.Keys(wr.inferredEnabledChecks)))
++			lg := logutils.NewStderrLog("Test_goCriticSettingsWrapper_InferEnabledChecks")
++			wr := newSettingsWrapper(tt.sett, lg)
+ 
+-			assert.NoError(t, wr.validate())
++			wr.InferEnabledChecks()
++			assert.ElementsMatch(t, tt.expectedEnabledChecks, slices.Collect(maps.Keys(wr.inferredEnabledChecks)))
++			assert.NoError(t, wr.Validate())
+ 		})
+ 	}
+ }
+ 
+-func Test_settingsWrapper_Load(t *testing.T) {
+-	testCases := []struct {
++func Test_settingsWrapper_Validate(t *testing.T) {
++	cases := []struct {
+ 		name        string
+-		settings    *config.GoCriticSettings
++		sett        *config.GoCriticSettings
+ 		expectedErr bool
+ 	}{
+ 		{
+ 			name: "combine enable-all and disable-all",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnableAll:  true,
+ 				DisableAll: true,
+ 			},
+@@ -290,7 +289,7 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		},
+ 		{
+ 			name: "combine enable-all and enabled-tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnableAll:   true,
+ 				EnabledTags: []string{"experimental"},
+ 			},
+@@ -298,7 +297,7 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		},
+ 		{
+ 			name: "combine enable-all and enabled-checks",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnableAll:     true,
+ 				EnabledChecks: []string{"dupImport"},
+ 			},
+@@ -306,7 +305,7 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		},
+ 		{
+ 			name: "combine disable-all and disabled-tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisableAll:   true,
+ 				DisabledTags: []string{"style"},
+ 			},
+@@ -314,7 +313,7 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		},
+ 		{
+ 			name: "combine disable-all and disable-checks",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisableAll:     true,
+ 				DisabledChecks: []string{"appendAssign"},
+ 			},
+@@ -322,42 +321,42 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		},
+ 		{
+ 			name: "disable-all and no one check enabled",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisableAll: true,
+ 			},
+ 			expectedErr: true,
+ 		},
+ 		{
+ 			name: "unknown enabled tag",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledTags: []string{"diagnostic", "go-proverbs"},
+ 			},
+ 			expectedErr: true,
+ 		},
+ 		{
+ 			name: "unknown disabled tag",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisabledTags: []string{"style", "go-proverbs"},
+ 			},
+ 			expectedErr: true,
+ 		},
+ 		{
+ 			name: "unknown enabled check",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledChecks: []string{"appendAssign", "noExitAfterDefer", "underef"},
+ 			},
+ 			expectedErr: true,
+ 		},
+ 		{
+ 			name: "unknown disabled check",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisabledChecks: []string{"dupSubExpr", "noExitAfterDefer", "returnAfterHttpError"},
+ 			},
+ 			expectedErr: true,
+ 		},
+ 		{
+ 			name: "settings for unknown check",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				SettingsPerCheck: map[string]config.GoCriticCheckSettings{
+ 					"captLocall":    {"paramsOnly": false},
+ 					"unnamedResult": {"checkExported": true},
+@@ -367,7 +366,7 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		},
+ 		{
+ 			name: "settings for disabled check",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisabledChecks: []string{"elseif"},
+ 				SettingsPerCheck: map[string]config.GoCriticCheckSettings{
+ 					"elseif": {"skipBalanced": true},
+@@ -377,7 +376,7 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		},
+ 		{
+ 			name: "settings by lower-cased checker name",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledChecks: []string{"tooManyResultsChecker"},
+ 				SettingsPerCheck: map[string]config.GoCriticCheckSettings{
+ 					"toomanyresultschecker": {"maxResults": 3},
+@@ -388,7 +387,7 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		},
+ 		{
+ 			name: "enabled and disabled at one moment check",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledChecks:  []string{"appendAssign", "codegenComment", "underef"},
+ 				DisabledChecks: []string{"elseif", "underef"},
+ 			},
+@@ -396,7 +395,7 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		},
+ 		{
+ 			name: "enabled and disabled at one moment tag",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledTags:  []string{"performance", "style"},
+ 				DisabledTags: []string{"style", "diagnostic"},
+ 			},
+@@ -404,14 +403,14 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		},
+ 		{
+ 			name: "disable all checks via tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				DisabledTags: []string{"diagnostic", "experimental", "opinionated", "performance", "style"},
+ 			},
+ 			expectedErr: true,
+ 		},
+ 		{
+ 			name: "enable-all and disable all checks via tags",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnableAll:    true,
+ 				DisabledTags: []string{"diagnostic", "experimental", "opinionated", "performance", "style"},
+ 			},
+@@ -419,7 +418,7 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		},
+ 		{
+ 			name: "valid configuration",
+-			settings: &config.GoCriticSettings{
++			sett: &config.GoCriticSettings{
+ 				EnabledTags:    []string{"performance"},
+ 				DisabledChecks: []string{"dupImport", "ifElseChain", "octalLiteral", "whyNoLint"},
+ 				SettingsPerCheck: map[string]config.GoCriticCheckSettings{
+@@ -431,15 +430,17 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		},
+ 	}
+ 
+-	for _, test := range testCases {
+-		t.Run(test.name, func(t *testing.T) {
++	for _, tt := range cases {
++		t.Run(tt.name, func(t *testing.T) {
+ 			t.Parallel()
+ 
+-			lg := logutils.NewStderrLog(t.Name())
+-			wr := newSettingsWrapper(lg, test.settings, nil)
++			lg := logutils.NewStderrLog("Test_goCriticSettingsWrapper_Validate")
++			wr := newSettingsWrapper(tt.sett, lg)
+ 
+-			err := wr.Load()
+-			if test.expectedErr {
++			wr.InferEnabledChecks()
++
++			err := wr.Validate()
++			if tt.expectedErr {
+ 				if assert.Error(t, err) {
+ 					t.Log(err)
+ 				}
+@@ -449,25 +450,3 @@ func Test_settingsWrapper_Load(t *testing.T) {
+ 		})
+ 	}
+ }
+-
+-type Slicer []string
+-
+-func (s Slicer) add(toAdd ...string) Slicer {
+-	return slices.Concat(s, toAdd)
+-}
+-
+-func (s Slicer) remove(toRemove ...string) Slicer {
+-	result := slices.Clone(s)
+-
+-	for _, v := range toRemove {
+-		if i := slices.Index(result, v); i != -1 {
+-			result = slices.Delete(result, i, i+1)
+-		}
+-	}
+-
+-	return result
+-}
+-
+-func (s Slicer) uniq() Slicer {
+-	return slices.Compact(slices.Sorted(slices.Values(s)))
+-}
+diff --git a/pkg/golinters/gocritic/testdata/gocritic.yml b/pkg/golinters/gocritic/testdata/gocritic.yml
+index e64cb2e5..5c90af7d 100644
+--- a/pkg/golinters/gocritic/testdata/gocritic.yml
++++ b/pkg/golinters/gocritic/testdata/gocritic.yml
+@@ -14,7 +14,7 @@ linters:
+           sizeThreshold: 24
+         ruleguard:
+           failOn: dsl,import
+-          rules: '${base-path}/ruleguard/preferWriteString.go,${config-path}/ruleguard/stringsSimplify.go'
++          rules: '${base-path}/ruleguard/preferWriteString.go,${base-path}/ruleguard/stringsSimplify.go'
+ 
+ run:
+   relative-path-mode: cfg
+diff --git a/pkg/golinters/goheader/goheader.go b/pkg/golinters/goheader/goheader.go
+index e03d3277..491e54a7 100644
+--- a/pkg/golinters/goheader/goheader.go
++++ b/pkg/golinters/goheader/goheader.go
+@@ -9,17 +9,18 @@ import (
+ 
+ 	"github.com/golangci/golangci-lint/v2/pkg/config"
+ 	"github.com/golangci/golangci-lint/v2/pkg/goanalysis"
++	"github.com/golangci/golangci-lint/v2/pkg/golinters/internal"
+ )
+ 
+ const linterName = "goheader"
+ 
+-func New(settings *config.GoHeaderSettings, replacer *strings.Replacer) *goanalysis.Linter {
++func New(settings *config.GoHeaderSettings, basePath string) *goanalysis.Linter {
+ 	conf := &goheader.Configuration{}
+ 	if settings != nil {
+ 		conf = &goheader.Configuration{
+ 			Values:       settings.Values,
+ 			Template:     settings.Template,
+-			TemplatePath: replacer.Replace(settings.TemplatePath),
++			TemplatePath: strings.ReplaceAll(settings.TemplatePath, internal.PlaceholderBasePath, basePath),
+ 		}
+ 	}
+ 
+diff --git a/pkg/golinters/internal/commons.go b/pkg/golinters/internal/commons.go
+index d19c1fd4..ebc21190 100644
+--- a/pkg/golinters/internal/commons.go
++++ b/pkg/golinters/internal/commons.go
+@@ -4,3 +4,6 @@ import "github.com/golangci/golangci-lint/v2/pkg/logutils"
+ 
+ // LinterLogger must be use only when the context logger is not available.
+ var LinterLogger = logutils.NewStderrLog(logutils.DebugKeyLinter)
++
++// PlaceholderBasePath used inside linters to evaluate relative paths.
++const PlaceholderBasePath = "${base-path}"
+diff --git a/pkg/lint/lintersdb/builder_linter.go b/pkg/lint/lintersdb/builder_linter.go
+index 00c333aa..7e8e4ad1 100644
+--- a/pkg/lint/lintersdb/builder_linter.go
++++ b/pkg/lint/lintersdb/builder_linter.go
+@@ -129,8 +129,6 @@ func (LinterBuilder) Build(cfg *config.Config) ([]*linter.Config, error) {
+ 		return nil, nil
+ 	}
+ 
+-	placeholderReplacer := config.NewPlaceholderReplacer(cfg)
+-
+ 	// The linters are sorted in the alphabetical order (case-insensitive).
+ 	// When a new linter is added the version in `WithSince(...)` must be the next minor version of golangci-lint.
+ 	return []*linter.Config{
+@@ -182,7 +180,7 @@ func (LinterBuilder) Build(cfg *config.Config) ([]*linter.Config, error) {
+ 			WithSince("v1.44.0").
+ 			WithURL("https://gitlab.com/bosi/decorder"),
+ 
+-		linter.NewConfig(depguard.New(&cfg.Linters.Settings.Depguard, placeholderReplacer)).
++		linter.NewConfig(depguard.New(&cfg.Linters.Settings.Depguard, cfg.GetBasePath())).
+ 			WithSince("v1.4.0").
+ 			WithURL("https://github.com/OpenPeeDeeP/depguard"),
+ 
+@@ -302,7 +300,7 @@ func (LinterBuilder) Build(cfg *config.Config) ([]*linter.Config, error) {
+ 			WithSince("v1.0.0").
+ 			WithURL("https://github.com/jgautheron/goconst"),
+ 
+-		linter.NewConfig(gocritic.New(&cfg.Linters.Settings.Gocritic, placeholderReplacer)).
++		linter.NewConfig(gocritic.New(&cfg.Linters.Settings.Gocritic)).
+ 			WithSince("v1.12.0").
+ 			WithLoadForGoAnalysis().
+ 			WithAutoFix().
+@@ -342,7 +340,7 @@ func (LinterBuilder) Build(cfg *config.Config) ([]*linter.Config, error) {
+ 			WithAutoFix().
+ 			WithURL("https://github.com/segmentio/golines"),
+ 
+-		linter.NewConfig(goheader.New(&cfg.Linters.Settings.Goheader, placeholderReplacer)).
++		linter.NewConfig(goheader.New(&cfg.Linters.Settings.Goheader, cfg.GetBasePath())).
+ 			WithSince("v1.28.0").
+ 			WithAutoFix().
+ 			WithURL("https://github.com/denis-tingaikin/go-header"),

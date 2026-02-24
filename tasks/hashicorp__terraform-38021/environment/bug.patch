@@ -1,0 +1,196 @@
+diff --git a/.changes/v1.15/NEW FEATURES-20260212-104240.yaml b/.changes/v1.15/NEW FEATURES-20260212-104240.yaml
+deleted file mode 100644
+index 1567580d89..0000000000
+--- a/.changes/v1.15/NEW FEATURES-20260212-104240.yaml	
++++ /dev/null
+@@ -1,5 +0,0 @@
+-kind: NEW FEATURES
+-body: "validate: The validate command now checks the `backend` block. This ensures the backend type exists, that all required attributes are present, and that the backend's own validation logic passes."
+-time: 2026-02-12T10:42:40.333849Z
+-custom:
+-    Issue: "38021"
+diff --git a/internal/command/testdata/invalid-backend-configuration/missing-required-attr/main.tf b/internal/command/testdata/invalid-backend-configuration/missing-required-attr/main.tf
+deleted file mode 100644
+index ca9cb7b956..0000000000
+--- a/internal/command/testdata/invalid-backend-configuration/missing-required-attr/main.tf
++++ /dev/null
+@@ -1,9 +0,0 @@
+-terraform {
+-  backend "gcs" {
+-    # Missing required attribute "bucket"
+-    #
+-    # Everything else is missing as well, but this
+-    # test fixture is intended for use testing the validate command,
+-    # which is offline only. So lack of credentials etc is not a problem.
+-  }
+-}
+diff --git a/internal/command/validate.go b/internal/command/validate.go
+index c3bd859dbc..f679e2fae8 100644
+--- a/internal/command/validate.go
++++ b/internal/command/validate.go
+@@ -8,10 +8,7 @@ import (
+ 	"path/filepath"
+ 	"strings"
+ 
+-	"github.com/hashicorp/hcl/v2"
+-	"github.com/hashicorp/hcl/v2/hcldec"
+ 	"github.com/hashicorp/terraform/internal/addrs"
+-	backendInit "github.com/hashicorp/terraform/internal/backend/init"
+ 	"github.com/hashicorp/terraform/internal/command/arguments"
+ 	"github.com/hashicorp/terraform/internal/command/views"
+ 	"github.com/hashicorp/terraform/internal/configs"
+@@ -90,13 +87,6 @@ func (c *ValidateCommand) validate(dir string) tfdiags.Diagnostics {
+ 
+ 	diags = diags.Append(c.validateConfig(cfg))
+ 
+-	// Validation of backend block, if present
+-	// Backend blocks live outside the Terraform graph so we have to do this separately.
+-	backend := cfg.Module.Backend
+-	if backend != nil {
+-		diags = diags.Append(c.validateBackend(backend))
+-	}
+-
+ 	// Unless excluded, we'll also do a quick validation of the Terraform test files. These live
+ 	// outside the Terraform graph so we have to do this separately.
+ 	if !c.ParsedArgs.NoTests {
+@@ -167,48 +157,6 @@ func (c *ValidateCommand) validateTestFiles(cfg *configs.Config) tfdiags.Diagnos
+ 	return diags
+ }
+ 
+-// We validate the backend in an offline manner, so we use PrepareConfig to validate the configuration (and ENVs present),
+-// but we never use the Configure method, as that will interact with third-party systems.
+-//
+-// The code in this method is very similar to the `backendInitFromConfig` method, expect it doesn't configure the backend.
+-func (c *ValidateCommand) validateBackend(cfg *configs.Backend) tfdiags.Diagnostics {
+-	var diags tfdiags.Diagnostics
+-
+-	bf := backendInit.Backend(cfg.Type)
+-	if bf == nil {
+-		detail := fmt.Sprintf("There is no backend type named %q.", cfg.Type)
+-		if msg, removed := backendInit.RemovedBackends[cfg.Type]; removed {
+-			detail = msg
+-		}
+-
+-		diags = diags.Append(&hcl.Diagnostic{
+-			Severity: hcl.DiagError,
+-			Summary:  "Unsupported backend type",
+-			Detail:   detail,
+-			Subject:  &cfg.TypeRange,
+-		})
+-		return diags
+-	}
+-
+-	b := bf()
+-	backendSchema := b.ConfigSchema()
+-
+-	decSpec := backendSchema.DecoderSpec()
+-	configVal, hclDiags := hcldec.Decode(cfg.Config, decSpec, nil)
+-	diags = diags.Append(hclDiags)
+-	if hclDiags.HasErrors() {
+-		return diags
+-	}
+-
+-	_, validateDiags := b.PrepareConfig(configVal)
+-	diags = diags.Append(validateDiags)
+-	if validateDiags.HasErrors() {
+-		return diags
+-	}
+-
+-	return diags
+-}
+-
+ func (c *ValidateCommand) Synopsis() string {
+ 	return "Check whether the configuration is valid"
+ }
+diff --git a/internal/command/validate_test.go b/internal/command/validate_test.go
+index 4ea1fe7f4b..8f89189f5e 100644
+--- a/internal/command/validate_test.go
++++ b/internal/command/validate_test.go
+@@ -221,6 +221,7 @@ func TestMissingDefinedVar(t *testing.T) {
+ }
+ 
+ func TestValidateWithInvalidTestFile(t *testing.T) {
++
+ 	// We're reusing some testing configs that were written for testing the
+ 	// test command here, so we have to initalise things slightly differently
+ 	// to the other tests.
+@@ -252,6 +253,7 @@ func TestValidateWithInvalidTestFile(t *testing.T) {
+ }
+ 
+ func TestValidateWithInvalidTestModule(t *testing.T) {
++
+ 	// We're reusing some testing configs that were written for testing the
+ 	// test command here, so we have to initalise things slightly differently
+ 	// to the other tests.
+@@ -308,6 +310,7 @@ func TestValidateWithInvalidTestModule(t *testing.T) {
+ }
+ 
+ func TestValidateWithInvalidOverrides(t *testing.T) {
++
+ 	// We're reusing some testing configs that were written for testing the
+ 	// test command here, so we have to initalise things slightly differently
+ 	// to the other tests.
+@@ -544,44 +547,33 @@ func TestValidate_backendBlocks(t *testing.T) {
+ 		}
+ 	})
+ 
+-	t.Run("invalid when the backend type is unknown", func(t *testing.T) {
++	// TODO: Should this validation be added?
++	t.Run("NOT invalid when the backend type is unknown", func(t *testing.T) {
+ 		output, code := setupTest(t, "invalid-backend-configuration/unknown-backend-type")
+-		if code != 1 {
+-			t.Fatalf("expected an unsuccessful exit code %d\n\n%s", code, output.Stderr())
++		if code != 0 {
++			t.Fatalf("expected a successful exit code %d\n\n%s", code, output.Stderr())
+ 		}
+-		expectedErr := "Error: Unsupported backend type"
+-		if !strings.Contains(output.Stderr(), expectedErr) {
+-			t.Fatalf("unexpected error content: wanted %q, got: %s",
+-				expectedErr,
+-				output.Stderr(),
++		expectedMsg := "Success! The configuration is valid."
++		if !strings.Contains(output.Stdout(), expectedMsg) {
++			t.Fatalf("unexpected output content: wanted %q, got: %s",
++				expectedMsg,
++				output.Stdout(),
+ 			)
+ 		}
+ 	})
+ 
+-	t.Run("invalid when there's an unknown attribute present", func(t *testing.T) {
++	// Backend blocks aren't validated using their schemas currently.
++	// TODO: Should this validation be added?
++	t.Run("NOT invalid when there's an unknown attribute present", func(t *testing.T) {
+ 		output, code := setupTest(t, "invalid-backend-configuration/unknown-attr")
+-		if code != 1 {
+-			t.Fatalf("expected an unsuccessful exit code %d\n\n%s", code, output.Stdout())
++		if code != 0 {
++			t.Fatalf("expected a successful exit code %d\n\n%s", code, output.Stderr())
+ 		}
+-		expectedErr := "Error: Unsupported argument"
+-		if !strings.Contains(output.Stderr(), expectedErr) {
+-			t.Fatalf("unexpected error content: wanted %q, got: %s",
+-				expectedErr,
+-				output.Stderr(),
+-			)
+-		}
+-	})
+-
+-	t.Run("invalid when a required attribute is unset", func(t *testing.T) {
+-		output, code := setupTest(t, "invalid-backend-configuration/missing-required-attr")
+-		if code != 1 {
+-			t.Fatalf("expected an unsuccessful exit code %d\n\n%s", code, output.Stdout())
+-		}
+-		expectedErr := "Error: Missing required argument"
+-		if !strings.Contains(output.Stderr(), expectedErr) {
+-			t.Fatalf("unexpected error content: wanted %q, got: %s",
+-				expectedErr,
+-				output.Stderr(),
++		expectedMsg := "Success! The configuration is valid."
++		if !strings.Contains(output.Stdout(), expectedMsg) {
++			t.Fatalf("unexpected output content: wanted %q, got: %s",
++				expectedMsg,
++				output.Stdout(),
+ 			)
+ 		}
+ 	})

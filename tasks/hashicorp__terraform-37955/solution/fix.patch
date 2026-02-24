@@ -1,0 +1,96 @@
+diff --git a/.changes/v1.15/BUG FIXES-20251201-114950.yaml b/.changes/v1.15/BUG FIXES-20251201-114950.yaml
+new file mode 100644
+index 0000000000..cfa8ded58b
+--- /dev/null
++++ b/.changes/v1.15/BUG FIXES-20251201-114950.yaml	
+@@ -0,0 +1,5 @@
++kind: BUG FIXES
++body: 'apply: Terraform will raise an explicit error if a plan file intended for one workspace is applied against another workspace'
++time: 2025-12-01T11:49:50.360928Z
++custom:
++    Issue: "37954"
+diff --git a/internal/command/meta_backend.go b/internal/command/meta_backend.go
+index 6911fd4c5c..0bc88efd3a 100644
+--- a/internal/command/meta_backend.go
++++ b/internal/command/meta_backend.go
+@@ -337,6 +337,32 @@ func (m *Meta) selectWorkspace(b backend.Backend) error {
+ func (m *Meta) BackendForLocalPlan(plan *plans.Plan) (backendrun.OperationsBackend, tfdiags.Diagnostics) {
+ 	var diags tfdiags.Diagnostics
+ 
++	// Check the workspace name in the plan matches the current workspace
++	currentWorkspace, err := m.Workspace()
++	if err != nil {
++		diags = diags.Append(fmt.Errorf("error determining current workspace when initializing a backend from the plan file: %w", err))
++		return nil, diags
++	}
++	var plannedWorkspace string
++	var isCloud bool
++	switch {
++	case plan.StateStore != nil:
++		plannedWorkspace = plan.StateStore.Workspace
++		isCloud = false
++	case plan.Backend != nil:
++		plannedWorkspace = plan.Backend.Workspace
++		isCloud = plan.Backend.Type == "cloud"
++	default:
++		panic(fmt.Sprintf("Workspace data missing from plan file. Current workspace is %q. This is a bug in Terraform and should be reported.", currentWorkspace))
++	}
++	if currentWorkspace != plannedWorkspace {
++		return nil, diags.Append(&errWrongWorkspaceForPlan{
++			currentWorkspace: currentWorkspace,
++			plannedWorkspace: plannedWorkspace,
++			isCloud:          isCloud,
++		})
++	}
++
+ 	var b backend.Backend
+ 	switch {
+ 	case plan.StateStore != nil:
+diff --git a/internal/command/meta_backend_errors.go b/internal/command/meta_backend_errors.go
+index 74314bf752..456f3bcd24 100644
+--- a/internal/command/meta_backend_errors.go
++++ b/internal/command/meta_backend_errors.go
+@@ -9,6 +9,43 @@ import (
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+ )
+ 
++// errWrongWorkspaceForPlan is a custom error used to alert users that the plan file they are applying
++// describes a workspace that doesn't match the currently selected workspace.
++//
++// This needs to render slightly different errors depending on whether we're using:
++// > CE Workspaces (remote-state backends, local backends)
++// > HCP Terraform Workspaces (cloud backend)
++type errWrongWorkspaceForPlan struct {
++	plannedWorkspace string
++	currentWorkspace string
++	isCloud          bool
++}
++
++func (e *errWrongWorkspaceForPlan) Error() string {
++	msg := fmt.Sprintf(`The plan file describes changes to the %q workspace, but the %q workspace is currently in use.
++
++Applying this plan with the incorrect workspace selected could result in state being stored in an unexpected location, or a downstream error when Terraform attempts apply a plan using the other workspace's state.`,
++		e.plannedWorkspace,
++		e.currentWorkspace,
++	)
++
++	// For users to understand what's happened and how to correct it we'll give some guidance,
++	// but that guidance depends on whether a cloud backend is in use or not.
++	if e.isCloud {
++		// When using the cloud backend the solution is to focus on the cloud block and running init
++		msg = msg + fmt.Sprintf(` If you'd like to continue to use the plan file, make sure the cloud block in your configuration contains the workspace name %q.
++In future, make sure your cloud block is correct and unchanged since the last time you performed "terraform init" before creating a plan.`, e.plannedWorkspace)
++	} else {
++		// When using the backend block the solution is to not select a different workspace
++		// between plan and apply operations.
++		msg = msg + fmt.Sprintf(` If you'd like to continue to use the plan file, you must run "terraform workspace select %s" to select the matching workspace.
++In future make sure the selected workspace is not changed between creating and applying a plan file.
++`, e.plannedWorkspace)
++	}
++
++	return msg
++}
++
+ // errBackendLocalRead is a custom error used to alert users that state
+ // files on their local filesystem were not erased successfully after
+ // migrating that state to a remote-state backend.

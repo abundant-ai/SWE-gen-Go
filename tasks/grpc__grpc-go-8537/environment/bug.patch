@@ -1,0 +1,792 @@
+diff --git a/internal/envconfig/xds.go b/internal/envconfig/xds.go
+index b1f883bc..e8755155 100644
+--- a/internal/envconfig/xds.go
++++ b/internal/envconfig/xds.go
+@@ -68,10 +68,4 @@ var (
+ 	// trust.  For more details, see:
+ 	// https://github.com/grpc/proposal/blob/master/A87-mtls-spiffe-support.md
+ 	XDSSPIFFEEnabled = boolFromEnv("GRPC_EXPERIMENTAL_XDS_MTLS_SPIFFE", false)
+-
+-	// XDSHTTPConnectEnabled is true if gRPC should parse custom Metadata
+-	// configuring use of an HTTP CONNECT proxy via xDS from cluster resources.
+-	// For more details, see:
+-	// https://github.com/grpc/proposal/blob/master/A86-xds-http-connect.md
+-	XDSHTTPConnectEnabled = boolFromEnv("GRPC_EXPERIMENTAL_XDS_HTTP_CONNECT", false)
+ )
+diff --git a/internal/xds/xdsclient/xdsresource/metadata.go b/internal/xds/xdsclient/xdsresource/metadata.go
+deleted file mode 100644
+index b56c309d..00000000
+--- a/internal/xds/xdsclient/xdsresource/metadata.go
++++ /dev/null
+@@ -1,93 +0,0 @@
+-/*
+- *
+- * Copyright 2025 gRPC authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package xdsresource
+-
+-import (
+-	"fmt"
+-	"net/netip"
+-
+-	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+-	"google.golang.org/protobuf/types/known/anypb"
+-)
+-
+-func init() {
+-	registerMetadataConverter("type.googleapis.com/envoy.config.core.v3.Address", proxyAddressConvertor{})
+-}
+-
+-var (
+-	// metdataRegistry is a map from proto type to metadataConverter.
+-	metdataRegistry = make(map[string]metadataConverter)
+-)
+-
+-// metadataConverter converts xds metadata entries in
+-// Metadata.typed_filter_metadata into an internal form with the fields relevant
+-// to gRPC.
+-type metadataConverter interface {
+-	// convert parses the Any proto into a concrete struct.
+-	convert(*anypb.Any) (any, error)
+-}
+-
+-// registerMetadataConverter registers the converter to the map keyed on a proto
+-// type_url. Must be called at init time. Not thread safe.
+-func registerMetadataConverter(protoType string, c metadataConverter) {
+-	metdataRegistry[protoType] = c
+-}
+-
+-// metadataConverterForType retrieves a converter based on key given.
+-func metadataConverterForType(typeURL string) metadataConverter {
+-	return metdataRegistry[typeURL]
+-}
+-
+-// StructMetadataValue stores the values in a google.protobuf.Struct from
+-// FilterMetadata.
+-type StructMetadataValue struct {
+-	// Data stores the parsed JSON representation of a google.protobuf.Struct.
+-	Data map[string]any
+-}
+-
+-// ProxyAddressMetadataValue holds the address parsed from the
+-// envoy.config.core.v3.Address proto message, as specified in gRFC A86.
+-type ProxyAddressMetadataValue struct {
+-	// Address stores the proxy address configured (A86). It will be in the form
+-	// of host:port. It has to be either IPv6 or IPv4.
+-	Address string
+-}
+-
+-// proxyAddressConvertor implements the metadataConverter interface to handle
+-// the conversion of envoy.config.core.v3.Address protobuf messages into an
+-// internal representation.
+-type proxyAddressConvertor struct{}
+-
+-func (proxyAddressConvertor) convert(anyProto *anypb.Any) (any, error) {
+-	addressProto := &v3corepb.Address{}
+-	if err := anyProto.UnmarshalTo(addressProto); err != nil {
+-		return nil, fmt.Errorf("failed to unmarshal resource from Any proto: %v", err)
+-	}
+-	socketaddress := addressProto.GetSocketAddress()
+-	if socketaddress == nil {
+-		return nil, fmt.Errorf("no socket_address field in metadata")
+-	}
+-	if _, err := netip.ParseAddr(socketaddress.GetAddress()); err != nil {
+-		return nil, fmt.Errorf("address field is not a valid IPv4 or IPv6 address: %q", socketaddress.GetAddress())
+-	}
+-	portvalue := socketaddress.GetPortValue()
+-	if portvalue == 0 {
+-		return nil, fmt.Errorf("port value not set in socket_address")
+-	}
+-	return ProxyAddressMetadataValue{Address: parseAddress(socketaddress)}, nil
+-}
+diff --git a/internal/xds/xdsclient/xdsresource/metadata_test.go b/internal/xds/xdsclient/xdsresource/metadata_test.go
+deleted file mode 100644
+index 28de8b51..00000000
+--- a/internal/xds/xdsclient/xdsresource/metadata_test.go
++++ /dev/null
+@@ -1,199 +0,0 @@
+-/*
+- *
+- * Copyright 2025 gRPC authors.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package xdsresource
+-
+-import (
+-	"testing"
+-
+-	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+-	"github.com/google/go-cmp/cmp"
+-	"google.golang.org/grpc/internal/testutils"
+-)
+-
+-const proxyAddressTypeURL = "type.googleapis.com/envoy.config.core.v3.Address"
+-
+-func (s) TestProxyAddressConverterSuccess(t *testing.T) {
+-	converter := metadataConverterForType(proxyAddressTypeURL)
+-	if converter == nil {
+-		t.Fatalf("Converter for %q not found in registry", proxyAddressTypeURL)
+-	}
+-	tests := []struct {
+-		name string
+-		addr *v3corepb.Address
+-		want ProxyAddressMetadataValue
+-	}{
+-		{
+-			name: "valid IPv4 address and port",
+-			addr: &v3corepb.Address{
+-				Address: &v3corepb.Address_SocketAddress{
+-					SocketAddress: &v3corepb.SocketAddress{
+-						Address: "192.168.1.1",
+-						PortSpecifier: &v3corepb.SocketAddress_PortValue{
+-							PortValue: 8080,
+-						},
+-					},
+-				},
+-			},
+-			want: ProxyAddressMetadataValue{
+-				Address: "192.168.1.1:8080",
+-			},
+-		},
+-		{
+-			name: "valid full IPv6 address and port",
+-			addr: &v3corepb.Address{
+-				Address: &v3corepb.Address_SocketAddress{
+-					SocketAddress: &v3corepb.SocketAddress{
+-						Address: "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+-						PortSpecifier: &v3corepb.SocketAddress_PortValue{
+-							PortValue: 9090,
+-						},
+-					},
+-				},
+-			},
+-			want: ProxyAddressMetadataValue{
+-				Address: "[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:9090",
+-			},
+-		},
+-		{
+-			name: "valid shortened IPv6 address",
+-			addr: &v3corepb.Address{
+-				Address: &v3corepb.Address_SocketAddress{
+-					SocketAddress: &v3corepb.SocketAddress{
+-						Address: "2001:db8::1",
+-						PortSpecifier: &v3corepb.SocketAddress_PortValue{
+-							PortValue: 9090,
+-						},
+-					},
+-				},
+-			},
+-			want: ProxyAddressMetadataValue{
+-				Address: "[2001:db8::1]:9090",
+-			},
+-		},
+-		{
+-			name: "valid link-local IPv6 address",
+-			addr: &v3corepb.Address{
+-				Address: &v3corepb.Address_SocketAddress{
+-					SocketAddress: &v3corepb.SocketAddress{
+-						Address: "fe80::1ff:fe23:4567:890a",
+-						PortSpecifier: &v3corepb.SocketAddress_PortValue{
+-							PortValue: 8888,
+-						},
+-					},
+-				},
+-			},
+-			want: ProxyAddressMetadataValue{
+-				Address: "[fe80::1ff:fe23:4567:890a]:8888",
+-			},
+-		},
+-		{
+-			name: "valid IPv4-mapped IPv6 address",
+-			addr: &v3corepb.Address{
+-				Address: &v3corepb.Address_SocketAddress{
+-					SocketAddress: &v3corepb.SocketAddress{
+-						Address: "::ffff:192.0.2.128",
+-						PortSpecifier: &v3corepb.SocketAddress_PortValue{
+-							PortValue: 1234,
+-						},
+-					},
+-				},
+-			},
+-			want: ProxyAddressMetadataValue{
+-				Address: "[::ffff:192.0.2.128]:1234",
+-			},
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			anyProto := testutils.MarshalAny(t, tt.addr)
+-			got, err := converter.convert(anyProto)
+-			if err != nil {
+-				t.Fatalf("convert() failed with error: %v", err)
+-			}
+-			if diff := cmp.Diff(tt.want, got, cmp.AllowUnexported(ProxyAddressMetadataValue{})); diff != "" {
+-				t.Errorf("convert() returned unexpected value (-want +got):\n%s", diff)
+-			}
+-		})
+-	}
+-}
+-
+-func (s) TestProxyAddressConverterFailure(t *testing.T) {
+-	converter := metadataConverterForType(proxyAddressTypeURL)
+-	if converter == nil {
+-		t.Fatalf("Converter for %q not found in registry", proxyAddressTypeURL)
+-	}
+-	tests := []struct {
+-		name    string
+-		addr    *v3corepb.Address
+-		wantErr string
+-	}{
+-		{
+-			name: "invalid address",
+-			addr: &v3corepb.Address{
+-				Address: &v3corepb.Address_SocketAddress{
+-					SocketAddress: &v3corepb.SocketAddress{
+-						Address: "invalid-ip",
+-					},
+-				},
+-			},
+-			wantErr: "address field is not a valid IPv4 or IPv6 address: \"invalid-ip\"",
+-		},
+-		{
+-			name: "missing socket_address",
+-			addr: &v3corepb.Address{
+-				// No SocketAddress field set.
+-			},
+-			wantErr: "no socket_address field in metadata",
+-		},
+-		{
+-			name: "address is not a socket address",
+-			addr: &v3corepb.Address{
+-				Address: &v3corepb.Address_EnvoyInternalAddress{
+-					EnvoyInternalAddress: &v3corepb.EnvoyInternalAddress{
+-						AddressNameSpecifier: &v3corepb.EnvoyInternalAddress_ServerListenerName{
+-							ServerListenerName: "some-internal-listener",
+-						},
+-					},
+-				},
+-			},
+-			wantErr: "no socket_address field in metadata",
+-		},
+-		{
+-			name: "port value not set",
+-			addr: &v3corepb.Address{
+-				Address: &v3corepb.Address_SocketAddress{
+-					SocketAddress: &v3corepb.SocketAddress{
+-						Address:       "127.0.0.1",
+-						PortSpecifier: nil,
+-					},
+-				},
+-			},
+-			wantErr: "port value not set in socket_address",
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			anyProto := testutils.MarshalAny(t, tt.addr)
+-			_, err := converter.convert(anyProto)
+-			if err == nil || err.Error() != tt.wantErr {
+-				t.Errorf("convert() got error = %v, wantErr = %q", err, tt.wantErr)
+-			}
+-		})
+-	}
+-}
+diff --git a/internal/xds/xdsclient/xdsresource/type_eds.go b/internal/xds/xdsclient/xdsresource/type_eds.go
+index a8d568e1..42eea009 100644
+--- a/internal/xds/xdsclient/xdsresource/type_eds.go
++++ b/internal/xds/xdsclient/xdsresource/type_eds.go
+@@ -53,7 +53,6 @@ type Endpoint struct {
+ 	HealthStatus EndpointHealthStatus
+ 	Weight       uint32
+ 	HashKey      string
+-	Metadata     map[string]any
+ }
+ 
+ // Locality contains information of a locality.
+@@ -62,7 +61,6 @@ type Locality struct {
+ 	ID        clients.Locality
+ 	Priority  uint32
+ 	Weight    uint32
+-	Metadata  map[string]any
+ }
+ 
+ // EndpointsUpdate contains an EDS update.
+diff --git a/internal/xds/xdsclient/xdsresource/unmarshal_eds.go b/internal/xds/xdsclient/xdsresource/unmarshal_eds.go
+index f0e73acd..3e1e59cd 100644
+--- a/internal/xds/xdsclient/xdsresource/unmarshal_eds.go
++++ b/internal/xds/xdsclient/xdsresource/unmarshal_eds.go
+@@ -108,16 +108,11 @@ func parseEndpoints(lbEndpoints []*v3endpointpb.LbEndpoint, uniqueEndpointAddrs
+ 			}
+ 			uniqueEndpointAddrs[a] = true
+ 		}
+-		endpointMetadata, err := validateAndConstructMetadata(lbEndpoint.GetMetadata())
+-		if err != nil {
+-			return nil, err
+-		}
+ 		endpoints = append(endpoints, Endpoint{
+ 			HealthStatus: EndpointHealthStatus(lbEndpoint.GetHealthStatus()),
+ 			Addresses:    addrs,
+ 			Weight:       weight,
+ 			HashKey:      hashKey(lbEndpoint),
+-			Metadata:     endpointMetadata,
+ 		})
+ 	}
+ 	return endpoints, nil
+@@ -195,17 +190,11 @@ func parseEDSRespProto(m *v3endpointpb.ClusterLoadAssignment) (EndpointsUpdate,
+ 		if err != nil {
+ 			return EndpointsUpdate{}, err
+ 		}
+-		localityMetadata, err := validateAndConstructMetadata(locality.GetMetadata())
+-		if err != nil {
+-			return EndpointsUpdate{}, err
+-		}
+-
+ 		ret.Localities = append(ret.Localities, Locality{
+ 			ID:        lid,
+ 			Endpoints: endpoints,
+ 			Weight:    weight,
+ 			Priority:  priority,
+-			Metadata:  localityMetadata,
+ 		})
+ 	}
+ 	for i := 0; i < len(priorities); i++ {
+@@ -215,36 +204,3 @@ func parseEDSRespProto(m *v3endpointpb.ClusterLoadAssignment) (EndpointsUpdate,
+ 	}
+ 	return ret, nil
+ }
+-
+-func validateAndConstructMetadata(metadataProto *v3corepb.Metadata) (map[string]any, error) {
+-	// TODO(easwars): Find a better place for the environment variable check
+-	// once A83 is implemented.
+-	if !envconfig.XDSHTTPConnectEnabled || metadataProto == nil {
+-		return nil, nil
+-	}
+-	metadata := make(map[string]any)
+-	// First go through TypedFilterMetadata.
+-	for key, anyProto := range metadataProto.GetTypedFilterMetadata() {
+-		converter := metadataConverterForType(anyProto.GetTypeUrl())
+-		// Ignore types we don't have a converter for.
+-		if converter == nil {
+-			continue
+-		}
+-		val, err := converter.convert(anyProto)
+-		if err != nil {
+-			// If the converter fails, nack the whole resource.
+-			return nil, fmt.Errorf("metadata conversion for key %q and type %q failed: %v", key, anyProto.GetTypeUrl(), err)
+-		}
+-		metadata[key] = val
+-	}
+-
+-	// Process FilterMetadata for any keys not already handled.
+-	for key, structProto := range metadataProto.GetFilterMetadata() {
+-		// Skip keys already added from TyperFilterMetadata.
+-		if metadata[key] != nil {
+-			continue
+-		}
+-		metadata[key] = StructMetadataValue{Data: structProto.AsMap()}
+-	}
+-	return metadata, nil
+-}
+diff --git a/internal/xds/xdsclient/xdsresource/unmarshal_eds_test.go b/internal/xds/xdsclient/xdsresource/unmarshal_eds_test.go
+index bad0798f..4eb088dc 100644
+--- a/internal/xds/xdsclient/xdsresource/unmarshal_eds_test.go
++++ b/internal/xds/xdsclient/xdsresource/unmarshal_eds_test.go
+@@ -41,124 +41,12 @@ import (
+ )
+ 
+ func (s) TestEDSParseRespProto(t *testing.T) {
+-	testutils.SetEnvConfig(t, &envconfig.XDSHTTPConnectEnabled, true)
+ 	tests := []struct {
+ 		name    string
+ 		m       *v3endpointpb.ClusterLoadAssignment
+ 		want    EndpointsUpdate
+ 		wantErr bool
+ 	}{
+-		{
+-			name: "with endpoint metadata from typed",
+-			m: func() *v3endpointpb.ClusterLoadAssignment {
+-				clab0 := newClaBuilder("test", nil)
+-				clab0.addLocality("locality-1", 1, 0, []endpointOpts{{
+-					addrWithPort: "addr1:314",
+-					metadata: &v3corepb.Metadata{
+-						TypedFilterMetadata: map[string]*anypb.Any{
+-							"typed.key": testutils.MarshalAny(t, &v3corepb.Address{
+-								Address: &v3corepb.Address_SocketAddress{
+-									SocketAddress: &v3corepb.SocketAddress{
+-										Address: "1.2.3.4",
+-										PortSpecifier: &v3corepb.SocketAddress_PortValue{
+-											PortValue: 1111,
+-										}},
+-								},
+-							}),
+-						},
+-						FilterMetadata: map[string]*structpb.Struct{
+-							"some.key": {Fields: map[string]*structpb.Value{
+-								"field": structpb.NewStringValue("untyped-value")}},
+-						},
+-					},
+-				}}, nil)
+-				return clab0.Build()
+-			}(),
+-			want: EndpointsUpdate{
+-				Localities: []Locality{
+-					{
+-						Endpoints: []Endpoint{{
+-							Addresses:    []string{"addr1:314"},
+-							HealthStatus: EndpointHealthStatusUnknown,
+-							Weight:       1,
+-							Metadata: map[string]any{
+-								"typed.key": ProxyAddressMetadataValue{
+-									Address: "1.2.3.4:1111",
+-								},
+-								"some.key": StructMetadataValue{
+-									Data: map[string]any{"field": "untyped-value"},
+-								},
+-							},
+-						}},
+-						ID:       clients.Locality{SubZone: "locality-1"},
+-						Priority: 0,
+-						Weight:   1,
+-					},
+-				},
+-			},
+-		},
+-
+-		{
+-			name: "with endpoint metadata from filtered",
+-			m: func() *v3endpointpb.ClusterLoadAssignment {
+-				clab0 := newClaBuilder("test", nil)
+-				clab0.addLocality("locality-1", 1, 0, []endpointOpts{{
+-					addrWithPort: "addr1:314",
+-					metadata: &v3corepb.Metadata{
+-						FilterMetadata: map[string]*structpb.Struct{
+-							"test-key": {},
+-						},
+-					},
+-				}}, nil)
+-				return clab0.Build()
+-			}(),
+-			want: EndpointsUpdate{
+-				Localities: []Locality{
+-					{
+-						Endpoints: []Endpoint{{
+-							Addresses:    []string{"addr1:314"},
+-							HealthStatus: EndpointHealthStatusUnknown,
+-							Weight:       1,
+-							Metadata: map[string]any{
+-								"test-key": StructMetadataValue{Data: map[string]any{}},
+-							},
+-						}},
+-						ID:       clients.Locality{SubZone: "locality-1"},
+-						Priority: 0,
+-						Weight:   1,
+-					},
+-				},
+-			},
+-		},
+-		{
+-			name: "with locality metadata from filtered",
+-			m: func() *v3endpointpb.ClusterLoadAssignment {
+-				clab0 := newClaBuilder("test", nil)
+-				clab0.addLocality("locality-1", 1, 0, []endpointOpts{{addrWithPort: "addr1:314"}}, &addLocalityOptions{
+-					Metadata: &v3corepb.Metadata{
+-						FilterMetadata: map[string]*structpb.Struct{"test-key": {}},
+-					},
+-				})
+-				return clab0.Build()
+-			}(),
+-			want: EndpointsUpdate{
+-				Localities: []Locality{
+-					{
+-						Endpoints: []Endpoint{{
+-							Addresses:    []string{"addr1:314"},
+-							HealthStatus: EndpointHealthStatusUnknown,
+-							Weight:       1,
+-						}},
+-						ID:       clients.Locality{SubZone: "locality-1"},
+-						Priority: 0,
+-						Weight:   1,
+-						Metadata: map[string]any{
+-							"test-key": StructMetadataValue{Data: map[string]any{}},
+-						},
+-					},
+-				},
+-			},
+-		},
+ 		{
+ 			name: "missing-priority",
+ 			m: func() *v3endpointpb.ClusterLoadAssignment {
+@@ -326,7 +214,8 @@ func (s) TestEDSParseRespProto(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			got, err := parseEDSRespProto(tt.m)
+ 			if (err != nil) != tt.wantErr {
+-				t.Fatalf("parseEDSRespProto() error = %v, wantErr %v", err, tt.wantErr)
++				t.Errorf("parseEDSRespProto() error = %v, wantErr %v", err, tt.wantErr)
++				return
+ 			}
+ 			if d := cmp.Diff(got, tt.want, cmpopts.EquateEmpty()); d != "" {
+ 				t.Errorf("parseEDSRespProto() got = %v, want %v, diff: %v", got, tt.want, d)
+@@ -436,7 +325,8 @@ func (s) TestEDSParseRespProtoAdditionalAddrs(t *testing.T) {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			got, err := parseEDSRespProto(tt.m)
+ 			if (err != nil) != tt.wantErr {
+-				t.Fatalf("parseEDSRespProto() error = %v, wantErr %v", err, tt.wantErr)
++				t.Errorf("parseEDSRespProto() error = %v, wantErr %v", err, tt.wantErr)
++				return
+ 			}
+ 			if d := cmp.Diff(got, tt.want, cmpopts.EquateEmpty()); d != "" {
+ 				t.Errorf("parseEDSRespProto() got = %v, want %v, diff: %v", got, tt.want, d)
+@@ -575,7 +465,6 @@ func (s) TestUnmarshalEndpointHashKey(t *testing.T) {
+ }
+ 
+ func (s) TestUnmarshalEndpoints(t *testing.T) {
+-	testutils.SetEnvConfig(t, &envconfig.XDSHTTPConnectEnabled, true)
+ 	var v3EndpointsAny = testutils.MarshalAny(t, func() *v3endpointpb.ClusterLoadAssignment {
+ 		clab0 := newClaBuilder("test", nil)
+ 		clab0.addLocality("locality-1", 1, 1, []endpointOpts{{addrWithPort: "addr1:314"}}, &addLocalityOptions{
+@@ -699,174 +588,6 @@ func (s) TestUnmarshalEndpoints(t *testing.T) {
+ 	}
+ }
+ 
+-func (s) TestValidateAndConstructMetadataWithXDSHTTPConnectEnabled(t *testing.T) {
+-	testutils.SetEnvConfig(t, &envconfig.XDSHTTPConnectEnabled, true)
+-	tests := []struct {
+-		name          string
+-		metadataProto *v3corepb.Metadata
+-		want          map[string]any
+-		wantErr       bool
+-	}{
+-		{
+-			name: "typed filter metadata over filter metadata-xDSHTTPConnect-enabled",
+-			metadataProto: &v3corepb.Metadata{
+-				TypedFilterMetadata: map[string]*anypb.Any{
+-					"some.key": testutils.MarshalAny(t, &v3corepb.Address{
+-						Address: &v3corepb.Address_SocketAddress{
+-							SocketAddress: &v3corepb.SocketAddress{
+-								Address: "1.2.3.4",
+-								PortSpecifier: &v3corepb.SocketAddress_PortValue{
+-									PortValue: 1111,
+-								},
+-							},
+-						},
+-					}),
+-				},
+-				FilterMetadata: map[string]*structpb.Struct{
+-					"some.key": {Fields: map[string]*structpb.Value{
+-						"field": structpb.NewStringValue("untyped-value")}},
+-				},
+-			},
+-
+-			want: map[string]any{
+-				"some.key": ProxyAddressMetadataValue{Address: "1.2.3.4:1111"},
+-			},
+-		},
+-		{
+-			name: "success-case-xDSHTTPConnect-enabled",
+-			metadataProto: &v3corepb.Metadata{
+-				TypedFilterMetadata: map[string]*anypb.Any{
+-					"envoy.http11_proxy_transport_socket.proxy_address": testutils.MarshalAny(t, &v3corepb.Address{
+-						Address: &v3corepb.Address_SocketAddress{
+-							SocketAddress: &v3corepb.SocketAddress{
+-								Address: "1.2.3.4",
+-								PortSpecifier: &v3corepb.SocketAddress_PortValue{
+-									PortValue: 8080,
+-								},
+-							},
+-						},
+-					}),
+-				},
+-				FilterMetadata: map[string]*structpb.Struct{
+-					"untyped-key": {Fields: map[string]*structpb.Value{"field": structpb.NewStringValue("value")}},
+-				},
+-			},
+-			want: map[string]any{
+-				"envoy.http11_proxy_transport_socket.proxy_address": ProxyAddressMetadataValue{Address: "1.2.3.4:8080"},
+-				"untyped-key": StructMetadataValue{Data: map[string]any{"field": string("value")}},
+-			},
+-		},
+-		{
+-			name: "failure-case-converter-error-xDSHTTPConnect-enabled",
+-			metadataProto: &v3corepb.Metadata{
+-				TypedFilterMetadata: map[string]*anypb.Any{
+-					"envoy.http11_proxy_transport_socket.proxy_address": testutils.MarshalAny(t, &v3corepb.Address{
+-						Address: &v3corepb.Address_SocketAddress{
+-							SocketAddress: &v3corepb.SocketAddress{
+-								Address: "invalid",
+-							},
+-						},
+-					}),
+-				},
+-			},
+-			wantErr: true,
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			got, err := validateAndConstructMetadata(tt.metadataProto)
+-			if (err != nil) != tt.wantErr {
+-				t.Fatalf("validateAndConstructMetadata() error = %v, wantErr %v", err, tt.wantErr)
+-			}
+-			if diff := cmp.Diff(tt.want, got, cmp.AllowUnexported(ProxyAddressMetadataValue{})); diff != "" {
+-				t.Errorf("validateAndConstructMetadata() returned unexpected diff (-want +got):\n%s", diff)
+-			}
+-		})
+-	}
+-}
+-
+-func (s) TestValidateAndConstructMetadataWithXDSHTTPConnectDisabled(t *testing.T) {
+-	tests := []struct {
+-		name          string
+-		metadataProto *v3corepb.Metadata
+-		want          map[string]any
+-		wantErr       bool
+-	}{
+-		{
+-			name: "typed-filter-metadata-over-filter-metadata-disabled",
+-			metadataProto: &v3corepb.Metadata{
+-				TypedFilterMetadata: map[string]*anypb.Any{
+-					"some.key": testutils.MarshalAny(t, &v3corepb.Address{
+-						Address: &v3corepb.Address_SocketAddress{
+-							SocketAddress: &v3corepb.SocketAddress{
+-								Address: "1.2.3.4",
+-								PortSpecifier: &v3corepb.SocketAddress_PortValue{
+-									PortValue: 1111,
+-								},
+-							},
+-						},
+-					}),
+-				},
+-				FilterMetadata: map[string]*structpb.Struct{
+-					"some.key": {Fields: map[string]*structpb.Value{
+-						"field": structpb.NewStringValue("untyped-value")}},
+-				},
+-			},
+-			want: nil,
+-		},
+-		{
+-			name: "success-case-metadata-disabled",
+-			metadataProto: &v3corepb.Metadata{
+-				TypedFilterMetadata: map[string]*anypb.Any{
+-					"envoy.http11_proxy_transport_socket.proxy_address": testutils.MarshalAny(t, &v3corepb.Address{
+-						Address: &v3corepb.Address_SocketAddress{
+-							SocketAddress: &v3corepb.SocketAddress{
+-								Address: "1.2.3.4",
+-								PortSpecifier: &v3corepb.SocketAddress_PortValue{
+-									PortValue: 8080,
+-								},
+-							},
+-						},
+-					}),
+-				},
+-				FilterMetadata: map[string]*structpb.Struct{
+-					"untyped-key": {Fields: map[string]*structpb.Value{
+-						"field": structpb.NewStringValue("value")}},
+-				},
+-			},
+-			want: nil,
+-		},
+-		{
+-			name: "failure-case-converter-error-metadata-disabled",
+-			metadataProto: &v3corepb.Metadata{
+-				TypedFilterMetadata: map[string]*anypb.Any{
+-					"envoy.http11_proxy_transport_socket.proxy_address": testutils.MarshalAny(t, &v3corepb.Address{
+-						Address: &v3corepb.Address_SocketAddress{
+-							SocketAddress: &v3corepb.SocketAddress{
+-								Address: "invalid",
+-							},
+-						},
+-					}),
+-				},
+-			},
+-			want: nil,
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			got, err := validateAndConstructMetadata(tt.metadataProto)
+-			if (err != nil) != tt.wantErr {
+-				t.Fatalf("validateAndConstructMetadata() error = %v, wantErr %v", err, tt.wantErr)
+-			}
+-			if diff := cmp.Diff(tt.want, got, cmp.AllowUnexported(ProxyAddressMetadataValue{})); diff != "" {
+-				t.Errorf("validateAndConstructMetadata() returned unexpected diff (-want +got):\n%s", diff)
+-			}
+-		})
+-	}
+-}
+-
+ // claBuilder builds a ClusterLoadAssignment, aka EDS
+ // response.
+ type claBuilder struct {
+@@ -898,15 +619,13 @@ func newClaBuilder(clusterName string, dropPercents []uint32) *claBuilder {
+ 
+ // addLocalityOptions contains options when adding locality to the builder.
+ type addLocalityOptions struct {
+-	Health   []v3corepb.HealthStatus
+-	Weight   []uint32
+-	Metadata *v3corepb.Metadata
++	Health []v3corepb.HealthStatus
++	Weight []uint32
+ }
+ 
+ type endpointOpts struct {
+ 	addrWithPort            string
+ 	additionalAddrWithPorts []string
+-	metadata                *v3corepb.Metadata
+ }
+ 
+ func addressFromStr(addrWithPort string) *v3corepb.Address {
+@@ -947,7 +666,6 @@ func (clab *claBuilder) addLocality(subzone string, weight uint32, priority uint
+ 					AdditionalAddresses: additionalAddrs,
+ 				},
+ 			},
+-			Metadata: e.metadata,
+ 		}
+ 		if opts != nil {
+ 			if i < len(opts.Health) {
+@@ -969,16 +687,12 @@ func (clab *claBuilder) addLocality(subzone string, weight uint32, priority uint
+ 		}
+ 	}
+ 
+-	locality := &v3endpointpb.LocalityLbEndpoints{
++	clab.v.Endpoints = append(clab.v.Endpoints, &v3endpointpb.LocalityLbEndpoints{
+ 		Locality:            localityID,
+ 		LbEndpoints:         lbEndPoints,
+ 		LoadBalancingWeight: &wrapperspb.UInt32Value{Value: weight},
+ 		Priority:            priority,
+-	}
+-	if opts != nil {
+-		locality.Metadata = opts.Metadata
+-	}
+-	clab.v.Endpoints = append(clab.v.Endpoints, locality)
++	})
+ }
+ 
+ // Build builds ClusterLoadAssignment.

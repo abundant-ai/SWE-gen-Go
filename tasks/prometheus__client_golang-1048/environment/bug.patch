@@ -1,0 +1,256 @@
+diff --git a/.gitignore b/.gitignore
+index 788dfa1..f080929 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,7 +1,6 @@
+ # Examples
+ examples/simple/simple
+ examples/random/random
+-examples/gocollector/gocollector
+ 
+ # Typical backup/temporary files of editors
+ *~
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7740be2..d515e69 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,7 +3,6 @@
+ * [CHANGE] Minimum required Go version is now 1.16.
+ * [CHANGE] Added `collectors.WithGoCollections` that allows to choose what collection of Go runtime metrics user wants: Equivalent of [`MemStats` structure](https://pkg.go.dev/runtime#MemStats) configured using `GoRuntimeMemStatsCollection`, new based on dedicated [runtime/metrics](https://pkg.go.dev/runtime/metrics) metrics represented by `GoRuntimeMetricsCollection` option, or both by specifying `GoRuntimeMemStatsCollection | GoRuntimeMetricsCollection` flag.
+ * [CHANGE] :warning: Change in `collectors.NewGoCollector` metrics: Reverting addition of new ~80 runtime metrics by default. You can enable this back with `GoRuntimeMetricsCollection` option or `GoRuntimeMemStatsCollection | GoRuntimeMetricsCollection`  for smooth transition.
+-* [BUGFIX] Fix the bug that causes generated histogram metric names to end with `_total`. `go_gc_heap_allocs_by_size_bytes_total` -> `go_gc_heap_allocs_by_size_bytes`, `go_gc_heap_frees_by_size_bytes_total` -> `go_gc_heap_allocs_by_size_bytes` and`go_gc_pauses_seconds_total` -> `go_gc_pauses_seconds`.
+ 
+ ## 1.12.1 / 2022-01-29
+ 
+diff --git a/Dockerfile b/Dockerfile
+index 395a30a..2627ff4 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -21,14 +21,11 @@ WORKDIR /go/src/github.com/prometheus/client_golang/examples/random
+ RUN CGO_ENABLED=0 GOOS=linux go build -a -tags netgo -ldflags '-w'
+ WORKDIR /go/src/github.com/prometheus/client_golang/examples/simple
+ RUN CGO_ENABLED=0 GOOS=linux go build -a -tags netgo -ldflags '-w'
+-WORKDIR /go/src/github.com/prometheus/client_golang/examples/gocollector
+-RUN CGO_ENABLED=0 GOOS=linux go build -a -tags netgo -ldflags '-w'
+ 
+ # Final image.
+ FROM quay.io/prometheus/busybox:latest
+ LABEL maintainer="The Prometheus Authors <prometheus-developers@googlegroups.com>"
+ COPY --from=builder /go/src/github.com/prometheus/client_golang/examples/random \
+-    /go/src/github.com/prometheus/client_golang/examples/simple \
+-    /go/src/github.com/prometheus/client_golang/examples/gocollector ./
++    /go/src/github.com/prometheus/client_golang/examples/simple ./
+ EXPOSE 8080
+-CMD ["echo", "Please run an example. Either /random, /simple or /gocollector"]
++CMD ["echo", "Please run an example. Either /random or /simple"]
+diff --git a/examples/gocollector/main.go b/examples/gocollector/main.go
+deleted file mode 100644
+index 93f8c22..0000000
+--- a/examples/gocollector/main.go
++++ /dev/null
+@@ -1,55 +0,0 @@
+-// Copyright 2022 The Prometheus Authors
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-// http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-//go:build go1.17
+-// +build go1.17
+-
+-// A minimal example of how to include Prometheus instrumentation.
+-package main
+-
+-import (
+-	"flag"
+-	"fmt"
+-	"log"
+-	"net/http"
+-
+-	"github.com/prometheus/client_golang/prometheus"
+-	"github.com/prometheus/client_golang/prometheus/collectors"
+-	"github.com/prometheus/client_golang/prometheus/promhttp"
+-)
+-
+-var addr = flag.String("listen-address", ":8080", "The address to listen on for HTTP requests.")
+-
+-func main() {
+-	flag.Parse()
+-
+-	// Create a new registry.
+-	reg := prometheus.NewRegistry()
+-
+-	// Add Go module build info.
+-	reg.MustRegister(collectors.NewBuildInfoCollector())
+-	reg.MustRegister(collectors.NewGoCollector(
+-		collectors.WithGoCollections(collectors.GoRuntimeMemStatsCollection | collectors.GoRuntimeMetricsCollection),
+-	))
+-
+-	// Expose the registered metrics via HTTP.
+-	http.Handle("/metrics", promhttp.HandlerFor(
+-		reg,
+-		promhttp.HandlerOpts{
+-			// Opt into OpenMetrics to support exemplars.
+-			EnableOpenMetrics: true,
+-		},
+-	))
+-	fmt.Println("Hello world from new Go Collector!")
+-	log.Fatal(http.ListenAndServe(*addr, nil))
+-}
+diff --git a/prometheus/collectors/go_collector_latest.go b/prometheus/collectors/go_collector_latest.go
+index 01790e8..58b0a5b 100644
+--- a/prometheus/collectors/go_collector_latest.go
++++ b/prometheus/collectors/go_collector_latest.go
+@@ -72,9 +72,9 @@ const (
+ //
+ // The current default is GoRuntimeMemStatsCollection, so the compatibility mode with
+ // client_golang pre v1.12 (move to runtime/metrics).
+-func WithGoCollections(flags GoCollectionOption) goOption {
++func WithGoCollections(flags uint32) goOption {
+ 	return func(o *goOptions) {
+-		o.EnabledCollections = uint32(flags)
++		o.EnabledCollections = flags
+ 	}
+ }
+ 
+diff --git a/prometheus/gen_go_collector_metrics_set.go b/prometheus/gen_go_collector_metrics_set.go
+index 2f60ea3..4bc127c 100644
+--- a/prometheus/gen_go_collector_metrics_set.go
++++ b/prometheus/gen_go_collector_metrics_set.go
+@@ -39,11 +39,11 @@ func main() {
+ 	}
+ 	toolVersion := runtime.Version()
+ 	mtv := majorVersion(toolVersion)
+-	mv := majorVersion(os.Args[1])
++	mv != majorVersion(os.Args[1])
+ 	if mtv != mv {
+ 		log.Fatalf("using Go version %q but expected Go version %q", mtv, mv)
+ 	}
+-	version, err := parseVersion(mv)
++	version, err := parseVersion(os.Args[1])
+ 	if err != nil {
+ 		log.Fatalf("parsing Go version: %v", err)
+ 	}
+diff --git a/prometheus/go_collector_latest_test.go b/prometheus/go_collector_latest_test.go
+index 11094c8..88158df 100644
+--- a/prometheus/go_collector_latest_test.go
++++ b/prometheus/go_collector_latest_test.go
+@@ -24,9 +24,8 @@ import (
+ 	"sync"
+ 	"testing"
+ 
+-	dto "github.com/prometheus/client_model/go"
+-
+ 	"github.com/prometheus/client_golang/prometheus/internal"
++	dto "github.com/prometheus/client_model/go"
+ )
+ 
+ func TestRmForMemStats(t *testing.T) {
+@@ -122,7 +121,7 @@ func TestBatchHistogram(t *testing.T) {
+ 
+ 	var mhist Metric
+ 	for _, m := range goMetrics {
+-		if m.Desc().fqName == "go_gc_heap_allocs_by_size_bytes" {
++		if m.Desc().fqName == "go_gc_heap_allocs_by_size_bytes_total" {
+ 			mhist = m
+ 			break
+ 		}
+diff --git a/prometheus/go_collector_metrics_go117_test.go b/prometheus/go_collector_metrics_go117_test.go
+index 70c2733..20e98ef 100644
+--- a/prometheus/go_collector_metrics_go117_test.go
++++ b/prometheus/go_collector_metrics_go117_test.go
+@@ -10,16 +10,16 @@ var expectedRuntimeMetrics = map[string]string{
+ 	"/gc/cycles/automatic:gc-cycles":              "go_gc_cycles_automatic_gc_cycles_total",
+ 	"/gc/cycles/forced:gc-cycles":                 "go_gc_cycles_forced_gc_cycles_total",
+ 	"/gc/cycles/total:gc-cycles":                  "go_gc_cycles_total_gc_cycles_total",
+-	"/gc/heap/allocs-by-size:bytes":               "go_gc_heap_allocs_by_size_bytes",
++	"/gc/heap/allocs-by-size:bytes":               "go_gc_heap_allocs_by_size_bytes_total",
+ 	"/gc/heap/allocs:bytes":                       "go_gc_heap_allocs_bytes_total",
+ 	"/gc/heap/allocs:objects":                     "go_gc_heap_allocs_objects_total",
+-	"/gc/heap/frees-by-size:bytes":                "go_gc_heap_frees_by_size_bytes",
++	"/gc/heap/frees-by-size:bytes":                "go_gc_heap_frees_by_size_bytes_total",
+ 	"/gc/heap/frees:bytes":                        "go_gc_heap_frees_bytes_total",
+ 	"/gc/heap/frees:objects":                      "go_gc_heap_frees_objects_total",
+ 	"/gc/heap/goal:bytes":                         "go_gc_heap_goal_bytes",
+ 	"/gc/heap/objects:objects":                    "go_gc_heap_objects_objects",
+ 	"/gc/heap/tiny/allocs:objects":                "go_gc_heap_tiny_allocs_objects_total",
+-	"/gc/pauses:seconds":                          "go_gc_pauses_seconds",
++	"/gc/pauses:seconds":                          "go_gc_pauses_seconds_total",
+ 	"/memory/classes/heap/free:bytes":             "go_memory_classes_heap_free_bytes",
+ 	"/memory/classes/heap/objects:bytes":          "go_memory_classes_heap_objects_bytes",
+ 	"/memory/classes/heap/released:bytes":         "go_memory_classes_heap_released_bytes",
+diff --git a/prometheus/go_collector_metrics_go118_test.go b/prometheus/go_collector_metrics_go118_test.go
+index cdef74d..2bcf545 100644
+--- a/prometheus/go_collector_metrics_go118_test.go
++++ b/prometheus/go_collector_metrics_go118_test.go
+@@ -10,16 +10,16 @@ var expectedRuntimeMetrics = map[string]string{
+ 	"/gc/cycles/automatic:gc-cycles":              "go_gc_cycles_automatic_gc_cycles_total",
+ 	"/gc/cycles/forced:gc-cycles":                 "go_gc_cycles_forced_gc_cycles_total",
+ 	"/gc/cycles/total:gc-cycles":                  "go_gc_cycles_total_gc_cycles_total",
+-	"/gc/heap/allocs-by-size:bytes":               "go_gc_heap_allocs_by_size_bytes",
++	"/gc/heap/allocs-by-size:bytes":               "go_gc_heap_allocs_by_size_bytes_total",
+ 	"/gc/heap/allocs:bytes":                       "go_gc_heap_allocs_bytes_total",
+ 	"/gc/heap/allocs:objects":                     "go_gc_heap_allocs_objects_total",
+-	"/gc/heap/frees-by-size:bytes":                "go_gc_heap_frees_by_size_bytes",
++	"/gc/heap/frees-by-size:bytes":                "go_gc_heap_frees_by_size_bytes_total",
+ 	"/gc/heap/frees:bytes":                        "go_gc_heap_frees_bytes_total",
+ 	"/gc/heap/frees:objects":                      "go_gc_heap_frees_objects_total",
+ 	"/gc/heap/goal:bytes":                         "go_gc_heap_goal_bytes",
+ 	"/gc/heap/objects:objects":                    "go_gc_heap_objects_objects",
+ 	"/gc/heap/tiny/allocs:objects":                "go_gc_heap_tiny_allocs_objects_total",
+-	"/gc/pauses:seconds":                          "go_gc_pauses_seconds",
++	"/gc/pauses:seconds":                          "go_gc_pauses_seconds_total",
+ 	"/memory/classes/heap/free:bytes":             "go_memory_classes_heap_free_bytes",
+ 	"/memory/classes/heap/objects:bytes":          "go_memory_classes_heap_objects_bytes",
+ 	"/memory/classes/heap/released:bytes":         "go_memory_classes_heap_released_bytes",
+diff --git a/prometheus/internal/go_runtime_metrics.go b/prometheus/internal/go_runtime_metrics.go
+index 6cbe063..fe0a521 100644
+--- a/prometheus/internal/go_runtime_metrics.go
++++ b/prometheus/internal/go_runtime_metrics.go
+@@ -62,7 +62,7 @@ func RuntimeMetricsToProm(d *metrics.Description) (string, string, string, bool)
+ 	// other data.
+ 	name = strings.ReplaceAll(name, "-", "_")
+ 	name = name + "_" + unit
+-	if d.Cumulative && d.Kind != metrics.KindFloat64Histogram {
++	if d.Cumulative {
+ 		name = name + "_total"
+ 	}
+ 
+@@ -84,12 +84,12 @@ func RuntimeMetricsToProm(d *metrics.Description) (string, string, string, bool)
+ func RuntimeMetricsBucketsForUnit(buckets []float64, unit string) []float64 {
+ 	switch unit {
+ 	case "bytes":
+-		// Re-bucket as powers of 2.
+-		return reBucketExp(buckets, 2)
++		// Rebucket as powers of 2.
++		return rebucketExp(buckets, 2)
+ 	case "seconds":
+-		// Re-bucket as powers of 10 and then merge all buckets greater
++		// Rebucket as powers of 10 and then merge all buckets greater
+ 		// than 1 second into the +Inf bucket.
+-		b := reBucketExp(buckets, 10)
++		b := rebucketExp(buckets, 10)
+ 		for i := range b {
+ 			if b[i] <= 1 {
+ 				continue
+@@ -103,11 +103,11 @@ func RuntimeMetricsBucketsForUnit(buckets []float64, unit string) []float64 {
+ 	return buckets
+ }
+ 
+-// reBucketExp takes a list of bucket boundaries (lower bound inclusive) and
++// rebucketExp takes a list of bucket boundaries (lower bound inclusive) and
+ // downsamples the buckets to those a multiple of base apart. The end result
+ // is a roughly exponential (in many cases, perfectly exponential) bucketing
+ // scheme.
+-func reBucketExp(buckets []float64, base float64) []float64 {
++func rebucketExp(buckets []float64, base float64) []float64 {
+ 	bucket := buckets[0]
+ 	var newBuckets []float64
+ 	// We may see a -Inf here, in which case, add it and skip it

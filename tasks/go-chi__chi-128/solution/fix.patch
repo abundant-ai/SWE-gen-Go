@@ -1,0 +1,383 @@
+diff --git a/middleware/closenotify17.go b/middleware/closenotify17.go
+new file mode 100644
+index 0000000..a772f4f
+--- /dev/null
++++ b/middleware/closenotify17.go
+@@ -0,0 +1,43 @@
++// +build go1.7,!go1.8
++
++package middleware
++
++import (
++	"context"
++	"net/http"
++)
++
++// StatusClientClosedRequest represents a 499 Client Closed Request (Nginx) HTTP status.
++// See: https://en.wikipedia.org/wiki/List_of_HTTP_status_codes
++const StatusClientClosedRequest = 499
++
++// CloseNotify is a middleware that cancels ctx when the underlying
++// connection has gone away. It can be used to cancel long operations
++// on the server when the client disconnects before the response is ready.
++func CloseNotify(next http.Handler) http.Handler {
++	fn := func(w http.ResponseWriter, r *http.Request) {
++		cn, ok := w.(http.CloseNotifier)
++		if !ok {
++			panic("chi/middleware: CloseNotify expects http.ResponseWriter to implement http.CloseNotifier interface")
++		}
++		closeNotifyCh := cn.CloseNotify()
++
++		ctx, cancel := context.WithCancel(r.Context())
++		defer cancel()
++
++		go func() {
++			select {
++			case <-ctx.Done():
++				return
++			case <-closeNotifyCh:
++				cancel()
++				return
++			}
++		}()
++
++		r = r.WithContext(ctx)
++		next.ServeHTTP(w, r)
++	}
++
++	return http.HandlerFunc(fn)
++}
+diff --git a/middleware/compress.go b/middleware/compress.go
+index 7a8ebf4..5515e1d 100644
+--- a/middleware/compress.go
++++ b/middleware/compress.go
+@@ -1,9 +1,12 @@
+ package middleware
+ 
+ import (
++	"bufio"
+ 	"compress/flate"
+ 	"compress/gzip"
++	"errors"
+ 	"io"
++	"net"
+ 	"net/http"
+ 	"strings"
+ )
+@@ -179,9 +182,16 @@ func (w *maybeCompressResponseWriter) Flush() {
+ 	}
+ }
+ 
++func (w *maybeCompressResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
++	if hj, ok := w.w.(http.Hijacker); ok {
++		return hj.Hijack()
++	}
++	return nil, nil, errors.New("chi/middleware: http.Hijacker is unavailable on the writer")
++}
++
+ func (w *maybeCompressResponseWriter) Close() error {
+ 	if c, ok := w.w.(io.WriteCloser); ok {
+ 		return c.Close()
+ 	}
+-	return nil
++	return errors.New("chi/middleware: io.WriteCloser is unavailable on the writer")
+ }
+diff --git a/middleware/compress18.go b/middleware/compress18.go
+new file mode 100644
+index 0000000..ad12b14
+--- /dev/null
++++ b/middleware/compress18.go
+@@ -0,0 +1,15 @@
++// +build go1.8
++
++package middleware
++
++import (
++	"errors"
++	"net/http"
++)
++
++func (w *maybeCompressResponseWriter) Push(target string, opts *http.PushOptions) error {
++	if ps, ok := w.w.(http.Pusher); ok {
++		return ps.Push(target, opts)
++	}
++	return errors.New("chi/middleware: http.Pusher is unavailable on the writer")
++}
+diff --git a/middleware/logger.go b/middleware/logger.go
+index 5b1eafe..64e50b9 100644
+--- a/middleware/logger.go
++++ b/middleware/logger.go
+@@ -29,7 +29,7 @@ func RequestLogger(f LogFormatter) func(next http.Handler) http.Handler {
+ 	return func(next http.Handler) http.Handler {
+ 		fn := func(w http.ResponseWriter, r *http.Request) {
+ 			entry := f.NewLogEntry(r)
+-			ww := NewWrapResponseWriter(w)
++			ww := NewWrapResponseWriter(w, r.ProtoMajor)
+ 
+ 			t1 := time.Now()
+ 			defer func() {
+diff --git a/middleware/wrap_writer.go b/middleware/wrap_writer.go
+index 19edcb9..9991736 100644
+--- a/middleware/wrap_writer.go
++++ b/middleware/wrap_writer.go
+@@ -10,8 +10,6 @@ import (
+ 	"net/http"
+ )
+ 
+-var WrapResponseWriterCtxKey = &contextKey{"WrapResponseWriter"}
+-
+ // WrapResponseWriter is a proxy around an http.ResponseWriter that allows you to hook
+ // into various parts of the response process.
+ type WrapResponseWriter interface {
+@@ -32,24 +30,6 @@ type WrapResponseWriter interface {
+ 	Unwrap() http.ResponseWriter
+ }
+ 
+-// NewWrapResponseWriter wraps an http.ResponseWriter, returning a proxy that allows you to
+-// hook into various parts of the response process.
+-func NewWrapResponseWriter(w http.ResponseWriter) WrapResponseWriter {
+-	_, cn := w.(http.CloseNotifier)
+-	_, fl := w.(http.Flusher)
+-	_, hj := w.(http.Hijacker)
+-	_, rf := w.(io.ReaderFrom)
+-
+-	bw := basicWriter{ResponseWriter: w}
+-	if cn && fl && hj && rf {
+-		return &fancyWriter{bw}
+-	}
+-	if fl {
+-		return &flushWriter{bw}
+-	}
+-	return &bw
+-}
+-
+ // basicWriter wraps a http.ResponseWriter that implements the minimal
+ // http.ResponseWriter interface.
+ type basicWriter struct {
+@@ -98,27 +78,38 @@ func (b *basicWriter) Unwrap() http.ResponseWriter {
+ 	return b.ResponseWriter
+ }
+ 
+-// fancyWriter is a writer that additionally satisfies http.CloseNotifier,
++type flushWriter struct {
++	basicWriter
++}
++
++func (f *flushWriter) Flush() {
++	fl := f.basicWriter.ResponseWriter.(http.Flusher)
++	fl.Flush()
++}
++
++var _ http.Flusher = &flushWriter{}
++
++// httpFancyWriter is a HTTP writer that additionally satisfies http.CloseNotifier,
+ // http.Flusher, http.Hijacker, and io.ReaderFrom. It exists for the common case
+ // of wrapping the http.ResponseWriter that package http gives you, in order to
+ // make the proxied object support the full method set of the proxied object.
+-type fancyWriter struct {
++type httpFancyWriter struct {
+ 	basicWriter
+ }
+ 
+-func (f *fancyWriter) CloseNotify() <-chan bool {
++func (f *httpFancyWriter) CloseNotify() <-chan bool {
+ 	cn := f.basicWriter.ResponseWriter.(http.CloseNotifier)
+ 	return cn.CloseNotify()
+ }
+-func (f *fancyWriter) Flush() {
++func (f *httpFancyWriter) Flush() {
+ 	fl := f.basicWriter.ResponseWriter.(http.Flusher)
+ 	fl.Flush()
+ }
+-func (f *fancyWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
++func (f *httpFancyWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+ 	hj := f.basicWriter.ResponseWriter.(http.Hijacker)
+ 	return hj.Hijack()
+ }
+-func (f *fancyWriter) ReadFrom(r io.Reader) (int64, error) {
++func (f *httpFancyWriter) ReadFrom(r io.Reader) (int64, error) {
+ 	if f.basicWriter.tee != nil {
+ 		return io.Copy(&f.basicWriter, r)
+ 	}
+@@ -127,18 +118,27 @@ func (f *fancyWriter) ReadFrom(r io.Reader) (int64, error) {
+ 	return rf.ReadFrom(r)
+ }
+ 
+-var _ http.CloseNotifier = &fancyWriter{}
+-var _ http.Flusher = &fancyWriter{}
+-var _ http.Hijacker = &fancyWriter{}
+-var _ io.ReaderFrom = &fancyWriter{}
++var _ http.CloseNotifier = &httpFancyWriter{}
++var _ http.Flusher = &httpFancyWriter{}
++var _ http.Hijacker = &httpFancyWriter{}
++var _ io.ReaderFrom = &httpFancyWriter{}
+ 
+-type flushWriter struct {
++// http2FancyWriter is a HTTP2 writer that additionally satisfies http.CloseNotifier,
++// http.Flusher, and io.ReaderFrom. It exists for the common case
++// of wrapping the http.ResponseWriter that package http gives you, in order to
++// make the proxied object support the full method set of the proxied object.
++type http2FancyWriter struct {
+ 	basicWriter
+ }
+ 
+-func (f *flushWriter) Flush() {
++func (f *http2FancyWriter) CloseNotify() <-chan bool {
++	cn := f.basicWriter.ResponseWriter.(http.CloseNotifier)
++	return cn.CloseNotify()
++}
++func (f *http2FancyWriter) Flush() {
+ 	fl := f.basicWriter.ResponseWriter.(http.Flusher)
+ 	fl.Flush()
+ }
+ 
+-var _ http.Flusher = &flushWriter{}
++var _ http.CloseNotifier = &http2FancyWriter{}
++var _ http.Flusher = &http2FancyWriter{}
+diff --git a/middleware/wrap_writer17.go b/middleware/wrap_writer17.go
+new file mode 100644
+index 0000000..c60df60
+--- /dev/null
++++ b/middleware/wrap_writer17.go
+@@ -0,0 +1,34 @@
++// +build go1.7,!go1.8
++
++package middleware
++
++import (
++	"io"
++	"net/http"
++)
++
++// NewWrapResponseWriter wraps an http.ResponseWriter, returning a proxy that allows you to
++// hook into various parts of the response process.
++func NewWrapResponseWriter(w http.ResponseWriter, protoMajor int) WrapResponseWriter {
++	_, cn := w.(http.CloseNotifier)
++	_, fl := w.(http.Flusher)
++
++	bw := basicWriter{ResponseWriter: w}
++
++	if protoMajor == 2 {
++		if cn && fl {
++			return &http2FancyWriter{bw}
++		}
++	} else {
++		_, hj := w.(http.Hijacker)
++		_, rf := w.(io.ReaderFrom)
++		if cn && fl && hj && rf {
++			return &httpFancyWriter{bw}
++		}
++	}
++	if fl {
++		return &flushWriter{bw}
++	}
++
++	return &bw
++}
+diff --git a/middleware/wrap_writer18.go b/middleware/wrap_writer18.go
+new file mode 100644
+index 0000000..9233d8b
+--- /dev/null
++++ b/middleware/wrap_writer18.go
+@@ -0,0 +1,41 @@
++// +build go1.8
++
++package middleware
++
++import (
++	"io"
++	"net/http"
++)
++
++// NewWrapResponseWriter wraps an http.ResponseWriter, returning a proxy that allows you to
++// hook into various parts of the response process.
++func NewWrapResponseWriter(w http.ResponseWriter, protoMajor int) WrapResponseWriter {
++	_, cn := w.(http.CloseNotifier)
++	_, fl := w.(http.Flusher)
++
++	bw := basicWriter{ResponseWriter: w}
++
++	if protoMajor == 2 {
++		_, ps := w.(http.Pusher)
++		if cn && fl && ps {
++			return &http2FancyWriter{bw}
++		}
++	} else {
++		_, hj := w.(http.Hijacker)
++		_, rf := w.(io.ReaderFrom)
++		if cn && fl && hj && rf {
++			return &httpFancyWriter{bw}
++		}
++	}
++	if fl {
++		return &flushWriter{bw}
++	}
++
++	return &bw
++}
++
++func (f *http2FancyWriter) Push(target string, opts *http.PushOptions) error {
++	return f.basicWriter.ResponseWriter.(http.Pusher).Push(target, opts)
++}
++
++var _ http.Pusher = &http2FancyWriter{}
+diff --git a/testdata/cert.pem b/testdata/cert.pem
+new file mode 100644
+index 0000000..71d285e
+--- /dev/null
++++ b/testdata/cert.pem
+@@ -0,0 +1,19 @@
++-----BEGIN CERTIFICATE-----
++MIIC/zCCAeegAwIBAgIRANioW0Re7DtpT4qZpJU1iK8wDQYJKoZIhvcNAQELBQAw
++EjEQMA4GA1UEChMHQWNtZSBDbzAeFw0xNjEyMzExNDU0MzBaFw0xNzEyMzExNDU0
++MzBaMBIxEDAOBgNVBAoTB0FjbWUgQ28wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAw
++ggEKAoIBAQDpFfOsaXDYlL+ektfsqGYrSAsoTbe7zqjpow9nqUU4PmLRu2YMaaW8
++fAoneUnJxsJw7ql38+VMpphZUOmOWvsO7uV/lfnTIQfTwllHDdgAR5A11d84Zy/y
++TiNIFJduuaPtEhQs1dxPhU7TG8sEfFRhBoUDPv473akeGPNkVU756RVBYM6rUc3b
++YygD0PXGsQ2obrImbYUyyHH5YClCvGl1No57n3ugLqSSfwbgR3/Gw7kkGKy0PMOu
++TuHuJnTEmofJPkqEyFRVMlIAtfqFqJUfDHTOuQGWIUPnjDg+fqTI9EPJ+pElBqDQ
++IqW93BY5XePMdrTQc1h6xkduDfuLeA7TAgMBAAGjUDBOMA4GA1UdDwEB/wQEAwIF
++oDATBgNVHSUEDDAKBggrBgEFBQcDATAMBgNVHRMBAf8EAjAAMBkGA1UdEQQSMBCC
++DmxvY2FsaG9zdDo3MDcyMA0GCSqGSIb3DQEBCwUAA4IBAQDnsWmZdf7209A/XHUe
++xoONCbU8jaYFVoA+CN9J+3CASzrzTQ4fh9RJdm2FZuv4sWnb5c5hDN7H/M/nLcb0
+++uu7ACBGhd7yACYCQm/z3Pm3CY2BRIo0vCCRioGx+6J3CPGWFm0vHwNBge0iBOKC
++Wn+/YOlTDth/M3auHYlr7hdFmf57U4V/5iTr4wiKxwM9yMPcVRQF/1XpPd7A0VqM
++nFSEfDpFjrA7MvT3DrRqQGqF/ZXxDbro2nyki3YG8FwgKlFNVN9w55zNiriQ+WNA
++uz86lKg1FTc+m/R/0CD//7+7mme28N813EPVdV83TgxWNrfvAIRazkHE7YxETry0
++BJDg
++-----END CERTIFICATE-----
+\ No newline at end of file
+diff --git a/testdata/key.pem b/testdata/key.pem
+new file mode 100644
+index 0000000..f42ec5f
+--- /dev/null
++++ b/testdata/key.pem
+@@ -0,0 +1,27 @@
++-----BEGIN RSA PRIVATE KEY-----
++MIIEpAIBAAKCAQEA6RXzrGlw2JS/npLX7KhmK0gLKE23u86o6aMPZ6lFOD5i0btm
++DGmlvHwKJ3lJycbCcO6pd/PlTKaYWVDpjlr7Du7lf5X50yEH08JZRw3YAEeQNdXf
++OGcv8k4jSBSXbrmj7RIULNXcT4VO0xvLBHxUYQaFAz7+O92pHhjzZFVO+ekVQWDO
++q1HN22MoA9D1xrENqG6yJm2FMshx+WApQrxpdTaOe597oC6kkn8G4Ed/xsO5JBis
++tDzDrk7h7iZ0xJqHyT5KhMhUVTJSALX6haiVHwx0zrkBliFD54w4Pn6kyPRDyfqR
++JQag0CKlvdwWOV3jzHa00HNYesZHbg37i3gO0wIDAQABAoIBAFvqYDE5U1rVLctm
++tOeKcN/YhS3bl/zjvhCEUOrcAYPwdh+m+tMiRk1RzN9MISEE1GCcfQ/kiiPz/lga
++ZD/S+PYmlzH8/ouXlvKWzYYLm4ZgsinIsUIYzvuKfLdMB3uOkWpHmtUjcMGbHD57
++009tiAjK/WEOUkthWfOYe0KxsXczBn3PTAWZuiIkuA3RVWa7pCCFHUENkViP58wl
++Ky1hYKnunKPApRwuiC6qIT5ZOCSukdCCbkmRnj/x+P8+nsosu+1d85MNZb8uLRi0
++RzMmuOfOK2poDsrNHQX7itKlu7rzMJQc3+RauqIZovNe/BmSq+tYBLboXvUp18g/
+++VqKeEECgYEA/LaD1tJepzD/1lhgunFcnDjxsDJqLUpfR5eDMX1qhGJphuPBLOXS
++ushmVVjbVIn25Wxeoe4RYrZ6Tuu0FEJJgV44Lt42OOFgK2gyrCJpYmlxpRaw+7jc
++Dbp1Sh3/9VqMZjR/mQIzTnfOtS2n4Fk1Q53hdJn5Pn+uPMmMO4hF87sCgYEA7B4V
++BACsd6eqVxKkEMc72VLeYb0Ri0bl0FwbvIKXImppwA0tbMDmeA+6yhcRm23dhd5v
++cfNhJepRIzkM2CkhnazlsAbDoJPqb7/sbNzodtW1P0op7YIFYbrkcX4yOu9O1DNI
++Ij4PR8H1WcpPjhvr3q+iNO5agQX7bMQ1BnnJg8kCgYBA1tdm090DSrgpl81hqNpZ
++HucsDRNfAXkG1mIL3aDpzJJE0MTsrx7tW6Od/ElyHF/jp3V0WK/PQwCIpUMz+3n+
++nl0N8We6GmFhYb+2mLGvVVyaPgM04s5bG18ioCXfHtdtFcUzTfQ6CtVXeRpcnqbi
++7Ww+TY88sOfUouW/FIzWJwKBgQCsLauJhaw+fOc8I328NmywJzu+7g5TD9oZvHEF
++X/0xvYNr5rAPNANb3ayKHZRbURxOuEtwPtfCvEF6e+mf3y6COkgrumMBP5ue7cdM
++AzMJJQHMKxqz9TJTd+OJ10ptq4BCQTsCrVqbKxbs6RhmOnofoteX3Y/lsiULxXAd
++TsXh8QKBgQDQHosH8VoL7vIK+SqY5uoHAhMytSVNx4IaZZg4ho8oyjw12QXcidgV
++QJZQMdPEv8cAK78WcQdSthop+O/tu2cKLHyAmWmO3oU7gIQECui0aMXSqraO6Vde
++C5tqYlyLa7bHZS3AqrjRv9BRfwPKVkmBoYdA652rN/tE/K4UWsghnA==
++-----END RSA PRIVATE KEY-----
+\ No newline at end of file

@@ -1,0 +1,637 @@
+diff --git a/prometheus/counter.go b/prometheus/counter.go
+index 7463858..0537f88 100644
+--- a/prometheus/counter.go
++++ b/prometheus/counter.go
+@@ -96,15 +96,19 @@ func NewCounterVec(opts CounterOpts, labelNames []string) *CounterVec {
+ 		opts.ConstLabels,
+ 	)
+ 	return &CounterVec{
+-		MetricVec: newMetricVec(desc, func(lvs ...string) Metric {
+-			result := &counter{value: value{
+-				desc:       desc,
+-				valType:    CounterValue,
+-				labelPairs: makeLabelPairs(desc, lvs),
+-			}}
+-			result.init(result) // Init self-collection.
+-			return result
+-		}),
++		MetricVec: MetricVec{
++			children: map[uint64]Metric{},
++			desc:     desc,
++			newMetric: func(lvs ...string) Metric {
++				result := &counter{value: value{
++					desc:       desc,
++					valType:    CounterValue,
++					labelPairs: makeLabelPairs(desc, lvs),
++				}}
++				result.init(result) // Init self-collection.
++				return result
++			},
++		},
+ 	}
+ }
+ 
+diff --git a/prometheus/gauge.go b/prometheus/gauge.go
+index af3037d..390c074 100644
+--- a/prometheus/gauge.go
++++ b/prometheus/gauge.go
+@@ -72,9 +72,13 @@ func NewGaugeVec(opts GaugeOpts, labelNames []string) *GaugeVec {
+ 		opts.ConstLabels,
+ 	)
+ 	return &GaugeVec{
+-		MetricVec: newMetricVec(desc, func(lvs ...string) Metric {
+-			return newValue(desc, GaugeValue, 0, lvs...)
+-		}),
++		MetricVec: MetricVec{
++			children: map[uint64]Metric{},
++			desc:     desc,
++			newMetric: func(lvs ...string) Metric {
++				return newValue(desc, GaugeValue, 0, lvs...)
++			},
++		},
+ 	}
+ }
+ 
+diff --git a/prometheus/histogram.go b/prometheus/histogram.go
+index 3d550ba..11a9083 100644
+--- a/prometheus/histogram.go
++++ b/prometheus/histogram.go
+@@ -301,9 +301,13 @@ func NewHistogramVec(opts HistogramOpts, labelNames []string) *HistogramVec {
+ 		opts.ConstLabels,
+ 	)
+ 	return &HistogramVec{
+-		MetricVec: newMetricVec(desc, func(lvs ...string) Metric {
+-			return newHistogram(desc, opts, lvs...)
+-		}),
++		MetricVec: MetricVec{
++			children: map[uint64]Metric{},
++			desc:     desc,
++			newMetric: func(lvs ...string) Metric {
++				return newHistogram(desc, opts, lvs...)
++			},
++		},
+ 	}
+ }
+ 
+diff --git a/prometheus/summary.go b/prometheus/summary.go
+index 2d6739e..fda213c 100644
+--- a/prometheus/summary.go
++++ b/prometheus/summary.go
+@@ -404,9 +404,13 @@ func NewSummaryVec(opts SummaryOpts, labelNames []string) *SummaryVec {
+ 		opts.ConstLabels,
+ 	)
+ 	return &SummaryVec{
+-		MetricVec: newMetricVec(desc, func(lvs ...string) Metric {
+-			return newSummary(desc, opts, lvs...)
+-		}),
++		MetricVec: MetricVec{
++			children: map[uint64]Metric{},
++			desc:     desc,
++			newMetric: func(lvs ...string) Metric {
++				return newSummary(desc, opts, lvs...)
++			},
++		},
+ 	}
+ }
+ 
+diff --git a/prometheus/untyped.go b/prometheus/untyped.go
+index b1baf07..89b86ea 100644
+--- a/prometheus/untyped.go
++++ b/prometheus/untyped.go
+@@ -70,9 +70,13 @@ func NewUntypedVec(opts UntypedOpts, labelNames []string) *UntypedVec {
+ 		opts.ConstLabels,
+ 	)
+ 	return &UntypedVec{
+-		MetricVec: newMetricVec(desc, func(lvs ...string) Metric {
+-			return newValue(desc, UntypedValue, 0, lvs...)
+-		}),
++		MetricVec: MetricVec{
++			children: map[uint64]Metric{},
++			desc:     desc,
++			newMetric: func(lvs ...string) Metric {
++				return newValue(desc, UntypedValue, 0, lvs...)
++			},
++		},
+ 	}
+ }
+ 
+diff --git a/prometheus/vec.go b/prometheus/vec.go
+index ec847bd..68f9461 100644
+--- a/prometheus/vec.go
++++ b/prometheus/vec.go
+@@ -16,8 +16,6 @@ package prometheus
+ import (
+ 	"fmt"
+ 	"sync"
+-
+-	"github.com/prometheus/common/model"
+ )
+ 
+ // MetricVec is a Collector to bundle metrics of the same name that
+@@ -27,31 +25,10 @@ import (
+ // provided in this package.
+ type MetricVec struct {
+ 	mtx      sync.RWMutex // Protects the children.
+-	children map[uint64][]metricWithLabelValues
++	children map[uint64]Metric
+ 	desc     *Desc
+ 
+-	newMetric   func(labelValues ...string) Metric
+-	hashAdd     func(h uint64, s string) uint64 // replace hash function for testing collision handling
+-	hashAddByte func(h uint64, b byte) uint64
+-}
+-
+-// newMetricVec returns an initialized MetricVec. The concrete value is
+-// returned for embedding into another struct.
+-func newMetricVec(desc *Desc, newMetric func(lvs ...string) Metric) MetricVec {
+-	return MetricVec{
+-		children:    map[uint64][]metricWithLabelValues{},
+-		desc:        desc,
+-		newMetric:   newMetric,
+-		hashAdd:     hashAdd,
+-		hashAddByte: hashAddByte,
+-	}
+-}
+-
+-// metricWithLabelValues provides the metric and its label values for
+-// disambiguation on hash collision.
+-type metricWithLabelValues struct {
+-	values []string
+-	metric Metric
++	newMetric func(labelValues ...string) Metric
+ }
+ 
+ // Describe implements Collector. The length of the returned slice
+@@ -65,10 +42,8 @@ func (m *MetricVec) Collect(ch chan<- Metric) {
+ 	m.mtx.RLock()
+ 	defer m.mtx.RUnlock()
+ 
+-	for _, metrics := range m.children {
+-		for _, metric := range metrics {
+-			ch <- metric.metric
+-		}
++	for _, metric := range m.children {
++		ch <- metric
+ 	}
+ }
+ 
+@@ -102,7 +77,16 @@ func (m *MetricVec) GetMetricWithLabelValues(lvs ...string) (Metric, error) {
+ 		return nil, err
+ 	}
+ 
+-	return m.getOrCreateMetric(h, lvs), nil
++	m.mtx.RLock()
++	metric, ok := m.children[h]
++	m.mtx.RUnlock()
++	if ok {
++		return metric, nil
++	}
++
++	m.mtx.Lock()
++	defer m.mtx.Unlock()
++	return m.getOrCreateMetric(h, lvs...), nil
+ }
+ 
+ // GetMetricWith returns the Metric for the given Labels map (the label names
+@@ -123,7 +107,20 @@ func (m *MetricVec) GetMetricWith(labels Labels) (Metric, error) {
+ 		return nil, err
+ 	}
+ 
+-	return m.getOrCreateMetric(h, labels), nil
++	m.mtx.RLock()
++	metric, ok := m.children[h]
++	m.mtx.RUnlock()
++	if ok {
++		return metric, nil
++	}
++
++	lvs := make([]string, len(labels))
++	for i, label := range m.desc.variableLabels {
++		lvs[i] = labels[label]
++	}
++	m.mtx.Lock()
++	defer m.mtx.Unlock()
++	return m.getOrCreateMetric(h, lvs...), nil
+ }
+ 
+ // WithLabelValues works as GetMetricWithLabelValues, but panics if an error
+@@ -171,7 +168,11 @@ func (m *MetricVec) DeleteLabelValues(lvs ...string) bool {
+ 	if err != nil {
+ 		return false
+ 	}
+-	return m.deleteByHash(h, lvs)
++	if _, ok := m.children[h]; !ok {
++		return false
++	}
++	delete(m.children, h)
++	return true
+ }
+ 
+ // Delete deletes the metric where the variable labels are the same as those
+@@ -192,31 +193,10 @@ func (m *MetricVec) Delete(labels Labels) bool {
+ 	if err != nil {
+ 		return false
+ 	}
+-
+-	return m.deleteByHash(h, labels)
+-}
+-
+-// deleteByHash removes the metric from the hash bucket h. If there are
+-// multiple matches in the bucket, use lvs to select a metric and remove only
+-// that metric.
+-//
+-// lvs MUST be of type Labels or []string or this method will panic.
+-func (m *MetricVec) deleteByHash(h uint64, values interface{}) bool {
+-	metrics, ok := m.children[h]
+-	if !ok {
++	if _, ok := m.children[h]; !ok {
+ 		return false
+ 	}
+-
+-	i := m.findMetric(metrics, values)
+-	if i >= len(metrics) {
+-		return false
+-	}
+-
+-	if len(metrics) > 1 {
+-		m.children[h] = append(metrics[:i], metrics[i+1:]...)
+-	} else {
+-		delete(m.children, h)
+-	}
++	delete(m.children, h)
+ 	return true
+ }
+ 
+@@ -236,8 +216,7 @@ func (m *MetricVec) hashLabelValues(vals []string) (uint64, error) {
+ 	}
+ 	h := hashNew()
+ 	for _, val := range vals {
+-		h = m.hashAdd(h, val)
+-		h = m.hashAddByte(h, model.SeparatorByte)
++		h = hashAdd(h, val)
+ 	}
+ 	return h, nil
+ }
+@@ -252,125 +231,19 @@ func (m *MetricVec) hashLabels(labels Labels) (uint64, error) {
+ 		if !ok {
+ 			return 0, fmt.Errorf("label name %q missing in label map", label)
+ 		}
+-		h = m.hashAdd(h, val)
+-		h = m.hashAddByte(h, model.SeparatorByte)
++		h = hashAdd(h, val)
+ 	}
+ 	return h, nil
+ }
+ 
+-// getOrCreateMetric retrieves the metric by hash and label value or creates it
+-// and returns the new one.
+-//
+-// lvs MUST be of type Labels or []string or this method will panic.
+-//
+-// This function holds the mutex.
+-func (m *MetricVec) getOrCreateMetric(hash uint64, lvs interface{}) Metric {
+-	m.mtx.RLock()
+-	metric, ok := m.getMetric(hash, lvs)
+-	m.mtx.RUnlock()
+-	if ok {
+-		return metric
+-	}
+-
+-	m.mtx.Lock()
+-	defer m.mtx.Unlock()
+-	metric, ok = m.getMetric(hash, lvs)
++func (m *MetricVec) getOrCreateMetric(hash uint64, labelValues ...string) Metric {
++	metric, ok := m.children[hash]
+ 	if !ok {
+-		lvs := m.copyLabelValues(lvs)
+-		metric = m.newMetric(lvs...)
+-		m.children[hash] = append(m.children[hash], metricWithLabelValues{values: lvs, metric: metric})
++		// Copy labelValues. Otherwise, they would be allocated even if we don't go
++		// down this code path.
++		copiedLabelValues := append(make([]string, 0, len(labelValues)), labelValues...)
++		metric = m.newMetric(copiedLabelValues...)
++		m.children[hash] = metric
+ 	}
+ 	return metric
+ }
+-
+-// getMetric while handling possible collisions in the hash space. Must be
+-// called while holding read mutex.
+-//
+-// lvs must be of type Labels or []string.
+-func (m *MetricVec) getMetric(h uint64, lvs interface{}) (Metric, bool) {
+-	metrics, ok := m.children[h]
+-	if ok {
+-		return m.selectMetric(metrics, lvs)
+-	}
+-
+-	return nil, false
+-}
+-
+-func (m *MetricVec) selectMetric(metrics []metricWithLabelValues, lvs interface{}) (Metric, bool) {
+-	i := m.findMetric(metrics, lvs)
+-
+-	if i < len(metrics) {
+-		return metrics[i].metric, true
+-	}
+-
+-	return nil, false
+-}
+-
+-// findMetric returns the index of the matching metric or len(metrics) if not
+-// found.
+-func (m *MetricVec) findMetric(metrics []metricWithLabelValues, lvs interface{}) int {
+-	for i, metric := range metrics {
+-		if m.matchLabels(metric.values, lvs) {
+-			return i
+-		}
+-	}
+-
+-	return len(metrics)
+-}
+-
+-func (m *MetricVec) matchLabels(values []string, lvs interface{}) bool {
+-	switch lvs := lvs.(type) {
+-	case []string:
+-		if len(values) != len(lvs) {
+-			return false
+-		}
+-
+-		for i, v := range values {
+-			if v != lvs[i] {
+-				return false
+-			}
+-		}
+-
+-		return true
+-	case Labels:
+-		if len(lvs) != len(values) {
+-			return false
+-		}
+-
+-		for i, k := range m.desc.variableLabels {
+-			if values[i] != lvs[k] {
+-				return false
+-			}
+-		}
+-
+-		return true
+-	default:
+-		// If we reach this condition, there is an unexpected type being used
+-		// as a labels value. Either add branch here for the new type or fix
+-		// the bug causing the type to be passed in.
+-		panic("unsupported type")
+-	}
+-}
+-
+-// copyLabelValues copies the labels values into common string slice format to
+-// use when allocating the metric and to keep track of hash collision
+-// ambiguity.
+-//
+-// lvs must be of type Labels or []string or this method will panic.
+-func (m *MetricVec) copyLabelValues(lvs interface{}) []string {
+-	var labelValues []string
+-	switch lvs := lvs.(type) {
+-	case []string:
+-		labelValues = make([]string, len(lvs))
+-		copy(labelValues, lvs)
+-	case Labels:
+-		labelValues = make([]string, len(lvs))
+-		for i, k := range m.desc.variableLabels {
+-			labelValues[i] = lvs[k]
+-		}
+-	default:
+-		panic(fmt.Sprintf("unsupported type for lvs: %#v", lvs))
+-	}
+-
+-	return labelValues
+-}
+diff --git a/prometheus/vec_test.go b/prometheus/vec_test.go
+index fb26b67..6760ed8 100644
+--- a/prometheus/vec_test.go
++++ b/prometheus/vec_test.go
+@@ -14,25 +14,19 @@
+ package prometheus
+ 
+ import (
+-	"fmt"
+ 	"testing"
+-
+-	dto "github.com/prometheus/client_model/go"
+ )
+ 
+ func TestDelete(t *testing.T) {
+-	vec := newUntypedMetricVec("test", "helpless", []string{"l1", "l2"})
+-	testDelete(t, vec)
+-}
+-
+-func TestDeleteWithCollisions(t *testing.T) {
+-	vec := newUntypedMetricVec("test", "helpless", []string{"l1", "l2"})
+-	vec.hashAdd = func(h uint64, s string) uint64 { return 1 }
+-	vec.hashAddByte = func(h uint64, b byte) uint64 { return 1 }
+-	testDelete(t, vec)
+-}
++	desc := NewDesc("test", "helpless", []string{"l1", "l2"}, nil)
++	vec := MetricVec{
++		children: map[uint64]Metric{},
++		desc:     desc,
++		newMetric: func(lvs ...string) Metric {
++			return newValue(desc, UntypedValue, 0, lvs...)
++		},
++	}
+ 
+-func testDelete(t *testing.T, vec *MetricVec) {
+ 	if got, want := vec.Delete(Labels{"l1": "v1", "l2": "v2"}), false; got != want {
+ 		t.Errorf("got %v, want %v", got, want)
+ 	}
+@@ -63,36 +57,28 @@ func testDelete(t *testing.T, vec *MetricVec) {
+ }
+ 
+ func TestDeleteLabelValues(t *testing.T) {
+-	vec := newUntypedMetricVec("test", "helpless", []string{"l1", "l2"})
+-	testDeleteLabelValues(t, vec)
+-}
+-
+-func TestDeleteLabelValuesWithCollisions(t *testing.T) {
+-	vec := newUntypedMetricVec("test", "helpless", []string{"l1", "l2"})
+-	vec.hashAdd = func(h uint64, s string) uint64 { return 1 }
+-	vec.hashAddByte = func(h uint64, b byte) uint64 { return 1 }
+-	testDeleteLabelValues(t, vec)
+-}
++	desc := NewDesc("test", "helpless", []string{"l1", "l2"}, nil)
++	vec := MetricVec{
++		children: map[uint64]Metric{},
++		desc:     desc,
++		newMetric: func(lvs ...string) Metric {
++			return newValue(desc, UntypedValue, 0, lvs...)
++		},
++	}
+ 
+-func testDeleteLabelValues(t *testing.T, vec *MetricVec) {
+ 	if got, want := vec.DeleteLabelValues("v1", "v2"), false; got != want {
+ 		t.Errorf("got %v, want %v", got, want)
+ 	}
+ 
+ 	vec.With(Labels{"l1": "v1", "l2": "v2"}).(Untyped).Set(42)
+-	vec.With(Labels{"l1": "v1", "l2": "v3"}).(Untyped).Set(42) // add junk data for collision
+ 	if got, want := vec.DeleteLabelValues("v1", "v2"), true; got != want {
+ 		t.Errorf("got %v, want %v", got, want)
+ 	}
+ 	if got, want := vec.DeleteLabelValues("v1", "v2"), false; got != want {
+ 		t.Errorf("got %v, want %v", got, want)
+ 	}
+-	if got, want := vec.DeleteLabelValues("v1", "v3"), true; got != want {
+-		t.Errorf("got %v, want %v", got, want)
+-	}
+ 
+ 	vec.With(Labels{"l1": "v1", "l2": "v2"}).(Untyped).Set(42)
+-	// delete out of order
+ 	if got, want := vec.DeleteLabelValues("v2", "v1"), false; got != want {
+ 		t.Errorf("got %v, want %v", got, want)
+ 	}
+@@ -100,145 +86,3 @@ func testDeleteLabelValues(t *testing.T, vec *MetricVec) {
+ 		t.Errorf("got %v, want %v", got, want)
+ 	}
+ }
+-
+-func TestMetricVec(t *testing.T) {
+-	vec := newUntypedMetricVec("test", "helpless", []string{"l1", "l2"})
+-	testMetricVec(t, vec)
+-}
+-
+-func TestMetricVecWithCollisions(t *testing.T) {
+-	vec := newUntypedMetricVec("test", "helpless", []string{"l1", "l2"})
+-	vec.hashAdd = func(h uint64, s string) uint64 { return 1 }
+-	vec.hashAddByte = func(h uint64, b byte) uint64 { return 1 }
+-	testMetricVec(t, vec)
+-}
+-
+-func testMetricVec(t *testing.T, vec *MetricVec) {
+-	vec.Reset() // actually test Reset now!
+-
+-	var pair [2]string
+-	// keep track of metrics
+-	expected := map[[2]string]int{}
+-
+-	for i := 0; i < 1000; i++ {
+-		pair[0], pair[1] = fmt.Sprint(i%4), fmt.Sprint(i%5) // varying combinations multiples
+-		expected[pair]++
+-		vec.WithLabelValues(pair[0], pair[1]).(Untyped).Inc()
+-
+-		expected[[2]string{"v1", "v2"}]++
+-		vec.WithLabelValues("v1", "v2").(Untyped).Inc()
+-	}
+-
+-	var total int
+-	for _, metrics := range vec.children {
+-		for _, metric := range metrics {
+-			total++
+-			copy(pair[:], metric.values)
+-
+-			// is there a better way to access the value of a metric?
+-			var metricOut dto.Metric
+-			metric.metric.Write(&metricOut)
+-			actual := *metricOut.Untyped.Value
+-
+-			var actualPair [2]string
+-			for i, label := range metricOut.Label {
+-				actualPair[i] = *label.Value
+-			}
+-
+-			// test output pair against metric.values to ensure we've selected
+-			// the right one. We check this to ensure the below check means
+-			// anything at all.
+-			if actualPair != pair {
+-				t.Fatalf("unexpected pair association in metric map: %v != %v", actualPair, pair)
+-			}
+-
+-			if actual != float64(expected[pair]) {
+-				t.Fatalf("incorrect counter value for %v: %v != %v", pair, actual, expected[pair])
+-			}
+-		}
+-	}
+-
+-	if total != len(expected) {
+-		t.Fatalf("unexpected number of metrics: %v != %v", total, len(expected))
+-	}
+-
+-	vec.Reset()
+-
+-	if len(vec.children) > 0 {
+-		t.Fatalf("reset failed")
+-	}
+-}
+-
+-func newUntypedMetricVec(name, help string, labels []string) *MetricVec {
+-	desc := NewDesc("test", "helpless", labels, nil)
+-	vec := newMetricVec(desc, func(lvs ...string) Metric {
+-		return newValue(desc, UntypedValue, 0, lvs...)
+-	})
+-	return &vec
+-}
+-
+-func BenchmarkMetricVecWithLabelValuesBasic(B *testing.B) {
+-	benchmarkMetricVecWithLabelValues(B, map[string][]string{
+-		"l1": []string{"onevalue"},
+-		"l2": []string{"twovalue"},
+-	})
+-}
+-
+-func BenchmarkMetricVecWithLabelValues2Keys10ValueCardinality(B *testing.B) {
+-	benchmarkMetricVecWithLabelValuesCardinality(B, 2, 10)
+-}
+-
+-func BenchmarkMetricVecWithLabelValues4Keys10ValueCardinality(B *testing.B) {
+-	benchmarkMetricVecWithLabelValuesCardinality(B, 4, 10)
+-}
+-
+-func BenchmarkMetricVecWithLabelValues2Keys100ValueCardinality(B *testing.B) {
+-	benchmarkMetricVecWithLabelValuesCardinality(B, 2, 100)
+-}
+-
+-func BenchmarkMetricVecWithLabelValues10Keys100ValueCardinality(B *testing.B) {
+-	benchmarkMetricVecWithLabelValuesCardinality(B, 10, 100)
+-}
+-
+-func BenchmarkMetricVecWithLabelValues10Keys1000ValueCardinality(B *testing.B) {
+-	benchmarkMetricVecWithLabelValuesCardinality(B, 10, 1000)
+-}
+-
+-func benchmarkMetricVecWithLabelValuesCardinality(B *testing.B, nkeys, nvalues int) {
+-	labels := map[string][]string{}
+-
+-	for i := 0; i < nkeys; i++ {
+-		var (
+-			k  = fmt.Sprintf("key-%v", i)
+-			vs = make([]string, 0, nvalues)
+-		)
+-		for j := 0; j < nvalues; j++ {
+-			vs = append(vs, fmt.Sprintf("value-%v", j))
+-		}
+-		labels[k] = vs
+-	}
+-
+-	benchmarkMetricVecWithLabelValues(B, labels)
+-}
+-
+-func benchmarkMetricVecWithLabelValues(B *testing.B, labels map[string][]string) {
+-	var keys []string
+-	for k := range labels { // map order dependent, who cares though
+-		keys = append(keys, k)
+-	}
+-
+-	values := make([]string, len(labels)) // value cache for permutations
+-	vec := newUntypedMetricVec("test", "helpless", keys)
+-
+-	B.ReportAllocs()
+-	B.ResetTimer()
+-	for i := 0; i < B.N; i++ {
+-		// varies input across provide map entries based on key size.
+-		for j, k := range keys {
+-			candidates := labels[k]
+-			values[j] = candidates[i%len(candidates)]
+-		}
+-
+-		vec.WithLabelValues(values...)
+-	}
+-}
