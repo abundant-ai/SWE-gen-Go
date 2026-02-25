@@ -1,0 +1,191 @@
+diff --git a/.changelog/22534.txt b/.changelog/22534.txt
+deleted file mode 100644
+index 83bb1d245f..0000000000
+--- a/.changelog/22534.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-```release-note:security
+-agent: Fix a security vulnerability to filter out anonymous tokens along with empty tokens when setting the Results-Filtered-By-ACLs header
+-```
+diff --git a/agent/consul/acl_test.go b/agent/consul/acl_test.go
+index 1046d96931..0df1d9489e 100644
+--- a/agent/consul/acl_test.go
++++ b/agent/consul/acl_test.go
+@@ -204,26 +204,6 @@ func testIdentityForToken(token string) (bool, structs.ACLIdentity, error) {
+ 				},
+ 			},
+ 		}, nil
+-	case "authenticated":
+-		return true, &structs.ACLToken{
+-			AccessorID: "some-id",
+-			SecretID:   "some-id",
+-			Policies: []structs.ACLTokenPolicyLink{
+-				{
+-					ID: "node-wr",
+-				},
+-			},
+-		}, nil
+-	case "anonymous":
+-		return true, &structs.ACLToken{
+-			AccessorID: "00000000-0000-0000-0000-000000000002",
+-			SecretID:   "anonymous",
+-			Policies: []structs.ACLTokenPolicyLink{
+-				{
+-					ID: "node-wr",
+-				},
+-			},
+-		}, nil
+ 	default:
+ 		return true, nil, acl.ErrNotFound
+ 	}
+diff --git a/agent/consul/intention_endpoint_test.go b/agent/consul/intention_endpoint_test.go
+index 9a5ad89323..3954d8dcc5 100644
+--- a/agent/consul/intention_endpoint_test.go
++++ b/agent/consul/intention_endpoint_test.go
+@@ -1773,7 +1773,7 @@ func TestIntentionList_acl(t *testing.T) {
+ 		var resp structs.IndexedIntentions
+ 		require.NoError(t, msgpackrpc.CallWithCodec(codec, "Intention.List", req, &resp))
+ 		require.Len(t, resp.Intentions, 0)
+-		require.False(t, resp.ResultsFilteredByACLs, "ResultsFilteredByACLs should be false")
++		require.True(t, resp.ResultsFilteredByACLs, "ResultsFilteredByACLs should be true")
+ 	})
+ }
+ 
+diff --git a/agent/consul/rpc.go b/agent/consul/rpc.go
+index a7cb8c3051..8c5ad14eff 100644
+--- a/agent/consul/rpc.go
++++ b/agent/consul/rpc.go
+@@ -92,12 +92,6 @@ const (
+ 	// value is ever reached. However, it prevents us from blocking
+ 	// the requesting goroutine forever.
+ 	enqueueLimit = 30 * time.Second
+-
+-	// AnonymousAccessorID is the accessor ID for anonymous token.
+-	anonymousAccessorID = "00000000-0000-0000-0000-000000000002"
+-
+-	// AnonymousSecretID is the secret ID for anonymous token
+-	anonymousSecretID = "anonymous"
+ )
+ 
+ var ErrChunkingResubmit = errors.New("please resubmit call for rechunking")
+@@ -1051,7 +1045,7 @@ func (s *Server) SetQueryMeta(m blockingquery.ResponseMeta, token string) {
+ 		m.SetLastContact(time.Since(s.raft.LastContact()))
+ 		m.SetKnownLeader(s.raft.Leader() != "")
+ 	}
+-	maskResultsFilteredByACLs(token, m, s)
++	maskResultsFilteredByACLs(token, m)
+ 
+ 	// Always set a non-zero QueryMeta.Index. Generally we expect the
+ 	// QueryMeta.Index to be set to structs.RaftIndex.ModifyIndex. If the query
+@@ -1142,24 +1136,18 @@ func (s *Server) RPCQueryTimeout(queryTimeout time.Duration) time.Duration {
+ //
+ // Notes:
+ //
++//   - The definition of "unauthenticated" here is incomplete, as it doesn't
++//     account for the fact that operators can modify the anonymous token with
++//     custom policies, or set namespace default policies. As these scenarios
++//     are less common and this flag is a best-effort UX improvement, we think
++//     the trade-off for reduced complexity is acceptable.
++//
+ //   - This method assumes that the given token has already been validated (and
+-//     will only check whether it is blank or anonymous). It's a safe assumption because
++//     will only check whether it is blank or not). It's a safe assumption because
+ //     ResultsFilteredByACLs is only set to try when applying the already-resolved
+ //     token's policies.
+-func maskResultsFilteredByACLs(token string, m blockingQueryResponseMeta, s *Server) {
++func maskResultsFilteredByACLs(token string, meta blockingQueryResponseMeta) {
+ 	if token == "" {
+-		m.SetResultsFilteredByACLs(false)
+-		return
+-	}
+-
+-	identity, err := s.resolveIdentityFromToken(token)
+-	if err != nil {
+-		s.rpcLogger().Error("Failed to resolve identity from token", "err", err)
+-		m.SetResultsFilteredByACLs(false)
+-		return
+-	}
+-
+-	if identity.ID() == anonymousAccessorID && identity.SecretToken() == anonymousSecretID {
+-		m.SetResultsFilteredByACLs(false)
++		meta.SetResultsFilteredByACLs(false)
+ 	}
+ }
+diff --git a/agent/consul/rpc_test.go b/agent/consul/rpc_test.go
+index 2df6a88fad..52d0c72182 100644
+--- a/agent/consul/rpc_test.go
++++ b/agent/consul/rpc_test.go
+@@ -39,6 +39,7 @@ import (
+ 	"github.com/hashicorp/consul/agent/structs"
+ 	tokenStore "github.com/hashicorp/consul/agent/token"
+ 	"github.com/hashicorp/consul/api"
++	"github.com/hashicorp/consul/lib"
+ 	"github.com/hashicorp/consul/proto/private/pbsubscribe"
+ 	"github.com/hashicorp/consul/sdk/testutil"
+ 	"github.com/hashicorp/consul/sdk/testutil/retry"
+@@ -233,17 +234,9 @@ func (m *MockSink) Close() error {
+ // other blocking query tests reside in blockingquery_test.go in the blockingquery package.
+ func TestServer_blockingQuery(t *testing.T) {
+ 	t.Parallel()
+-	_, s := testServerWithConfig(t, testServerACLConfig)
+-	delegate := ACLResolverTestDelegate{
+-		enabled:    true,
+-		datacenter: "dc1",
+-	}
+-	delegate.tokenReadFn = delegate.defaultTokenReadFn(errRPC)
+-	r := newTestACLResolver(t, &delegate, nil)
+-	s.ACLResolver = r
++	_, s := testServerWithConfig(t)
+ 
+ 	t.Run("ResultsFilteredByACLs is reset for unauthenticated calls", func(t *testing.T) {
+-		// empty token
+ 		opts := structs.QueryOptions{
+ 			Token: "",
+ 		}
+@@ -256,36 +249,24 @@ func TestServer_blockingQuery(t *testing.T) {
+ 		err := s.blockingQuery(&opts, &meta, fn)
+ 		require.NoError(t, err)
+ 		require.False(t, meta.ResultsFilteredByACLs, "ResultsFilteredByACLs should be reset for unauthenticated calls")
+-
+-		// anonymous token
+-		anonOpts := structs.QueryOptions{
+-			Token: "anonymous", // secret id of anonymous token
+-		}
+-		var anonMeta structs.QueryMeta
+-		anonFn := func(_ memdb.WatchSet, _ *state.Store) error {
+-			anonMeta.ResultsFilteredByACLs = true
+-			return nil
+-		}
+-
+-		err = s.blockingQuery(&anonOpts, &anonMeta, anonFn)
+-		require.NoError(t, err)
+-		require.False(t, anonMeta.ResultsFilteredByACLs, "ResultsFilteredByACLs should be reset for unauthenticated calls")
+ 	})
+ 
+ 	t.Run("ResultsFilteredByACLs is honored for authenticated calls", func(t *testing.T) {
+-		delegate.localTokens = true
+-		authOpts := structs.QueryOptions{
+-			Token: "authenticated",
++		token, err := lib.GenerateUUID(nil)
++		require.NoError(t, err)
++
++		opts := structs.QueryOptions{
++			Token: token,
+ 		}
+-		var authMeta structs.QueryMeta
+-		authFn := func(_ memdb.WatchSet, _ *state.Store) error {
+-			authMeta.ResultsFilteredByACLs = true
++		var meta structs.QueryMeta
++		fn := func(_ memdb.WatchSet, _ *state.Store) error {
++			meta.ResultsFilteredByACLs = true
+ 			return nil
+ 		}
+ 
+-		err := s.blockingQuery(&authOpts, &authMeta, authFn)
++		err = s.blockingQuery(&opts, &meta, fn)
+ 		require.NoError(t, err)
+-		require.True(t, authMeta.ResultsFilteredByACLs, "ResultsFilteredByACLs should be honored for authenticated calls")
++		require.True(t, meta.ResultsFilteredByACLs, "ResultsFilteredByACLs should be honored for authenticated calls")
+ 	})
+ }
+ 

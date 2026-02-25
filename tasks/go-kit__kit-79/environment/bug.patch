@@ -1,0 +1,409 @@
+diff --git a/addsvc/main.go b/addsvc/main.go
+index b19e60d..1877716 100644
+--- a/addsvc/main.go
++++ b/addsvc/main.go
+@@ -96,9 +96,8 @@ func main() {
+ 		if zipkinCollector, err = zipkin.NewScribeCollector(
+ 			*zipkinCollectorAddr,
+ 			*zipkinCollectorTimeout,
+-			zipkin.ScribeBatchSize(*zipkinCollectorBatchSize),
+-			zipkin.ScribeBatchInterval(*zipkinCollectorBatchInterval),
+-			zipkin.ScribeLogger(logger),
++			*zipkinCollectorBatchSize,
++			*zipkinCollectorBatchInterval,
+ 		); err != nil {
+ 			logger.Log("err", err)
+ 			os.Exit(1)
+@@ -106,6 +105,7 @@ func main() {
+ 	}
+ 	zipkinMethodName := "add"
+ 	zipkinSpanFunc := zipkin.MakeNewSpanFunc(zipkinHostPort, *zipkinServiceName, zipkinMethodName)
++	zipkin.Log.Swap(logger) // log diagnostic/error details
+ 
+ 	// Our business and operational domain
+ 	var a Add = pureAdd
+@@ -142,7 +142,7 @@ func main() {
+ 	go func() {
+ 		ctx, cancel := context.WithCancel(root)
+ 		defer cancel()
+-		before := []httptransport.BeforeFunc{zipkin.ToContext(zipkinSpanFunc, logger)}
++		before := []httptransport.BeforeFunc{zipkin.ToContext(zipkinSpanFunc)}
+ 		after := []httptransport.AfterFunc{}
+ 		handler := makeHTTPBinding(ctx, e, before, after)
+ 		logger.Log("addr", *httpAddr, "transport", "HTTP/JSON")
+diff --git a/log/nop_logger.go b/log/nop_logger.go
+deleted file mode 100644
+index c8f4f00..0000000
+--- a/log/nop_logger.go
++++ /dev/null
+@@ -1,7 +0,0 @@
+-package log
+-
+-type nopLogger struct{}
+-
+-func (nopLogger) Log(...interface{}) error { return nil }
+-
+-func NewNopLogger() Logger { return nopLogger{} }
+diff --git a/log/nop_logger_test.go b/log/nop_logger_test.go
+deleted file mode 100644
+index 043553e..0000000
+--- a/log/nop_logger_test.go
++++ /dev/null
+@@ -1,17 +0,0 @@
+-package log_test
+-
+-import (
+-	"testing"
+-
+-	"github.com/go-kit/kit/log"
+-)
+-
+-func TestNopLogger(t *testing.T) {
+-	logger := log.NewNopLogger()
+-	if err := logger.Log("abc", 123); err != nil {
+-		t.Error(err)
+-	}
+-	if err := log.NewContext(logger).With("def", "ghi").Log(); err != nil {
+-		t.Error(err)
+-	}
+-}
+diff --git a/tracing/zipkin/collector.go b/tracing/zipkin/collector.go
+index 2da91a4..097d461 100644
+--- a/tracing/zipkin/collector.go
++++ b/tracing/zipkin/collector.go
+@@ -4,15 +4,12 @@ import (
+ 	"encoding/base64"
+ 	"errors"
+ 	"fmt"
+-	"math"
+-	"math/rand"
+ 	"net"
+ 	"strings"
+ 	"time"
+ 
+ 	"github.com/apache/thrift/lib/go/thrift"
+ 
+-	"github.com/go-kit/kit/log"
+ 	"github.com/go-kit/kit/tracing/zipkin/_thrift/gen-go/scribe"
+ )
+ 
+@@ -29,43 +26,29 @@ type ScribeCollector struct {
+ 	factory       func() (scribe.Scribe, error)
+ 	spanc         chan *Span
+ 	sendc         chan struct{}
++	quitc         chan chan struct{}
+ 	batch         []*scribe.LogEntry
+ 	nextSend      time.Time
+ 	batchInterval time.Duration
+ 	batchSize     int
+-	sampleRate    float64
+-	sampleSalt    int64
+-	logger        log.Logger
+ }
+ 
+-// NewScribeCollector returns a new Scribe-backed Collector. addr should be a
+-// TCP endpoint of the form "host:port". timeout is passed to the Thrift dial
+-// function NewTSocketFromAddrTimeout. batchSize and batchInterval control the
+-// maximum size and interval of a batch of spans; as soon as either limit is
+-// reached, the batch is sent. The logger is used to log errors, such as batch
+-// send failures; users should provide an appropriate context, if desired.
+-func NewScribeCollector(addr string, timeout time.Duration, options ...ScribeOption) (Collector, error) {
++// NewScribeCollector returns a new Scribe-backed Collector, ready for use.
++func NewScribeCollector(addr string, timeout time.Duration, batchSize int, batchInterval time.Duration) (Collector, error) {
+ 	factory := scribeClientFactory(addr, timeout)
+ 	client, err := factory()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	defaultBatchInterval := time.Second
+ 	c := &ScribeCollector{
+ 		client:        client,
+ 		factory:       factory,
+ 		spanc:         make(chan *Span),
+ 		sendc:         make(chan struct{}),
+ 		batch:         []*scribe.LogEntry{},
+-		nextSend:      time.Now().Add(defaultBatchInterval),
+-		batchInterval: defaultBatchInterval,
+-		batchSize:     100,
+-		sampleRate:    1.0,
+-		sampleSalt:    rand.Int63(),
+-		logger:        log.NewNopLogger(),
+-	}
+-	for _, option := range options {
+-		option(c)
++		nextSend:      time.Now().Add(batchInterval),
++		batchInterval: batchInterval,
++		batchSize:     batchSize,
+ 	}
+ 	go c.loop()
+ 	return c, nil
+@@ -83,9 +66,6 @@ func (c *ScribeCollector) loop() {
+ 	for {
+ 		select {
+ 		case span := <-c.spanc:
+-			if !shouldSample(span.traceID, c.sampleSalt, c.sampleRate) {
+-				continue
+-			}
+ 			c.batch = append(c.batch, &scribe.LogEntry{
+ 				Category: "zipkin", // TODO parameterize?
+ 				Message:  serialize(span),
+@@ -102,7 +82,8 @@ func (c *ScribeCollector) loop() {
+ 		case <-c.sendc:
+ 			c.nextSend = time.Now().Add(c.batchInterval)
+ 			if err := c.send(c.batch); err != nil {
+-				c.logger.Log("err", err.Error())
++				Log.Log("err", err.Error())
++				continue
+ 			}
+ 			c.batch = c.batch[:0]
+ 		}
+@@ -130,35 +111,6 @@ func (c *ScribeCollector) send(batch []*scribe.LogEntry) error {
+ 	return nil
+ }
+ 
+-// ScribeOption sets a parameter for the StdlibAdapter.
+-type ScribeOption func(s *ScribeCollector)
+-
+-// ScribeBatchSize sets the maximum batch size, after which a collect will be
+-// triggered. The default batch size is 100 traces.
+-func ScribeBatchSize(n int) ScribeOption {
+-	return func(s *ScribeCollector) { s.batchSize = n }
+-}
+-
+-// ScribeBatchInterval sets the maximum duration we will buffer traces before
+-// emitting them to the collector. The default batch interval is 1 second.
+-func ScribeBatchInterval(d time.Duration) ScribeOption {
+-	return func(s *ScribeCollector) { s.batchInterval = d }
+-}
+-
+-// ScribeSampleRate sets the sample rate used to determine if a trace will be
+-// sent to the collector. By default, the sample rate is 1.0, i.e. all traces
+-// are sent.
+-func ScribeSampleRate(f float64) ScribeOption {
+-	return func(s *ScribeCollector) { s.sampleRate = f }
+-}
+-
+-// ScribeLogger sets the logger used to report errors in the collection
+-// process. By default, a no-op logger is used, i.e. no errors are logged
+-// anywhere. It's important to set this option in a production service.
+-func ScribeLogger(logger log.Logger) ScribeOption {
+-	return func(s *ScribeCollector) { s.logger = logger }
+-}
+-
+ func scribeClientFactory(addr string, timeout time.Duration) func() (scribe.Scribe, error) {
+ 	return func() (scribe.Scribe, error) {
+ 		a, err := net.ResolveTCPAddr("tcp", addr)
+@@ -186,16 +138,6 @@ func serialize(s *Span) string {
+ 	return base64.StdEncoding.EncodeToString(t.Buffer.Bytes())
+ }
+ 
+-func shouldSample(id int64, salt int64, rate float64) bool {
+-	if rate <= 0 {
+-		return false
+-	}
+-	if rate >= 1.0 {
+-		return true
+-	}
+-	return int64(math.Abs(float64(id^salt)))%10000 < int64(rate*10000)
+-}
+-
+ // NopCollector implements Collector but performs no work.
+ type NopCollector struct{}
+ 
+diff --git a/tracing/zipkin/collector_internal_test.go b/tracing/zipkin/collector_internal_test.go
+deleted file mode 100644
+index aa2dc5d..0000000
+--- a/tracing/zipkin/collector_internal_test.go
++++ /dev/null
+@@ -1,31 +0,0 @@
+-package zipkin
+-
+-import "testing"
+-
+-func TestShouldSample(t *testing.T) {
+-	type triple struct {
+-		id, salt int64
+-		rate     float64
+-	}
+-	for input, want := range map[triple]bool{
+-		triple{123, 456, 1.0}:    true,
+-		triple{123, 456, 999}:    true,
+-		triple{123, 456, 0.0}:    false,
+-		triple{123, 456, -42}:    false,
+-		triple{1229998, 0, 0.01}: false,
+-		triple{1229999, 0, 0.01}: false,
+-		triple{1230000, 0, 0.01}: true,
+-		triple{1230001, 0, 0.01}: true,
+-		triple{1230098, 0, 0.01}: true,
+-		triple{1230099, 0, 0.01}: true,
+-		triple{1230100, 0, 0.01}: false,
+-		triple{1230101, 0, 0.01}: false,
+-		triple{1, 9999999, 0.01}: false,
+-		triple{999, 0, 0.99}:     true,
+-		triple{9999, 0, 0.99}:    false,
+-	} {
+-		if have := shouldSample(input.id, input.salt, input.rate); want != have {
+-			t.Errorf("%#+v: want %v, have %v", input, want, have)
+-		}
+-	}
+-}
+diff --git a/tracing/zipkin/collector_test.go b/tracing/zipkin/collector_test.go
+index 97f7d2b..c4b9620 100644
+--- a/tracing/zipkin/collector_test.go
++++ b/tracing/zipkin/collector_test.go
+@@ -21,7 +21,7 @@ func TestScribeCollector(t *testing.T) {
+ 
+ 	timeout := time.Second
+ 	batchInterval := time.Millisecond
+-	c, err := zipkin.NewScribeCollector(server.addr(), timeout, zipkin.ScribeBatchSize(0), zipkin.ScribeBatchInterval(batchInterval))
++	c, err := zipkin.NewScribeCollector(server.addr(), timeout, 0, batchInterval)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+diff --git a/tracing/zipkin/span.go b/tracing/zipkin/span.go
+index 369a903..123c02b 100644
+--- a/tracing/zipkin/span.go
++++ b/tracing/zipkin/span.go
+@@ -30,9 +30,7 @@ type Span struct {
+ 	//binaryAnnotations []BinaryAnnotation // TODO
+ }
+ 
+-// NewSpan returns a new Span, which can be annotated and collected by a
+-// collector. Spans are passed through the request context to each middleware
+-// under the SpanContextKey.
++// NewSpan returns a new Span object ready for use.
+ func NewSpan(hostport, serviceName, methodName string, traceID, spanID, parentSpanID int64) *Span {
+ 	return &Span{
+ 		host:         makeEndpoint(hostport, serviceName),
+@@ -43,23 +41,26 @@ func NewSpan(hostport, serviceName, methodName string, traceID, spanID, parentSp
+ 	}
+ }
+ 
+-// makeEndpoint takes the hostport and service name that represent this Zipkin
+-// service, and returns an endpoint that's embedded into the Zipkin core Span
+-// type. It will return a nil endpoint if the input parameters are malformed.
++// makeEndpoint will return a nil Endpoint if the input parameters are
++// malformed.
+ func makeEndpoint(hostport, serviceName string) *zipkincore.Endpoint {
+ 	host, port, err := net.SplitHostPort(hostport)
+ 	if err != nil {
++		Log.Log("hostport", hostport, "err", err)
+ 		return nil
+ 	}
+ 	addrs, err := net.LookupIP(host)
+ 	if err != nil {
++		Log.Log("host", host, "err", err)
+ 		return nil
+ 	}
+ 	if len(addrs) <= 0 {
++		Log.Log("host", host, "err", "no IPs")
+ 		return nil
+ 	}
+ 	portInt, err := strconv.ParseInt(port, 10, 16)
+ 	if err != nil {
++		Log.Log("port", port, "err", err)
+ 		return nil
+ 	}
+ 	endpoint := zipkincore.NewEndpoint()
+diff --git a/tracing/zipkin/zipkin.go b/tracing/zipkin/zipkin.go
+index 6b94220..95ff9b8 100644
+--- a/tracing/zipkin/zipkin.go
++++ b/tracing/zipkin/zipkin.go
+@@ -22,6 +22,10 @@ import (
+ // • https://groups.google.com/forum/#!topic/zipkin-user/KilwtSA0g1k
+ // • https://gist.github.com/yoavaa/3478d3a0df666f21a98c
+ 
++// Log is used to report diagnostic information. To enable it, swap in your
++// application's logger.
++var Log log.SwapLogger
++
+ const (
+ 	// https://github.com/racker/tryfer#headers
+ 	traceIDHTTPHeader      = "X-B3-TraceId"
+@@ -91,10 +95,10 @@ func AnnotateClient(newSpan NewSpanFunc, c Collector) endpoint.Middleware {
+ // ToContext returns a function that satisfies transport/http.BeforeFunc. It
+ // takes a Zipkin span from the incoming HTTP request, and saves it in the
+ // request context. It's designed to be wired into a server's HTTP transport
+-// Before stack. The logger is used to report errors.
+-func ToContext(newSpan NewSpanFunc, logger log.Logger) func(ctx context.Context, r *http.Request) context.Context {
++// Before stack.
++func ToContext(newSpan NewSpanFunc) func(ctx context.Context, r *http.Request) context.Context {
+ 	return func(ctx context.Context, r *http.Request) context.Context {
+-		return context.WithValue(ctx, SpanContextKey, fromHTTP(newSpan, r, logger))
++		return context.WithValue(ctx, SpanContextKey, fromHTTP(newSpan, r))
+ 	}
+ }
+ 
+@@ -122,25 +126,26 @@ func ToRequest(newSpan NewSpanFunc) func(ctx context.Context, r *http.Request) c
+ 	}
+ }
+ 
+-func fromHTTP(newSpan NewSpanFunc, r *http.Request, logger log.Logger) *Span {
++func fromHTTP(newSpan NewSpanFunc, r *http.Request) *Span {
+ 	traceIDStr := r.Header.Get(traceIDHTTPHeader)
+ 	if traceIDStr == "" {
++		Log.Log("debug", "make new span")
+ 		return newSpan(newID(), newID(), 0) // normal; just make a new one
+ 	}
+ 	traceID, err := strconv.ParseInt(traceIDStr, 16, 64)
+ 	if err != nil {
+-		logger.Log(traceIDHTTPHeader, traceIDStr, "err", err)
++		Log.Log(traceIDHTTPHeader, traceIDStr, "err", err)
+ 		return newSpan(newID(), newID(), 0)
+ 	}
+ 	spanIDStr := r.Header.Get(spanIDHTTPHeader)
+ 	if spanIDStr == "" {
+-		logger.Log("msg", "trace ID without span ID") // abnormal
+-		spanIDStr = strconv.FormatInt(newID(), 64)    // deal with it
++		Log.Log("msg", "trace ID without span ID") // abnormal
++		spanIDStr = strconv.FormatInt(newID(), 64) // deal with it
+ 	}
+ 	spanID, err := strconv.ParseInt(spanIDStr, 16, 64)
+ 	if err != nil {
+-		logger.Log(spanIDHTTPHeader, spanIDStr, "err", err) // abnormal
+-		spanID = newID()                                    // deal with it
++		Log.Log(spanIDHTTPHeader, spanIDStr, "err", err) // abnormal
++		spanID = newID()                                 // deal with it
+ 	}
+ 	parentSpanIDStr := r.Header.Get(parentSpanIDHTTPHeader)
+ 	if parentSpanIDStr == "" {
+@@ -148,8 +153,8 @@ func fromHTTP(newSpan NewSpanFunc, r *http.Request, logger log.Logger) *Span {
+ 	}
+ 	parentSpanID, err := strconv.ParseInt(parentSpanIDStr, 16, 64)
+ 	if err != nil {
+-		logger.Log(parentSpanIDHTTPHeader, parentSpanIDStr, "err", err) // abnormal
+-		parentSpanID = 0                                                // the only way to deal with it
++		Log.Log(parentSpanIDHTTPHeader, parentSpanIDStr, "err", err) // abnormal
++		parentSpanID = 0                                             // the only way to deal with it
+ 	}
+ 	return newSpan(traceID, spanID, parentSpanID)
+ }
+diff --git a/tracing/zipkin/zipkin_test.go b/tracing/zipkin/zipkin_test.go
+index d6952c1..cd64c83 100644
+--- a/tracing/zipkin/zipkin_test.go
++++ b/tracing/zipkin/zipkin_test.go
+@@ -2,7 +2,6 @@ package zipkin_test
+ 
+ import (
+ 	"fmt"
+-	"io/ioutil"
+ 	"net/http"
+ 	"reflect"
+ 	"runtime"
+@@ -13,7 +12,6 @@ import (
+ 	"golang.org/x/net/context"
+ 
+ 	"github.com/go-kit/kit/endpoint"
+-	"github.com/go-kit/kit/log"
+ 	"github.com/go-kit/kit/tracing/zipkin"
+ )
+ 
+@@ -33,7 +31,7 @@ func TestToContext(t *testing.T) {
+ 	r.Header.Set("X-B3-ParentSpanId", strconv.FormatInt(parentSpanID, 16))
+ 
+ 	newSpan := zipkin.MakeNewSpanFunc(hostport, serviceName, methodName)
+-	toContext := zipkin.ToContext(newSpan, log.NewLogfmtLogger(ioutil.Discard))
++	toContext := zipkin.ToContext(newSpan)
+ 
+ 	ctx := toContext(context.Background(), r)
+ 	val := ctx.Value(zipkin.SpanContextKey)

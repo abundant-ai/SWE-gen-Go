@@ -1,0 +1,551 @@
+diff --git a/.typos.toml b/.typos.toml
+index 68dba92be..087c2b9c3 100644
+--- a/.typos.toml
++++ b/.typos.toml
+@@ -3,6 +3,8 @@ extend-exclude = [
+     ".git/",
+     "docs/",
+     "CREDITS",
++    "go.mod",
++    "go.sum",
+ ]
+ ignore-hidden = false
+ 
+@@ -17,6 +19,7 @@ extend-ignore-re = [
+     "MIIDBTCCAe2gAwIBAgIQWHw7h.*",
+     'http\.Header\{"X-Amz-Server-Side-Encryptio":',
+     "ZoEoZdLlzVbOlT9rbhD7ZN7TLyiYXSAlB79uGEge",
++    "ERRO:",
+ ]
+ 
+ [default.extend-words]
+diff --git a/cmd/erasure-server-pool.go b/cmd/erasure-server-pool.go
+index 5a73f12d2..6fbaf9808 100644
+--- a/cmd/erasure-server-pool.go
++++ b/cmd/erasure-server-pool.go
+@@ -2447,6 +2447,7 @@ const (
+ type HealthOptions struct {
+ 	Maintenance    bool
+ 	DeploymentType string
++	NoLogging      bool
+ }
+ 
+ // HealthResult returns the current state of the system, also
+@@ -2483,7 +2484,7 @@ func (hr HealthResult) String() string {
+ 		if i == 0 {
+ 			str.WriteString(")")
+ 		} else {
+-			str.WriteString("), ")
++			str.WriteString(") | ")
+ 		}
+ 	}
+ 	return str.String()
+@@ -2606,7 +2607,7 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
+ 			})
+ 
+ 			healthy := erasureSetUpCount[poolIdx][setIdx].online >= poolWriteQuorums[poolIdx]
+-			if !healthy {
++			if !healthy && !opts.NoLogging {
+ 				storageLogIf(logger.SetReqInfo(ctx, reqInfo),
+ 					fmt.Errorf("Write quorum could not be established on pool: %d, set: %d, expected write quorum: %d, drives-online: %d",
+ 						poolIdx, setIdx, poolWriteQuorums[poolIdx], erasureSetUpCount[poolIdx][setIdx].online), logger.FatalKind)
+@@ -2614,7 +2615,7 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
+ 			result.Healthy = result.Healthy && healthy
+ 
+ 			healthyRead := erasureSetUpCount[poolIdx][setIdx].online >= poolReadQuorums[poolIdx]
+-			if !healthyRead {
++			if !healthyRead && !opts.NoLogging {
+ 				storageLogIf(logger.SetReqInfo(ctx, reqInfo),
+ 					fmt.Errorf("Read quorum could not be established on pool: %d, set: %d, expected read quorum: %d, drives-online: %d",
+ 						poolIdx, setIdx, poolReadQuorums[poolIdx], erasureSetUpCount[poolIdx][setIdx].online))
+diff --git a/cmd/erasure-sets.go b/cmd/erasure-sets.go
+index 61856cfcf..b35ff797a 100644
+--- a/cmd/erasure-sets.go
++++ b/cmd/erasure-sets.go
+@@ -189,7 +189,7 @@ func (s *erasureSets) Legacy() (ok bool) {
+ 
+ // connectDisks - attempt to connect all the endpoints, loads format
+ // and re-arranges the disks in proper position.
+-func (s *erasureSets) connectDisks() {
++func (s *erasureSets) connectDisks(log bool) {
+ 	defer func() {
+ 		s.lastConnectDisksOpTime = time.Now()
+ 	}()
+@@ -224,7 +224,9 @@ func (s *erasureSets) connectDisks() {
+ 				if endpoint.IsLocal && errors.Is(err, errUnformattedDisk) {
+ 					globalBackgroundHealState.pushHealLocalDisks(endpoint)
+ 				} else if !errors.Is(err, errDriveIsRoot) {
+-					printEndpointError(endpoint, err, true)
++					if log {
++						printEndpointError(endpoint, err, true)
++					}
+ 				}
+ 				return
+ 			}
+@@ -285,7 +287,7 @@ func (s *erasureSets) monitorAndConnectEndpoints(ctx context.Context, monitorInt
+ 	time.Sleep(time.Duration(r.Float64() * float64(time.Second)))
+ 
+ 	// Pre-emptively connect the disks if possible.
+-	s.connectDisks()
++	s.connectDisks(false)
+ 
+ 	monitor := time.NewTimer(monitorInterval)
+ 	defer monitor.Stop()
+@@ -299,7 +301,7 @@ func (s *erasureSets) monitorAndConnectEndpoints(ctx context.Context, monitorInt
+ 				console.Debugln("running drive monitoring")
+ 			}
+ 
+-			s.connectDisks()
++			s.connectDisks(true)
+ 
+ 			// Reset the timer for next interval
+ 			monitor.Reset(monitorInterval)
+diff --git a/cmd/iam.go b/cmd/iam.go
+index 9ff9f6919..c6ba2f3a5 100644
+--- a/cmd/iam.go
++++ b/cmd/iam.go
+@@ -217,6 +217,9 @@ func (sys *IAMSys) Load(ctx context.Context, firstTime bool) error {
+ 
+ 	if firstTime {
+ 		bootstrapTraceMsg(fmt.Sprintf("globalIAMSys.Load(): (duration: %s)", loadDuration))
++		if globalIsDistErasure {
++			logger.Info("IAM load(startup) finished. (duration: %s)", loadDuration)
++		}
+ 	}
+ 
+ 	select {
+@@ -400,12 +403,12 @@ func (sys *IAMSys) periodicRoutines(ctx context.Context, baseInterval time.Durat
+ 			// Load all IAM items (except STS creds) periodically.
+ 			refreshStart := time.Now()
+ 			if err := sys.Load(ctx, false); err != nil {
+-				iamLogIf(ctx, fmt.Errorf("Failure in periodic refresh for IAM (took %.2fs): %v", time.Since(refreshStart).Seconds(), err), logger.WarningKind)
++				iamLogIf(ctx, fmt.Errorf("Failure in periodic refresh for IAM (duration: %s): %v", time.Since(refreshStart), err), logger.WarningKind)
+ 			} else {
+ 				took := time.Since(refreshStart).Seconds()
+ 				if took > maxDurationSecondsForLog {
+ 					// Log if we took a lot of time to load.
+-					logger.Info("IAM refresh took %.2fs", took)
++					logger.Info("IAM refresh took (duration: %s)", took)
+ 				}
+ 			}
+ 
+diff --git a/cmd/prepare-storage.go b/cmd/prepare-storage.go
+index 5c25e4531..578a5fade 100644
+--- a/cmd/prepare-storage.go
++++ b/cmd/prepare-storage.go
+@@ -166,13 +166,13 @@ func connectLoadInitFormats(verboseLogging bool, firstDisk bool, storageDisks []
+ 		if err != nil && !errors.Is(err, errXLBackend) && !errors.Is(err, errUnformattedDisk) {
+ 			if errors.Is(err, errDiskNotFound) && verboseLogging {
+ 				if globalEndpoints.NEndpoints() > 1 {
+-					logger.Error("Unable to connect to %s: %v", endpoints[i], isServerResolvable(endpoints[i], time.Second))
++					logger.Info("Unable to connect to %s: %v, will be retried", endpoints[i], isServerResolvable(endpoints[i], time.Second))
+ 				} else {
+ 					logger.Fatal(err, "Unable to connect to %s: %v", endpoints[i], isServerResolvable(endpoints[i], time.Second))
+ 				}
+ 			} else {
+ 				if globalEndpoints.NEndpoints() > 1 {
+-					logger.Error("Unable to use the drive %s: %v", endpoints[i], err)
++					logger.Info("Unable to use the drive %s: %v, will be retried", endpoints[i], err)
+ 				} else {
+ 					logger.Fatal(errInvalidArgument, "Unable to use the drive %s: %v", endpoints[i], err)
+ 				}
+diff --git a/cmd/server-main.go b/cmd/server-main.go
+index b170543ad..4a168bd74 100644
+--- a/cmd/server-main.go
++++ b/cmd/server-main.go
+@@ -841,13 +841,14 @@ func serverMain(ctx *cli.Context) {
+ 
+ 	// Verify kernel release and version.
+ 	if oldLinux() {
+-		warnings = append(warnings, color.YellowBold("- Detected Linux kernel version older than 4.0.0 release, there are some known potential performance problems with this kernel version. MinIO recommends a minimum of 4.x.x linux kernel version for best performance"))
++		warnings = append(warnings, color.YellowBold("Detected Linux kernel version older than 4.0 release, there are some known potential performance problems with this kernel version. MinIO recommends a minimum of 4.x linux kernel version for best performance"))
+ 	}
+ 
+ 	maxProcs := runtime.GOMAXPROCS(0)
+ 	cpuProcs := runtime.NumCPU()
+ 	if maxProcs < cpuProcs {
+-		warnings = append(warnings, color.YellowBold("- Detected GOMAXPROCS(%d) < NumCPU(%d), please make sure to provide all PROCS to MinIO for optimal performance", maxProcs, cpuProcs))
++		warnings = append(warnings, color.YellowBold("Detected GOMAXPROCS(%d) < NumCPU(%d), please make sure to provide all PROCS to MinIO for optimal performance",
++			maxProcs, cpuProcs))
+ 	}
+ 
+ 	// Initialize grid
+@@ -921,16 +922,18 @@ func serverMain(ctx *cli.Context) {
+ 	}
+ 
+ 	bootstrapTrace("waitForQuorum", func() {
+-		result := newObject.Health(context.Background(), HealthOptions{})
++		result := newObject.Health(context.Background(), HealthOptions{NoLogging: true})
+ 		for !result.HealthyRead {
+ 			if debugNoExit {
+-				logger.Info("Not waiting for quorum since we are debugging.. possible cause unhealthy sets (%s)", result)
++				logger.Info("Not waiting for quorum since we are debugging.. possible cause unhealthy sets")
++				logger.Info(result.String())
+ 				break
+ 			}
+ 			d := time.Duration(r.Float64() * float64(time.Second))
+-			logger.Info("Waiting for quorum READ healthcheck to succeed.. possible cause unhealthy sets (%s), retrying in %s", result, d)
++			logger.Info("Waiting for quorum READ healthcheck to succeed retrying in %s.. possible cause unhealthy sets", d)
++			logger.Info(result.String())
+ 			time.Sleep(d)
+-			result = newObject.Health(context.Background(), HealthOptions{})
++			result = newObject.Health(context.Background(), HealthOptions{NoLogging: true})
+ 		}
+ 	})
+ 
+@@ -953,11 +956,11 @@ func serverMain(ctx *cli.Context) {
+ 		}
+ 
+ 		if !globalServerCtxt.StrictS3Compat {
+-			warnings = append(warnings, color.YellowBold("- Strict AWS S3 compatible incoming PUT, POST content payload validation is turned off, caution is advised do not use in production"))
++			warnings = append(warnings, color.YellowBold("Strict AWS S3 compatible incoming PUT, POST content payload validation is turned off, caution is advised do not use in production"))
+ 		}
+ 	})
+ 	if globalActiveCred.Equal(auth.DefaultCredentials) {
+-		msg := fmt.Sprintf("- Detected default credentials '%s', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables",
++		msg := fmt.Sprintf("Detected default credentials '%s', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables",
+ 			globalActiveCred)
+ 		warnings = append(warnings, color.YellowBold(msg))
+ 	}
+@@ -1103,18 +1106,12 @@ func serverMain(ctx *cli.Context) {
+ 		printStartupMessage(getAPIEndpoints(), err)
+ 
+ 		// Print a warning at the end of the startup banner so it is more noticeable
+-		if newObject.BackendInfo().StandardSCParity == 0 {
+-			warnings = append(warnings, color.YellowBold("- The standard parity is set to 0. This can lead to data loss."))
++		if newObject.BackendInfo().StandardSCParity == 0 && !globalIsErasureSD {
++			warnings = append(warnings, color.YellowBold("The standard parity is set to 0. This can lead to data loss."))
+ 		}
+-		objAPI := newObjectLayerFn()
+-		if objAPI != nil {
+-			printStorageInfo(objAPI.StorageInfo(GlobalContext, true))
+-		}
+-		if len(warnings) > 0 {
+-			logger.Info(color.Yellow("STARTUP WARNINGS:"))
+-			for _, warn := range warnings {
+-				logger.Info(warn)
+-			}
++
++		for _, warn := range warnings {
++			logger.Warning(warn)
+ 		}
+ 	}()
+ 
+diff --git a/cmd/server-startup-msg.go b/cmd/server-startup-msg.go
+index 5e49a7c49..c90995cae 100644
+--- a/cmd/server-startup-msg.go
++++ b/cmd/server-startup-msg.go
+@@ -23,7 +23,6 @@ import (
+ 	"net/url"
+ 	"strings"
+ 
+-	"github.com/minio/madmin-go/v3"
+ 	"github.com/minio/minio/internal/color"
+ 	"github.com/minio/minio/internal/logger"
+ 	xnet "github.com/minio/pkg/v3/net"
+@@ -37,7 +36,11 @@ func getFormatStr(strLen int, padding int) string {
+ 
+ // Prints the formatted startup message.
+ func printStartupMessage(apiEndpoints []string, err error) {
+-	logger.Info(color.Bold(MinioBannerName))
++	banner := strings.Repeat("-", len(MinioBannerName))
++	if globalIsDistErasure {
++		logger.Startup(color.Bold(banner))
++	}
++	logger.Startup(color.Bold(MinioBannerName))
+ 	if err != nil {
+ 		if globalConsoleSys != nil {
+ 			globalConsoleSys.Send(GlobalContext, fmt.Sprintf("Server startup failed with '%v', some features may be missing", err))
+@@ -47,7 +50,7 @@ func printStartupMessage(apiEndpoints []string, err error) {
+ 	if !globalSubnetConfig.Registered() {
+ 		var builder strings.Builder
+ 		startupBanner(&builder)
+-		logger.Info(builder.String())
++		logger.Startup(builder.String())
+ 	}
+ 
+ 	strippedAPIEndpoints := stripStandardPorts(apiEndpoints, globalMinioHost)
+@@ -61,6 +64,9 @@ func printStartupMessage(apiEndpoints []string, err error) {
+ 
+ 	// Prints documentation message.
+ 	printObjectAPIMsg()
++	if globalIsDistErasure {
++		logger.Startup(color.Bold(banner))
++	}
+ }
+ 
+ // Returns true if input is IPv6
+@@ -113,21 +119,21 @@ func printServerCommonMsg(apiEndpoints []string) {
+ 
+ 	apiEndpointStr := strings.TrimSpace(strings.Join(apiEndpoints, "  "))
+ 	// Colorize the message and print.
+-	logger.Info(color.Blue("API: ") + color.Bold(fmt.Sprintf("%s ", apiEndpointStr)))
++	logger.Startup(color.Blue("API: ") + color.Bold(fmt.Sprintf("%s ", apiEndpointStr)))
+ 	if color.IsTerminal() && (!globalServerCtxt.Anonymous && !globalServerCtxt.JSON && globalAPIConfig.permitRootAccess()) {
+-		logger.Info(color.Blue("   RootUser: ") + color.Bold("%s ", cred.AccessKey))
+-		logger.Info(color.Blue("   RootPass: ") + color.Bold("%s \n", cred.SecretKey))
++		logger.Startup(color.Blue("   RootUser: ") + color.Bold("%s ", cred.AccessKey))
++		logger.Startup(color.Blue("   RootPass: ") + color.Bold("%s \n", cred.SecretKey))
+ 		if region != "" {
+-			logger.Info(color.Blue("   Region: ") + color.Bold("%s", fmt.Sprintf(getFormatStr(len(region), 2), region)))
++			logger.Startup(color.Blue("   Region: ") + color.Bold("%s", fmt.Sprintf(getFormatStr(len(region), 2), region)))
+ 		}
+ 	}
+ 
+ 	if globalBrowserEnabled {
+ 		consoleEndpointStr := strings.Join(stripStandardPorts(getConsoleEndpoints(), globalMinioConsoleHost), " ")
+-		logger.Info(color.Blue("WebUI: ") + color.Bold(fmt.Sprintf("%s ", consoleEndpointStr)))
++		logger.Startup(color.Blue("WebUI: ") + color.Bold(fmt.Sprintf("%s ", consoleEndpointStr)))
+ 		if color.IsTerminal() && (!globalServerCtxt.Anonymous && !globalServerCtxt.JSON && globalAPIConfig.permitRootAccess()) {
+-			logger.Info(color.Blue("   RootUser: ") + color.Bold("%s ", cred.AccessKey))
+-			logger.Info(color.Blue("   RootPass: ") + color.Bold("%s ", cred.SecretKey))
++			logger.Startup(color.Blue("   RootUser: ") + color.Bold("%s ", cred.AccessKey))
++			logger.Startup(color.Blue("   RootPass: ") + color.Bold("%s ", cred.SecretKey))
+ 		}
+ 	}
+ 
+@@ -137,7 +143,7 @@ func printServerCommonMsg(apiEndpoints []string) {
+ 
+ // Prints startup message for Object API access, prints link to our SDK documentation.
+ func printObjectAPIMsg() {
+-	logger.Info(color.Blue("\nDocs: ") + "https://min.io/docs/minio/linux/index.html")
++	logger.Startup(color.Blue("\nDocs: ") + "https://min.io/docs/minio/linux/index.html")
+ }
+ 
+ func printLambdaTargets() {
+@@ -149,7 +155,7 @@ func printLambdaTargets() {
+ 	for _, arn := range globalLambdaTargetList.List(globalSite.Region()) {
+ 		arnMsg += color.Bold(fmt.Sprintf("%s ", arn))
+ 	}
+-	logger.Info(arnMsg + "\n")
++	logger.Startup(arnMsg + "\n")
+ }
+ 
+ // Prints bucket notification configurations.
+@@ -168,7 +174,7 @@ func printEventNotifiers() {
+ 		arnMsg += color.Bold(fmt.Sprintf("%s ", arn))
+ 	}
+ 
+-	logger.Info(arnMsg + "\n")
++	logger.Startup(arnMsg + "\n")
+ }
+ 
+ // Prints startup message for command line access. Prints link to our documentation
+@@ -181,35 +187,9 @@ func printCLIAccessMsg(endPoint string, alias string) {
+ 
+ 	// Configure 'mc', following block prints platform specific information for minio client.
+ 	if color.IsTerminal() && (!globalServerCtxt.Anonymous && globalAPIConfig.permitRootAccess()) {
+-		logger.Info(color.Blue("\nCLI: ") + mcQuickStartGuide)
++		logger.Startup(color.Blue("\nCLI: ") + mcQuickStartGuide)
+ 		mcMessage := fmt.Sprintf("$ mc alias set '%s' '%s' '%s' '%s'", alias,
+ 			endPoint, cred.AccessKey, cred.SecretKey)
+-		logger.Info(fmt.Sprintf(getFormatStr(len(mcMessage), 3), mcMessage))
+-	}
+-}
+-
+-// Get formatted disk/storage info message.
+-func getStorageInfoMsg(storageInfo StorageInfo) string {
+-	var msg string
+-	var mcMessage string
+-	onlineDisks, offlineDisks := getOnlineOfflineDisksStats(storageInfo.Disks)
+-	if storageInfo.Backend.Type == madmin.Erasure {
+-		if offlineDisks.Sum() > 0 {
+-			mcMessage = "Use `mc admin info` to look for latest server/drive info\n"
+-		}
+-
+-		diskInfo := fmt.Sprintf(" %d Online, %d Offline. ", onlineDisks.Sum(), offlineDisks.Sum())
+-		msg += color.Blue("Status:") + fmt.Sprintf(getFormatStr(len(diskInfo), 8), diskInfo)
+-		if len(mcMessage) > 0 {
+-			msg = fmt.Sprintf("%s %s", mcMessage, msg)
+-		}
+-	}
+-	return msg
+-}
+-
+-// Prints startup message of storage capacity and erasure information.
+-func printStorageInfo(storageInfo StorageInfo) {
+-	if msg := getStorageInfoMsg(storageInfo); msg != "" {
+-		logger.Info(msg)
++		logger.Startup(fmt.Sprintf(getFormatStr(len(mcMessage), 3), mcMessage))
+ 	}
+ }
+diff --git a/internal/logger/console.go b/internal/logger/console.go
+index f80adbf77..e3eb3d723 100644
+--- a/internal/logger/console.go
++++ b/internal/logger/console.go
+@@ -1,4 +1,4 @@
+-// Copyright (c) 2015-2021 MinIO, Inc.
++// Copyright (c) 2015-2024 MinIO, Inc.
+ //
+ // This file is part of MinIO Object Storage stack
+ //
+@@ -110,7 +110,7 @@ func (f fatalMsg) quiet(msg string, args ...interface{}) {
+ }
+ 
+ var (
+-	logTag      = "ERROR"
++	logTag      = "FATAL"
+ 	logBanner   = color.BgRed(color.FgWhite(color.Bold(logTag))) + " "
+ 	emptyBanner = color.BgRed(strings.Repeat(" ", len(logTag))) + " "
+ 	bannerWidth = len(logTag) + 1
+@@ -187,7 +187,7 @@ func (i infoMsg) pretty(msg string, args ...interface{}) {
+ 	if msg == "" {
+ 		fmt.Fprintln(Output, args...)
+ 	} else {
+-		fmt.Fprintf(Output, msg, args...)
++		fmt.Fprintf(Output, `INFO: `+msg, args...)
+ 	}
+ }
+ 
+@@ -222,13 +222,13 @@ func (i errorMsg) pretty(msg string, args ...interface{}) {
+ 	if msg == "" {
+ 		fmt.Fprintln(Output, args...)
+ 	} else {
+-		fmt.Fprintf(Output, msg, args...)
++		fmt.Fprintf(Output, `ERRO: `+msg, args...)
+ 	}
+ }
+ 
+ // Error :
+ func Error(msg string, data ...interface{}) {
+-	if DisableErrorLog {
++	if DisableLog {
+ 		return
+ 	}
+ 	consoleLog(errorMessage, msg, data...)
+@@ -236,8 +236,92 @@ func Error(msg string, data ...interface{}) {
+ 
+ // Info :
+ func Info(msg string, data ...interface{}) {
+-	if DisableErrorLog {
++	if DisableLog {
+ 		return
+ 	}
+ 	consoleLog(info, msg, data...)
+ }
++
++// Startup :
++func Startup(msg string, data ...interface{}) {
++	if DisableLog {
++		return
++	}
++	consoleLog(startup, msg, data...)
++}
++
++type startupMsg struct{}
++
++var startup startupMsg
++
++func (i startupMsg) json(msg string, args ...interface{}) {
++	var message string
++	if msg != "" {
++		message = fmt.Sprintf(msg, args...)
++	} else {
++		message = fmt.Sprint(args...)
++	}
++	logJSON, err := json.Marshal(&log.Entry{
++		Level:   InfoKind,
++		Message: message,
++		Time:    time.Now().UTC(),
++	})
++	if err != nil {
++		panic(err)
++	}
++	fmt.Fprintln(Output, string(logJSON))
++}
++
++func (i startupMsg) quiet(msg string, args ...interface{}) {
++}
++
++func (i startupMsg) pretty(msg string, args ...interface{}) {
++	if msg == "" {
++		fmt.Fprintln(Output, args...)
++	} else {
++		fmt.Fprintf(Output, msg, args...)
++	}
++}
++
++type warningMsg struct{}
++
++var warningMessage warningMsg
++
++func (i warningMsg) json(msg string, args ...interface{}) {
++	var message string
++	if msg != "" {
++		message = fmt.Sprintf(msg, args...)
++	} else {
++		message = fmt.Sprint(args...)
++	}
++	logJSON, err := json.Marshal(&log.Entry{
++		Level:   WarningKind,
++		Message: message,
++		Time:    time.Now().UTC(),
++		Trace:   &log.Trace{Message: message, Source: []string{getSource(6)}},
++	})
++	if err != nil {
++		panic(err)
++	}
++	fmt.Fprintln(Output, string(logJSON))
++}
++
++func (i warningMsg) quiet(msg string, args ...interface{}) {
++	i.pretty(msg, args...)
++}
++
++func (i warningMsg) pretty(msg string, args ...interface{}) {
++	if msg == "" {
++		fmt.Fprintln(Output, args...)
++	} else {
++		fmt.Fprintf(Output, `WARN: `+msg, args...)
++	}
++}
++
++// Warning :
++func Warning(msg string, data ...interface{}) {
++	if DisableLog {
++		return
++	}
++	consoleLog(warningMessage, msg, data...)
++}
+diff --git a/internal/logger/logger.go b/internal/logger/logger.go
+index 9d73853d3..27365fd9f 100644
+--- a/internal/logger/logger.go
++++ b/internal/logger/logger.go
+@@ -53,8 +53,8 @@ const (
+ )
+ 
+ var (
+-	// DisableErrorLog avoids printing error/event/info kind of logs
+-	DisableErrorLog = false
++	// DisableLog avoids printing error/event/info kind of logs
++	DisableLog = false
+ 	// Output allows configuring custom writer, defaults to os.Stderr
+ 	Output io.Writer = os.Stderr
+ )
+@@ -386,7 +386,7 @@ func buildLogEntry(ctx context.Context, subsystem, message string, trace []strin
+ // consoleLogIf prints a detailed error message during
+ // the execution of the server.
+ func consoleLogIf(ctx context.Context, subsystem string, err error, errKind ...interface{}) {
+-	if DisableErrorLog {
++	if DisableLog {
+ 		return
+ 	}
+ 	if err == nil {
+@@ -401,7 +401,7 @@ func consoleLogIf(ctx context.Context, subsystem string, err error, errKind ...i
+ // logIf prints a detailed error message during
+ // the execution of the server.
+ func logIf(ctx context.Context, subsystem string, err error, errKind ...interface{}) {
+-	if DisableErrorLog {
++	if DisableLog {
+ 		return
+ 	}
+ 	if err == nil {
+@@ -430,7 +430,7 @@ func sendLog(ctx context.Context, entry log.Entry) {
+ 
+ // Event sends a event log to  log targets
+ func Event(ctx context.Context, subsystem, msg string, args ...interface{}) {
+-	if DisableErrorLog {
++	if DisableLog {
+ 		return
+ 	}
+ 	entry := logToEntry(ctx, subsystem, fmt.Sprintf(msg, args...), EventKind)

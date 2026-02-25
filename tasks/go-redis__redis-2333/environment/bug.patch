@@ -1,0 +1,397 @@
+diff --git a/cluster.go b/cluster.go
+index d36b5c36..a70ff12c 100644
+--- a/cluster.go
++++ b/cluster.go
+@@ -29,9 +29,6 @@ type ClusterOptions struct {
+ 	// A seed list of host:port addresses of cluster nodes.
+ 	Addrs []string
+ 
+-	// ClientName will execute the `CLIENT SETNAME ClientName` command for each conn.
+-	ClientName string
+-
+ 	// NewClient creates a cluster node client with provided name and options.
+ 	NewClient func(opt *Options) *Client
+ 
+@@ -211,7 +208,6 @@ func setupClusterConn(u *url.URL, host string, o *ClusterOptions) (*ClusterOptio
+ func setupClusterQueryParams(u *url.URL, o *ClusterOptions) (*ClusterOptions, error) {
+ 	q := queryOptions{q: u.Query()}
+ 
+-	o.ClientName = q.string("client_name")
+ 	o.MaxRedirects = q.int("max_redirects")
+ 	o.ReadOnly = q.bool("read_only")
+ 	o.RouteByLatency = q.bool("route_by_latency")
+@@ -254,9 +250,8 @@ func setupClusterQueryParams(u *url.URL, o *ClusterOptions) (*ClusterOptions, er
+ 
+ func (opt *ClusterOptions) clientOptions() *Options {
+ 	return &Options{
+-		ClientName: opt.ClientName,
+-		Dialer:     opt.Dialer,
+-		OnConnect:  opt.OnConnect,
++		Dialer:    opt.Dialer,
++		OnConnect: opt.OnConnect,
+ 
+ 		Username: opt.Username,
+ 		Password: opt.Password,
+@@ -876,7 +871,7 @@ func (c *ClusterClient) Close() error {
+ 	return c.nodes.Close()
+ }
+ 
+-// Do create a Cmd from the args and processes the cmd.
++// Do creates a Cmd from the args and processes the cmd.
+ func (c *ClusterClient) Do(ctx context.Context, args ...interface{}) *Cmd {
+ 	cmd := NewCmd(ctx, args...)
+ 	_ = c.Process(ctx, cmd)
+diff --git a/cluster_test.go b/cluster_test.go
+index 2827d3fc..f9dc6792 100644
+--- a/cluster_test.go
++++ b/cluster_test.go
+@@ -589,7 +589,6 @@ var _ = Describe("ClusterClient", func() {
+ 	Describe("ClusterClient", func() {
+ 		BeforeEach(func() {
+ 			opt = redisClusterOptions()
+-			opt.ClientName = "cluster_hi"
+ 			client = cluster.newClusterClient(ctx, opt)
+ 
+ 			err := client.ForEachMaster(ctx, func(ctx context.Context, master *redis.Client) error {
+@@ -680,20 +679,6 @@ var _ = Describe("ClusterClient", func() {
+ 			Expect(assertSlotsEqual(res, wanted)).NotTo(HaveOccurred())
+ 		})
+ 
+-		It("should cluster client setname", func() {
+-			err := client.ForEachShard(ctx, func(ctx context.Context, c *redis.Client) error {
+-				return c.Ping(ctx).Err()
+-			})
+-			Expect(err).NotTo(HaveOccurred())
+-
+-			_ = client.ForEachShard(ctx, func(ctx context.Context, c *redis.Client) error {
+-				val, err := c.ClientList(ctx).Result()
+-				Expect(err).NotTo(HaveOccurred())
+-				Expect(val).Should(ContainSubstring("name=cluster_hi"))
+-				return nil
+-			})
+-		})
+-
+ 		It("should CLUSTER NODES", func() {
+ 			res, err := client.ClusterNodes(ctx).Result()
+ 			Expect(err).NotTo(HaveOccurred())
+@@ -1423,10 +1408,6 @@ func TestParseClusterURL(t *testing.T) {
+ 			test: "UseDefault",
+ 			url:  "redis://localhost:123?conn_max_idle_time=",
+ 			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123"}, ConnMaxIdleTime: 0},
+-		}, {
+-			test: "ClientName",
+-			url:  "redis://localhost:123?client_name=cluster_hi",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123"}, ClientName: "cluster_hi"},
+ 		}, {
+ 			test: "UseDefaultMissing=",
+ 			url:  "redis://localhost:123?conn_max_idle_time",
+diff --git a/options.go b/options.go
+index 49abe214..651d0d4f 100644
+--- a/options.go
++++ b/options.go
+@@ -27,7 +27,7 @@ type Limiter interface {
+ 	ReportResult(result error)
+ }
+ 
+-// Options keeps the settings to set up redis connection.
++// Options keeps the settings to setup redis connection.
+ type Options struct {
+ 	// The network type, either tcp or unix.
+ 	// Default is tcp.
+@@ -35,9 +35,6 @@ type Options struct {
+ 	// host:port address.
+ 	Addr string
+ 
+-	// ClientName will execute the `CLIENT SETNAME ClientName` command for each conn.
+-	ClientName string
+-
+ 	// Dialer creates new network connection and has priority over
+ 	// Network and Addr options.
+ 	Dialer func(ctx context.Context, network, addr string) (net.Conn, error)
+@@ -429,7 +426,6 @@ func setupConnParams(u *url.URL, o *Options) (*Options, error) {
+ 		o.DB = db
+ 	}
+ 
+-	o.ClientName = q.string("client_name")
+ 	o.MaxRetries = q.int("max_retries")
+ 	o.MinRetryBackoff = q.duration("min_retry_backoff")
+ 	o.MaxRetryBackoff = q.duration("max_retry_backoff")
+diff --git a/options_test.go b/options_test.go
+index 4ad91753..47fa9cbc 100644
+--- a/options_test.go
++++ b/options_test.go
+@@ -59,9 +59,6 @@ func TestParseURL(t *testing.T) {
+ 		}, {
+ 			url: "redis://localhost:123/?db=2&conn_max_idle_time", // missing "=" at the end
+ 			o:   &Options{Addr: "localhost:123", DB: 2, ConnMaxIdleTime: 0},
+-		}, {
+-			url: "redis://localhost:123/?db=2&client_name=hi", // client name
+-			o:   &Options{Addr: "localhost:123", DB: 2, ClientName: "hi"},
+ 		}, {
+ 			url: "unix:///tmp/redis.sock",
+ 			o:   &Options{Addr: "/tmp/redis.sock"},
+diff --git a/redis.go b/redis.go
+index d587c1fe..ee6c9bdb 100644
+--- a/redis.go
++++ b/redis.go
+@@ -256,10 +256,6 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
+ 			pipe.ReadOnly(ctx)
+ 		}
+ 
+-		if c.opt.ClientName != "" {
+-			pipe.ClientSetName(ctx, c.opt.ClientName)
+-		}
+-
+ 		return nil
+ 	})
+ 	if err != nil {
+diff --git a/redis_test.go b/redis_test.go
+index 4cbc3899..8df1dd85 100644
+--- a/redis_test.go
++++ b/redis_test.go
+@@ -169,21 +169,6 @@ var _ = Describe("Client", func() {
+ 		Expect(db2.Close()).NotTo(HaveOccurred())
+ 	})
+ 
+-	It("should client setname", func() {
+-		opt := redisOptions()
+-		opt.ClientName = "hi"
+-		db := redis.NewClient(opt)
+-
+-		defer func() {
+-			Expect(db.Close()).NotTo(HaveOccurred())
+-		}()
+-
+-		Expect(db.Ping(ctx).Err()).NotTo(HaveOccurred())
+-		val, err := db.ClientList(ctx).Result()
+-		Expect(err).NotTo(HaveOccurred())
+-		Expect(val).Should(ContainSubstring("name=hi"))
+-	})
+-
+ 	It("processes custom commands", func() {
+ 		cmd := redis.NewCmd(ctx, "PING")
+ 		_ = client.Process(ctx, cmd)
+diff --git a/ring.go b/ring.go
+index bc299da0..0a1069dd 100644
+--- a/ring.go
++++ b/ring.go
+@@ -51,9 +51,6 @@ type RingOptions struct {
+ 	// NewClient creates a shard client with provided options.
+ 	NewClient func(opt *Options) *Client
+ 
+-	// ClientName will execute the `CLIENT SETNAME ClientName` command for each conn.
+-	ClientName string
+-
+ 	// Frequency of PING commands sent to check shards availability.
+ 	// Shard is considered down after 3 subsequent failed checks.
+ 	HeartbeatFrequency time.Duration
+@@ -132,9 +129,8 @@ func (opt *RingOptions) init() {
+ 
+ func (opt *RingOptions) clientOptions() *Options {
+ 	return &Options{
+-		ClientName: opt.ClientName,
+-		Dialer:     opt.Dialer,
+-		OnConnect:  opt.OnConnect,
++		Dialer:    opt.Dialer,
++		OnConnect: opt.OnConnect,
+ 
+ 		Username: opt.Username,
+ 		Password: opt.Password,
+@@ -526,7 +522,7 @@ func (c *Ring) SetAddrs(addrs map[string]string) {
+ 	c.sharding.SetAddrs(addrs)
+ }
+ 
+-// Do create a Cmd from the args and processes the cmd.
++// Do creates a Cmd from the args and processes the cmd.
+ func (c *Ring) Do(ctx context.Context, args ...interface{}) *Cmd {
+ 	cmd := NewCmd(ctx, args...)
+ 	_ = c.Process(ctx, cmd)
+diff --git a/ring_test.go b/ring_test.go
+index df335992..7caa8689 100644
+--- a/ring_test.go
++++ b/ring_test.go
+@@ -29,7 +29,6 @@ var _ = Describe("Redis Ring", func() {
+ 
+ 	BeforeEach(func() {
+ 		opt := redisRingOptions()
+-		opt.ClientName = "ring_hi"
+ 		opt.HeartbeatFrequency = heartbeat
+ 		ring = redis.NewRing(opt)
+ 
+@@ -51,20 +50,6 @@ var _ = Describe("Redis Ring", func() {
+ 		Expect(err).To(MatchError("context canceled"))
+ 	})
+ 
+-	It("should ring client setname", func() {
+-		err := ring.ForEachShard(ctx, func(ctx context.Context, c *redis.Client) error {
+-			return c.Ping(ctx).Err()
+-		})
+-		Expect(err).NotTo(HaveOccurred())
+-
+-		_ = ring.ForEachShard(ctx, func(ctx context.Context, c *redis.Client) error {
+-			val, err := c.ClientList(ctx).Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).Should(ContainSubstring("name=ring_hi"))
+-			return nil
+-		})
+-	})
+-
+ 	It("distributes keys", func() {
+ 		setRingKeys()
+ 
+diff --git a/sentinel.go b/sentinel.go
+index 1feeb039..44b073f4 100644
+--- a/sentinel.go
++++ b/sentinel.go
+@@ -24,9 +24,6 @@ type FailoverOptions struct {
+ 	// A seed list of host:port addresses of sentinel nodes.
+ 	SentinelAddrs []string
+ 
+-	// ClientName will execute the `CLIENT SETNAME ClientName` command for each conn.
+-	ClientName string
+-
+ 	// If specified with SentinelPassword, enables ACL-based authentication (via
+ 	// AUTH <user> <pass>).
+ 	SentinelUsername string
+@@ -81,8 +78,7 @@ type FailoverOptions struct {
+ 
+ func (opt *FailoverOptions) clientOptions() *Options {
+ 	return &Options{
+-		Addr:       "FailoverClient",
+-		ClientName: opt.ClientName,
++		Addr: "FailoverClient",
+ 
+ 		Dialer:    opt.Dialer,
+ 		OnConnect: opt.OnConnect,
+@@ -114,8 +110,7 @@ func (opt *FailoverOptions) clientOptions() *Options {
+ 
+ func (opt *FailoverOptions) sentinelOptions(addr string) *Options {
+ 	return &Options{
+-		Addr:       addr,
+-		ClientName: opt.ClientName,
++		Addr: addr,
+ 
+ 		Dialer:    opt.Dialer,
+ 		OnConnect: opt.OnConnect,
+@@ -146,8 +141,6 @@ func (opt *FailoverOptions) sentinelOptions(addr string) *Options {
+ 
+ func (opt *FailoverOptions) clusterOptions() *ClusterOptions {
+ 	return &ClusterOptions{
+-		ClientName: opt.ClientName,
+-
+ 		Dialer:    opt.Dialer,
+ 		OnConnect: opt.OnConnect,
+ 
+diff --git a/sentinel_test.go b/sentinel_test.go
+index cfa8b01a..ecde161f 100644
+--- a/sentinel_test.go
++++ b/sentinel_test.go
+@@ -1,7 +1,6 @@
+ package redis_test
+ 
+ import (
+-	"context"
+ 	"net"
+ 
+ 	. "github.com/onsi/ginkgo"
+@@ -18,7 +17,6 @@ var _ = Describe("Sentinel", func() {
+ 
+ 	BeforeEach(func() {
+ 		client = redis.NewFailoverClient(&redis.FailoverOptions{
+-			ClientName:    "sentinel_hi",
+ 			MasterName:    sentinelName,
+ 			SentinelAddrs: sentinelAddrs,
+ 			MaxRetries:    -1,
+@@ -127,13 +125,6 @@ var _ = Describe("Sentinel", func() {
+ 		err := client.Ping(ctx).Err()
+ 		Expect(err).NotTo(HaveOccurred())
+ 	})
+-
+-	It("should sentinel client setname", func() {
+-		Expect(client.Ping(ctx).Err()).NotTo(HaveOccurred())
+-		val, err := client.ClientList(ctx).Result()
+-		Expect(err).NotTo(HaveOccurred())
+-		Expect(val).Should(ContainSubstring("name=sentinel_hi"))
+-	})
+ })
+ 
+ var _ = Describe("NewFailoverClusterClient", func() {
+@@ -143,7 +134,6 @@ var _ = Describe("NewFailoverClusterClient", func() {
+ 
+ 	BeforeEach(func() {
+ 		client = redis.NewFailoverClusterClient(&redis.FailoverOptions{
+-			ClientName:    "sentinel_cluster_hi",
+ 			MasterName:    sentinelName,
+ 			SentinelAddrs: sentinelAddrs,
+ 
+@@ -223,20 +213,6 @@ var _ = Describe("NewFailoverClusterClient", func() {
+ 		_, err = startRedis(masterPort)
+ 		Expect(err).NotTo(HaveOccurred())
+ 	})
+-
+-	It("should sentinel cluster client setname", func() {
+-		err := client.ForEachShard(ctx, func(ctx context.Context, c *redis.Client) error {
+-			return c.Ping(ctx).Err()
+-		})
+-		Expect(err).NotTo(HaveOccurred())
+-
+-		_ = client.ForEachShard(ctx, func(ctx context.Context, c *redis.Client) error {
+-			val, err := c.ClientList(ctx).Result()
+-			Expect(err).NotTo(HaveOccurred())
+-			Expect(val).Should(ContainSubstring("name=sentinel_cluster_hi"))
+-			return nil
+-		})
+-	})
+ })
+ 
+ var _ = Describe("SentinelAclAuth", func() {
+diff --git a/universal.go b/universal.go
+index 9d1a8520..73bbf17d 100644
+--- a/universal.go
++++ b/universal.go
+@@ -14,9 +14,6 @@ type UniversalOptions struct {
+ 	// of cluster/sentinel nodes.
+ 	Addrs []string
+ 
+-	// ClientName will execute the `CLIENT SETNAME ClientName` command for each conn.
+-	ClientName string
+-
+ 	// Database to be selected after connecting to the server.
+ 	// Only single-node and failover clients.
+ 	DB int
+@@ -72,10 +69,9 @@ func (o *UniversalOptions) Cluster() *ClusterOptions {
+ 	}
+ 
+ 	return &ClusterOptions{
+-		Addrs:      o.Addrs,
+-		ClientName: o.ClientName,
+-		Dialer:     o.Dialer,
+-		OnConnect:  o.OnConnect,
++		Addrs:     o.Addrs,
++		Dialer:    o.Dialer,
++		OnConnect: o.OnConnect,
+ 
+ 		Username: o.Username,
+ 		Password: o.Password,
+@@ -116,7 +112,6 @@ func (o *UniversalOptions) Failover() *FailoverOptions {
+ 	return &FailoverOptions{
+ 		SentinelAddrs: o.Addrs,
+ 		MasterName:    o.MasterName,
+-		ClientName:    o.ClientName,
+ 
+ 		Dialer:    o.Dialer,
+ 		OnConnect: o.OnConnect,
+@@ -156,10 +151,9 @@ func (o *UniversalOptions) Simple() *Options {
+ 	}
+ 
+ 	return &Options{
+-		Addr:       addr,
+-		ClientName: o.ClientName,
+-		Dialer:     o.Dialer,
+-		OnConnect:  o.OnConnect,
++		Addr:      addr,
++		Dialer:    o.Dialer,
++		OnConnect: o.OnConnect,
+ 
+ 		DB:       o.DB,
+ 		Username: o.Username,

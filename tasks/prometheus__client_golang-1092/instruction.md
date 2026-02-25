@@ -1,7 +1,0 @@
-Histogram metrics are being exposed using an outdated protobuf representation that is incompatible with the new sparse histogram exposition format. When a histogram is written into a protobuf metric (via the histogram’s `Write(*dto.Metric)` method), the produced protobuf does not match the new exposition schema expected by updated Prometheus components, causing scrapes/decoding to fail once the server switches to the new format.
-
-Update the histogram protobuf exposition so that `NewHistogram(HistogramOpts{...})`-created histograms serialize into the new histogram protobuf format when `Write` is called. The emitted protobuf must include the correct histogram fields for the new schema (including timestamp handling where applicable) and must remain consistent under concurrent observation and writing.
-
-The change must preserve existing histogram semantics: bucket configuration validation still must reject invalid bucket definitions at construction time (e.g., `NewHistogram` must panic if buckets are not strictly increasing, contain duplicates, or contain `+Inf` anywhere except as the final implicit bound). Observations must still update count/sum correctly, and repeated `Write` calls must reflect the current state.
-
-In addition, ensure that the protobuf produced by `Write` can be marshaled/unmarshaled without relying on deprecated proto behavior and that the resulting message is compatible with the new exposition format for histograms (this is an intentionally incompatible wire-format change vs the previous histogram protobuf encoding).

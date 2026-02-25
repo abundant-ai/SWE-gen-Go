@@ -1,0 +1,111 @@
+diff --git a/internal/backend/local/backend_apply.go b/internal/backend/local/backend_apply.go
+index 413f92afc6..cc734777a3 100644
+--- a/internal/backend/local/backend_apply.go
++++ b/internal/backend/local/backend_apply.go
+@@ -145,13 +145,19 @@ func (b *Local) opApply(
+ 				desc = "Terraform will destroy all your managed infrastructure, as shown above.\n" +
+ 					"There is no undo. Only 'yes' will be accepted to confirm."
+ 			case plans.RefreshOnlyMode:
+-				if op.Workspace != "default" {
+-					query = "Would you like to update the Terraform state for \"" + op.Workspace + "\" to reflect these detected changes?"
++				if len(plan.ActionTargetAddrs) > 0 {
++					query = "Would you like to invoke the specified actions?"
++					desc = "Terraform will invoke the actions described above, and any changes will be written to the state without modifying real infrastructure\n" +
++						"There is no undo. Only 'yes' will be accepted to confirm."
+ 				} else {
+-					query = "Would you like to update the Terraform state to reflect these detected changes?"
++					if op.Workspace != "default" {
++						query = "Would you like to update the Terraform state for \"" + op.Workspace + "\" to reflect these detected changes?"
++					} else {
++						query = "Would you like to update the Terraform state to reflect these detected changes?"
++					}
++					desc = "Terraform will write these changes to the state without modifying any real infrastructure.\n" +
++						"There is no undo. Only 'yes' will be accepted to confirm."
+ 				}
+-				desc = "Terraform will write these changes to the state without modifying any real infrastructure.\n" +
+-					"There is no undo. Only 'yes' will be accepted to confirm."
+ 			default:
+ 				if op.Workspace != "default" {
+ 					query = "Do you want to perform these actions in workspace \"" + op.Workspace + "\"?"
+diff --git a/internal/command/jsonformat/diff.go b/internal/command/jsonformat/diff.go
+index 31662cb0fc..a241108a40 100644
+--- a/internal/command/jsonformat/diff.go
++++ b/internal/command/jsonformat/diff.go
+@@ -84,8 +84,8 @@ func precomputeDiffs(plan Plan, mode plans.Mode) diffs {
+ 		slices.SortFunc(before, jsonplan.ActionInvocationCompare)
+ 		slices.SortFunc(after, jsonplan.ActionInvocationCompare)
+ 
+-		beforeActionsTriggered := []actionInvocation{}
+-		afterActionsTriggered := []actionInvocation{}
++		var beforeActionsTriggered []actionInvocation
++		var afterActionsTriggered []actionInvocation
+ 		for _, action := range before {
+ 			schema := plan.getActionSchema(action)
+ 			beforeActionsTriggered = append(beforeActionsTriggered, actionInvocation{
+@@ -109,6 +109,17 @@ func precomputeDiffs(plan Plan, mode plans.Mode) diffs {
+ 		})
+ 	}
+ 
++	for _, action := range plan.ActionInvocations {
++		if action.InvokeActionTrigger == nil {
++			// lifecycle actions are handled within the resource
++			continue
++		}
++		diffs.actions = append(diffs.actions, actionInvocation{
++			invocation: action,
++			schema:     plan.getActionSchema(action),
++		})
++	}
++
+ 	for _, change := range plan.DeferredChanges {
+ 		schema := plan.getSchema(change.ResourceChange)
+ 		structuredChange := structured.FromJsonChange(change.ResourceChange.Change, attribute_path.AlwaysMatcher())
+@@ -133,6 +144,7 @@ type diffs struct {
+ 	drift    []diff
+ 	changes  []diff
+ 	deferred []deferredDiff
++	actions  []actionInvocation
+ 	outputs  map[string]computed.Diff
+ }
+ 
+diff --git a/internal/command/jsonformat/plan.go b/internal/command/jsonformat/plan.go
+index 3b9e909d31..6321aa0c77 100644
+--- a/internal/command/jsonformat/plan.go
++++ b/internal/command/jsonformat/plan.go
+@@ -94,9 +94,9 @@ func (plan Plan) renderHuman(renderer Renderer, mode plans.Mode, opts ...plans.Q
+ 	// Precompute the outputs and actions early, so we can make a decision about whether we
+ 	// display the "there are no changes messages".
+ 	outputs := renderHumanDiffOutputs(renderer, diffs.outputs)
+-	actions := renderHumanActionInvocations(renderer, plan.ActionInvocations)
++	actions, actionCount := renderHumanActionInvocations(renderer, diffs.actions)
+ 
+-	if len(changes) == 0 && len(outputs) == 0 && len(actions) == 0 {
++	if len(changes) == 0 && len(outputs) == 0 && actionCount == 0 {
+ 		// If we didn't find any changes to report at all then this is a
+ 		// "No changes" plan. How we'll present this depends on whether
+ 		// the plan is "applyable" and, if so, whether it had refresh changes
+@@ -256,7 +256,7 @@ func (plan Plan) renderHuman(renderer Renderer, mode plans.Mode, opts ...plans.Q
+ 	}
+ 
+ 	if len(actions) > 0 {
+-		renderer.Streams.Print("\nActions to be invoked:\n")
++		renderer.Streams.Print(renderer.Colorize.Color("\nTerraform will invoke the following action(s):\n\n"))
+ 		renderer.Streams.Printf("%s\n", actions)
+ 	}
+ 
+@@ -502,8 +502,13 @@ func renderHumanDeferredDiff(renderer Renderer, deferred deferredDiff) (string,
+ 
+ // All actions that run based on the resource lifecycle should be rendered as part of the resource
+ // changes, therefore this function only renders actions that are invoked by the CLI
+-func renderHumanActionInvocations(renderer Renderer, actionInvocations []jsonplan.ActionInvocation) string {
+-	return "" // TODO: We will use this function once we support CLI invoked actions.
++func renderHumanActionInvocations(renderer Renderer, actionInvocations []actionInvocation) (string, int) {
++	var invocations []string
++	for _, invocation := range actionInvocations {
++		header := fmt.Sprintf(renderer.Colorize.Color("  [bold]# %s[reset] will be invoked"), invocation.invocation.Address)
++		invocations = append(invocations, fmt.Sprintf("%s\n%s", header, renderActionInvocation(renderer, invocation)))
++	}
++	return strings.Join(invocations, "\n"), len(invocations)
+ }
+ 
+ func resourceChangeComment(resource jsonplan.ResourceChange, action plans.Action, changeCause string) string {

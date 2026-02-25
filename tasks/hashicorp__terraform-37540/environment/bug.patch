@@ -1,0 +1,291 @@
+diff --git a/internal/backend/local/backend_apply.go b/internal/backend/local/backend_apply.go
+index cc734777a3..413f92afc6 100644
+--- a/internal/backend/local/backend_apply.go
++++ b/internal/backend/local/backend_apply.go
+@@ -145,19 +145,13 @@ func (b *Local) opApply(
+ 				desc = "Terraform will destroy all your managed infrastructure, as shown above.\n" +
+ 					"There is no undo. Only 'yes' will be accepted to confirm."
+ 			case plans.RefreshOnlyMode:
+-				if len(plan.ActionTargetAddrs) > 0 {
+-					query = "Would you like to invoke the specified actions?"
+-					desc = "Terraform will invoke the actions described above, and any changes will be written to the state without modifying real infrastructure\n" +
+-						"There is no undo. Only 'yes' will be accepted to confirm."
++				if op.Workspace != "default" {
++					query = "Would you like to update the Terraform state for \"" + op.Workspace + "\" to reflect these detected changes?"
+ 				} else {
+-					if op.Workspace != "default" {
+-						query = "Would you like to update the Terraform state for \"" + op.Workspace + "\" to reflect these detected changes?"
+-					} else {
+-						query = "Would you like to update the Terraform state to reflect these detected changes?"
+-					}
+-					desc = "Terraform will write these changes to the state without modifying any real infrastructure.\n" +
+-						"There is no undo. Only 'yes' will be accepted to confirm."
++					query = "Would you like to update the Terraform state to reflect these detected changes?"
+ 				}
++				desc = "Terraform will write these changes to the state without modifying any real infrastructure.\n" +
++					"There is no undo. Only 'yes' will be accepted to confirm."
+ 			default:
+ 				if op.Workspace != "default" {
+ 					query = "Do you want to perform these actions in workspace \"" + op.Workspace + "\"?"
+diff --git a/internal/command/jsonformat/diff.go b/internal/command/jsonformat/diff.go
+index a241108a40..31662cb0fc 100644
+--- a/internal/command/jsonformat/diff.go
++++ b/internal/command/jsonformat/diff.go
+@@ -84,8 +84,8 @@ func precomputeDiffs(plan Plan, mode plans.Mode) diffs {
+ 		slices.SortFunc(before, jsonplan.ActionInvocationCompare)
+ 		slices.SortFunc(after, jsonplan.ActionInvocationCompare)
+ 
+-		var beforeActionsTriggered []actionInvocation
+-		var afterActionsTriggered []actionInvocation
++		beforeActionsTriggered := []actionInvocation{}
++		afterActionsTriggered := []actionInvocation{}
+ 		for _, action := range before {
+ 			schema := plan.getActionSchema(action)
+ 			beforeActionsTriggered = append(beforeActionsTriggered, actionInvocation{
+@@ -109,17 +109,6 @@ func precomputeDiffs(plan Plan, mode plans.Mode) diffs {
+ 		})
+ 	}
+ 
+-	for _, action := range plan.ActionInvocations {
+-		if action.InvokeActionTrigger == nil {
+-			// lifecycle actions are handled within the resource
+-			continue
+-		}
+-		diffs.actions = append(diffs.actions, actionInvocation{
+-			invocation: action,
+-			schema:     plan.getActionSchema(action),
+-		})
+-	}
+-
+ 	for _, change := range plan.DeferredChanges {
+ 		schema := plan.getSchema(change.ResourceChange)
+ 		structuredChange := structured.FromJsonChange(change.ResourceChange.Change, attribute_path.AlwaysMatcher())
+@@ -144,7 +133,6 @@ type diffs struct {
+ 	drift    []diff
+ 	changes  []diff
+ 	deferred []deferredDiff
+-	actions  []actionInvocation
+ 	outputs  map[string]computed.Diff
+ }
+ 
+diff --git a/internal/command/jsonformat/plan.go b/internal/command/jsonformat/plan.go
+index 6321aa0c77..3b9e909d31 100644
+--- a/internal/command/jsonformat/plan.go
++++ b/internal/command/jsonformat/plan.go
+@@ -94,9 +94,9 @@ func (plan Plan) renderHuman(renderer Renderer, mode plans.Mode, opts ...plans.Q
+ 	// Precompute the outputs and actions early, so we can make a decision about whether we
+ 	// display the "there are no changes messages".
+ 	outputs := renderHumanDiffOutputs(renderer, diffs.outputs)
+-	actions, actionCount := renderHumanActionInvocations(renderer, diffs.actions)
++	actions := renderHumanActionInvocations(renderer, plan.ActionInvocations)
+ 
+-	if len(changes) == 0 && len(outputs) == 0 && actionCount == 0 {
++	if len(changes) == 0 && len(outputs) == 0 && len(actions) == 0 {
+ 		// If we didn't find any changes to report at all then this is a
+ 		// "No changes" plan. How we'll present this depends on whether
+ 		// the plan is "applyable" and, if so, whether it had refresh changes
+@@ -256,7 +256,7 @@ func (plan Plan) renderHuman(renderer Renderer, mode plans.Mode, opts ...plans.Q
+ 	}
+ 
+ 	if len(actions) > 0 {
+-		renderer.Streams.Print(renderer.Colorize.Color("\nTerraform will invoke the following action(s):\n\n"))
++		renderer.Streams.Print("\nActions to be invoked:\n")
+ 		renderer.Streams.Printf("%s\n", actions)
+ 	}
+ 
+@@ -502,13 +502,8 @@ func renderHumanDeferredDiff(renderer Renderer, deferred deferredDiff) (string,
+ 
+ // All actions that run based on the resource lifecycle should be rendered as part of the resource
+ // changes, therefore this function only renders actions that are invoked by the CLI
+-func renderHumanActionInvocations(renderer Renderer, actionInvocations []actionInvocation) (string, int) {
+-	var invocations []string
+-	for _, invocation := range actionInvocations {
+-		header := fmt.Sprintf(renderer.Colorize.Color("  [bold]# %s[reset] will be invoked"), invocation.invocation.Address)
+-		invocations = append(invocations, fmt.Sprintf("%s\n%s", header, renderActionInvocation(renderer, invocation)))
+-	}
+-	return strings.Join(invocations, "\n"), len(invocations)
++func renderHumanActionInvocations(renderer Renderer, actionInvocations []jsonplan.ActionInvocation) string {
++	return "" // TODO: We will use this function once we support CLI invoked actions.
+ }
+ 
+ func resourceChangeComment(resource jsonplan.ResourceChange, action plans.Action, changeCause string) string {
+diff --git a/internal/command/jsonformat/plan_test.go b/internal/command/jsonformat/plan_test.go
+index 5ebbfae38d..e47b63c89f 100644
+--- a/internal/command/jsonformat/plan_test.go
++++ b/internal/command/jsonformat/plan_test.go
+@@ -27,175 +27,6 @@ import (
+ 	"github.com/hashicorp/terraform/internal/terraform"
+ )
+ 
+-func TestRenderHuman_InvokeActionPlan(t *testing.T) {
+-	color := &colorstring.Colorize{Colors: colorstring.DefaultColors, Disable: true}
+-	streams, done := terminal.StreamsForTesting(t)
+-
+-	plan := Plan{
+-		ActionInvocations: []jsonplan.ActionInvocation{
+-			{
+-				Address: "action.test_action.action",
+-				Type:    "test_action",
+-				Name:    "action",
+-				ConfigValues: map[string]json.RawMessage{
+-					"attr": []byte("\"one\""),
+-				},
+-				ConfigSensitive:     nil,
+-				ProviderName:        "test",
+-				InvokeActionTrigger: new(jsonplan.InvokeActionTrigger),
+-			},
+-		},
+-		ProviderSchemas: map[string]*jsonprovider.Provider{
+-			"test": {
+-				ActionSchemas: map[string]*jsonprovider.ActionSchema{
+-					"test_action": {
+-						ConfigSchema: &jsonprovider.Block{
+-							Attributes: map[string]*jsonprovider.Attribute{
+-								"attr": {
+-									AttributeType: []byte("\"string\""),
+-								},
+-							},
+-						},
+-						Unlinked: new(jsonprovider.UnlinkedAction),
+-					},
+-				},
+-			},
+-		},
+-	}
+-
+-	renderer := Renderer{Colorize: color, Streams: streams}
+-	plan.renderHuman(renderer, plans.RefreshOnlyMode)
+-
+-	want := `
+-Terraform will invoke the following action(s):
+-
+-  # action.test_action.action will be invoked
+-    action "test_action" "action" {
+-        config {
+-            attr = "one"
+-        }
+-    }
+-
+-`
+-
+-	got := done(t).Stdout()
+-	if diff := cmp.Diff(want, got); len(diff) > 0 {
+-		t.Errorf("unexpected output\ngot:\n%s\nwant:\n%s\ndiff:\n%s", got, want, diff)
+-	}
+-}
+-
+-func TestRenderHuman_InvokeActionPlanWithRefresh(t *testing.T) {
+-	color := &colorstring.Colorize{Colors: colorstring.DefaultColors, Disable: true}
+-	streams, done := terminal.StreamsForTesting(t)
+-
+-	plan := Plan{
+-		ActionInvocations: []jsonplan.ActionInvocation{
+-			{
+-				Address: "action.test_action.action",
+-				Type:    "test_action",
+-				Name:    "action",
+-				ConfigValues: map[string]json.RawMessage{
+-					"attr": []byte("\"one\""),
+-				},
+-				ConfigSensitive:     nil,
+-				ProviderName:        "test",
+-				InvokeActionTrigger: new(jsonplan.InvokeActionTrigger),
+-			},
+-		},
+-		ResourceDrift: []jsonplan.ResourceChange{
+-			{
+-				Address:      "aws_instance.foo",
+-				Mode:         "managed",
+-				Type:         "aws_instance",
+-				Name:         "foo",
+-				IndexUnknown: true,
+-				ProviderName: "aws",
+-				Change: jsonplan.Change{
+-					Actions: []string{"update"},
+-					Before: marshalJson(t, map[string]interface{}{
+-						"id":    "1D5F5E9E-F2E5-401B-9ED5-692A215AC67E",
+-						"value": "Hello, World!",
+-					}),
+-					After: marshalJson(t, map[string]interface{}{
+-						"id":    "1D5F5E9E-F2E5-401B-9ED5-692A215AC67E",
+-						"value": "Hello, World!",
+-					}),
+-				},
+-			},
+-		},
+-		ProviderSchemas: map[string]*jsonprovider.Provider{
+-			"test": {
+-				ActionSchemas: map[string]*jsonprovider.ActionSchema{
+-					"test_action": {
+-						ConfigSchema: &jsonprovider.Block{
+-							Attributes: map[string]*jsonprovider.Attribute{
+-								"attr": {
+-									AttributeType: []byte("\"string\""),
+-								},
+-							},
+-						},
+-						Unlinked: new(jsonprovider.UnlinkedAction),
+-					},
+-				},
+-			},
+-			"aws": {
+-				ResourceSchemas: map[string]*jsonprovider.Schema{
+-					"aws_instance": {
+-						Block: &jsonprovider.Block{
+-							Attributes: map[string]*jsonprovider.Attribute{
+-								"id": {
+-									AttributeType: marshalJson(t, "string"),
+-								},
+-								"ami": {
+-									AttributeType: marshalJson(t, "string"),
+-								},
+-							},
+-						},
+-					},
+-				},
+-			},
+-		},
+-	}
+-
+-	renderer := Renderer{Colorize: color, Streams: streams}
+-	plan.renderHuman(renderer, plans.RefreshOnlyMode)
+-
+-	want := `
+-Note: Objects have changed outside of Terraform
+-
+-Terraform detected the following changes made outside of Terraform since the
+-last "terraform apply" which may have affected this plan:
+-
+-  # aws_instance.foo has changed
+-  ~ resource "aws_instance" "foo" {
+-        id = "1D5F5E9E-F2E5-401B-9ED5-692A215AC67E"
+-    }
+-
+-
+-This is a refresh-only plan, so Terraform will not take any actions to undo
+-these. If you were expecting these changes then you can apply this plan to
+-record the updated values in the Terraform state without changing any remote
+-objects.
+-
+-─────────────────────────────────────────────────────────────────────────────
+-
+-Terraform will invoke the following action(s):
+-
+-  # action.test_action.action will be invoked
+-    action "test_action" "action" {
+-        config {
+-            attr = "one"
+-        }
+-    }
+-
+-`
+-
+-	got := done(t).Stdout()
+-	if diff := cmp.Diff(want, got); len(diff) > 0 {
+-		t.Errorf("unexpected output\ngot:\n%s\nwant:\n%s\ndiff:\n%s", got, want, diff)
+-	}
+-}
+-
+ func TestRenderHuman_EmptyPlan(t *testing.T) {
+ 	color := &colorstring.Colorize{Colors: colorstring.DefaultColors, Disable: true}
+ 	streams, done := terminal.StreamsForTesting(t)

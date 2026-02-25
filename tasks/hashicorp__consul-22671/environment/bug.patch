@@ -1,0 +1,346 @@
+diff --git a/.changelog/22671.txt b/.changelog/22671.txt
+deleted file mode 100644
+index 4a1217d052..0000000000
+--- a/.changelog/22671.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-```release-note:security
+-security: Fixed proxied URL path validation to prevent path traversal.
+-```
+\ No newline at end of file
+diff --git a/agent/ui_endpoint.go b/agent/ui_endpoint.go
+index 006e64b57d..94c3545647 100644
+--- a/agent/ui_endpoint.go
++++ b/agent/ui_endpoint.go
+@@ -813,34 +813,20 @@ func (s *HTTPHandlers) UIMetricsProxy(resp http.ResponseWriter, req *http.Reques
+ 	// Replace prefix in the path
+ 	subPath := strings.TrimPrefix(req.URL.Path, "/v1/internal/ui/metrics-proxy")
+ 
+-	// This prevents path traversal while preserving URL structure
+-	cleanedSubPath := path.Clean(subPath)
+-
+-	// Clean the base URL for security in logging and comparisons
+-	cleanedBaseURL := cfg.BaseURL
+-	if parsedBase, err := url.Parse(cfg.BaseURL); err == nil && parsedBase.Path != "" {
+-		parsedBase.Path = path.Clean(parsedBase.Path)
+-		cleanedBaseURL = parsedBase.String()
+-	}
+-
+-	// Parse the base URL to get its components
+-	baseURL, err := url.Parse(cfg.BaseURL)
+-	if err != nil {
+-		log.Error("couldn't parse base URL", "base_url", cleanedBaseURL)
+-		return nil, HTTPError{StatusCode: http.StatusBadRequest, Reason: "Invalid base URL."}
+-	}
+-
+-	// Join the base path with the cleaned subpath using proper URL path joining
+-	baseURL.Path = path.Join(baseURL.Path, cleanedSubPath)
+-	newURL := baseURL.String()
++	// Append that to the BaseURL (which might contain a path prefix component)
++	newURL := cfg.BaseURL + subPath
+ 
+ 	// Parse it into a new URL
+ 	u, err := url.Parse(newURL)
+ 	if err != nil {
+-		log.Error("couldn't parse target URL", "base_url", cleanedBaseURL, "path", subPath)
++		log.Error("couldn't parse target URL", "base_url", cfg.BaseURL, "path", subPath)
+ 		return nil, HTTPError{StatusCode: http.StatusBadRequest, Reason: "Invalid path."}
+ 	}
+ 
++	// Clean the new URL path to prevent path traversal attacks and remove any
++	// double slashes etc.
++	u.Path = path.Clean(u.Path)
++
+ 	if len(cfg.PathAllowlist) > 0 {
+ 		// This could be done better with a map, but for the prometheus default
+ 		// integration this list has two items in it, so the straight iteration
+@@ -854,7 +840,7 @@ func (s *HTTPHandlers) UIMetricsProxy(resp http.ResponseWriter, req *http.Reques
+ 		}
+ 		if denied {
+ 			log.Error("target URL path is not allowed",
+-				"base_url", cleanedBaseURL,
++				"base_url", cfg.BaseURL,
+ 				"path", subPath,
+ 				"target_url", u.String(),
+ 				"path_allowlist", cfg.PathAllowlist,
+@@ -877,18 +863,9 @@ func (s *HTTPHandlers) UIMetricsProxy(resp http.ResponseWriter, req *http.Reques
+ 	// hit this handler. Any /../ that are far enough into the path to hit this
+ 	// handler, can't backtrack far enough to eat into the BaseURL either. But we
+ 	// leave this in anyway in case something changes in the future.
+-
+-	// Security fix: Ensure BaseURL has trailing "/" for proper prefix checking
+-	baseURLForPrefix := cfg.BaseURL
+-	if !strings.HasSuffix(baseURLForPrefix, "/") {
+-		baseURLForPrefix += "/"
+-	}
+-
+-	targetURL := u.String()
+-	// Allow exact match of BaseURL (without trailing slash) or proper prefix match
+-	if targetURL != cfg.BaseURL && !strings.HasPrefix(targetURL, baseURLForPrefix) {
++	if !strings.HasPrefix(u.String(), cfg.BaseURL) {
+ 		log.Error("target URL escaped from base path",
+-			"base_url", cleanedBaseURL,
++			"base_url", cfg.BaseURL,
+ 			"path", subPath,
+ 			"target_url", u.String(),
+ 		)
+diff --git a/agent/ui_endpoint_test.go b/agent/ui_endpoint_test.go
+index fed184f0bb..4055c19fb6 100644
+--- a/agent/ui_endpoint_test.go
++++ b/agent/ui_endpoint_test.go
+@@ -14,7 +14,6 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"path/filepath"
+-	"strings"
+ 	"sync/atomic"
+ 	"testing"
+ 	"time"
+@@ -2636,78 +2635,6 @@ func TestUIEndpoint_MetricsProxy(t *testing.T) {
+ 			wantCode:     http.StatusMovedPermanently,
+ 			wantContains: "Moved Permanently",
+ 		},
+-		{
+-			name: "path traversal with single dot-dot should be cleaned",
+-			config: config.UIMetricsProxy{
+-				BaseURL: backendURL,
+-			},
+-			path:         endpointPath + "/../ok",
+-			wantCode:     http.StatusMovedPermanently,
+-			wantContains: "Moved Permanently",
+-		},
+-		{
+-			name: "path traversal with multiple dot-dots should be cleaned",
+-			config: config.UIMetricsProxy{
+-				BaseURL: backendURL,
+-			},
+-			path:         endpointPath + "/../../ok",
+-			wantCode:     http.StatusMovedPermanently,
+-			wantContains: "Moved Permanently",
+-		},
+-		{
+-			name: "path traversal with mixed slashes should be cleaned",
+-			config: config.UIMetricsProxy{
+-				BaseURL: backendURL,
+-			},
+-			path:         endpointPath + "/./../ok",
+-			wantCode:     http.StatusMovedPermanently,
+-			wantContains: "Moved Permanently",
+-		},
+-		{
+-			name: "path traversal with encoded dots should be handled",
+-			config: config.UIMetricsProxy{
+-				BaseURL: backendURL,
+-			},
+-			path:         endpointPath + "/%2e%2e/ok",
+-			wantCode:     http.StatusOK,
+-			wantContains: "OK",
+-		},
+-		{
+-			name: "path with double slashes should be cleaned",
+-			config: config.UIMetricsProxy{
+-				BaseURL: backendURL,
+-			},
+-			path:         endpointPath + "//ok",
+-			wantCode:     http.StatusMovedPermanently,
+-			wantContains: "Moved Permanently",
+-		},
+-		{
+-			name: "path with trailing slash should work",
+-			config: config.UIMetricsProxy{
+-				BaseURL: backendURL,
+-			},
+-			path:         endpointPath + "/ok/",
+-			wantCode:     http.StatusOK,
+-			wantContains: "OK",
+-		},
+-		{
+-			name: "baseURL exact match should work",
+-			config: config.UIMetricsProxy{
+-				BaseURL: strings.TrimSuffix(backendURL, "/"),
+-			},
+-			path:         endpointPath + "/",
+-			wantCode:     http.StatusNotFound,
+-			wantContains: "not found on backend",
+-		},
+-		{
+-			name: "clean path prevents directory traversal",
+-			config: config.UIMetricsProxy{
+-				BaseURL: backendURL,
+-			},
+-			path:         endpointPath + "/subdir/../../../etc/passwd",
+-			wantCode:     http.StatusMovedPermanently,
+-			wantContains: "Moved Permanently",
+-		},
+ 		{
+ 			name: "adding auth header",
+ 			config: config.UIMetricsProxy{
+@@ -2744,40 +2671,6 @@ func TestUIEndpoint_MetricsProxy(t *testing.T) {
+ 			wantCode:     http.StatusOK,
+ 			wantContains: "RawQuery: foo=bar&encoded=test%5B0%5D%26%26test%5B1%5D%3D%3D%21%40%C2%A3%24%25%5E",
+ 		},
+-		{
+-			name: "targetURL exactly matches BaseURL without trailing slash",
+-			config: config.UIMetricsProxy{
+-				BaseURL: strings.TrimSuffix(backendURL, "/some/prefix"),
+-			},
+-			path:         endpointPath + "/",
+-			wantCode:     http.StatusNotFound,
+-			wantContains: "not found on backend",
+-		},
+-		{
+-			name: "targetURL matches BaseURL prefix with trailing slash",
+-			config: config.UIMetricsProxy{
+-				BaseURL: backendURL,
+-			},
+-			path:         endpointPath + "/ok",
+-			wantCode:     http.StatusOK,
+-			wantContains: "OK",
+-		},
+-		{
+-			name: "targetURL fails prefix check - different domain",
+-			config: config.UIMetricsProxy{
+-				BaseURL: "http://localhost:9999/metrics",
+-			},
+-			path:     endpointPath + "/../../evil.com/attack",
+-			wantCode: http.StatusMovedPermanently,
+-		},
+-		{
+-			name: "targetURL fails prefix check - sibling path escape",
+-			config: config.UIMetricsProxy{
+-				BaseURL: backend.URL + "/secure/metrics",
+-			},
+-			path:     endpointPath + "/../../../public/data",
+-			wantCode: http.StatusMovedPermanently,
+-		},
+ 	}
+ 
+ 	for _, tc := range cases {
+@@ -2822,127 +2715,3 @@ func TestUIEndpoint_MetricsProxy(t *testing.T) {
+ 		})
+ 	}
+ }
+-
+-func TestUIEndpoint_MetricsProxy_TargetURLValidation(t *testing.T) {
+-	if testing.Short() {
+-		t.Skip("too slow for testing.Short")
+-	}
+-
+-	t.Parallel()
+-
+-	// Create a test backend server
+-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		w.WriteHeader(http.StatusOK)
+-		w.Write([]byte("OK"))
+-	}))
+-	defer backend.Close()
+-
+-	a := NewTestAgent(t, `
+-		ui_config {
+-			enabled = true
+-		}
+-	`)
+-	defer a.Shutdown()
+-
+-	endpointPath := "/v1/internal/ui/metrics-proxy"
+-
+-	cases := []struct {
+-		name         string
+-		baseURL      string
+-		requestPath  string
+-		wantCode     int
+-		wantContains string
+-	}{
+-		{
+-			name:         "exact BaseURL match - allowed",
+-			baseURL:      backend.URL + "/metrics",
+-			requestPath:  endpointPath + "/",
+-			wantCode:     http.StatusOK,
+-			wantContains: "OK",
+-		},
+-		{
+-			name:         "proper prefix match with trailing slash - allowed",
+-			baseURL:      backend.URL + "/metrics",
+-			requestPath:  endpointPath + "/dashboard",
+-			wantCode:     http.StatusOK,
+-			wantContains: "OK",
+-		},
+-		{
+-			name:         "baseURL without trailing slash, targetURL with prefix - allowed",
+-			baseURL:      strings.TrimSuffix(backend.URL, "/") + "/metrics",
+-			requestPath:  endpointPath + "/dashboard",
+-			wantCode:     http.StatusOK,
+-			wantContains: "OK",
+-		},
+-		{
+-			name:         "baseURL with trailing slash, targetURL matches prefix - allowed",
+-			baseURL:      backend.URL + "/metrics/",
+-			requestPath:  endpointPath + "/dashboard",
+-			wantCode:     http.StatusOK,
+-			wantContains: "OK",
+-		},
+-		{
+-			name:         "targetURL escapes from baseURL prefix - blocked",
+-			baseURL:      backend.URL + "/secure/metrics",
+-			requestPath:  endpointPath + "/../../public/data",
+-			wantCode:     http.StatusMovedPermanently,
+-			wantContains: "Moved Permanently",
+-		},
+-		{
+-			name:         "targetURL attempts sibling directory access - blocked",
+-			baseURL:      backend.URL + "/app/metrics",
+-			requestPath:  endpointPath + "/../admin/config",
+-			wantCode:     http.StatusMovedPermanently,
+-			wantContains: "Moved Permanently",
+-		},
+-		{
+-			name:         "targetURL with encoded dots - path.Clean prevents traversal",
+-			baseURL:      backend.URL + "/app/metrics",
+-			requestPath:  endpointPath + "/%2e%2e/admin/config",
+-			wantCode:     http.StatusOK,
+-			wantContains: "OK",
+-		},
+-		{
+-			name:         "baseURL validation - exact match is allowed",
+-			baseURL:      backend.URL,
+-			requestPath:  endpointPath + "/",
+-			wantCode:     http.StatusOK,
+-			wantContains: "OK",
+-		},
+-		{
+-			name:         "baseURL validation - proper prefix is allowed",
+-			baseURL:      backend.URL + "/secure",
+-			requestPath:  endpointPath + "/dashboard",
+-			wantCode:     http.StatusOK,
+-			wantContains: "OK",
+-		},
+-	}
+-
+-	for _, tc := range cases {
+-		tc := tc
+-		t.Run(tc.name, func(t *testing.T) {
+-			// Configure the metrics proxy with the specific BaseURL
+-			cfg := *a.config
+-			cfg.UIConfig.MetricsProxy = config.UIMetricsProxy{
+-				BaseURL: tc.baseURL,
+-			}
+-
+-			require.NoError(t, a.reloadConfigInternal(&cfg))
+-
+-			// Make the request
+-			h := a.srv.handler()
+-			req := httptest.NewRequest("GET", tc.requestPath, nil)
+-			rec := httptest.NewRecorder()
+-
+-			h.ServeHTTP(rec, req)
+-
+-			require.Equal(t, tc.wantCode, rec.Code,
+-				"Wrong status code for %s. Body = %s", tc.name, rec.Body.String())
+-
+-			if tc.wantContains != "" {
+-				require.Contains(t, rec.Body.String(), tc.wantContains,
+-					"Response body should contain expected text for %s", tc.name)
+-			}
+-		})
+-	}
+-}

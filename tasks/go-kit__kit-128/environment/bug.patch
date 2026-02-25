@@ -1,0 +1,880 @@
+diff --git a/examples/stringsvc3/proxying.go b/examples/stringsvc3/proxying.go
+index 6de5e1d..6427b06 100644
+--- a/examples/stringsvc3/proxying.go
++++ b/examples/stringsvc3/proxying.go
+@@ -3,7 +3,6 @@ package main
+ import (
+ 	"errors"
+ 	"fmt"
+-	"io"
+ 	"net/url"
+ 	"strings"
+ 	"time"
+@@ -65,12 +64,12 @@ func (mw proxymw) Uppercase(s string) (string, error) {
+ }
+ 
+ func factory(ctx context.Context, qps int) loadbalancer.Factory {
+-	return func(instance string) (endpoint.Endpoint, io.Closer, error) {
++	return func(instance string) (endpoint.Endpoint, error) {
+ 		var e endpoint.Endpoint
+ 		e = makeUppercaseProxy(ctx, instance)
+ 		e = circuitbreaker.Gobreaker(gobreaker.NewCircuitBreaker(gobreaker.Settings{}))(e)
+ 		e = kitratelimit.NewTokenBucketLimiter(jujuratelimit.NewBucketWithRate(float64(qps), int64(qps)))(e)
+-		return e, nil, nil
++		return e, nil
+ 	}
+ }
+ 
+diff --git a/loadbalancer/dnssrv/publisher.go b/loadbalancer/dnssrv/publisher.go
+index 8a81afa..0f9fe9f 100644
+--- a/loadbalancer/dnssrv/publisher.go
++++ b/loadbalancer/dnssrv/publisher.go
+@@ -1,8 +1,10 @@
+ package dnssrv
+ 
+ import (
++	"crypto/md5"
+ 	"fmt"
+ 	"net"
++	"sort"
+ 	"time"
+ 
+ 	"github.com/go-kit/kit/endpoint"
+@@ -13,11 +15,12 @@ import (
+ // Publisher yields endpoints taken from the named DNS SRV record. The name is
+ // resolved on a fixed schedule. Priorities and weights are ignored.
+ type Publisher struct {
+-	name   string
+-	ttl    time.Duration
+-	cache  *loadbalancer.EndpointCache
+-	logger log.Logger
+-	quit   chan struct{}
++	name      string
++	ttl       time.Duration
++	factory   loadbalancer.Factory
++	logger    log.Logger
++	endpoints chan []endpoint.Endpoint
++	quit      chan struct{}
+ }
+ 
+ // NewPublisher returns a DNS SRV publisher. The name is resolved
+@@ -25,25 +28,22 @@ type Publisher struct {
+ // constructor will return an error. The factory is used to convert a
+ // host:port to a usable endpoint. The logger is used to report DNS and
+ // factory errors.
+-func NewPublisher(name string, ttl time.Duration, factory loadbalancer.Factory, logger log.Logger) *Publisher {
+-	p := &Publisher{
+-		name:   name,
+-		ttl:    ttl,
+-		cache:  loadbalancer.NewEndpointCache(factory, logger),
+-		logger: logger,
+-		quit:   make(chan struct{}),
+-	}
+-
+-	instances, err := p.resolve()
++func NewPublisher(name string, ttl time.Duration, f loadbalancer.Factory, logger log.Logger) (*Publisher, error) {
++	logger = log.NewContext(logger).With("component", "DNS SRV Publisher")
++	addrs, md5, err := resolve(name)
+ 	if err != nil {
+-		logger.Log(name, len(instances))
+-	} else {
+-		logger.Log(name, err)
++		return nil, err
+ 	}
+-	p.cache.Replace(instances)
+-
+-	go p.loop()
+-	return p
++	p := &Publisher{
++		name:      name,
++		ttl:       ttl,
++		factory:   f,
++		logger:    logger,
++		endpoints: make(chan []endpoint.Endpoint),
++		quit:      make(chan struct{}),
++	}
++	go p.loop(makeEndpoints(addrs, f, logger), md5)
++	return p, nil
+ }
+ 
+ // Stop terminates the publisher.
+@@ -51,18 +51,25 @@ func (p *Publisher) Stop() {
+ 	close(p.quit)
+ }
+ 
+-func (p *Publisher) loop() {
++func (p *Publisher) loop(endpoints []endpoint.Endpoint, md5 string) {
+ 	t := newTicker(p.ttl)
+ 	defer t.Stop()
+ 	for {
+ 		select {
++		case p.endpoints <- endpoints:
++
+ 		case <-t.C:
+-			instances, err := p.resolve()
++			// TODO should we do this out-of-band?
++			addrs, newmd5, err := resolve(p.name)
+ 			if err != nil {
+-				p.logger.Log(p.name, err)
+-				continue // don't replace potentially-good with bad
++				p.logger.Log("name", p.name, "err", err)
++				continue // don't replace good endpoints with bad ones
++			}
++			if newmd5 == md5 {
++				continue // no change
+ 			}
+-			p.cache.Replace(instances)
++			endpoints = makeEndpoints(addrs, p.factory, p.logger)
++			md5 = newmd5
+ 
+ 		case <-p.quit:
+ 			return
+@@ -72,7 +79,12 @@ func (p *Publisher) loop() {
+ 
+ // Endpoints implements the Publisher interface.
+ func (p *Publisher) Endpoints() ([]endpoint.Endpoint, error) {
+-	return p.cache.Endpoints(), nil
++	select {
++	case endpoints := <-p.endpoints:
++		return endpoints, nil
++	case <-p.quit:
++		return nil, loadbalancer.ErrPublisherStopped
++	}
+ }
+ 
+ var (
+@@ -80,14 +92,36 @@ var (
+ 	newTicker = time.NewTicker
+ )
+ 
+-func (p *Publisher) resolve() ([]string, error) {
+-	_, addrs, err := lookupSRV("", "", p.name)
++func resolve(name string) (addrs []*net.SRV, md5sum string, err error) {
++	_, addrs, err = lookupSRV("", "", name)
+ 	if err != nil {
+-		return []string{}, err
++		return addrs, "", err
+ 	}
+-	instances := make([]string, len(addrs))
++	hostports := make([]string, len(addrs))
+ 	for i, addr := range addrs {
+-		instances[i] = net.JoinHostPort(addr.Target, fmt.Sprint(addr.Port))
++		hostports[i] = fmt.Sprintf("%s:%d", addr.Target, addr.Port)
++	}
++	sort.Sort(sort.StringSlice(hostports))
++	h := md5.New()
++	for _, hostport := range hostports {
++		fmt.Fprintf(h, hostport)
++	}
++	return addrs, fmt.Sprintf("%x", h.Sum(nil)), nil
++}
++
++func makeEndpoints(addrs []*net.SRV, f loadbalancer.Factory, logger log.Logger) []endpoint.Endpoint {
++	endpoints := make([]endpoint.Endpoint, 0, len(addrs))
++	for _, addr := range addrs {
++		endpoint, err := f(addr2instance(addr))
++		if err != nil {
++			logger.Log("instance", addr2instance(addr), "err", err)
++			continue
++		}
++		endpoints = append(endpoints, endpoint)
+ 	}
+-	return instances, nil
++	return endpoints
++}
++
++func addr2instance(addr *net.SRV) string {
++	return net.JoinHostPort(addr.Target, fmt.Sprint(addr.Port))
+ }
+diff --git a/loadbalancer/dnssrv/publisher_internal_test.go b/loadbalancer/dnssrv/publisher_internal_test.go
+index 9fa0fb4..49680f7 100644
+--- a/loadbalancer/dnssrv/publisher_internal_test.go
++++ b/loadbalancer/dnssrv/publisher_internal_test.go
+@@ -2,7 +2,6 @@ package dnssrv
+ 
+ import (
+ 	"errors"
+-	"io"
+ 	"net"
+ 	"sync/atomic"
+ 	"testing"
+@@ -11,19 +10,37 @@ import (
+ 	"golang.org/x/net/context"
+ 
+ 	"github.com/go-kit/kit/endpoint"
++	"github.com/go-kit/kit/loadbalancer"
+ 	"github.com/go-kit/kit/log"
+ )
+ 
+ func TestPublisher(t *testing.T) {
+ 	var (
+-		name    = "foo"
+-		ttl     = time.Second
+-		e       = func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil }
+-		factory = func(string) (endpoint.Endpoint, io.Closer, error) { return e, nil, nil }
+-		logger  = log.NewNopLogger()
++		target = "my-target"
++		port   = uint16(1234)
++		addr   = &net.SRV{Target: target, Port: port}
++		addrs  = []*net.SRV{addr}
++		name   = "my-name"
++		ttl    = time.Second
++		logger = log.NewNopLogger()
++		e      = func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil }
+ 	)
+ 
+-	p := NewPublisher(name, ttl, factory, logger)
++	oldLookup := lookupSRV
++	defer func() { lookupSRV = oldLookup }()
++	lookupSRV = mockLookupSRV(addrs, nil, nil)
++
++	factory := func(instance string) (endpoint.Endpoint, error) {
++		if want, have := addr2instance(addr), instance; want != have {
++			t.Errorf("want %q, have %q", want, have)
++		}
++		return e, nil
++	}
++
++	p, err := NewPublisher(name, ttl, factory, logger)
++	if err != nil {
++		t.Fatal(err)
++	}
+ 	defer p.Stop()
+ 
+ 	if _, err := p.Endpoints(); err != nil {
+@@ -39,20 +56,12 @@ func TestBadLookup(t *testing.T) {
+ 	var (
+ 		name    = "some-name"
+ 		ttl     = time.Second
+-		e       = func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil }
+-		factory = func(string) (endpoint.Endpoint, io.Closer, error) { return e, nil, nil }
++		factory = func(string) (endpoint.Endpoint, error) { return nil, errors.New("unreachable") }
+ 		logger  = log.NewNopLogger()
+ 	)
+ 
+-	p := NewPublisher(name, ttl, factory, logger)
+-	defer p.Stop()
+-
+-	endpoints, err := p.Endpoints()
+-	if err != nil {
+-		t.Error(err)
+-	}
+-	if want, have := 0, len(endpoints); want != have {
+-		t.Errorf("want %d, have %d", want, have)
++	if _, err := NewPublisher(name, ttl, factory, logger); err == nil {
++		t.Fatal("wanted error, got none")
+ 	}
+ }
+ 
+@@ -62,7 +71,7 @@ func TestBadFactory(t *testing.T) {
+ 		addrs   = []*net.SRV{addr}
+ 		name    = "some-name"
+ 		ttl     = time.Second
+-		factory = func(string) (endpoint.Endpoint, io.Closer, error) { return nil, nil, errors.New("kaboom") }
++		factory = func(string) (endpoint.Endpoint, error) { return nil, errors.New("kaboom") }
+ 		logger  = log.NewNopLogger()
+ 	)
+ 
+@@ -70,12 +79,15 @@ func TestBadFactory(t *testing.T) {
+ 	defer func() { lookupSRV = oldLookup }()
+ 	lookupSRV = mockLookupSRV(addrs, nil, nil)
+ 
+-	p := NewPublisher(name, ttl, factory, logger)
++	p, err := NewPublisher(name, ttl, factory, logger)
++	if err != nil {
++		t.Fatal(err)
++	}
+ 	defer p.Stop()
+ 
+ 	endpoints, err := p.Endpoints()
+ 	if err != nil {
+-		t.Error(err)
++		t.Fatal(err)
+ 	}
+ 	if want, have := 0, len(endpoints); want != have {
+ 		t.Errorf("want %q, have %q", want, have)
+@@ -95,7 +107,7 @@ func TestRefreshNoChange(t *testing.T) {
+ 		addrs   = []*net.SRV{addr}
+ 		name    = "my-name"
+ 		ttl     = time.Second
+-		factory = func(string) (endpoint.Endpoint, io.Closer, error) { return nil, nil, errors.New("kaboom") }
++		factory = func(string) (endpoint.Endpoint, error) { return nil, errors.New("kaboom") }
+ 		logger  = log.NewNopLogger()
+ 	)
+ 
+@@ -108,7 +120,10 @@ func TestRefreshNoChange(t *testing.T) {
+ 	defer func() { lookupSRV = oldLookup }()
+ 	lookupSRV = mockLookupSRV(addrs, nil, &resolves)
+ 
+-	p := NewPublisher(name, ttl, factory, logger)
++	p, err := NewPublisher(name, ttl, factory, logger)
++	if err != nil {
++		t.Fatal(err)
++	}
+ 	defer p.Stop()
+ 
+ 	tick <- time.Now()
+@@ -121,6 +136,30 @@ func TestRefreshResolveError(t *testing.T) {
+ 	t.Skip("TODO")
+ }
+ 
++func TestErrPublisherStopped(t *testing.T) {
++	var (
++		name    = "my-name"
++		ttl     = time.Second
++		factory = func(string) (endpoint.Endpoint, error) { return nil, errors.New("kaboom") }
++		logger  = log.NewNopLogger()
++	)
++
++	oldLookup := lookupSRV
++	defer func() { lookupSRV = oldLookup }()
++	lookupSRV = mockLookupSRV([]*net.SRV{}, nil, nil)
++
++	p, err := NewPublisher(name, ttl, factory, logger)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	p.Stop()
++	_, have := p.Endpoints()
++	if want := loadbalancer.ErrPublisherStopped; want != have {
++		t.Fatalf("want %v, have %v", want, have)
++	}
++}
++
+ func mockLookupSRV(addrs []*net.SRV, err error, count *uint64) func(service, proto, name string) (string, []*net.SRV, error) {
+ 	return func(service, proto, name string) (string, []*net.SRV, error) {
+ 		if count != nil {
+diff --git a/loadbalancer/endpoint_cache.go b/loadbalancer/endpoint_cache.go
+deleted file mode 100644
+index f4b8bc9..0000000
+--- a/loadbalancer/endpoint_cache.go
++++ /dev/null
+@@ -1,90 +0,0 @@
+-package loadbalancer
+-
+-import (
+-	"io"
+-	"sync"
+-
+-	"github.com/go-kit/kit/endpoint"
+-	"github.com/go-kit/kit/log"
+-)
+-
+-// EndpointCache caches endpoints that need to be deallocated when they're no
+-// longer useful. Clients update the cache by providing a current set of
+-// instance strings. The cache converts each instance string to an endpoint
+-// and a closer via the factory function.
+-//
+-// Instance strings are assumed to be unique and are used as keys. Endpoints
+-// that were in the previous set of instances and are not in the current set
+-// are considered invalid and closed.
+-//
+-// EndpointCache is designed to be used in your publisher implementation.
+-type EndpointCache struct {
+-	mtx    sync.RWMutex
+-	f      Factory
+-	m      map[string]endpointCloser
+-	logger log.Logger
+-}
+-
+-// NewEndpointCache produces a new EndpointCache, ready for use. Instance
+-// strings will be converted to endpoints via the provided factory function.
+-// The logger is used to log errors.
+-func NewEndpointCache(f Factory, logger log.Logger) *EndpointCache {
+-	return &EndpointCache{
+-		f:      f,
+-		m:      map[string]endpointCloser{},
+-		logger: log.NewContext(logger).With("component", "Endpoint Cache"),
+-	}
+-}
+-
+-type endpointCloser struct {
+-	endpoint.Endpoint
+-	io.Closer
+-}
+-
+-// Replace replaces the current set of endpoints with endpoints manufactured
+-// by the passed instances. If the same instance exists in both the existing
+-// and new sets, it's left untouched.
+-func (t *EndpointCache) Replace(instances []string) {
+-	t.mtx.Lock()
+-	defer t.mtx.Unlock()
+-
+-	// Produce the current set of endpoints.
+-	m := make(map[string]endpointCloser, len(instances))
+-	for _, instance := range instances {
+-		// If it already exists, just copy it over.
+-		if ec, ok := t.m[instance]; ok {
+-			m[instance] = ec
+-			delete(t.m, instance)
+-			continue
+-		}
+-
+-		// If it doesn't exist, create it.
+-		endpoint, closer, err := t.f(instance)
+-		if err != nil {
+-			t.logger.Log("instance", instance, "err", err)
+-			continue
+-		}
+-		m[instance] = endpointCloser{endpoint, closer}
+-	}
+-
+-	// Close any leftover endpoints.
+-	for _, ec := range t.m {
+-		if ec.Closer != nil {
+-			ec.Closer.Close()
+-		}
+-	}
+-
+-	// Swap and GC.
+-	t.m = m
+-}
+-
+-// Endpoints returns the current set of endpoints in undefined order.
+-func (t *EndpointCache) Endpoints() []endpoint.Endpoint {
+-	t.mtx.RLock()
+-	defer t.mtx.RUnlock()
+-	a := make([]endpoint.Endpoint, 0, len(t.m))
+-	for _, ec := range t.m {
+-		a = append(a, ec.Endpoint)
+-	}
+-	return a
+-}
+diff --git a/loadbalancer/endpoint_cache_test.go b/loadbalancer/endpoint_cache_test.go
+deleted file mode 100644
+index d471146..0000000
+--- a/loadbalancer/endpoint_cache_test.go
++++ /dev/null
+@@ -1,71 +0,0 @@
+-package loadbalancer_test
+-
+-import (
+-	"io"
+-	"testing"
+-	"time"
+-
+-	"golang.org/x/net/context"
+-
+-	"github.com/go-kit/kit/endpoint"
+-	"github.com/go-kit/kit/loadbalancer"
+-	"github.com/go-kit/kit/log"
+-)
+-
+-func TestEndpointCache(t *testing.T) {
+-	var (
+-		e  = func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil }
+-		ca = make(closer)
+-		cb = make(closer)
+-		c  = map[string]io.Closer{"a": ca, "b": cb}
+-		f  = func(s string) (endpoint.Endpoint, io.Closer, error) { return e, c[s], nil }
+-		ec = loadbalancer.NewEndpointCache(f, log.NewNopLogger())
+-	)
+-
+-	// Populate
+-	ec.Replace([]string{"a", "b"})
+-	select {
+-	case <-ca:
+-		t.Errorf("endpoint a closed, not good")
+-	case <-cb:
+-		t.Errorf("endpoint b closed, not good")
+-	case <-time.After(time.Millisecond):
+-		t.Logf("no closures yet, good")
+-	}
+-
+-	// Duplicate, should be no-op
+-	ec.Replace([]string{"a", "b"})
+-	select {
+-	case <-ca:
+-		t.Errorf("endpoint a closed, not good")
+-	case <-cb:
+-		t.Errorf("endpoint b closed, not good")
+-	case <-time.After(time.Millisecond):
+-		t.Logf("no closures yet, good")
+-	}
+-
+-	// Delete b
+-	go ec.Replace([]string{"a"})
+-	select {
+-	case <-ca:
+-		t.Errorf("endpoint a closed, not good")
+-	case <-cb:
+-		t.Logf("endpoint b closed, good")
+-	case <-time.After(time.Millisecond):
+-		t.Errorf("didn't close the deleted instance in time")
+-	}
+-
+-	// Delete a
+-	go ec.Replace([]string{""})
+-	select {
+-	// case <-cb: will succeed, as it's closed
+-	case <-ca:
+-		t.Logf("endpoint a closed, good")
+-	case <-time.After(time.Millisecond):
+-		t.Errorf("didn't close the deleted instance in time")
+-	}
+-}
+-
+-type closer chan struct{}
+-
+-func (c closer) Close() error { close(c); return nil }
+diff --git a/loadbalancer/etcd/client.go b/loadbalancer/etcd/client.go
+index c19101d..27d9284 100644
+--- a/loadbalancer/etcd/client.go
++++ b/loadbalancer/etcd/client.go
+@@ -7,7 +7,7 @@ import (
+ 	"github.com/coreos/go-etcd/etcd"
+ )
+ 
+-// Client is a wrapper arround the etcd client.
++// Client is a wrapper arround the etcd client
+ type Client interface {
+ 	// GetEntries will query the given prefix in etcd and returns a set of entries.
+ 	GetEntries(prefix string) ([]string, error)
+@@ -43,7 +43,7 @@ func NewClient(machines []string, cert, key, caCert string) (Client, error) {
+ 	return &client{c}, nil
+ }
+ 
+-// GetEntries implements the etcd Client interface.
++// GetEntries implements the EtcdClient interface.
+ func (c *client) GetEntries(key string) ([]string, error) {
+ 	resp, err := c.Get(key, false, true)
+ 	if err != nil {
+@@ -57,7 +57,7 @@ func (c *client) GetEntries(key string) ([]string, error) {
+ 	return entries, nil
+ }
+ 
+-// WatchPrefix implements the etcd Client interface.
++// WatchPrefix implements the EtcdClient interface.
+ func (c *client) WatchPrefix(prefix string, responseChan chan *etcd.Response) {
+ 	c.Watch(prefix, 0, true, responseChan, nil)
+ }
+diff --git a/loadbalancer/etcd/publisher.go b/loadbalancer/etcd/publisher.go
+index dbafd65..27e9912 100644
+--- a/loadbalancer/etcd/publisher.go
++++ b/loadbalancer/etcd/publisher.go
+@@ -9,50 +9,53 @@ import (
+ )
+ 
+ // Publisher yield endpoints stored in a certain etcd keyspace. Any kind of
+-// change in that keyspace is watched and will update the Publisher endpoints.
++// change in that keyspace is watched and wil update the Publisher endpoints.
+ type Publisher struct {
+-	client Client
+-	prefix string
+-	cache  *loadbalancer.EndpointCache
+-	logger log.Logger
+-	quit   chan struct{}
++	client    Client
++	prefix    string
++	factory   loadbalancer.Factory
++	logger    log.Logger
++	endpoints chan []endpoint.Endpoint
++	quit      chan struct{}
+ }
+ 
+ // NewPublisher returs a etcd publisher. Etcd will start watching the given
+ // prefix for changes and update the Publisher endpoints.
+ func NewPublisher(c Client, prefix string, f loadbalancer.Factory, logger log.Logger) (*Publisher, error) {
++	logger = log.NewContext(logger).With("component", "Etcd Publisher")
++
+ 	p := &Publisher{
+-		client: c,
+-		prefix: prefix,
+-		cache:  loadbalancer.NewEndpointCache(f, logger),
+-		logger: logger,
+-		quit:   make(chan struct{}),
++		client:    c,
++		prefix:    prefix,
++		factory:   f,
++		logger:    logger,
++		endpoints: make(chan []endpoint.Endpoint),
++		quit:      make(chan struct{}),
+ 	}
+ 
+-	instances, err := p.client.GetEntries(p.prefix)
+-	if err == nil {
+-		logger.Log(p.prefix, len(instances))
+-	} else {
+-		logger.Log("msg", "failed to retrieve entries", "err", err)
++	entries, err := p.client.GetEntries(prefix)
++	if err != nil {
++		return nil, err
+ 	}
+-	p.cache.Replace(instances)
+-
+-	go p.loop()
++	go p.loop(makeEndpoints(entries, f, logger))
+ 	return p, nil
+ }
+ 
+-func (p *Publisher) loop() {
++func (p *Publisher) loop(endpoints []endpoint.Endpoint) {
+ 	responseChan := make(chan *etcd.Response)
+ 	go p.client.WatchPrefix(p.prefix, responseChan)
++
+ 	for {
+ 		select {
++		case p.endpoints <- endpoints:
++
+ 		case <-responseChan:
+-			instances, err := p.client.GetEntries(p.prefix)
++			entries, err := p.client.GetEntries(p.prefix)
+ 			if err != nil {
+ 				p.logger.Log("msg", "failed to retrieve entries", "err", err)
+ 				continue
+ 			}
+-			p.cache.Replace(instances)
++			endpoints = makeEndpoints(entries, p.factory, p.logger)
+ 
+ 		case <-p.quit:
+ 			return
+@@ -62,10 +65,29 @@ func (p *Publisher) loop() {
+ 
+ // Endpoints implements the Publisher interface.
+ func (p *Publisher) Endpoints() ([]endpoint.Endpoint, error) {
+-	return p.cache.Endpoints(), nil
++	select {
++	case endpoints := <-p.endpoints:
++		return endpoints, nil
++	case <-p.quit:
++		return nil, loadbalancer.ErrPublisherStopped
++	}
+ }
+ 
+-// Stop terminates the Publisher.
++// Stop terminates the publisher.
+ func (p *Publisher) Stop() {
+ 	close(p.quit)
+ }
++
++func makeEndpoints(addrs []string, f loadbalancer.Factory, logger log.Logger) []endpoint.Endpoint {
++	endpoints := make([]endpoint.Endpoint, 0, len(addrs))
++
++	for _, addr := range addrs {
++		endpoint, err := f(addr)
++		if err != nil {
++			logger.Log("instance", addr, "err", err)
++			continue
++		}
++		endpoints = append(endpoints, endpoint)
++	}
++	return endpoints
++}
+diff --git a/loadbalancer/etcd/publisher_test.go b/loadbalancer/etcd/publisher_test.go
+index 89668bb..c17ba25 100644
+--- a/loadbalancer/etcd/publisher_test.go
++++ b/loadbalancer/etcd/publisher_test.go
+@@ -2,13 +2,13 @@ package etcd_test
+ 
+ import (
+ 	"errors"
+-	"io"
+ 	"testing"
+ 
+ 	stdetcd "github.com/coreos/go-etcd/etcd"
+ 	"golang.org/x/net/context"
+ 
+ 	"github.com/go-kit/kit/endpoint"
++	"github.com/go-kit/kit/loadbalancer"
+ 	kitetcd "github.com/go-kit/kit/loadbalancer/etcd"
+ 	"github.com/go-kit/kit/log"
+ )
+@@ -32,8 +32,8 @@ func TestPublisher(t *testing.T) {
+ 		e      = func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil }
+ 	)
+ 
+-	factory := func(string) (endpoint.Endpoint, io.Closer, error) {
+-		return e, nil, nil
++	factory := func(instance string) (endpoint.Endpoint, error) {
++		return e, nil
+ 	}
+ 
+ 	client := &fakeClient{
+@@ -52,10 +52,13 @@ func TestPublisher(t *testing.T) {
+ }
+ 
+ func TestBadFactory(t *testing.T) {
+-	logger := log.NewNopLogger()
++	var (
++		logger = log.NewNopLogger()
++		e      = func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil }
++	)
+ 
+-	factory := func(string) (endpoint.Endpoint, io.Closer, error) {
+-		return nil, nil, errors.New("kaboom")
++	factory := func(instance string) (endpoint.Endpoint, error) {
++		return e, errors.New("_")
+ 	}
+ 
+ 	client := &fakeClient{
+@@ -78,6 +81,33 @@ func TestBadFactory(t *testing.T) {
+ 	}
+ }
+ 
++func TestPublisherStoppped(t *testing.T) {
++	var (
++		logger = log.NewNopLogger()
++		e      = func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil }
++	)
++
++	factory := func(instance string) (endpoint.Endpoint, error) {
++		return e, errors.New("_")
++	}
++
++	client := &fakeClient{
++		responses: map[string]*stdetcd.Response{"/foo": fakeResponse},
++	}
++
++	p, err := kitetcd.NewPublisher(client, "/foo", factory, logger)
++	if err != nil {
++		t.Fatalf("failed to create new publisher: %v", err)
++	}
++
++	p.Stop()
++
++	_, have := p.Endpoints()
++	if want := loadbalancer.ErrPublisherStopped; want != have {
++		t.Fatalf("want %v, have %v", want, have)
++	}
++}
++
+ type fakeClient struct {
+ 	responses map[string]*stdetcd.Response
+ }
+diff --git a/loadbalancer/factory.go b/loadbalancer/factory.go
+index 71a7be5..2974033 100644
+--- a/loadbalancer/factory.go
++++ b/loadbalancer/factory.go
+@@ -1,10 +1,6 @@
+ package loadbalancer
+ 
+-import (
+-	"io"
+-
+-	"github.com/go-kit/kit/endpoint"
+-)
++import "github.com/go-kit/kit/endpoint"
+ 
+ // Factory is a function that converts an instance string, e.g. a host:port,
+ // to a usable endpoint. Factories are used by load balancers to convert
+@@ -12,4 +8,4 @@ import (
+ // endpoints. Users are expected to provide their own factory functions that
+ // assume specific transports, or can deduce transports by parsing the
+ // instance string.
+-type Factory func(instance string) (endpoint.Endpoint, io.Closer, error)
++type Factory func(instance string) (endpoint.Endpoint, error)
+diff --git a/loadbalancer/publisher.go b/loadbalancer/publisher.go
+index ec17d7e..d175da8 100644
+--- a/loadbalancer/publisher.go
++++ b/loadbalancer/publisher.go
+@@ -1,6 +1,10 @@
+ package loadbalancer
+ 
+-import "github.com/go-kit/kit/endpoint"
++import (
++	"errors"
++
++	"github.com/go-kit/kit/endpoint"
++)
+ 
+ // Publisher describes something that provides a set of identical endpoints.
+ // Different publisher implementations exist for different kinds of service
+@@ -8,3 +12,7 @@ import "github.com/go-kit/kit/endpoint"
+ type Publisher interface {
+ 	Endpoints() ([]endpoint.Endpoint, error)
+ }
++
++// ErrPublisherStopped is returned by publishers when the underlying
++// implementation has been terminated and can no longer serve requests.
++var ErrPublisherStopped = errors.New("publisher stopped")
+diff --git a/loadbalancer/random_test.go b/loadbalancer/random_test.go
+index e6c5f83..156cf3d 100644
+--- a/loadbalancer/random_test.go
++++ b/loadbalancer/random_test.go
+@@ -35,9 +35,7 @@ func TestRandomDistribution(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+-		if _, err := e(ctx, struct{}{}); err != nil {
+-			t.Error(err)
+-		}
++		e(ctx, struct{}{})
+ 	}
+ 
+ 	for i, have := range counts {
+diff --git a/loadbalancer/round_robin_test.go b/loadbalancer/round_robin_test.go
+index beabe80..9f5fcbb 100644
+--- a/loadbalancer/round_robin_test.go
++++ b/loadbalancer/round_robin_test.go
+@@ -36,9 +36,7 @@ func TestRoundRobinDistribution(t *testing.T) {
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+-		if _, err := e(ctx, struct{}{}); err != nil {
+-			t.Error(err)
+-		}
++		e(ctx, struct{}{})
+ 		if have := counts; !reflect.DeepEqual(want, have) {
+ 			t.Fatalf("%d: want %v, have %v", i, want, have)
+ 		}
+diff --git a/loadbalancer/static/publisher.go b/loadbalancer/static/publisher.go
+index 88b0f26..d92948a 100644
+--- a/loadbalancer/static/publisher.go
++++ b/loadbalancer/static/publisher.go
+@@ -8,24 +8,19 @@ import (
+ )
+ 
+ // Publisher yields a set of static endpoints as produced by the passed factory.
+-type Publisher struct{ publisher *fixed.Publisher }
++type Publisher struct{ *fixed.Publisher }
+ 
+ // NewPublisher returns a static endpoint Publisher.
+ func NewPublisher(instances []string, factory loadbalancer.Factory, logger log.Logger) Publisher {
+-	logger = log.NewContext(logger).With("component", "Static Publisher")
++	logger = log.NewContext(logger).With("component", "Fixed Publisher")
+ 	endpoints := []endpoint.Endpoint{}
+ 	for _, instance := range instances {
+-		e, _, err := factory(instance) // never close
++		e, err := factory(instance)
+ 		if err != nil {
+ 			_ = logger.Log("instance", instance, "err", err)
+ 			continue
+ 		}
+ 		endpoints = append(endpoints, e)
+ 	}
+-	return Publisher{publisher: fixed.NewPublisher(endpoints)}
+-}
+-
+-// Endpoints implements Publisher.
+-func (p Publisher) Endpoints() ([]endpoint.Endpoint, error) {
+-	return p.publisher.Endpoints()
++	return Publisher{fixed.NewPublisher(endpoints)}
+ }
+diff --git a/loadbalancer/static/publisher_test.go b/loadbalancer/static/publisher_test.go
+index 42cd581..196d91e 100644
+--- a/loadbalancer/static/publisher_test.go
++++ b/loadbalancer/static/publisher_test.go
+@@ -2,7 +2,6 @@ package static_test
+ 
+ import (
+ 	"fmt"
+-	"io"
+ 	"testing"
+ 
+ 	"golang.org/x/net/context"
+@@ -20,11 +19,11 @@ func TestStatic(t *testing.T) {
+ 			"bar": func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil },
+ 			"baz": func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil },
+ 		}
+-		factory = func(instance string) (endpoint.Endpoint, io.Closer, error) {
++		factory = func(instance string) (endpoint.Endpoint, error) {
+ 			if e, ok := endpoints[instance]; ok {
+-				return e, nil, nil
++				return e, nil
+ 			}
+-			return nil, nil, fmt.Errorf("%s: not found", instance)
++			return nil, fmt.Errorf("%s: not found", instance)
+ 		}
+ 	)
+ 	p := static.NewPublisher(instances, factory, log.NewNopLogger())

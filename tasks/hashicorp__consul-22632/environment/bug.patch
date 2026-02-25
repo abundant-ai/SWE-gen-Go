@@ -1,0 +1,312 @@
+diff --git a/.changelog/22624.txt b/.changelog/22624.txt
+deleted file mode 100644
+index 29c4a841f9..0000000000
+--- a/.changelog/22624.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-```release-note:improvement
+-cli: add troubleshoot ports in debug command. A ports.json file is created, which lists the open or closed ports on the host where the command is executed.
+-```
+diff --git a/command/debug/debug.go b/command/debug/debug.go
+index c0bce85126..30384017f7 100644
+--- a/command/debug/debug.go
++++ b/command/debug/debug.go
+@@ -13,13 +13,10 @@ import (
+ 	"flag"
+ 	"fmt"
+ 	"io"
+-	"net"
+ 	"os"
+ 	"os/signal"
+ 	"path/filepath"
+-	"strconv"
+ 	"strings"
+-	"sync"
+ 	"syscall"
+ 	"time"
+ 
+@@ -55,13 +52,6 @@ const (
+ 	// to ensure that all information can be collected in time
+ 	debugMinDuration = 10 * time.Second
+ 
+-	// validatePortsTimeout is the timeout while checking connectivity to default ports
+-	// This is same as the timeout used in troubleshoot ports command
+-	validatePortsTimeout = 5 * time.Second
+-
+-	// debugDefaultHost is the host on which connectivity to default ports are validated
+-	debugDefaultHost = "localhost"
+-
+ 	// debugArchiveExtension is the extension for archive files
+ 	debugArchiveExtension = ".tar.gz"
+ 
+@@ -121,11 +111,6 @@ type debugIndex struct {
+ 	Targets []string
+ }
+ 
+-type PortStatus struct {
+-	Open   []string `json:"Open"`
+-	Closed []string `json:"Closed"`
+-}
+-
+ // timeDateformat is a modified version of time.RFC3339 which replaces colons with
+ // hyphens. This is to make it more convenient to untar these files, because
+ // tar assumes colons indicate the file is on a remote host, unless --force-local
+@@ -228,12 +213,6 @@ func (c *cmd) Run(args []string) int {
+ 		c.UI.Warn(fmt.Sprintf("Static capture failed: %v", err))
+ 	}
+ 
+-	// Capture ports connectivity report
+-	err = c.troubleshootPorts()
+-	if err != nil {
+-		c.UI.Warn(fmt.Sprintf("Troubleshoot ports failed: %v", err))
+-	}
+-
+ 	// Capture dynamic information from the target agent, blocking for duration
+ 	if c.captureTarget(targetMetrics) || c.captureTarget(targetLogs) || c.captureTarget(targetProfiles) {
+ 		g := new(errgroup.Group)
+@@ -403,83 +382,6 @@ func (c *cmd) captureStatic() error {
+ 	return errs
+ }
+ 
+-func (c *cmd) troubleshootPorts() error {
+-	output, err := troubleshootRun(default_ports, debugDefaultHost)
+-	if err != nil {
+-		return err
+-	}
+-
+-	if err := writeJSONFile(filepath.Join(c.output, targetPorts+".json"), output); err != nil {
+-		return err
+-	}
+-
+-	return nil
+-}
+-
+-func troubleshootRun(ports []string, host string) (PortStatus, error) {
+-	numPorts := len(ports)
+-	openPorts := make(chan string, numPorts)
+-	closePorts := make(chan string, numPorts)
+-
+-	var portResults PortStatus
+-	var wg sync.WaitGroup
+-	wg.Add(numPorts)
+-
+-	for _, port := range ports {
+-		err := isValidPort(port)
+-		if err != nil {
+-			return portResults, err
+-		}
+-		go func(port string) {
+-			defer wg.Done()
+-
+-			address := fmt.Sprintf("%s:%s", host, port)
+-
+-			err := dialPort(address)
+-			if err != nil {
+-				closePorts <- port
+-			} else {
+-				// If no error occurs, the connection was successful, and the port is open.
+-				openPorts <- port
+-			}
+-		}(port)
+-	}
+-
+-	wg.Wait()
+-	close(openPorts)
+-	close(closePorts)
+-
+-	for port := range openPorts {
+-		portResults.Open = append(portResults.Open, port)
+-	}
+-
+-	for port := range closePorts {
+-		portResults.Closed = append(portResults.Closed, port)
+-	}
+-	return portResults, nil
+-}
+-
+-func dialPort(address string) error {
+-	// Attempt to establish a TCP connection with a timeout.
+-	conn, err := net.DialTimeout("tcp", address, validatePortsTimeout)
+-	if err != nil {
+-		return err
+-	}
+-	defer conn.Close()
+-	return nil
+-}
+-
+-func isValidPort(port string) error {
+-	portInt, err := strconv.Atoi(port)
+-	if err != nil {
+-		return fmt.Errorf("port %s is not a number", port)
+-	}
+-	if portInt < 0 || portInt > 65535 || port == "" {
+-		return fmt.Errorf("invalid port %s", port)
+-	}
+-	return nil
+-}
+-
+ func writeJSONFile(filename string, content interface{}) error {
+ 	marshaled, err := json.MarshalIndent(content, "", "\t")
+ 	if err != nil {
+@@ -902,13 +804,10 @@ const (
+ 	targetHost     = "host"
+ 	targetAgent    = "agent"
+ 	targetMembers  = "members"
+-	targetPorts    = "ports"
+ 	// targetCluster is the now deprecated name for targetMembers
+ 	targetCluster = "cluster"
+ )
+ 
+-var default_ports = []string{"8600", "8500", "8501", "8502", "8503", "8301", "8302", "8300"}
+-
+ // defaultTargets specifies the list of targets that will be captured by default
+ var defaultTargets = []string{
+ 	targetMetrics,
+diff --git a/command/debug/debug_test.go b/command/debug/debug_test.go
+index 826b7d9c02..c983382857 100644
+--- a/command/debug/debug_test.go
++++ b/command/debug/debug_test.go
+@@ -11,7 +11,6 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
+-	"net"
+ 	"os"
+ 	"path/filepath"
+ 	"regexp"
+@@ -21,7 +20,6 @@ import (
+ 
+ 	"github.com/google/pprof/profile"
+ 	"github.com/mitchellh/cli"
+-	testifyassert "github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ 	"gotest.tools/v3/assert"
+ 	"gotest.tools/v3/assert/cmp"
+@@ -80,7 +78,6 @@ func TestDebugCommand(t *testing.T) {
+ 			fs.WithFile("agent.json", "", fs.MatchFileContent(validJSON)),
+ 			fs.WithFile("host.json", "", fs.MatchFileContent(validJSON)),
+ 			fs.WithFile("members.json", "", fs.MatchFileContent(validJSON)),
+-			fs.WithFile("ports.json", "", fs.MatchFileContent(validJSON)),
+ 			fs.WithFile("metrics.json", "", fs.MatchAnyFileContent),
+ 			fs.WithFile("listpeers.json", "", fs.MatchAnyFileContent),
+ 			fs.WithFile("consul.log", "", fs.MatchFileContent(validLogFile)),
+@@ -228,7 +225,7 @@ func TestDebugCommand_Archive(t *testing.T) {
+ 		}
+ 
+ 		// should only contain this one capture target
+-		if h.Name != "debug/agent.json" && h.Name != "debug/index.json" && h.Name != "debug/listpeers.json" && h.Name != "debug/ports.json" {
++		if h.Name != "debug/agent.json" && h.Name != "debug/index.json" && h.Name != "debug/listpeers.json" {
+ 			t.Fatalf("archive contents do not match: %s", h.Name)
+ 		}
+ 	}
+@@ -680,110 +677,3 @@ func TestDebugCommand_PprofScenarios(t *testing.T) {
+ 		})
+ 	}
+ }
+-
+-func startMockTCPServer(t *testing.T, portsList []string) (cleanup func()) {
+-	t.Helper()
+-	var listeners []net.Listener
+-
+-	for _, port := range portsList {
+-		listener, err := net.Listen("tcp", "127.0.0.1:"+port)
+-		if err != nil {
+-			for _, l := range listeners {
+-				l.Close()
+-			}
+-			t.Fatalf("Failed to start mock TCP server on port %s: %v", port, err)
+-		}
+-
+-		listeners = append(listeners, listener)
+-
+-	}
+-	cleanup = func() {
+-		for _, l := range listeners {
+-			l.Close()
+-		}
+-	}
+-
+-	return cleanup
+-}
+-
+-func TestDebugCommand_TroubleshootPorts(t *testing.T) {
+-	if testing.Short() {
+-		t.Skip("too slow for testing.Short")
+-	}
+-
+-	emptyStrArr := []string{}
+-
+-	testCases := []struct {
+-		name        string
+-		portsOpen   []string
+-		portsClosed []string
+-	}{
+-		{
+-			name:        "All ports closed",
+-			portsOpen:   emptyStrArr,
+-			portsClosed: default_ports,
+-		},
+-		{
+-			name:        "All ports opened",
+-			portsOpen:   default_ports,
+-			portsClosed: emptyStrArr,
+-		},
+-		{
+-			name:        "Ports 8500, 8501, 8502, 8503 Open",
+-			portsOpen:   []string{"8500", "8501", "8502", "8503"},
+-			portsClosed: []string{"8600", "8301", "8302", "8300"},
+-		},
+-	}
+-
+-	for _, tc := range testCases {
+-		t.Run(tc.name, func(t *testing.T) {
+-			cleanup := startMockTCPServer(t, tc.portsOpen)
+-			defer cleanup()
+-
+-			testDir := t.TempDir()
+-
+-			a := agent.NewTestAgent(t, `
+-			enable_debug = true
+-			`)
+-
+-			defer a.Shutdown()
+-			testrpc.WaitForLeader(t, a.RPC, "dc1")
+-
+-			ui := cli.NewMockUi()
+-			cmd := New(ui)
+-			cmd.validateTiming = false
+-
+-			outputPath := fmt.Sprintf("%s/debug", testDir)
+-			args := []string{
+-				"-http-addr=" + a.HTTPAddr(),
+-				"-output=" + outputPath,
+-				"-duration=2s",
+-				"-interval=1s",
+-				"-archive=false",
+-			}
+-
+-			code := cmd.Run(args)
+-			require.Equal(t, 0, code)
+-			require.Equal(t, "", ui.ErrorWriter.String())
+-
+-			expected := PortStatus{
+-				Open:   tc.portsOpen,
+-				Closed: tc.portsClosed,
+-			}
+-
+-			fileBytes, err := os.ReadFile(outputPath + "/ports.json")
+-			if err != nil {
+-				t.Fatalf("Failed to read output file %q: %v", outputPath, err)
+-			}
+-
+-			// Parse JSON into struct
+-			var actual PortStatus
+-			if err := json.Unmarshal(fileBytes, &actual); err != nil {
+-				t.Fatalf("Failed to unmarshal JSON from file: %v", err)
+-			}
+-
+-			testifyassert.ElementsMatch(t, expected.Open, actual.Open, "Mismatch in open ports")
+-			testifyassert.ElementsMatch(t, expected.Closed, actual.Closed, "Mismatch in closed ports")
+-		})
+-	}
+-}

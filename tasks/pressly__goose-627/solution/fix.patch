@@ -1,0 +1,171 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b359116..b18fed8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ - Improve provider `Apply()` errors, add `ErrNotApplied` when attempting to rollback a migration
+   that has not been previously applied. (#660)
+ - Add `WithDisableGlobalRegistry` option to `NewProvider` to disable the global registry. (#645)
++- Add `-timeout` flag to CLI to set the maximum allowed duration for queries to run. Default is
++  remains no timeout.
+ 
+ ## [v3.16.0] - 2023-11-12
+ 
+diff --git a/README.md b/README.md
+index d15a1ba..cceb0d9 100644
+--- a/README.md
++++ b/README.md
+@@ -60,6 +60,14 @@ See the docs for more [installation instructions](https://pressly.github.io/goos
+ ```
+ Usage: goose [OPTIONS] DRIVER DBSTRING COMMAND
+ 
++or
++
++Set environment key
++GOOSE_DRIVER=DRIVER
++GOOSE_DBSTRING=DBSTRING
++
++Usage: goose [OPTIONS] COMMAND
++
+ Drivers:
+     postgres
+     mysql
+@@ -78,36 +86,46 @@ Examples:
+     goose sqlite3 ./foo.db create fetch_user_data go
+     goose sqlite3 ./foo.db up
+ 
+-    goose postgres "user=postgres password=postgres dbname=postgres sslmode=disable" status
++    goose postgres "user=postgres dbname=postgres sslmode=disable" status
+     goose mysql "user:password@/dbname?parseTime=true" status
+     goose redshift "postgres://user:password@qwerty.us-east-1.redshift.amazonaws.com:5439/db" status
+     goose tidb "user:password@/dbname?parseTime=true" status
+     goose mssql "sqlserver://user:password@dbname:1433?database=master" status
+     goose clickhouse "tcp://127.0.0.1:9000" status
+     goose vertica "vertica://user:password@localhost:5433/dbname?connection_load_balance=1" status
+-    goose ydb "grpc://localhost:2136/local?go_query_mode=scripting&go_fake_tx=scripting&go_query_bind=declare,numeric" status
++    goose ydb "grpcs://localhost:2135/local?go_query_mode=scripting&go_fake_tx=scripting&go_query_bind=declare,numeric" status
++
++    GOOSE_DRIVER=sqlite3 GOOSE_DBSTRING=./foo.db goose status
++    GOOSE_DRIVER=sqlite3 GOOSE_DBSTRING=./foo.db goose create init sql
++    GOOSE_DRIVER=postgres GOOSE_DBSTRING="user=postgres dbname=postgres sslmode=disable" goose status
++    GOOSE_DRIVER=mysql GOOSE_DBSTRING="user:password@/dbname" goose status
++    GOOSE_DRIVER=redshift GOOSE_DBSTRING="postgres://user:password@qwerty.us-east-1.redshift.amazonaws.com:5439/db" goose status
+ 
+ Options:
+ 
+   -allow-missing
+-    	applies missing (out-of-order) migrations
++        applies missing (out-of-order) migrations
+   -certfile string
+-    	file path to root CA's certificates in pem format (only supported on mysql)
++        file path to root CA's certificates in pem format (only support on mysql)
+   -dir string
+-    	directory with migration files (default ".")
+-  -h	print help
++        directory with migration files (default ".")
++  -h    print help
++  -no-color
++        disable color output (NO_COLOR env variable supported)
+   -no-versioning
+-    	apply migration commands with no versioning, in file order, from directory pointed to
+-  -s	use sequential numbering for new migrations
++        apply migration commands with no versioning, in file order, from directory pointed to
++  -s    use sequential numbering for new migrations
+   -ssl-cert string
+-    	file path to SSL certificates in pem format (only supported on mysql)
++        file path to SSL certificates in pem format (only support on mysql)
+   -ssl-key string
+-    	file path to SSL key in pem format (only supported on mysql)
++        file path to SSL key in pem format (only support on mysql)
+   -table string
+-    	migrations table name (default "goose_db_version")
+-  -v	enable verbose mode
++        migrations table name (default "goose_db_version")
++  -timeout duration
++        maximum allowed duration for queries to run; e.g., 1h13m
++  -v    enable verbose mode
+   -version
+-    	print version
++        print version
+ 
+ Commands:
+     up                   Migrate the DB to the most recent version available
+diff --git a/cmd/goose/main.go b/cmd/goose/main.go
+index c842171..b930205 100644
+--- a/cmd/goose/main.go
++++ b/cmd/goose/main.go
+@@ -1,6 +1,7 @@
+ package main
+ 
+ import (
++	"context"
+ 	_ "embed"
+ 	"errors"
+ 	"flag"
+@@ -35,11 +36,14 @@ var (
+ 	sslkey       = flags.String("ssl-key", "", "file path to SSL key in pem format (only support on mysql)")
+ 	noVersioning = flags.Bool("no-versioning", false, "apply migration commands with no versioning, in file order, from directory pointed to")
+ 	noColor      = flags.Bool("no-color", false, "disable color output (NO_COLOR env variable supported)")
++	timeout      = flags.Duration("timeout", 0, "maximum allowed duration for queries to run; e.g., 1h13m")
+ )
+ 
+ var version string
+ 
+ func main() {
++	ctx := context.Background()
++
+ 	flags.Usage = usage
+ 	if err := flags.Parse(os.Args[1:]); err != nil {
+ 		log.Fatalf("failed to parse args: %v", err)
+@@ -87,12 +91,12 @@ func main() {
+ 		}
+ 		return
+ 	case "create":
+-		if err := goose.Run("create", nil, *dir, args[1:]...); err != nil {
++		if err := goose.RunContext(ctx, "create", nil, *dir, args[1:]...); err != nil {
+ 			log.Fatalf("goose run: %v", err)
+ 		}
+ 		return
+ 	case "fix":
+-		if err := goose.Run("fix", nil, *dir); err != nil {
++		if err := goose.RunContext(ctx, "fix", nil, *dir); err != nil {
+ 			log.Fatalf("goose run: %v", err)
+ 		}
+ 		return
+@@ -148,7 +152,13 @@ func main() {
+ 	if *noVersioning {
+ 		options = append(options, goose.WithNoVersioning())
+ 	}
+-	if err := goose.RunWithOptions(
++	if timeout != nil && *timeout != 0 {
++		var cancel context.CancelFunc
++		ctx, cancel = context.WithTimeout(ctx, *timeout)
++		defer cancel()
++	}
++	if err := goose.RunWithOptionsContext(
++		ctx,
+ 		command,
+ 		db,
+ 		*dir,
+diff --git a/goose.go b/goose.go
+index daf0593..fc42dbf 100644
+--- a/goose.go
++++ b/goose.go
+@@ -39,6 +39,8 @@ func SetBaseFS(fsys fs.FS) {
+ }
+ 
+ // Run runs a goose command.
++//
++// Deprecated: Use RunContext.
+ func Run(command string, db *sql.DB, dir string, args ...string) error {
+ 	ctx := context.Background()
+ 	return RunContext(ctx, command, db, dir, args...)
+@@ -50,6 +52,8 @@ func RunContext(ctx context.Context, command string, db *sql.DB, dir string, arg
+ }
+ 
+ // RunWithOptions runs a goose command with options.
++//
++// Deprecated: Use RunWithOptionsContext.
+ func RunWithOptions(command string, db *sql.DB, dir string, args []string, options ...OptionsFunc) error {
+ 	ctx := context.Background()
+ 	return RunWithOptionsContext(ctx, command, db, dir, args, options...)

@@ -1,0 +1,309 @@
+diff --git a/log/log.go b/log/log.go
+index 336a0e2..345d9f5 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -4,48 +4,47 @@
+ // key/value data.
+ package log
+ 
+-// Logger is the fundamental interface for all log operations. Implementations
+-// must be safe for concurrent use by multiple goroutines. Log creates a log
+-// event from keyvals, a variadic sequence of alternating keys and values.
++// Logger is the fundamental interface for all log operations.
++//
++// Log creates a log event from keyvals, a variadic sequence of alternating
++// keys and values.
++//
++// Logger implementations must be safe for concurrent use by multiple
++// goroutines.
+ type Logger interface {
+ 	Log(keyvals ...interface{}) error
+ }
+ 
+-// With returns a new Logger that includes keyvals in all log events. The
+-// returned Logger replaces all value elements (odd indexes) containing a
+-// Valuer with their generated value for each call to its Log method.
++// With returns a new Logger that includes keyvals in all log events.
++//
++// If logger implements the Wither interface, the result of
++// logger.With(keyvals...) is returned.
+ func With(logger Logger, keyvals ...interface{}) Logger {
+-	w, ok := logger.(*withLogger)
++	w, ok := logger.(Wither)
+ 	if !ok {
+ 		w = &withLogger{logger: logger}
+ 	}
+-	return w.with(keyvals...)
++	return w.With(keyvals...)
+ }
+ 
+ type withLogger struct {
+-	logger    Logger
+-	keyvals   []interface{}
+-	hasValuer bool
++	logger  Logger
++	keyvals []interface{}
+ }
+ 
+ func (l *withLogger) Log(keyvals ...interface{}) error {
+-	kvs := append(l.keyvals, keyvals...)
+-	if l.hasValuer {
+-		bindValues(kvs[:len(l.keyvals)])
+-	}
+-	return l.logger.Log(kvs...)
++	return l.logger.Log(append(l.keyvals, keyvals...)...)
+ }
+ 
+-func (l *withLogger) with(keyvals ...interface{}) Logger {
++func (l *withLogger) With(keyvals ...interface{}) Logger {
+ 	// Limiting the capacity of the stored keyvals ensures that a new
+ 	// backing array is created if the slice must grow in Log or With.
+ 	// Using the extra capacity without copying risks a data race that
+ 	// would violate the Logger interface contract.
+ 	n := len(l.keyvals) + len(keyvals)
+ 	return &withLogger{
+-		logger:    l.logger,
+-		keyvals:   append(l.keyvals, keyvals...)[:n:n],
+-		hasValuer: l.hasValuer || containsValuer(keyvals),
++		logger:  l.logger,
++		keyvals: append(l.keyvals, keyvals...)[:n:n],
+ 	}
+ }
+ 
+@@ -58,3 +57,17 @@ type LoggerFunc func(...interface{}) error
+ func (f LoggerFunc) Log(keyvals ...interface{}) error {
+ 	return f(keyvals...)
+ }
++
++// A Wither creates Loggers that include keyvals in all log events.
++//
++// The With function uses Wither if available.
++type Wither interface {
++	With(keyvals ...interface{}) Logger
++}
++
++// NewDiscardLogger returns a logger that does not log anything.
++func NewDiscardLogger() Logger {
++	return LoggerFunc(func(...interface{}) error {
++		return nil
++	})
++}
+diff --git a/log/log_test.go b/log/log_test.go
+index b9392a4..de6c198 100644
+--- a/log/log_test.go
++++ b/log/log_test.go
+@@ -8,8 +8,6 @@ import (
+ 	"github.com/peterbourgon/gokit/log"
+ )
+ 
+-var discard = log.Logger(log.LoggerFunc(func(...interface{}) error { return nil }))
+-
+ func TestWith(t *testing.T) {
+ 	buf := &bytes.Buffer{}
+ 	kvs := []interface{}{"a", 123}
+@@ -25,6 +23,20 @@ func TestWith(t *testing.T) {
+ 	}
+ }
+ 
++func TestWither(t *testing.T) {
++	logger := &mylogger{}
++	log.With(logger, "a", "b").Log("c", "d")
++	if want, have := 1, logger.withs; want != have {
++		t.Errorf("want %d, have %d", want, have)
++	}
++}
++
++type mylogger struct{ withs int }
++
++func (l *mylogger) Log(keyvals ...interface{}) error { return nil }
++
++func (l *mylogger) With(keyvals ...interface{}) log.Logger { l.withs++; return l }
++
+ // Test that With returns a Logger safe for concurrent use. This test
+ // validates that the stored logging context does not get corrupted when
+ // multiple clients concurrently log additional keyvals.
+@@ -70,7 +82,7 @@ func TestWithConcurrent(t *testing.T) {
+ }
+ 
+ func BenchmarkDiscard(b *testing.B) {
+-	logger := discard
++	logger := log.NewDiscardLogger()
+ 	b.ReportAllocs()
+ 	b.ResetTimer()
+ 	for i := 0; i < b.N; i++ {
+@@ -79,7 +91,7 @@ func BenchmarkDiscard(b *testing.B) {
+ }
+ 
+ func BenchmarkOneWith(b *testing.B) {
+-	logger := discard
++	logger := log.NewDiscardLogger()
+ 	logger = log.With(logger, "k", "v")
+ 	b.ReportAllocs()
+ 	b.ResetTimer()
+@@ -89,7 +101,7 @@ func BenchmarkOneWith(b *testing.B) {
+ }
+ 
+ func BenchmarkTwoWith(b *testing.B) {
+-	logger := discard
++	logger := log.NewDiscardLogger()
+ 	for i := 0; i < 2; i++ {
+ 		logger = log.With(logger, "k", "v")
+ 	}
+@@ -101,7 +113,7 @@ func BenchmarkTwoWith(b *testing.B) {
+ }
+ 
+ func BenchmarkTenWith(b *testing.B) {
+-	logger := discard
++	logger := log.NewDiscardLogger()
+ 	for i := 0; i < 10; i++ {
+ 		logger = log.With(logger, "k", "v")
+ 	}
+diff --git a/log/value.go b/log/value.go
+deleted file mode 100644
+index 3ae74f0..0000000
+--- a/log/value.go
++++ /dev/null
+@@ -1,65 +0,0 @@
+-package log
+-
+-import (
+-	"time"
+-
+-	"gopkg.in/stack.v1"
+-)
+-
+-// A Valuer generates a log value. When passed to With in a value element (odd
+-// indexes), it represents a dynamic value which is re-evaluated with each log
+-// event.
+-type Valuer func() interface{}
+-
+-// bindValues replaces all value elements (odd indexes) containing a Valuer
+-// with their generated value.
+-func bindValues(keyvals []interface{}) {
+-	for i := 1; i < len(keyvals); i += 2 {
+-		if v, ok := keyvals[i].(Valuer); ok {
+-			keyvals[i] = v()
+-		}
+-	}
+-}
+-
+-// containsValuer returns true if any of the value elements (odd indexes)
+-// contain a Valuer.
+-func containsValuer(keyvals []interface{}) bool {
+-	for i := 1; i < len(keyvals); i += 2 {
+-		if _, ok := keyvals[i].(Valuer); ok {
+-			return true
+-		}
+-	}
+-	return false
+-}
+-
+-// Timestamp returns a Valuer that invokes the underlying function when bound,
+-// returning a time.Time. Users will probably want to use DefaultTimestamp or
+-// DefaultTimestampUTC.
+-func Timestamp(t func() time.Time) Valuer {
+-	return func() interface{} { return t() }
+-}
+-
+-var (
+-	// DefaultTimestamp is a Timestamp Valuer that returns the current
+-	// wallclock time, respecting time zones, when bound.
+-	DefaultTimestamp = Timestamp(time.Now)
+-
+-	// DefaultTimestampUTC wraps DefaultTimestamp but ensures the returned
+-	// time is always in UTC. Note that it invokes DefaultTimestamp, and so
+-	// reflects any changes to the DefaultTimestamp package global.
+-	DefaultTimestampUTC = Timestamp(func() time.Time {
+-		return DefaultTimestamp().(time.Time).UTC()
+-	})
+-)
+-
+-// Caller returns a Valuer that returns a file and line from a specified depth
+-// in the callstack. Users will probably want to use DefaultCaller.
+-func Caller(depth int) Valuer {
+-	return func() interface{} { return stack.Caller(depth) }
+-}
+-
+-var (
+-	// DefaultCaller is a Valuer that returns the file and line where the Log
+-	// method was invoked.
+-	DefaultCaller = Caller(3)
+-)
+diff --git a/log/value_test.go b/log/value_test.go
+deleted file mode 100644
+index b879720..0000000
+--- a/log/value_test.go
++++ /dev/null
+@@ -1,72 +0,0 @@
+-package log_test
+-
+-import (
+-	"fmt"
+-	"testing"
+-	"time"
+-
+-	"github.com/peterbourgon/gokit/log"
+-)
+-
+-func TestValueBinding(t *testing.T) {
+-	var output []interface{}
+-
+-	logger := log.Logger(log.LoggerFunc(func(keyvals ...interface{}) error {
+-		output = keyvals
+-		return nil
+-	}))
+-
+-	start := time.Date(2015, time.April, 25, 0, 0, 0, 0, time.UTC)
+-	now := start
+-	mocktime := func() time.Time {
+-		now = now.Add(time.Second)
+-		return now
+-	}
+-
+-	logger = log.With(logger, "ts", log.Timestamp(mocktime), "caller", log.DefaultCaller)
+-
+-	logger.Log("foo", "bar")
+-	timestamp, ok := output[1].(time.Time)
+-	if !ok {
+-		t.Fatalf("want time.Time, have %T", output[1])
+-	}
+-	if want, have := start.Add(time.Second), timestamp; want != have {
+-		t.Errorf("output[1]: want %v, have %v", want, have)
+-	}
+-	if want, have := "value_test.go:28", fmt.Sprint(output[3]); want != have {
+-		t.Fatalf("output[3]: want %s, have %s", want, have)
+-	}
+-
+-	// A second attempt to confirm the bindings are truly dynamic.
+-	logger.Log("foo", "bar")
+-	timestamp, ok = output[1].(time.Time)
+-	if !ok {
+-		t.Fatalf("want time.Time, have %T", output[1])
+-	}
+-	if want, have := start.Add(2*time.Second), timestamp; want != have {
+-		t.Errorf("output[1]: want %v, have %v", want, have)
+-	}
+-	if want, have := "value_test.go:41", fmt.Sprint(output[3]); want != have {
+-		t.Fatalf("output[3]: want %s, have %s", want, have)
+-	}
+-}
+-
+-func BenchmarkValueBindingTimestamp(b *testing.B) {
+-	logger := discard
+-	logger = log.With(logger, "ts", log.DefaultTimestamp)
+-	b.ReportAllocs()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		logger.Log("k", "v")
+-	}
+-}
+-
+-func BenchmarkValueBindingCaller(b *testing.B) {
+-	logger := discard
+-	logger = log.With(logger, "caller", log.DefaultCaller)
+-	b.ReportAllocs()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		logger.Log("k", "v")
+-	}
+-}

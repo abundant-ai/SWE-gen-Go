@@ -1,0 +1,896 @@
+diff --git a/cmd/sftp-server-driver.go b/cmd/sftp-server-driver.go
+index c4c506fe0..b255f2df3 100644
+--- a/cmd/sftp-server-driver.go
++++ b/cmd/sftp-server-driver.go
+@@ -1,4 +1,4 @@
+-// Copyright (c) 2015-2024 MinIO, Inc.
++// Copyright (c) 2015-2023 MinIO, Inc.
+ //
+ // This file is part of MinIO Object Storage stack
+ //
+@@ -32,6 +32,7 @@ import (
+ 	"github.com/minio/madmin-go/v3"
+ 	"github.com/minio/minio-go/v7"
+ 	"github.com/minio/minio-go/v7/pkg/credentials"
++	"github.com/minio/minio/internal/auth"
+ 	xioutil "github.com/minio/minio/internal/ioutil"
+ 	"github.com/minio/pkg/v3/mimedb"
+ 	"github.com/pkg/sftp"
+@@ -100,20 +101,103 @@ func NewSFTPDriver(perms *ssh.Permissions) sftp.Handlers {
+ }
+ 
+ func (f *sftpDriver) getMinIOClient() (*minio.Client, error) {
+-	mcreds := credentials.NewStaticV4(
+-		f.permissions.CriticalOptions["AccessKey"],
+-		f.permissions.CriticalOptions["SecretKey"],
+-		f.permissions.CriticalOptions["SessionToken"],
+-	)
++	ui, ok := globalIAMSys.GetUser(context.Background(), f.AccessKey())
++	if !ok && !globalIAMSys.LDAPConfig.Enabled() {
++		return nil, errNoSuchUser
++	}
++	if !ok && globalIAMSys.LDAPConfig.Enabled() {
++		sa, _, err := globalIAMSys.getServiceAccount(context.Background(), f.AccessKey())
++		if err != nil && !errors.Is(err, errNoSuchServiceAccount) {
++			return nil, err
++		}
++		var mcreds *credentials.Credentials
++		if errors.Is(err, errNoSuchServiceAccount) {
++			lookupResult, targetGroups, err := globalIAMSys.LDAPConfig.LookupUserDN(f.AccessKey())
++			if err != nil {
++				return nil, err
++			}
++			expiryDur, err := globalIAMSys.LDAPConfig.GetExpiryDuration("")
++			if err != nil {
++				return nil, err
++			}
++			claims := make(map[string]interface{})
++			claims[expClaim] = UTCNow().Add(expiryDur).Unix()
++			for k, v := range f.permissions.CriticalOptions {
++				claims[k] = v
++			}
++
++			// Set LDAP claims.
++			claims[ldapUserN] = f.AccessKey()
++			claims[ldapUser] = lookupResult.NormDN
++			// Add LDAP attributes that were looked up into the claims.
++			for attribKey, attribValue := range lookupResult.Attributes {
++				claims[ldapAttribPrefix+attribKey] = attribValue
++			}
++
++			cred, err := auth.GetNewCredentialsWithMetadata(claims, globalActiveCred.SecretKey)
++			if err != nil {
++				return nil, err
++			}
++
++			// Set the parent of the temporary access key, this is useful
++			// in obtaining service accounts by this cred.
++			cred.ParentUser = lookupResult.NormDN
++
++			// Set this value to LDAP groups, LDAP user can be part
++			// of large number of groups
++			cred.Groups = targetGroups
++
++			// Set the newly generated credentials, policyName is empty on purpose
++			// LDAP policies are applied automatically using their ldapUser, ldapGroups
++			// mapping.
++			updatedAt, err := globalIAMSys.SetTempUser(context.Background(), cred.AccessKey, cred, "")
++			if err != nil {
++				return nil, err
++			}
++
++			// Call hook for site replication.
++			replLogIf(context.Background(), globalSiteReplicationSys.IAMChangeHook(context.Background(), madmin.SRIAMItem{
++				Type: madmin.SRIAMItemSTSAcc,
++				STSCredential: &madmin.SRSTSCredential{
++					AccessKey:    cred.AccessKey,
++					SecretKey:    cred.SecretKey,
++					SessionToken: cred.SessionToken,
++					ParentUser:   cred.ParentUser,
++				},
++				UpdatedAt: updatedAt,
++			}))
++
++			mcreds = credentials.NewStaticV4(cred.AccessKey, cred.SecretKey, cred.SessionToken)
++		} else {
++			mcreds = credentials.NewStaticV4(sa.Credentials.AccessKey, sa.Credentials.SecretKey, "")
++		}
++
++		return minio.New(f.endpoint, &minio.Options{
++			Creds:     mcreds,
++			Secure:    globalIsTLS,
++			Transport: globalRemoteFTPClientTransport,
++		})
++	}
++
++	// ok == true - at this point
++
++	if ui.Credentials.IsTemp() {
++		// Temporary credentials are not allowed.
++		return nil, errAuthentication
++	}
++
+ 	return minio.New(f.endpoint, &minio.Options{
+-		Creds:     mcreds,
++		Creds:     credentials.NewStaticV4(ui.Credentials.AccessKey, ui.Credentials.SecretKey, ""),
+ 		Secure:    globalIsTLS,
+ 		Transport: globalRemoteFTPClientTransport,
+ 	})
+ }
+ 
+ func (f *sftpDriver) AccessKey() string {
+-	return f.permissions.CriticalOptions["AccessKey"]
++	if _, ok := f.permissions.CriticalOptions["accessKey"]; !ok {
++		return f.permissions.CriticalOptions[ldapUserN]
++	}
++	return f.permissions.CriticalOptions["accessKey"]
+ }
+ 
+ func (f *sftpDriver) Fileread(r *sftp.Request) (ra io.ReaderAt, err error) {
+diff --git a/cmd/sftp-server.go b/cmd/sftp-server.go
+index dfb473596..df9bb2fca 100644
+--- a/cmd/sftp-server.go
++++ b/cmd/sftp-server.go
+@@ -1,4 +1,4 @@
+-// Copyright (c) 2015-2024 MinIO, Inc.
++// Copyright (c) 2015-2023 MinIO, Inc.
+ //
+ // This file is part of MinIO Object Storage stack
+ //
+@@ -18,6 +18,7 @@
+ package cmd
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"crypto/subtle"
+ 	"errors"
+@@ -28,15 +29,18 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/minio/madmin-go/v3"
+-	"github.com/minio/minio/internal/auth"
+ 	"github.com/minio/minio/internal/logger"
+-	xldap "github.com/minio/pkg/v3/ldap"
+ 	xsftp "github.com/minio/pkg/v3/sftp"
+ 	"github.com/pkg/sftp"
+ 	"golang.org/x/crypto/ssh"
+ )
+ 
++type sftpLogger struct{}
++
++func (s *sftpLogger) Info(tag xsftp.LogType, msg string) {
++	logger.Info(msg)
++}
++
+ const (
+ 	kexAlgoDH1SHA1                = "diffie-hellman-group1-sha1"
+ 	kexAlgoDH14SHA1               = "diffie-hellman-group14-sha1"
+@@ -54,16 +58,6 @@ const (
+ 	tripledescbcID     = "3des-cbc"
+ )
+ 
+-var (
+-	errSFTPPublicKeyBadFormat = errors.New("the public key provided could not be parsed")
+-	errSFTPUserHasNoPolicies  = errors.New("no policies present on this account")
+-	errSFTPLDAPNotEnabled     = errors.New("ldap authentication is not enabled")
+-)
+-
+-// if the sftp parameter --trusted-user-ca-key is set, then
+-// the final form of the key file will be set as this variable.
+-var caPublicKey ssh.PublicKey
+-
+ // https://cs.opensource.google/go/x/crypto/+/refs/tags/v0.22.0:ssh/common.go;l=46
+ // preferredKexAlgos specifies the default preference for key-exchange
+ // algorithms in preference order. The diffie-hellman-group16-sha512 algorithm
+@@ -126,226 +120,6 @@ var supportedMACs = []string{
+ 	"hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com", "hmac-sha2-256", "hmac-sha2-512", "hmac-sha1", "hmac-sha1-96",
+ }
+ 
+-func sshPubKeyAuth(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+-	return authenticateSSHConnection(c, key, nil)
+-}
+-
+-func sshPasswordAuth(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+-	return authenticateSSHConnection(c, nil, pass)
+-}
+-
+-func authenticateSSHConnection(c ssh.ConnMetadata, key ssh.PublicKey, pass []byte) (*ssh.Permissions, error) {
+-	user, found := strings.CutSuffix(c.User(), "=ldap")
+-	if found {
+-		if !globalIAMSys.LDAPConfig.Enabled() {
+-			return nil, errSFTPLDAPNotEnabled
+-		}
+-		return processLDAPAuthentication(key, pass, user)
+-	}
+-
+-	user, found = strings.CutSuffix(c.User(), "=svc")
+-	if found {
+-		goto internalAuth
+-	}
+-
+-	if globalIAMSys.LDAPConfig.Enabled() {
+-		perms, _ := processLDAPAuthentication(key, pass, user)
+-		if perms != nil {
+-			return perms, nil
+-		}
+-	}
+-
+-internalAuth:
+-	ui, ok := globalIAMSys.GetUser(context.Background(), user)
+-	if !ok {
+-		return nil, errNoSuchUser
+-	}
+-
+-	if caPublicKey != nil {
+-		err := validateKey(c, key)
+-		if err != nil {
+-			return nil, errAuthentication
+-		}
+-	} else {
+-
+-		// Temporary credentials are not allowed.
+-		if ui.Credentials.IsTemp() {
+-			return nil, errAuthentication
+-		}
+-
+-		if subtle.ConstantTimeCompare([]byte(ui.Credentials.SecretKey), pass) != 1 {
+-			return nil, errAuthentication
+-		}
+-	}
+-
+-	return &ssh.Permissions{
+-		CriticalOptions: map[string]string{
+-			"AccessKey":    ui.Credentials.AccessKey,
+-			"SecretKey":    ui.Credentials.SecretKey,
+-			"SessionToken": ui.Credentials.SessionToken,
+-		},
+-		Extensions: make(map[string]string),
+-	}, nil
+-}
+-
+-func processLDAPAuthentication(key ssh.PublicKey, pass []byte, user string) (perms *ssh.Permissions, err error) {
+-	var lookupResult *xldap.DNSearchResult
+-	var targetGroups []string
+-
+-	if pass == nil && key == nil {
+-		return nil, errAuthentication
+-	}
+-
+-	if pass != nil {
+-		sa, _, err := globalIAMSys.getServiceAccount(context.Background(), user)
+-		if err == nil {
+-			if subtle.ConstantTimeCompare([]byte(sa.Credentials.SecretKey), pass) != 1 {
+-				return nil, errAuthentication
+-			}
+-
+-			return &ssh.Permissions{
+-				CriticalOptions: map[string]string{
+-					"AccessKey":    sa.Credentials.AccessKey,
+-					"SecretKey":    sa.Credentials.SecretKey,
+-					"SessionToken": sa.Credentials.SessionToken,
+-				},
+-				Extensions: make(map[string]string),
+-			}, nil
+-		}
+-
+-		if !errors.Is(err, errNoSuchServiceAccount) {
+-			return nil, err
+-		}
+-
+-		lookupResult, targetGroups, err = globalIAMSys.LDAPConfig.Bind(user, string(pass))
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-	} else if key != nil {
+-
+-		lookupResult, targetGroups, err = globalIAMSys.LDAPConfig.LookupUserDN(user)
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-	}
+-
+-	if lookupResult == nil {
+-		return nil, errNoSuchUser
+-	}
+-
+-	ldapPolicies, _ := globalIAMSys.PolicyDBGet(lookupResult.NormDN, targetGroups...)
+-	if len(ldapPolicies) == 0 {
+-		return nil, errSFTPUserHasNoPolicies
+-	}
+-
+-	claims := make(map[string]interface{})
+-	for attribKey, attribValue := range lookupResult.Attributes {
+-		// we skip multi-value attributes here, as they cannot
+-		// be stored in the critical options.
+-		if len(attribValue) != 1 {
+-			continue
+-		}
+-
+-		if attribKey == "sshPublicKey" && key != nil {
+-			key2, _, _, _, err := ssh.ParseAuthorizedKey([]byte(attribValue[0]))
+-			if err != nil {
+-				return nil, errSFTPPublicKeyBadFormat
+-			}
+-
+-			if subtle.ConstantTimeCompare(key2.Marshal(), key.Marshal()) != 1 {
+-				return nil, errAuthentication
+-			}
+-		}
+-		claims[ldapAttribPrefix+attribKey] = attribValue[0]
+-	}
+-
+-	expiryDur, err := globalIAMSys.LDAPConfig.GetExpiryDuration("")
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	claims[expClaim] = UTCNow().Add(expiryDur).Unix()
+-	claims[ldapUserN] = user
+-	claims[ldapUser] = lookupResult.NormDN
+-
+-	cred, err := auth.GetNewCredentialsWithMetadata(claims, globalActiveCred.SecretKey)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	// Set the parent of the temporary access key, this is useful
+-	// in obtaining service accounts by this cred.
+-	cred.ParentUser = lookupResult.NormDN
+-
+-	// Set this value to LDAP groups, LDAP user can be part
+-	// of large number of groups
+-	cred.Groups = targetGroups
+-
+-	// Set the newly generated credentials, policyName is empty on purpose
+-	// LDAP policies are applied automatically using their ldapUser, ldapGroups
+-	// mapping.
+-	updatedAt, err := globalIAMSys.SetTempUser(context.Background(), cred.AccessKey, cred, "")
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	replLogIf(context.Background(), globalSiteReplicationSys.IAMChangeHook(context.Background(), madmin.SRIAMItem{
+-		Type: madmin.SRIAMItemSTSAcc,
+-		STSCredential: &madmin.SRSTSCredential{
+-			AccessKey:    cred.AccessKey,
+-			SecretKey:    cred.SecretKey,
+-			SessionToken: cred.SessionToken,
+-			ParentUser:   cred.ParentUser,
+-		},
+-		UpdatedAt: updatedAt,
+-	}))
+-
+-	return &ssh.Permissions{
+-		CriticalOptions: map[string]string{
+-			"AccessKey":    cred.AccessKey,
+-			"SecretKey":    cred.SecretKey,
+-			"SessionToken": cred.SessionToken,
+-		},
+-		Extensions: make(map[string]string),
+-	}, nil
+-}
+-
+-func validateKey(c ssh.ConnMetadata, clientKey ssh.PublicKey) (err error) {
+-	if caPublicKey == nil {
+-		return errors.New("public key authority validation requested but no ca public key specified.")
+-	}
+-
+-	cert, ok := clientKey.(*ssh.Certificate)
+-	if !ok {
+-		return errSftpPublicKeyWithoutCert
+-	}
+-
+-	// ssh.CheckCert called by ssh.Authenticate accepts certificates
+-	// with empty principles list so we block those in here.
+-	if len(cert.ValidPrincipals) == 0 {
+-		return errSftpCertWithoutPrincipals
+-	}
+-
+-	// Verify that certificate provided by user is issued by trusted CA,
+-	// username in authentication request matches to identities in certificate
+-	// and that certificate type is correct.
+-	checker := ssh.CertChecker{}
+-	checker.IsUserAuthority = func(k ssh.PublicKey) bool {
+-		return subtle.ConstantTimeCompare(caPublicKey.Marshal(), k.Marshal()) == 1
+-	}
+-
+-	_, err = checker.Authenticate(c, clientKey)
+-	return
+-}
+-
+-type sftpLogger struct{}
+-
+-func (s *sftpLogger) Info(tag xsftp.LogType, msg string) {
+-	logger.Info(msg)
+-}
+-
+ func (s *sftpLogger) Error(tag xsftp.LogType, err error) {
+ 	switch tag {
+ 	case xsftp.AcceptNetworkError:
+@@ -386,19 +160,16 @@ func filterAlgos(arg string, want []string, allowed []string) []string {
+ 
+ func startSFTPServer(args []string) {
+ 	var (
+-		port            int
+-		publicIP        string
+-		sshPrivateKey   string
+-		userCaKeyFile   string
+-		disablePassAuth bool
++		port          int
++		publicIP      string
++		sshPrivateKey string
++		userCaKeyFile string
+ 	)
+-
+ 	allowPubKeys := supportedPubKeyAuthAlgos
+ 	allowKexAlgos := preferredKexAlgos
+ 	allowCiphers := preferredCiphers
+ 	allowMACs := supportedMACs
+ 	var err error
+-
+ 	for _, arg := range args {
+ 		tokens := strings.SplitN(arg, "=", 2)
+ 		if len(tokens) != 2 {
+@@ -430,8 +201,6 @@ func startSFTPServer(args []string) {
+ 			allowMACs = filterAlgos(arg, strings.Split(tokens[1], ","), supportedMACs)
+ 		case "trusted-user-ca-key":
+ 			userCaKeyFile = tokens[1]
+-		case "password-auth":
+-			disablePassAuth, _ = strconv.ParseBool(tokens[1])
+ 		}
+ 	}
+ 
+@@ -453,18 +222,6 @@ func startSFTPServer(args []string) {
+ 		logger.Fatal(fmt.Errorf("invalid arguments passed, private key file is not parseable: %v", err), "unable to start SFTP server")
+ 	}
+ 
+-	if userCaKeyFile != "" {
+-		keyBytes, err := os.ReadFile(userCaKeyFile)
+-		if err != nil {
+-			logger.Fatal(fmt.Errorf("invalid arguments passed, trusted user certificate authority public key file is not accessible: %v", err), "unable to start SFTP server")
+-		}
+-
+-		caPublicKey, _, _, _, err = ssh.ParseAuthorizedKey(keyBytes)
+-		if err != nil {
+-			logger.Fatal(fmt.Errorf("invalid arguments passed, trusted user certificate authority public key file is not parseable: %v", err), "unable to start SFTP server")
+-		}
+-	}
+-
+ 	// An SSH server is represented by a ServerConfig, which holds
+ 	// certificate details and handles authentication of ServerConns.
+ 	sshConfig := &ssh.ServerConfig{
+@@ -474,13 +231,116 @@ func startSFTPServer(args []string) {
+ 			MACs:         allowMACs,
+ 		},
+ 		PublicKeyAuthAlgorithms: allowPubKeys,
+-		PublicKeyCallback:       sshPubKeyAuth,
++		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
++			if globalIAMSys.LDAPConfig.Enabled() {
++				sa, _, err := globalIAMSys.getServiceAccount(context.Background(), c.User())
++				if err != nil && !errors.Is(err, errNoSuchServiceAccount) {
++					return nil, err
++				}
++				if errors.Is(err, errNoSuchServiceAccount) {
++					lookupResult, targetGroups, err := globalIAMSys.LDAPConfig.Bind(c.User(), string(pass))
++					if err != nil {
++						return nil, err
++					}
++					targetUser := lookupResult.NormDN
++					ldapPolicies, _ := globalIAMSys.PolicyDBGet(targetUser, targetGroups...)
++					if len(ldapPolicies) == 0 {
++						return nil, errAuthentication
++					}
++					criticalOptions := map[string]string{
++						ldapUser:       targetUser,
++						ldapActualUser: lookupResult.ActualDN,
++						ldapUserN:      c.User(),
++					}
++					for attribKey, attribValue := range lookupResult.Attributes {
++						// we skip multi-value attributes here, as they cannot
++						// be stored in the critical options.
++						if len(attribValue) == 1 {
++							criticalOptions[ldapAttribPrefix+attribKey] = attribValue[0]
++						}
++					}
++
++					return &ssh.Permissions{
++						CriticalOptions: criticalOptions,
++						Extensions:      make(map[string]string),
++					}, nil
++				}
++				if subtle.ConstantTimeCompare([]byte(sa.Credentials.SecretKey), pass) == 1 {
++					return &ssh.Permissions{
++						CriticalOptions: map[string]string{
++							"accessKey": c.User(),
++						},
++						Extensions: make(map[string]string),
++					}, nil
++				}
++				return nil, errAuthentication
++			}
++
++			ui, ok := globalIAMSys.GetUser(context.Background(), c.User())
++			if !ok {
++				return nil, errNoSuchUser
++			}
++
++			if subtle.ConstantTimeCompare([]byte(ui.Credentials.SecretKey), pass) == 1 {
++				return &ssh.Permissions{
++					CriticalOptions: map[string]string{
++						"accessKey": c.User(),
++					},
++					Extensions: make(map[string]string),
++				}, nil
++			}
++			return nil, errAuthentication
++		},
+ 	}
+ 
+-	if !disablePassAuth {
+-		sshConfig.PasswordCallback = sshPasswordAuth
+-	} else {
+-		sshConfig.PasswordCallback = nil
++	if userCaKeyFile != "" {
++		keyBytes, err := os.ReadFile(userCaKeyFile)
++		if err != nil {
++			logger.Fatal(fmt.Errorf("invalid arguments passed, trusted user certificate authority public key file is not accessible: %v", err), "unable to start SFTP server")
++		}
++
++		caPublicKey, _, _, _, err := ssh.ParseAuthorizedKey(keyBytes)
++		if err != nil {
++			logger.Fatal(fmt.Errorf("invalid arguments passed, trusted user certificate authority public key file is not parseable: %v", err), "unable to start SFTP server")
++		}
++
++		sshConfig.PublicKeyCallback = func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
++			_, ok := globalIAMSys.GetUser(context.Background(), c.User())
++			if !ok {
++				return nil, errNoSuchUser
++			}
++
++			// Verify that client provided certificate, not only public key.
++			cert, ok := key.(*ssh.Certificate)
++			if !ok {
++				return nil, errSftpPublicKeyWithoutCert
++			}
++
++			// ssh.CheckCert called by ssh.Authenticate accepts certificates
++			// with empty principles list so we block those in here.
++			if len(cert.ValidPrincipals) == 0 {
++				return nil, errSftpCertWithoutPrincipals
++			}
++
++			// Verify that certificate provided by user is issued by trusted CA,
++			// username in authentication request matches to identities in certificate
++			// and that certificate type is correct.
++			checker := ssh.CertChecker{}
++			checker.IsUserAuthority = func(k ssh.PublicKey) bool {
++				return bytes.Equal(k.Marshal(), caPublicKey.Marshal())
++			}
++			_, err = checker.Authenticate(c, key)
++			if err != nil {
++				return nil, err
++			}
++
++			return &ssh.Permissions{
++				CriticalOptions: map[string]string{
++					"accessKey": c.User(),
++				},
++				Extensions: make(map[string]string),
++			}, nil
++		}
+ 	}
+ 
+ 	sshConfig.AddHostKey(private)
+diff --git a/cmd/sftp-server_test.go b/cmd/sftp-server_test.go
+deleted file mode 100644
+index 327a330fd..000000000
+--- a/cmd/sftp-server_test.go
++++ /dev/null
+@@ -1,289 +0,0 @@
+-// Copyright (c) 2015-2024 MinIO, Inc.
+-//
+-// This file is part of MinIO Object Storage stack
+-//
+-// This program is free software: you can redistribute it and/or modify
+-// it under the terms of the GNU Affero General Public License as published by
+-// the Free Software Foundation, either version 3 of the License, or
+-// (at your option) any later version.
+-//
+-// This program is distributed in the hope that it will be useful
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-// GNU Affero General Public License for more details.
+-//
+-// You should have received a copy of the GNU Affero General Public License
+-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-
+-package cmd
+-
+-import (
+-	"context"
+-	"errors"
+-	"fmt"
+-	"net"
+-	"os"
+-	"testing"
+-
+-	"github.com/minio/madmin-go/v3"
+-	"golang.org/x/crypto/ssh"
+-)
+-
+-type MockConnMeta struct {
+-	username string
+-}
+-
+-func (m *MockConnMeta) User() string {
+-	return m.username
+-}
+-
+-func (m *MockConnMeta) SessionID() []byte {
+-	return []byte{}
+-}
+-
+-func (m *MockConnMeta) ClientVersion() []byte {
+-	return []byte{}
+-}
+-
+-func (m *MockConnMeta) ServerVersion() []byte {
+-	return []byte{}
+-}
+-
+-func (m *MockConnMeta) RemoteAddr() net.Addr {
+-	return nil
+-}
+-
+-func (m *MockConnMeta) LocalAddr() net.Addr {
+-	return nil
+-}
+-
+-func newSSHConnMock(username string) ssh.ConnMetadata {
+-	return &MockConnMeta{username: username}
+-}
+-
+-func TestSFTPAuthentication(t *testing.T) {
+-	for i, testCase := range iamTestSuites {
+-		t.Run(
+-			fmt.Sprintf("Test: %d, ServerType: %s", i+1, testCase.ServerTypeDescription),
+-			func(t *testing.T) {
+-				c := &check{t, testCase.serverType}
+-				suite := testCase
+-
+-				suite.SetUpSuite(c)
+-
+-				suite.SFTPServiceAccountLogin(c)
+-				suite.SFTPInvalidServiceAccountPassword(c)
+-
+-				// LDAP tests
+-				ldapServer := os.Getenv(EnvTestLDAPServer)
+-				if ldapServer == "" {
+-					c.Skipf("Skipping LDAP test as no LDAP server is provided via %s", EnvTestLDAPServer)
+-				}
+-
+-				suite.SetUpLDAP(c, ldapServer)
+-
+-				suite.SFTPFailedAuthDueToMissingPolicy(c)
+-				suite.SFTPFailedAuthDueToInvalidUser(c)
+-				suite.SFTPFailedForcedServiceAccountAuthOnLDAPUser(c)
+-				suite.SFTPFailedAuthDueToInvalidPassword(c)
+-
+-				suite.SFTPValidLDAPLoginWithPassword(c)
+-
+-				suite.SFTPPublicKeyAuthentication(c)
+-				suite.SFTPFailedPublicKeyAuthenticationInvalidKey(c)
+-
+-				suite.TearDownSuite(c)
+-			},
+-		)
+-	}
+-}
+-
+-func (s *TestSuiteIAM) SFTPFailedPublicKeyAuthenticationInvalidKey(c *check) {
+-	keyBytes, err := os.ReadFile("./testdata/invalid_test_key.pub")
+-	if err != nil {
+-		c.Fatalf("could not read test key file: %s", err)
+-	}
+-
+-	testKey, _, _, _, err := ssh.ParseAuthorizedKey(keyBytes)
+-	if err != nil {
+-		c.Fatalf("could not parse test key file: %s", err)
+-	}
+-
+-	newSSHCon := newSSHConnMock("dillon=ldap")
+-	_, err = sshPubKeyAuth(newSSHCon, testKey)
+-	if err == nil || !errors.Is(err, errAuthentication) {
+-		c.Fatalf("expected err(%s) but got (%s)", errAuthentication, err)
+-	}
+-
+-	newSSHCon = newSSHConnMock("dillon")
+-	_, err = sshPubKeyAuth(newSSHCon, testKey)
+-	if err == nil || !errors.Is(err, errNoSuchUser) {
+-		c.Fatalf("expected err(%s) but got (%s)", errNoSuchUser, err)
+-	}
+-}
+-
+-func (s *TestSuiteIAM) SFTPPublicKeyAuthentication(c *check) {
+-	keyBytes, err := os.ReadFile("./testdata/dillon_test_key.pub")
+-	if err != nil {
+-		c.Fatalf("could not read test key file: %s", err)
+-	}
+-
+-	testKey, _, _, _, err := ssh.ParseAuthorizedKey(keyBytes)
+-	if err != nil {
+-		c.Fatalf("could not parse test key file: %s", err)
+-	}
+-
+-	newSSHCon := newSSHConnMock("dillon=ldap")
+-	_, err = sshPubKeyAuth(newSSHCon, testKey)
+-	if err != nil {
+-		c.Fatalf("expected no error but got(%s)", err)
+-	}
+-
+-	newSSHCon = newSSHConnMock("dillon")
+-	_, err = sshPubKeyAuth(newSSHCon, testKey)
+-	if err != nil {
+-		c.Fatalf("expected no error but got(%s)", err)
+-	}
+-}
+-
+-func (s *TestSuiteIAM) SFTPFailedAuthDueToMissingPolicy(c *check) {
+-	newSSHCon := newSSHConnMock("dillon=ldap")
+-	_, err := sshPasswordAuth(newSSHCon, []byte("dillon"))
+-	if err == nil || !errors.Is(err, errSFTPUserHasNoPolicies) {
+-		c.Fatalf("expected err(%s) but got (%s)", errSFTPUserHasNoPolicies, err)
+-	}
+-
+-	newSSHCon = newSSHConnMock("dillon")
+-	_, err = sshPasswordAuth(newSSHCon, []byte("dillon"))
+-	if err == nil || !errors.Is(err, errNoSuchUser) {
+-		c.Fatalf("expected err(%s) but got (%s)", errNoSuchUser, err)
+-	}
+-}
+-
+-func (s *TestSuiteIAM) SFTPFailedAuthDueToInvalidUser(c *check) {
+-	newSSHCon := newSSHConnMock("dillon_error")
+-	_, err := sshPasswordAuth(newSSHCon, []byte("dillon_error"))
+-	if err == nil || !errors.Is(err, errNoSuchUser) {
+-		c.Fatalf("expected err(%s) but got (%s)", errNoSuchUser, err)
+-	}
+-}
+-
+-func (s *TestSuiteIAM) SFTPFailedForcedServiceAccountAuthOnLDAPUser(c *check) {
+-	newSSHCon := newSSHConnMock("dillon=svc")
+-	_, err := sshPasswordAuth(newSSHCon, []byte("dillon"))
+-	if err == nil || !errors.Is(err, errNoSuchUser) {
+-		c.Fatalf("expected err(%s) but got (%s)", errNoSuchUser, err)
+-	}
+-}
+-
+-func (s *TestSuiteIAM) SFTPFailedAuthDueToInvalidPassword(c *check) {
+-	newSSHCon := newSSHConnMock("dillon")
+-	_, err := sshPasswordAuth(newSSHCon, []byte("dillon_error"))
+-	if err == nil || !errors.Is(err, errNoSuchUser) {
+-		c.Fatalf("expected err(%s) but got (%s)", errNoSuchUser, err)
+-	}
+-}
+-
+-func (s *TestSuiteIAM) SFTPInvalidServiceAccountPassword(c *check) {
+-	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+-	defer cancel()
+-
+-	accessKey, secretKey := mustGenerateCredentials(c)
+-	err := s.adm.SetUser(ctx, accessKey, secretKey, madmin.AccountEnabled)
+-	if err != nil {
+-		c.Fatalf("Unable to set user: %v", err)
+-	}
+-
+-	err = s.adm.SetPolicy(ctx, "readwrite", accessKey, false)
+-	if err != nil {
+-		c.Fatalf("unable to set policy: %v", err)
+-	}
+-
+-	newSSHCon := newSSHConnMock(accessKey + "=svc")
+-	_, err = sshPasswordAuth(newSSHCon, []byte("invalid"))
+-	if err == nil || !errors.Is(err, errAuthentication) {
+-		c.Fatalf("expected err(%s) but got (%s)", errAuthentication, err)
+-	}
+-
+-	newSSHCon = newSSHConnMock(accessKey)
+-	_, err = sshPasswordAuth(newSSHCon, []byte("invalid"))
+-	if err == nil || !errors.Is(err, errAuthentication) {
+-		c.Fatalf("expected err(%s) but got (%s)", errAuthentication, err)
+-	}
+-}
+-
+-func (s *TestSuiteIAM) SFTPServiceAccountLogin(c *check) {
+-	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+-	defer cancel()
+-
+-	accessKey, secretKey := mustGenerateCredentials(c)
+-	err := s.adm.SetUser(ctx, accessKey, secretKey, madmin.AccountEnabled)
+-	if err != nil {
+-		c.Fatalf("Unable to set user: %v", err)
+-	}
+-
+-	err = s.adm.SetPolicy(ctx, "readwrite", accessKey, false)
+-	if err != nil {
+-		c.Fatalf("unable to set policy: %v", err)
+-	}
+-
+-	newSSHCon := newSSHConnMock(accessKey + "=svc")
+-	_, err = sshPasswordAuth(newSSHCon, []byte(secretKey))
+-	if err != nil {
+-		c.Fatalf("expected no error but got (%s)", err)
+-	}
+-
+-	newSSHCon = newSSHConnMock(accessKey)
+-	_, err = sshPasswordAuth(newSSHCon, []byte(secretKey))
+-	if err != nil {
+-		c.Fatalf("expected no error but got (%s)", err)
+-	}
+-}
+-
+-func (s *TestSuiteIAM) SFTPValidLDAPLoginWithPassword(c *check) {
+-	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+-	defer cancel()
+-
+-	// we need to do this so that the user has a policy before authentication.
+-	// ldap user accounts without policies are denied access in sftp.
+-	policy := "mypolicy"
+-	policyBytes := []byte(`{
+- "Version": "2012-10-17",
+- "Statement": [
+-  {
+-   "Effect": "Allow",
+-   "Action": [
+-    "s3:PutObject",
+-    "s3:GetObject",
+-    "s3:ListBucket"
+-   ],
+-   "Resource": [
+-    "arn:aws:s3:::BUCKET/*"
+-   ]
+-  }
+- ]
+-}`)
+-
+-	err := s.adm.AddCannedPolicy(ctx, policy, policyBytes)
+-	if err != nil {
+-		c.Fatalf("policy add error: %v", err)
+-	}
+-
+-	userDN := "uid=dillon,ou=people,ou=swengg,dc=min,dc=io"
+-	err = s.adm.SetPolicy(ctx, policy, userDN, false)
+-	if err != nil {
+-		c.Fatalf("Unable to set policy: %v", err)
+-	}
+-
+-	newSSHCon := newSSHConnMock("dillon=ldap")
+-	_, err = sshPasswordAuth(newSSHCon, []byte("dillon"))
+-	if err != nil {
+-		c.Fatal("Password authentication failed for user (dillon):", err)
+-	}
+-
+-	newSSHCon = newSSHConnMock("dillon")
+-	_, err = sshPasswordAuth(newSSHCon, []byte("dillon"))
+-	if err != nil {
+-		c.Fatal("Password authentication failed for user (dillon):", err)
+-	}
+-}
+diff --git a/cmd/testdata/dillon_test_key.pub b/cmd/testdata/dillon_test_key.pub
+deleted file mode 100644
+index dc22abbd7..000000000
+--- a/cmd/testdata/dillon_test_key.pub
++++ /dev/null
+@@ -1 +0,0 @@
+-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDVGk/SRz4fwTPK0+Ra7WYUGf3o08YkpI0yTMPpHwYoq dillon@example.io
+diff --git a/cmd/testdata/invalid_test_key.pub b/cmd/testdata/invalid_test_key.pub
+deleted file mode 100644
+index 182a4766e..000000000
+--- a/cmd/testdata/invalid_test_key.pub
++++ /dev/null
+@@ -1 +0,0 @@
+-ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDES4saDDRpoHDVmiYESEQrCYhw8EK7Utj/A/lqxiqZlP6Il3aN2fWu6uJQdWAovZxNeXUf8LIujisW1mJWGZPql0SLKVq6IZ707OAGmKA59IXfF5onRoU9+K4UDL7BJFfix6/3F5OV2WB3ChFrOrXhJ0CZ0sVAfGcV4q72kS19YjZNX3fqCc2HF8UQEaZGKIkw5MtdZI9a1P2bqnPuPGJybRFUzyoQXPge45QT5jnpcsAXOuXcGxbjuqaaHXFNTSKAkCU93TcjAbqUMkTz2mnFz/MnrKJTECN3Fy0GPCCQ5dxmG8p8DyMiNl7JYkX2r3XYgxmioCzkcg8fDs5p0CaQcipu+MA7iK7APKq7v4Zr/wNltXHI3DE9S8J88Hxb2FZAyEhCRfcgGmCVfoZxVNCRHNkGYzfe63BkxtnseUCzpYEhKv02H5u9rjFpdMY37kDfHDVqBbgutdMij+tQAEp1kyqi6TQL+4XHjPHkLaeekW07yB+VI90dK1A9dzTpOvE= liza@example.io

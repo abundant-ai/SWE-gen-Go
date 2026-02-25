@@ -19,7 +19,6 @@ RUN curl -fsSL https://go.dev/dl/go1.23.0.linux-amd64.tar.gz | tar -C /usr/local
     ln -s /usr/local/go/bin/go /usr/local/bin/go && \
     ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
 
-
 WORKDIR /app
 
 # Clone repo at HEAD commit (with fix applied)

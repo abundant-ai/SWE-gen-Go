@@ -1,0 +1,178 @@
+diff --git a/config.go b/config.go
+index 192fd1a..55637fb 100644
+--- a/config.go
++++ b/config.go
+@@ -101,6 +101,7 @@ func NewProductionEncoderConfig() zapcore.EncoderConfig {
+ 		LevelKey:       "level",
+ 		NameKey:        "logger",
+ 		CallerKey:      "caller",
++		FunctionKey:    zapcore.OmitKey,
+ 		MessageKey:     "msg",
+ 		StacktraceKey:  "stacktrace",
+ 		LineEnding:     zapcore.DefaultLineEnding,
+@@ -140,6 +141,7 @@ func NewDevelopmentEncoderConfig() zapcore.EncoderConfig {
+ 		LevelKey:       "L",
+ 		NameKey:        "N",
+ 		CallerKey:      "C",
++		FunctionKey:    zapcore.OmitKey,
+ 		MessageKey:     "M",
+ 		StacktraceKey:  "S",
+ 		LineEnding:     zapcore.DefaultLineEnding,
+diff --git a/logger.go b/logger.go
+index cd6e195..a379e96 100644
+--- a/logger.go
++++ b/logger.go
+@@ -297,11 +297,19 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
+ 	// Thread the error output through to the CheckedEntry.
+ 	ce.ErrorOutput = log.errorOutput
+ 	if log.addCaller {
+-		ce.Entry.Caller = zapcore.NewEntryCaller(runtime.Caller(log.callerSkip + callerSkipOffset))
+-		if !ce.Entry.Caller.Defined {
++		frame, defined := getCallerFrame(log.callerSkip + callerSkipOffset)
++		if !defined {
+ 			fmt.Fprintf(log.errorOutput, "%v Logger.check error: failed to get caller\n", time.Now().UTC())
+ 			log.errorOutput.Sync()
+ 		}
++
++		ce.Entry.Caller = zapcore.EntryCaller{
++			Defined:  defined,
++			PC:       frame.PC,
++			File:     frame.File,
++			Line:     frame.Line,
++			Function: frame.Function,
++		}
+ 	}
+ 	if log.addStack.Enabled(ce.Entry.Level) {
+ 		ce.Entry.Stack = Stack("").String
+@@ -309,3 +317,21 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
+ 
+ 	return ce
+ }
++
++// getCallerFrame gets caller frame. The argument skip is the number of stack
++// frames to ascend, with 0 identifying the caller of getCallerFrame. The
++// boolean ok is false if it was not possible to recover the information.
++//
++// Note: This implementation is similar to runtime.Caller, but it returns the whole frame.
++func getCallerFrame(skip int) (frame runtime.Frame, ok bool) {
++	const skipOffset = 2 // skip getCallerFrame and Callers
++
++	pc := make([]uintptr, 1)
++	numFrames := runtime.Callers(skip+skipOffset, pc[:])
++	if numFrames < 1 {
++		return
++	}
++
++	frame, _ = runtime.CallersFrames(pc).Next()
++	return frame, frame.PC != 0
++}
+diff --git a/options.go b/options.go
+index c05b381..2bf2cb2 100644
+--- a/options.go
++++ b/options.go
+@@ -86,15 +86,15 @@ func Development() Option {
+ 	})
+ }
+ 
+-// AddCaller configures the Logger to annotate each message with the filename
+-// and line number of zap's caller.  See also WithCaller.
++// AddCaller configures the Logger to annotate each message with the filename,
++// line number, and function name of zap's caller. See also WithCaller.
+ func AddCaller() Option {
+ 	return WithCaller(true)
+ }
+ 
+-// WithCaller configures the Logger to annotate each message with the filename
+-// and line number of zap's caller, or not, depending on the value of enabled.
+-// This is a generalized form of AddCaller.
++// WithCaller configures the Logger to annotate each message with the filename,
++// line number, and function name of zap's caller, or not, depending on the
++// value of enabled. This is a generalized form of AddCaller.
+ func WithCaller(enabled bool) Option {
+ 	return optionFunc(func(log *Logger) {
+ 		log.addCaller = enabled
+diff --git a/zapcore/console_encoder.go b/zapcore/console_encoder.go
+index 54aae7e..bad19ed 100644
+--- a/zapcore/console_encoder.go
++++ b/zapcore/console_encoder.go
+@@ -93,8 +93,13 @@ func (c consoleEncoder) EncodeEntry(ent Entry, fields []Field) (*buffer.Buffer,
+ 
+ 		nameEncoder(ent.LoggerName, arr)
+ 	}
+-	if ent.Caller.Defined && c.CallerKey != "" && c.EncodeCaller != nil {
+-		c.EncodeCaller(ent.Caller, arr)
++	if ent.Caller.Defined {
++		if c.CallerKey != "" && c.EncodeCaller != nil {
++			c.EncodeCaller(ent.Caller, arr)
++		}
++		if c.FunctionKey != "" {
++			arr.AppendString(ent.Caller.Function)
++		}
+ 	}
+ 	for i := range arr.elems {
+ 		if i > 0 {
+diff --git a/zapcore/encoder.go b/zapcore/encoder.go
+index 961878c..6601ca1 100644
+--- a/zapcore/encoder.go
++++ b/zapcore/encoder.go
+@@ -317,6 +317,7 @@ type EncoderConfig struct {
+ 	TimeKey       string `json:"timeKey" yaml:"timeKey"`
+ 	NameKey       string `json:"nameKey" yaml:"nameKey"`
+ 	CallerKey     string `json:"callerKey" yaml:"callerKey"`
++	FunctionKey   string `json:"functionKey" yaml:"functionKey"`
+ 	StacktraceKey string `json:"stacktraceKey" yaml:"stacktraceKey"`
+ 	LineEnding    string `json:"lineEnding" yaml:"lineEnding"`
+ 	// Configure the primitive representations of common complex types. For
+diff --git a/zapcore/entry.go b/zapcore/entry.go
+index 8273abd..717dc0c 100644
+--- a/zapcore/entry.go
++++ b/zapcore/entry.go
+@@ -70,10 +70,11 @@ func NewEntryCaller(pc uintptr, file string, line int, ok bool) EntryCaller {
+ 
+ // EntryCaller represents the caller of a logging function.
+ type EntryCaller struct {
+-	Defined bool
+-	PC      uintptr
+-	File    string
+-	Line    int
++	Defined  bool
++	PC       uintptr
++	File     string
++	Line     int
++	Function string
+ }
+ 
+ // String returns the full path and line number of the caller.
+diff --git a/zapcore/json_encoder.go b/zapcore/json_encoder.go
+index 9ede4a9..5cf7d91 100644
+--- a/zapcore/json_encoder.go
++++ b/zapcore/json_encoder.go
+@@ -366,14 +366,20 @@ func (enc *jsonEncoder) EncodeEntry(ent Entry, fields []Field) (*buffer.Buffer,
+ 			final.AppendString(ent.LoggerName)
+ 		}
+ 	}
+-	if ent.Caller.Defined && final.CallerKey != "" {
+-		final.addKey(final.CallerKey)
+-		cur := final.buf.Len()
+-		final.EncodeCaller(ent.Caller, final)
+-		if cur == final.buf.Len() {
+-			// User-supplied EncodeCaller was a no-op. Fall back to strings to
+-			// keep output JSON valid.
+-			final.AppendString(ent.Caller.String())
++	if ent.Caller.Defined {
++		if final.CallerKey != "" {
++			final.addKey(final.CallerKey)
++			cur := final.buf.Len()
++			final.EncodeCaller(ent.Caller, final)
++			if cur == final.buf.Len() {
++				// User-supplied EncodeCaller was a no-op. Fall back to strings to
++				// keep output JSON valid.
++				final.AppendString(ent.Caller.String())
++			}
++		}
++		if final.FunctionKey != "" {
++			final.addKey(final.FunctionKey)
++			final.AppendString(ent.Caller.Function)
+ 		}
+ 	}
+ 	if final.MessageKey != "" {

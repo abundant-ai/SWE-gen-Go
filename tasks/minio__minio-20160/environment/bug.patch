@@ -1,0 +1,240 @@
+diff --git a/cmd/generic-handlers.go b/cmd/generic-handlers.go
+index defd66e6c..996c84ad2 100644
+--- a/cmd/generic-handlers.go
++++ b/cmd/generic-handlers.go
+@@ -251,7 +251,7 @@ func guessIsRPCReq(req *http.Request) bool {
+ 		return true
+ 	}
+ 
+-	return (req.Method == http.MethodPost || req.Method == http.MethodGet) &&
++	return req.Method == http.MethodPost &&
+ 		strings.HasPrefix(req.URL.Path, minioReservedBucketPath+SlashSeparator)
+ }
+ 
+diff --git a/cmd/generic-handlers_test.go b/cmd/generic-handlers_test.go
+index 12ba5631e..303e42d2f 100644
+--- a/cmd/generic-handlers_test.go
++++ b/cmd/generic-handlers_test.go
+@@ -51,10 +51,9 @@ func TestGuessIsRPC(t *testing.T) {
+ 	r = &http.Request{
+ 		Proto:  "HTTP/1.1",
+ 		Method: http.MethodGet,
+-		URL:    u,
+ 	}
+-	if !guessIsRPCReq(r) {
+-		t.Fatal("Test shouldn't fail for a possible net/rpc request.")
++	if guessIsRPCReq(r) {
++		t.Fatal("Test shouldn't report as net/rpc for a non net/rpc request.")
+ 	}
+ 	r = &http.Request{
+ 		Proto:  "HTTP/1.1",
+diff --git a/cmd/storage-rest-client.go b/cmd/storage-rest-client.go
+index 593fa9f82..7a71c174e 100644
+--- a/cmd/storage-rest-client.go
++++ b/cmd/storage-rest-client.go
+@@ -617,11 +617,9 @@ func (client *storageRESTClient) ReadFileStream(ctx context.Context, volume, pat
+ 	values.Set(storageRESTFilePath, path)
+ 	values.Set(storageRESTOffset, strconv.Itoa(int(offset)))
+ 	values.Set(storageRESTLength, strconv.Itoa(int(length)))
+-	values.Set(storageRESTDiskID, *client.diskID.Load())
+-
+-	respBody, err := client.restClient.CallWithHTTPMethod(ctx, http.MethodGet, storageRESTMethodReadFileStream, values, nil, -1)
++	respBody, err := client.call(ctx, storageRESTMethodReadFileStream, values, nil, -1)
+ 	if err != nil {
+-		return nil, toStorageErr(err)
++		return nil, err
+ 	}
+ 	return respBody, nil
+ }
+diff --git a/cmd/storage-rest-common.go b/cmd/storage-rest-common.go
+index 8b9493058..d8434e97b 100644
+--- a/cmd/storage-rest-common.go
++++ b/cmd/storage-rest-common.go
+@@ -20,7 +20,7 @@ package cmd
+ //go:generate msgp -file $GOFILE -unexported
+ 
+ const (
+-	storageRESTVersion       = "v60" // ReadFileStream now uses http.MethodGet
++	storageRESTVersion       = "v59" // Change ReadOptions inclFreeVersions
+ 	storageRESTVersionPrefix = SlashSeparator + storageRESTVersion
+ 	storageRESTPrefix        = minioReservedBucketPath + "/storage"
+ )
+diff --git a/cmd/storage-rest-server.go b/cmd/storage-rest-server.go
+index 43bfae5da..ab34552c9 100644
+--- a/cmd/storage-rest-server.go
++++ b/cmd/storage-rest-server.go
+@@ -29,12 +29,14 @@ import (
+ 	"net/http"
+ 	"os/user"
+ 	"path"
++	"runtime"
+ 	"runtime/debug"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
+ 
++	"github.com/dustin/go-humanize"
+ 	"github.com/minio/minio/internal/grid"
+ 	"github.com/tinylib/msgp/msgp"
+ 
+@@ -604,6 +606,8 @@ func (s *storageRESTServer) ReadFileStreamHandler(w http.ResponseWriter, r *http
+ 		return
+ 	}
+ 
++	w.Header().Set(xhttp.ContentLength, strconv.FormatInt(length, 10))
++
+ 	rc, err := s.getStorage().ReadFileStream(r.Context(), volume, filePath, offset, length)
+ 	if err != nil {
+ 		s.writeErrorResponse(w, err)
+@@ -611,6 +615,28 @@ func (s *storageRESTServer) ReadFileStreamHandler(w http.ResponseWriter, r *http
+ 	}
+ 	defer rc.Close()
+ 
++	noReadFrom := runtime.GOOS == "windows" || length < 4*humanize.MiByte
++	if !noReadFrom {
++		rf, ok := w.(io.ReaderFrom)
++		if ok {
++			// Attempt to use splice/sendfile() optimization, A very specific behavior mentioned below is necessary.
++			// See https://github.com/golang/go/blob/f7c5cbb82087c55aa82081e931e0142783700ce8/src/net/sendfile_linux.go#L20
++			// Windows can lock up with this optimization, so we fall back to regular copy.
++			sr, ok := rc.(*sendFileReader)
++			if ok {
++				// Sendfile sends in 4MiB chunks per sendfile syscall which is more than enough
++				// for most setups.
++				_, err = rf.ReadFrom(sr.Reader)
++				if !xnet.IsNetworkOrHostDown(err, true) { // do not need to log disconnected clients
++					storageLogIf(r.Context(), err)
++				}
++				if err == nil || !errors.Is(err, xhttp.ErrNotImplemented) {
++					return
++				}
++			}
++		}
++	} // noReadFrom means use io.Copy()
++
+ 	_, err = xioutil.Copy(w, rc)
+ 	if !xnet.IsNetworkOrHostDown(err, true) { // do not need to log disconnected clients
+ 		storageLogIf(r.Context(), err)
+@@ -1341,12 +1367,12 @@ func registerStorageRESTHandlers(router *mux.Router, endpointServerPools Endpoin
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodCreateFile).HandlerFunc(h(server.CreateFileHandler))
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadFile).HandlerFunc(h(server.ReadFileHandler))
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadFileStream).HandlerFunc(h(server.ReadFileStreamHandler))
++
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodDeleteVersions).HandlerFunc(h(server.DeleteVersionsHandler))
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodVerifyFile).HandlerFunc(h(server.VerifyFileHandler))
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodStatInfoFile).HandlerFunc(h(server.StatInfoFile))
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadMultiple).HandlerFunc(h(server.ReadMultiple))
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodCleanAbandoned).HandlerFunc(h(server.CleanAbandonedDataHandler))
+-			subrouter.Methods(http.MethodGet).Path(storageRESTVersionPrefix + storageRESTMethodReadFileStream).HandlerFunc(h(server.ReadFileStreamHandler))
+ 			logger.FatalIf(storageListDirRPC.RegisterNoInput(gm, server.ListDirHandler, endpoint.Path), "unable to register handler")
+ 			logger.FatalIf(storageReadAllRPC.Register(gm, server.ReadAllHandler, endpoint.Path), "unable to register handler")
+ 			logger.FatalIf(storageWriteAllRPC.Register(gm, server.WriteAllHandler, endpoint.Path), "unable to register handler")
+diff --git a/internal/ioutil/ioutil.go b/internal/ioutil/ioutil.go
+index 49a4300c5..1b93fbb60 100644
+--- a/internal/ioutil/ioutil.go
++++ b/internal/ioutil/ioutil.go
+@@ -34,9 +34,8 @@ import (
+ 
+ // Block sizes constant.
+ const (
+-	SmallBlock  = 32 * humanize.KiByte  // Default r/w block size for smaller objects.
+-	MediumBlock = 128 * humanize.KiByte // Default r/w block size for medium sized objects.
+-	LargeBlock  = 1 * humanize.MiByte   // Default r/w block size for normal objects.
++	SmallBlock = 32 * humanize.KiByte // Default r/w block size for smaller objects.
++	LargeBlock = 1 * humanize.MiByte  // Default r/w block size for normal objects.
+ )
+ 
+ // aligned sync.Pool's
+@@ -47,12 +46,6 @@ var (
+ 			return &b
+ 		},
+ 	}
+-	ODirectPoolMedium = sync.Pool{
+-		New: func() interface{} {
+-			b := disk.AlignedBlock(MediumBlock)
+-			return &b
+-		},
+-	}
+ 	ODirectPoolSmall = sync.Pool{
+ 		New: func() interface{} {
+ 			b := disk.AlignedBlock(SmallBlock)
+@@ -301,19 +294,13 @@ func NewSkipReader(r io.Reader, n int64) io.Reader {
+ 	return &SkipReader{r, n}
+ }
+ 
+-// writerOnly hides an io.Writer value's optional ReadFrom method
+-// from io.Copy.
+-type writerOnly struct {
+-	io.Writer
+-}
+-
+ // Copy is exactly like io.Copy but with reusable buffers.
+ func Copy(dst io.Writer, src io.Reader) (written int64, err error) {
+-	bufp := ODirectPoolMedium.Get().(*[]byte)
+-	defer ODirectPoolMedium.Put(bufp)
++	bufp := ODirectPoolLarge.Get().(*[]byte)
+ 	buf := *bufp
++	defer ODirectPoolLarge.Put(bufp)
+ 
+-	return io.CopyBuffer(writerOnly{dst}, src, buf)
++	return io.CopyBuffer(dst, src, buf)
+ }
+ 
+ // SameFile returns if the files are same.
+diff --git a/internal/rest/client.go b/internal/rest/client.go
+index c07de174f..4e01b9cc8 100644
+--- a/internal/rest/client.go
++++ b/internal/rest/client.go
+@@ -129,13 +129,13 @@ func removeEmptyPort(host string) string {
+ }
+ 
+ // Copied from http.NewRequest but implemented to ensure we reuse `url.URL` instance.
+-func (c *Client) newRequest(ctx context.Context, method string, u url.URL, body io.Reader) (*http.Request, error) {
++func (c *Client) newRequest(ctx context.Context, u url.URL, body io.Reader) (*http.Request, error) {
+ 	rc, ok := body.(io.ReadCloser)
+ 	if !ok && body != nil {
+ 		rc = io.NopCloser(body)
+ 	}
+ 	req := &http.Request{
+-		Method:     method,
++		Method:     http.MethodPost,
+ 		URL:        &u,
+ 		Proto:      "HTTP/1.1",
+ 		ProtoMajor: 1,
+@@ -290,8 +290,8 @@ func (c *Client) dumpHTTP(req *http.Request, resp *http.Response) {
+ // ErrClientClosed returned when *Client is closed.
+ var ErrClientClosed = errors.New("rest client is closed")
+ 
+-// CallWithHTTPMethod - make a REST call with context, using a custom HTTP method.
+-func (c *Client) CallWithHTTPMethod(ctx context.Context, httpMethod, rpcMethod string, values url.Values, body io.Reader, length int64) (reply io.ReadCloser, err error) {
++// Call - make a REST call with context.
++func (c *Client) Call(ctx context.Context, method string, values url.Values, body io.Reader, length int64) (reply io.ReadCloser, err error) {
+ 	switch atomic.LoadInt32(&c.connected) {
+ 	case closed:
+ 		// client closed, this is usually a manual process
+@@ -307,10 +307,10 @@ func (c *Client) CallWithHTTPMethod(ctx context.Context, httpMethod, rpcMethod s
+ 	// Shallow copy. We don't modify the *UserInfo, if set.
+ 	// All other fields are copied.
+ 	u := *c.url
+-	u.Path = path.Join(u.Path, rpcMethod)
++	u.Path = path.Join(u.Path, method)
+ 	u.RawQuery = values.Encode()
+ 
+-	req, err := c.newRequest(ctx, httpMethod, u, body)
++	req, err := c.newRequest(ctx, u, body)
+ 	if err != nil {
+ 		return nil, &NetworkError{Err: err}
+ 	}
+@@ -382,11 +382,6 @@ func (c *Client) CallWithHTTPMethod(ctx context.Context, httpMethod, rpcMethod s
+ 	return resp.Body, nil
+ }
+ 
+-// Call - make a REST call with context.
+-func (c *Client) Call(ctx context.Context, rpcMethod string, values url.Values, body io.Reader, length int64) (reply io.ReadCloser, err error) {
+-	return c.CallWithHTTPMethod(ctx, http.MethodPost, rpcMethod, values, body, length)
+-}
+-
+ // Close closes all idle connections of the underlying http client
+ func (c *Client) Close() {
+ 	atomic.StoreInt32(&c.connected, closed)

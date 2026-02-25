@@ -1,0 +1,306 @@
+diff --git a/config_test.go b/config_test.go
+index ac098aa..19af607 100644
+--- a/config_test.go
++++ b/config_test.go
+@@ -52,7 +52,7 @@ func TestConfig(t *testing.T) {
+ 			expectRe: "DEBUG\tzap/config_test.go:" + `\d+` + "\tdebug\t" + `{"k": "v", "z": "zz"}` + "\n" +
+ 				"INFO\tzap/config_test.go:" + `\d+` + "\tinfo\t" + `{"k": "v", "z": "zz"}` + "\n" +
+ 				"WARN\tzap/config_test.go:" + `\d+` + "\twarn\t" + `{"k": "v", "z": "zz"}` + "\n" +
+-				`go.uber.org/zap.TestConfig.\w+`,
++				`testing.\w+`,
+ 		},
+ 	}
+ 
+diff --git a/field.go b/field.go
+index 3c0d7d9..dd558fc 100644
+--- a/field.go
++++ b/field.go
+@@ -364,17 +364,11 @@ func Timep(key string, val *time.Time) Field {
+ // expensive (relatively speaking); this function both makes an allocation and
+ // takes about two microseconds.
+ func Stack(key string) Field {
+-	return StackSkip(key, 1) // skip Stack
+-}
+-
+-// StackSkip constructs a field similarly to Stack, but also skips the given
+-// number of frames from the top of the stacktrace.
+-func StackSkip(key string, skip int) Field {
+ 	// Returning the stacktrace as a string costs an allocation, but saves us
+ 	// from expanding the zapcore.Field union struct to include a byte slice. Since
+ 	// taking a stacktrace is already so expensive (~10us), the extra allocation
+ 	// is okay.
+-	return String(key, takeStacktrace(skip+1)) // skip StackSkip
++	return String(key, takeStacktrace())
+ }
+ 
+ // Duration constructs a field with the given key and value. The encoder
+diff --git a/field_test.go b/field_test.go
+index fbfc635..cc7f2e5 100644
+--- a/field_test.go
++++ b/field_test.go
+@@ -23,7 +23,6 @@ package zap
+ import (
+ 	"math"
+ 	"net"
+-	"regexp"
+ 	"sync"
+ 	"testing"
+ 	"time"
+@@ -260,24 +259,6 @@ func TestStackField(t *testing.T) {
+ 	f := Stack("stacktrace")
+ 	assert.Equal(t, "stacktrace", f.Key, "Unexpected field key.")
+ 	assert.Equal(t, zapcore.StringType, f.Type, "Unexpected field type.")
+-	r := regexp.MustCompile(`field_test.go:(\d+)`)
+-	assert.Equal(t, r.ReplaceAllString(takeStacktrace(0), "field_test.go"), r.ReplaceAllString(f.String, "field_test.go"), "Unexpected stack trace")
+-	assertCanBeReused(t, f)
+-}
+-
+-func TestStackSkipField(t *testing.T) {
+-	f := StackSkip("stacktrace", 0)
+-	assert.Equal(t, "stacktrace", f.Key, "Unexpected field key.")
+-	assert.Equal(t, zapcore.StringType, f.Type, "Unexpected field type.")
+-	r := regexp.MustCompile(`field_test.go:(\d+)`)
+-	assert.Equal(t, r.ReplaceAllString(takeStacktrace(0), "field_test.go"), r.ReplaceAllString(f.String, "field_test.go"), f.String, "Unexpected stack trace")
+-	assertCanBeReused(t, f)
+-}
+-
+-func TestStackSkipFieldWithSkip(t *testing.T) {
+-	f := StackSkip("stacktrace", 1)
+-	assert.Equal(t, "stacktrace", f.Key, "Unexpected field key.")
+-	assert.Equal(t, zapcore.StringType, f.Type, "Unexpected field type.")
+-	assert.Equal(t, takeStacktrace(1), f.String, "Unexpected stack trace")
++	assert.Equal(t, takeStacktrace(), f.String, "Unexpected stack trace")
+ 	assertCanBeReused(t, f)
+ }
+diff --git a/logger.go b/logger.go
+index 532968d..cd6e195 100644
+--- a/logger.go
++++ b/logger.go
+@@ -304,7 +304,7 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
+ 		}
+ 	}
+ 	if log.addStack.Enabled(ce.Entry.Level) {
+-		ce.Entry.Stack = StackSkip("", log.callerSkip+callerSkipOffset).String
++		ce.Entry.Stack = Stack("").String
+ 	}
+ 
+ 	return ce
+diff --git a/stacktrace.go b/stacktrace.go
+index 0cf8c1d..100fac2 100644
+--- a/stacktrace.go
++++ b/stacktrace.go
+@@ -22,20 +22,28 @@ package zap
+ 
+ import (
+ 	"runtime"
++	"strings"
+ 	"sync"
+ 
+ 	"go.uber.org/zap/internal/bufferpool"
+ )
+ 
++const _zapPackage = "go.uber.org/zap"
++
+ var (
+ 	_stacktracePool = sync.Pool{
+ 		New: func() interface{} {
+ 			return newProgramCounters(64)
+ 		},
+ 	}
++
++	// We add "." and "/" suffixes to the package name to ensure we only match
++	// the exact package and not any package with the same prefix.
++	_zapStacktracePrefixes       = addPrefix(_zapPackage, ".", "/")
++	_zapStacktraceVendorContains = addPrefix("/vendor/", _zapStacktracePrefixes...)
+ )
+ 
+-func takeStacktrace(skip int) string {
++func takeStacktrace() string {
+ 	buffer := bufferpool.Get()
+ 	defer buffer.Free()
+ 	programCounters := _stacktracePool.Get().(*programCounters)
+@@ -43,9 +51,9 @@ func takeStacktrace(skip int) string {
+ 
+ 	var numFrames int
+ 	for {
+-		// Skip the call to runtime.Callers and takeStacktrace so that the
++		// Skip the call to runtime.Counters and takeStacktrace so that the
+ 		// program counters start at the caller of takeStacktrace.
+-		numFrames = runtime.Callers(skip+2, programCounters.pcs)
++		numFrames = runtime.Callers(2, programCounters.pcs)
+ 		if numFrames < len(programCounters.pcs) {
+ 			break
+ 		}
+@@ -55,12 +63,19 @@ func takeStacktrace(skip int) string {
+ 	}
+ 
+ 	i := 0
++	skipZapFrames := true // skip all consecutive zap frames at the beginning.
+ 	frames := runtime.CallersFrames(programCounters.pcs[:numFrames])
+ 
+ 	// Note: On the last iteration, frames.Next() returns false, with a valid
+ 	// frame, but we ignore this frame. The last frame is a a runtime frame which
+ 	// adds noise, since it's only either runtime.main or runtime.goexit.
+ 	for frame, more := frames.Next(); more; frame, more = frames.Next() {
++		if skipZapFrames && isZapFrame(frame.Function) {
++			continue
++		} else {
++			skipZapFrames = false
++		}
++
+ 		if i != 0 {
+ 			buffer.AppendByte('\n')
+ 		}
+@@ -76,6 +91,24 @@ func takeStacktrace(skip int) string {
+ 	return buffer.String()
+ }
+ 
++func isZapFrame(function string) bool {
++	for _, prefix := range _zapStacktracePrefixes {
++		if strings.HasPrefix(function, prefix) {
++			return true
++		}
++	}
++
++	// We can't use a prefix match here since the location of the vendor
++	// directory affects the prefix. Instead we do a contains match.
++	for _, contains := range _zapStacktraceVendorContains {
++		if strings.Contains(function, contains) {
++			return true
++		}
++	}
++
++	return false
++}
++
+ type programCounters struct {
+ 	pcs []uintptr
+ }
+@@ -83,3 +116,11 @@ type programCounters struct {
+ func newProgramCounters(size int) *programCounters {
+ 	return &programCounters{make([]uintptr, size)}
+ }
++
++func addPrefix(prefix string, ss ...string) []string {
++	withPrefix := make([]string, len(ss))
++	for i, s := range ss {
++		withPrefix[i] = prefix + s
++	}
++	return withPrefix
++}
+diff --git a/stacktrace_ext_test.go b/stacktrace_ext_test.go
+index 3b56070..f780b33 100644
+--- a/stacktrace_ext_test.go
++++ b/stacktrace_ext_test.go
+@@ -120,30 +120,6 @@ func TestStacktraceFiltersVendorZap(t *testing.T) {
+ 	})
+ }
+ 
+-func TestStacktraceWithoutCallerSkip(t *testing.T) {
+-	withLogger(t, func(logger *zap.Logger, out *bytes.Buffer) {
+-		func() {
+-			logger.Error("test log")
+-		}()
+-
+-		require.Contains(t, out.String(), "TestStacktraceWithoutCallerSkip.", "Should not skip too much")
+-		verifyNoZap(t, out.String())
+-	})
+-}
+-
+-func TestStacktraceWithCallerSkip(t *testing.T) {
+-	withLogger(t, func(logger *zap.Logger, out *bytes.Buffer) {
+-		logger = logger.WithOptions(zap.AddCallerSkip(2))
+-		func() {
+-			logger.Error("test log")
+-		}()
+-
+-		require.NotContains(t, out.String(), "TestStacktraceWithCallerSkip.", "Should skip as requested by caller skip")
+-		require.Contains(t, out.String(), "TestStacktraceWithCallerSkip", "Should not skip too much")
+-		verifyNoZap(t, out.String())
+-	})
+-}
+-
+ // withLogger sets up a logger with a real encoder set up, so that any marshal functions are called.
+ // The inbuilt observer does not call Marshal for objects/arrays, which we need for some tests.
+ func withLogger(t *testing.T, fn func(logger *zap.Logger, out *bytes.Buffer)) {
+diff --git a/stacktrace_test.go b/stacktrace_test.go
+index d473029..3c9a41c 100644
+--- a/stacktrace_test.go
++++ b/stacktrace_test.go
+@@ -29,46 +29,47 @@ import (
+ )
+ 
+ func TestTakeStacktrace(t *testing.T) {
+-	trace := takeStacktrace(0)
++	trace := takeStacktrace()
+ 	lines := strings.Split(trace, "\n")
+-	require.NotEmpty(t, lines, "Expected stacktrace to have at least one frame.")
+-	assert.Contains(
+-		t,
+-		lines[0],
+-		"go.uber.org/zap.TestTakeStacktrace",
+-		"Expected stacktrace to start with the test.",
+-	)
+-}
+-
+-func TestTakeStacktraceWithSkip(t *testing.T) {
+-	trace := takeStacktrace(1)
+-	lines := strings.Split(trace, "\n")
+-	require.NotEmpty(t, lines, "Expected stacktrace to have at least one frame.")
++	require.True(t, len(lines) > 0, "Expected stacktrace to have at least one frame.")
+ 	assert.Contains(
+ 		t,
+ 		lines[0],
+ 		"testing.",
+-		"Expected stacktrace to start with the test runner (skipping our own frame).",
++		"Expected stacktrace to start with the test runner (zap frames are filtered out) %s.", lines[0],
+ 	)
+ }
+ 
+-func TestTakeStacktraceWithSkipInnerFunc(t *testing.T) {
+-	var trace string
+-	func() {
+-		trace = takeStacktrace(2)
+-	}()
+-	lines := strings.Split(trace, "\n")
+-	require.NotEmpty(t, lines, "Expected stacktrace to have at least one frame.")
+-	assert.Contains(
+-		t,
+-		lines[0],
+-		"testing.",
+-		"Expected stacktrace to start with the test function (skipping the test function).",
+-	)
++func TestIsZapFrame(t *testing.T) {
++	zapFrames := []string{
++		"go.uber.org/zap.Stack",
++		"go.uber.org/zap.(*SugaredLogger).log",
++		"go.uber.org/zap/zapcore.(ArrayMarshalerFunc).MarshalLogArray",
++		"github.com/uber/tchannel-go/vendor/go.uber.org/zap.Stack",
++		"github.com/uber/tchannel-go/vendor/go.uber.org/zap.(*SugaredLogger).log",
++		"github.com/uber/tchannel-go/vendor/go.uber.org/zap/zapcore.(ArrayMarshalerFunc).MarshalLogArray",
++	}
++	nonZapFrames := []string{
++		"github.com/uber/tchannel-go.NewChannel",
++		"go.uber.org/not-zap.New",
++		"go.uber.org/zapext.ctx",
++		"go.uber.org/zap_ext/ctx.New",
++	}
++
++	t.Run("zap frames", func(t *testing.T) {
++		for _, f := range zapFrames {
++			require.True(t, isZapFrame(f), f)
++		}
++	})
++	t.Run("non-zap frames", func(t *testing.T) {
++		for _, f := range nonZapFrames {
++			require.False(t, isZapFrame(f), f)
++		}
++	})
+ }
+ 
+ func BenchmarkTakeStacktrace(b *testing.B) {
+ 	for i := 0; i < b.N; i++ {
+-		takeStacktrace(0)
++		takeStacktrace()
+ 	}
+ }

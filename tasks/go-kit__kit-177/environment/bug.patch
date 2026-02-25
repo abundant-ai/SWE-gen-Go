@@ -1,0 +1,803 @@
+diff --git a/examples/addsvc/main.go b/examples/addsvc/main.go
+index 341e015..37be6e4 100644
+--- a/examples/addsvc/main.go
++++ b/examples/addsvc/main.go
+@@ -70,7 +70,6 @@ func main() {
+ 	var requestDuration metrics.TimeHistogram
+ 	{
+ 		requestDuration = metrics.NewTimeHistogram(time.Nanosecond, metrics.NewMultiHistogram(
+-			"request_duration_ns",
+ 			expvar.NewHistogram("request_duration_ns", 0, 5e9, 1, 50, 95, 99),
+ 			prometheus.NewSummary(stdprometheus.SummaryOpts{
+ 				Namespace: "myorg",
+diff --git a/metrics/README.md b/metrics/README.md
+index 9aa64aa..2907cc7 100644
+--- a/metrics/README.md
++++ b/metrics/README.md
+@@ -13,11 +13,7 @@ It has **[counters][]**, **[gauges][]**, and **[histograms][]**,
+ 
+ ## Rationale
+ 
+-Code instrumentation is absolutely essential to achieve [observability][] into a distributed system.
+-Metrics and instrumentation tools have coalesced around a few well-defined idioms.
+-`package metrics` provides a common, minimal interface those idioms for service authors. 
+-
+-[observability]: https://speakerdeck.com/mattheath/observability-in-micro-service-architectures
++TODO
+ 
+ ## Usage
+ 
+@@ -57,7 +53,6 @@ func handleRequest() {
+ ```
+ 
+ A gauge for the number of goroutines currently running, exported via statsd.
+-
+ ```go
+ import (
+ 	"net"
+@@ -71,13 +66,14 @@ import (
+ func main() {
+ 	statsdWriter, err := net.Dial("udp", "127.0.0.1:8126")
+ 	if err != nil {
+-		panic(err)
++		os.Exit(1)
+ 	}
+ 
+-	reportInterval := 5 * time.Second
+-	goroutines := statsd.NewGauge(statsdWriter, "total_goroutines", reportInterval)
+-	for range time.Tick(reportInterval) {
++	reportingDuration := 5 * time.Second
++	goroutines := statsd.NewGauge(statsdWriter, "total_goroutines", reportingDuration)
++	for range time.Tick(reportingDuration) {
+ 		goroutines.Set(float64(runtime.NumGoroutine()))
+ 	}
+ }
++
+ ```
+diff --git a/metrics/expvar/expvar.go b/metrics/expvar/expvar.go
+index 5ff6c13..b8245e2 100644
+--- a/metrics/expvar/expvar.go
++++ b/metrics/expvar/expvar.go
+@@ -29,42 +29,34 @@ import (
+ )
+ 
+ type counter struct {
+-	name string
+-	v    *expvar.Int
++	v *expvar.Int
+ }
+ 
+ // NewCounter returns a new Counter backed by an expvar with the given name.
+ // Fields are ignored.
+ func NewCounter(name string) metrics.Counter {
+-	return &counter{
+-		name: name,
+-		v:    expvar.NewInt(name),
+-	}
++	return &counter{expvar.NewInt(name)}
+ }
+ 
+-func (c *counter) Name() string                       { return c.name }
+ func (c *counter) With(metrics.Field) metrics.Counter { return c }
+ func (c *counter) Add(delta uint64)                   { c.v.Add(int64(delta)) }
+ 
+ type gauge struct {
+-	name string
+-	v    *expvar.Float
++	v *expvar.Float
+ }
+ 
+ // NewGauge returns a new Gauge backed by an expvar with the given name. It
+ // should be updated manually; for a callback-based approach, see
+ // PublishCallbackGauge. Fields are ignored.
+ func NewGauge(name string) metrics.Gauge {
+-	return &gauge{
+-		name: name,
+-		v:    expvar.NewFloat(name),
+-	}
++	return &gauge{expvar.NewFloat(name)}
+ }
+ 
+-func (g *gauge) Name() string                     { return g.name }
+ func (g *gauge) With(metrics.Field) metrics.Gauge { return g }
+-func (g *gauge) Add(delta float64)                { g.v.Add(delta) }
+-func (g *gauge) Set(value float64)                { g.v.Set(value) }
++
++func (g *gauge) Add(delta float64) { g.v.Add(delta) }
++
++func (g *gauge) Set(value float64) { g.v.Set(value) }
+ 
+ // PublishCallbackGauge publishes a Gauge as an expvar with the given name,
+ // whose value is determined at collect time by the passed callback function.
+@@ -109,7 +101,6 @@ func NewHistogram(name string, minValue, maxValue int64, sigfigs int, quantiles
+ 	return h
+ }
+ 
+-func (h *histogram) Name() string                         { return h.name }
+ func (h *histogram) With(metrics.Field) metrics.Histogram { return h }
+ 
+ func (h *histogram) Observe(value int64) {
+@@ -126,19 +117,6 @@ func (h *histogram) Observe(value int64) {
+ 	}
+ }
+ 
+-func (h *histogram) Distribution() []metrics.Bucket {
+-	bars := h.hist.Current.Distribution()
+-	buckets := make([]metrics.Bucket, len(bars))
+-	for i, bar := range bars {
+-		buckets[i] = metrics.Bucket{
+-			From:  bar.From,
+-			To:    bar.To,
+-			Count: bar.Count,
+-		}
+-	}
+-	return buckets
+-}
+-
+ func (h *histogram) rotateLoop(d time.Duration) {
+ 	for range time.Tick(d) {
+ 		h.mu.Lock()
+diff --git a/metrics/expvar/expvar_test.go b/metrics/expvar/expvar_test.go
+index 644bb40..636f70e 100644
+--- a/metrics/expvar/expvar_test.go
++++ b/metrics/expvar/expvar_test.go
+@@ -12,7 +12,7 @@ import (
+ 
+ func TestHistogramQuantiles(t *testing.T) {
+ 	var (
+-		name      = "test_histogram_quantiles"
++		name      = "test_histogram"
+ 		quantiles = []int{50, 90, 95, 99}
+ 		h         = expvar.NewHistogram(name, 0, 100, 3, quantiles...).With(metrics.Field{Key: "ignored", Value: "field"})
+ 	)
+diff --git a/metrics/metrics.go b/metrics/metrics.go
+index f126925..49e93d3 100644
+--- a/metrics/metrics.go
++++ b/metrics/metrics.go
+@@ -9,7 +9,6 @@ package metrics
+ // between measurements of a counter over intervals of time, an aggregation
+ // layer can derive rates, acceleration, etc.
+ type Counter interface {
+-	Name() string
+ 	With(Field) Counter
+ 	Add(delta uint64)
+ }
+@@ -17,7 +16,6 @@ type Counter interface {
+ // Gauge captures instantaneous measurements of something using signed, 64-bit
+ // floats. The value does not need to be monotonic.
+ type Gauge interface {
+-	Name() string
+ 	With(Field) Gauge
+ 	Set(value float64)
+ 	Add(delta float64)
+@@ -27,10 +25,8 @@ type Gauge interface {
+ // milliseconds it takes to handle requests). Implementations may choose to
+ // add gauges for values at meaningful quantiles.
+ type Histogram interface {
+-	Name() string
+ 	With(Field) Histogram
+ 	Observe(value int64)
+-	Distribution() []Bucket
+ }
+ 
+ // Field is a key/value pair associated with an observation for a specific
+@@ -39,10 +35,3 @@ type Field struct {
+ 	Key   string
+ 	Value string
+ }
+-
+-// Bucket is a range in a histogram which aggregates observations.
+-type Bucket struct {
+-	From  int64
+-	To    int64
+-	Count int64
+-}
+diff --git a/metrics/multi.go b/metrics/multi.go
+index 42938ac..1981637 100644
+--- a/metrics/multi.go
++++ b/metrics/multi.go
+@@ -1,107 +1,73 @@
+ package metrics
+ 
+-type multiCounter struct {
+-	name string
+-	a    []Counter
+-}
++type multiCounter []Counter
+ 
+ // NewMultiCounter returns a wrapper around multiple Counters.
+-func NewMultiCounter(name string, counters ...Counter) Counter {
+-	return &multiCounter{
+-		name: name,
+-		a:    counters,
+-	}
++func NewMultiCounter(counters ...Counter) Counter {
++	c := make(multiCounter, 0, len(counters))
++	return append(c, counters...)
+ }
+ 
+-func (c multiCounter) Name() string { return c.name }
+-
+ func (c multiCounter) With(f Field) Counter {
+-	next := &multiCounter{
+-		name: c.name,
+-		a:    make([]Counter, len(c.a)),
+-	}
+-	for i, counter := range c.a {
+-		next.a[i] = counter.With(f)
++	next := make(multiCounter, len(c))
++	for i, counter := range c {
++		next[i] = counter.With(f)
+ 	}
+ 	return next
+ }
+ 
+ func (c multiCounter) Add(delta uint64) {
+-	for _, counter := range c.a {
++	for _, counter := range c {
+ 		counter.Add(delta)
+ 	}
+ }
+ 
+-type multiGauge struct {
+-	name string
+-	a    []Gauge
+-}
+-
+-func (g multiGauge) Name() string { return g.name }
++type multiGauge []Gauge
+ 
+ // NewMultiGauge returns a wrapper around multiple Gauges.
+-func NewMultiGauge(name string, gauges ...Gauge) Gauge {
+-	return &multiGauge{
+-		name: name,
+-		a:    gauges,
+-	}
++func NewMultiGauge(gauges ...Gauge) Gauge {
++	g := make(multiGauge, 0, len(gauges))
++	return append(g, gauges...)
+ }
+ 
+ func (g multiGauge) With(f Field) Gauge {
+-	next := &multiGauge{
+-		name: g.name,
+-		a:    make([]Gauge, len(g.a)),
+-	}
+-	for i, gauge := range g.a {
+-		next.a[i] = gauge.With(f)
++	next := make(multiGauge, len(g))
++	for i, gauge := range g {
++		next[i] = gauge.With(f)
+ 	}
+ 	return next
+ }
+ 
+ func (g multiGauge) Set(value float64) {
+-	for _, gauge := range g.a {
++	for _, gauge := range g {
+ 		gauge.Set(value)
+ 	}
+ }
+ 
+ func (g multiGauge) Add(delta float64) {
+-	for _, gauge := range g.a {
++	for _, gauge := range g {
+ 		gauge.Add(delta)
+ 	}
+ }
+ 
+-type multiHistogram struct {
+-	name string
+-	a    []Histogram
+-}
++type multiHistogram []Histogram
+ 
+ // NewMultiHistogram returns a wrapper around multiple Histograms.
+-func NewMultiHistogram(name string, histograms ...Histogram) Histogram {
+-	return &multiHistogram{
+-		name: name,
+-		a:    histograms,
+-	}
++func NewMultiHistogram(histograms ...Histogram) Histogram {
++	h := make(multiHistogram, 0, len(histograms))
++	return append(h, histograms...)
+ }
+ 
+-func (h multiHistogram) Name() string { return h.name }
+-
+ func (h multiHistogram) With(f Field) Histogram {
+-	next := &multiHistogram{
+-		name: h.name,
+-		a:    make([]Histogram, len(h.a)),
+-	}
+-	for i, histogram := range h.a {
+-		next.a[i] = histogram.With(f)
++	next := make(multiHistogram, len(h))
++	for i, histogram := range h {
++		next[i] = histogram.With(f)
+ 	}
+ 	return next
+ }
+ 
+ func (h multiHistogram) Observe(value int64) {
+-	for _, histogram := range h.a {
++	for _, histogram := range h {
+ 		histogram.Observe(value)
+ 	}
+ }
+-
+-func (h multiHistogram) Distribution() []Bucket {
+-	return []Bucket{} // TODO(pb): can this be statistically valid?
+-}
+diff --git a/metrics/multi_test.go b/metrics/multi_test.go
+index 8102dac..29cdcf2 100644
+--- a/metrics/multi_test.go
++++ b/metrics/multi_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"io/ioutil"
+ 	"math"
++	"math/rand"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"regexp"
+@@ -17,12 +18,10 @@ import (
+ 	"github.com/go-kit/kit/metrics"
+ 	"github.com/go-kit/kit/metrics/expvar"
+ 	"github.com/go-kit/kit/metrics/prometheus"
+-	"github.com/go-kit/kit/metrics/teststat"
+ )
+ 
+ func TestMultiWith(t *testing.T) {
+ 	c := metrics.NewMultiCounter(
+-		"multifoo",
+ 		expvar.NewCounter("foo"),
+ 		prometheus.NewCounter(stdprometheus.CounterOpts{
+ 			Namespace: "test",
+@@ -48,7 +47,6 @@ func TestMultiWith(t *testing.T) {
+ 
+ func TestMultiCounter(t *testing.T) {
+ 	metrics.NewMultiCounter(
+-		"multialpha",
+ 		expvar.NewCounter("alpha"),
+ 		prometheus.NewCounter(stdprometheus.CounterOpts{
+ 			Namespace: "test",
+@@ -73,7 +71,6 @@ func TestMultiCounter(t *testing.T) {
+ 
+ func TestMultiGauge(t *testing.T) {
+ 	g := metrics.NewMultiGauge(
+-		"multidelta",
+ 		expvar.NewGauge("delta"),
+ 		prometheus.NewGauge(stdprometheus.GaugeOpts{
+ 			Namespace: "test",
+@@ -114,7 +111,6 @@ func TestMultiGauge(t *testing.T) {
+ func TestMultiHistogram(t *testing.T) {
+ 	quantiles := []int{50, 90, 99}
+ 	h := metrics.NewMultiHistogram(
+-		"multiomicron",
+ 		expvar.NewHistogram("omicron", 0, 100, 3, quantiles...),
+ 		prometheus.NewSummary(stdprometheus.SummaryOpts{
+ 			Namespace: "test",
+@@ -125,11 +121,19 @@ func TestMultiHistogram(t *testing.T) {
+ 	)
+ 
+ 	const seed, mean, stdev int64 = 123, 50, 10
+-	teststat.PopulateNormalHistogram(t, h, seed, mean, stdev)
++	populateNormalHistogram(t, h, seed, mean, stdev)
+ 	assertExpvarNormalHistogram(t, "omicron", mean, stdev, quantiles)
+ 	assertPrometheusNormalHistogram(t, `test_multi_histogram_nu`, mean, stdev)
+ }
+ 
++func populateNormalHistogram(t *testing.T, h metrics.Histogram, seed int64, mean, stdev int64) {
++	rand.Seed(seed)
++	for i := 0; i < 1234; i++ {
++		sample := int64(rand.NormFloat64()*float64(stdev) + float64(mean))
++		h.Observe(sample)
++	}
++}
++
+ func assertExpvarNormalHistogram(t *testing.T, metricName string, mean, stdev int64, quantiles []int) {
+ 	const tolerance int = 2
+ 	for _, quantile := range quantiles {
+diff --git a/metrics/print.go b/metrics/print.go
+deleted file mode 100644
+index d22c426..0000000
+--- a/metrics/print.go
++++ /dev/null
+@@ -1,39 +0,0 @@
+-package metrics
+-
+-import (
+-	"fmt"
+-	"io"
+-	"text/tabwriter"
+-)
+-
+-const (
+-	bs  = "####################################################################################################"
+-	bsz = float64(len(bs))
+-)
+-
+-// PrintDistribution writes a human-readable graph of the distribution to the
+-// passed writer.
+-func PrintDistribution(w io.Writer, name string, buckets []Bucket) {
+-	fmt.Fprintf(w, "name: %v\n", name)
+-
+-	var total float64
+-	for _, bucket := range buckets {
+-		total += float64(bucket.Count)
+-	}
+-
+-	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+-	fmt.Fprintf(tw, "From\tTo\tCount\tProb\tBar\n")
+-
+-	axis := "|"
+-	for _, bucket := range buckets {
+-		if bucket.Count > 0 {
+-			p := float64(bucket.Count) / total
+-			fmt.Fprintf(tw, "%d\t%d\t%d\t%.4f\t%s%s\n", bucket.From, bucket.To, bucket.Count, p, axis, bs[:int(p*bsz)])
+-			axis = "|"
+-		} else {
+-			axis = ":" // show that some bars were skipped
+-		}
+-	}
+-
+-	tw.Flush()
+-}
+diff --git a/metrics/print_test.go b/metrics/print_test.go
+deleted file mode 100644
+index a3e4561..0000000
+--- a/metrics/print_test.go
++++ /dev/null
+@@ -1,41 +0,0 @@
+-package metrics_test
+-
+-import (
+-	"bytes"
+-	"testing"
+-
+-	"math"
+-
+-	"github.com/go-kit/kit/metrics"
+-	"github.com/go-kit/kit/metrics/expvar"
+-	"github.com/go-kit/kit/metrics/teststat"
+-)
+-
+-func TestPrintDistribution(t *testing.T) {
+-	var (
+-		name      = "foobar"
+-		quantiles = []int{50, 90, 95, 99}
+-		h         = expvar.NewHistogram("test_print_distribution", 1, 10, 3, quantiles...)
+-		seed      = int64(555)
+-		mean      = int64(5)
+-		stdev     = int64(1)
+-	)
+-	teststat.PopulateNormalHistogram(t, h, seed, mean, stdev)
+-
+-	var buf bytes.Buffer
+-	metrics.PrintDistribution(&buf, name, h.Distribution())
+-	t.Logf("\n%s\n", buf.String())
+-
+-	// Count the number of bar chart characters.
+-	// We should have roughly 100 in any distribution.
+-
+-	var n int
+-	for _, r := range buf.String() {
+-		if r == '#' {
+-			n++
+-		}
+-	}
+-	if want, have, tol := 100, n, 5; int(math.Abs(float64(want-have))) > tol {
+-		t.Errorf("want %d, have %d (tolerance %d)", want, have, tol)
+-	}
+-}
+diff --git a/metrics/prometheus/prometheus.go b/metrics/prometheus/prometheus.go
+index 29968c4..3c913e4 100644
+--- a/metrics/prometheus/prometheus.go
++++ b/metrics/prometheus/prometheus.go
+@@ -16,7 +16,6 @@ var PrometheusLabelValueUnknown = "unknown"
+ 
+ type prometheusCounter struct {
+ 	*prometheus.CounterVec
+-	name  string
+ 	Pairs map[string]string
+ }
+ 
+@@ -31,17 +30,13 @@ func NewCounter(opts prometheus.CounterOpts, fieldKeys []string) metrics.Counter
+ 	}
+ 	return prometheusCounter{
+ 		CounterVec: m,
+-		name:       opts.Name,
+ 		Pairs:      p,
+ 	}
+ }
+ 
+-func (c prometheusCounter) Name() string { return c.name }
+-
+ func (c prometheusCounter) With(f metrics.Field) metrics.Counter {
+ 	return prometheusCounter{
+ 		CounterVec: c.CounterVec,
+-		name:       c.name,
+ 		Pairs:      merge(c.Pairs, f),
+ 	}
+ }
+@@ -52,7 +47,6 @@ func (c prometheusCounter) Add(delta uint64) {
+ 
+ type prometheusGauge struct {
+ 	*prometheus.GaugeVec
+-	name  string
+ 	Pairs map[string]string
+ }
+ 
+@@ -63,17 +57,13 @@ func NewGauge(opts prometheus.GaugeOpts, fieldKeys []string) metrics.Gauge {
+ 	prometheus.MustRegister(m)
+ 	return prometheusGauge{
+ 		GaugeVec: m,
+-		name:     opts.Name,
+ 		Pairs:    pairsFrom(fieldKeys),
+ 	}
+ }
+ 
+-func (g prometheusGauge) Name() string { return g.name }
+-
+ func (g prometheusGauge) With(f metrics.Field) metrics.Gauge {
+ 	return prometheusGauge{
+ 		GaugeVec: g.GaugeVec,
+-		name:     g.name,
+ 		Pairs:    merge(g.Pairs, f),
+ 	}
+ }
+@@ -96,7 +86,6 @@ func RegisterCallbackGauge(opts prometheus.GaugeOpts, callback func() float64) {
+ 
+ type prometheusSummary struct {
+ 	*prometheus.SummaryVec
+-	name  string
+ 	Pairs map[string]string
+ }
+ 
+@@ -110,17 +99,13 @@ func NewSummary(opts prometheus.SummaryOpts, fieldKeys []string) metrics.Histogr
+ 	prometheus.MustRegister(m)
+ 	return prometheusSummary{
+ 		SummaryVec: m,
+-		name:       opts.Name,
+ 		Pairs:      pairsFrom(fieldKeys),
+ 	}
+ }
+ 
+-func (s prometheusSummary) Name() string { return s.name }
+-
+ func (s prometheusSummary) With(f metrics.Field) metrics.Histogram {
+ 	return prometheusSummary{
+ 		SummaryVec: s.SummaryVec,
+-		name:       s.name,
+ 		Pairs:      merge(s.Pairs, f),
+ 	}
+ }
+@@ -129,14 +114,8 @@ func (s prometheusSummary) Observe(value int64) {
+ 	s.SummaryVec.With(prometheus.Labels(s.Pairs)).Observe(float64(value))
+ }
+ 
+-func (s prometheusSummary) Distribution() []metrics.Bucket {
+-	// TODO(pb): see https://github.com/prometheus/client_golang/issues/58
+-	return []metrics.Bucket{}
+-}
+-
+ type prometheusHistogram struct {
+ 	*prometheus.HistogramVec
+-	name  string
+ 	Pairs map[string]string
+ }
+ 
+@@ -150,17 +129,13 @@ func NewHistogram(opts prometheus.HistogramOpts, fieldKeys []string) metrics.His
+ 	prometheus.MustRegister(m)
+ 	return prometheusHistogram{
+ 		HistogramVec: m,
+-		name:         opts.Name,
+ 		Pairs:        pairsFrom(fieldKeys),
+ 	}
+ }
+ 
+-func (h prometheusHistogram) Name() string { return h.name }
+-
+ func (h prometheusHistogram) With(f metrics.Field) metrics.Histogram {
+ 	return prometheusHistogram{
+ 		HistogramVec: h.HistogramVec,
+-		name:         h.name,
+ 		Pairs:        merge(h.Pairs, f),
+ 	}
+ }
+@@ -169,11 +144,6 @@ func (h prometheusHistogram) Observe(value int64) {
+ 	h.HistogramVec.With(prometheus.Labels(h.Pairs)).Observe(float64(value))
+ }
+ 
+-func (h prometheusHistogram) Distribution() []metrics.Bucket {
+-	// TODO(pb): see https://github.com/prometheus/client_golang/issues/58
+-	return []metrics.Bucket{}
+-}
+-
+ func pairsFrom(fieldKeys []string) map[string]string {
+ 	p := map[string]string{}
+ 	for _, fieldName := range fieldKeys {
+diff --git a/metrics/scaled_histogram_test.go b/metrics/scaled_histogram_test.go
+index 138f572..5fb37f5 100644
+--- a/metrics/scaled_histogram_test.go
++++ b/metrics/scaled_histogram_test.go
+@@ -5,7 +5,6 @@ import (
+ 
+ 	"github.com/go-kit/kit/metrics"
+ 	"github.com/go-kit/kit/metrics/expvar"
+-	"github.com/go-kit/kit/metrics/teststat"
+ )
+ 
+ func TestScaledHistogram(t *testing.T) {
+@@ -20,7 +19,7 @@ func TestScaledHistogram(t *testing.T) {
+ 	h = metrics.NewScaledHistogram(h, scale)
+ 	h = h.With(metrics.Field{Key: "a", Value: "b"})
+ 
+-	const seed, mean, stdev = 333, 500, 100                   // input values
+-	teststat.PopulateNormalHistogram(t, h, seed, mean, stdev) // will be scaled down
++	const seed, mean, stdev = 333, 500, 100          // input values
++	populateNormalHistogram(t, h, seed, mean, stdev) // will be scaled down
+ 	assertExpvarNormalHistogram(t, metricName, mean/scale, stdev/scale, quantiles)
+ }
+diff --git a/metrics/statsd/statsd.go b/metrics/statsd/statsd.go
+index 7a02ded..2876bf5 100644
+--- a/metrics/statsd/statsd.go
++++ b/metrics/statsd/statsd.go
+@@ -27,10 +27,7 @@ import (
+ 
+ const maxBufferSize = 1400 // bytes
+ 
+-type statsdCounter struct {
+-	key string
+-	c   chan string
+-}
++type statsdCounter chan string
+ 
+ // NewCounter returns a Counter that emits observations in the statsd protocol
+ // to the passed writer. Observations are buffered for the report interval or
+@@ -39,24 +36,16 @@ type statsdCounter struct {
+ //
+ // TODO: support for sampling.
+ func NewCounter(w io.Writer, key string, reportInterval time.Duration) metrics.Counter {
+-	c := &statsdCounter{
+-		key: key,
+-		c:   make(chan string),
+-	}
+-	go fwd(w, key, reportInterval, c.c)
+-	return c
++	c := make(chan string)
++	go fwd(w, key, reportInterval, c)
++	return statsdCounter(c)
+ }
+ 
+-func (c *statsdCounter) Name() string { return c.key }
++func (c statsdCounter) With(metrics.Field) metrics.Counter { return c }
+ 
+-func (c *statsdCounter) With(metrics.Field) metrics.Counter { return c }
++func (c statsdCounter) Add(delta uint64) { c <- fmt.Sprintf("%d|c", delta) }
+ 
+-func (c *statsdCounter) Add(delta uint64) { c.c <- fmt.Sprintf("%d|c", delta) }
+-
+-type statsdGauge struct {
+-	key string
+-	g   chan string
+-}
++type statsdGauge chan string
+ 
+ // NewGauge returns a Gauge that emits values in the statsd protocol to the
+ // passed writer. Values are buffered for the report interval or until the
+@@ -65,29 +54,24 @@ type statsdGauge struct {
+ //
+ // TODO: support for sampling.
+ func NewGauge(w io.Writer, key string, reportInterval time.Duration) metrics.Gauge {
+-	g := &statsdGauge{
+-		key: key,
+-		g:   make(chan string),
+-	}
+-	go fwd(w, key, reportInterval, g.g)
+-	return g
++	g := make(chan string)
++	go fwd(w, key, reportInterval, g)
++	return statsdGauge(g)
+ }
+ 
+-func (g *statsdGauge) Name() string { return g.key }
++func (g statsdGauge) With(metrics.Field) metrics.Gauge { return g }
+ 
+-func (g *statsdGauge) With(metrics.Field) metrics.Gauge { return g }
+-
+-func (g *statsdGauge) Add(delta float64) {
++func (g statsdGauge) Add(delta float64) {
+ 	// https://github.com/etsy/statsd/blob/master/docs/metric_types.md#gauges
+ 	sign := "+"
+ 	if delta < 0 {
+ 		sign, delta = "-", -delta
+ 	}
+-	g.g <- fmt.Sprintf("%s%f|g", sign, delta)
++	g <- fmt.Sprintf("%s%f|g", sign, delta)
+ }
+ 
+-func (g *statsdGauge) Set(value float64) {
+-	g.g <- fmt.Sprintf("%f|g", value)
++func (g statsdGauge) Set(value float64) {
++	g <- fmt.Sprintf("%f|g", value)
+ }
+ 
+ // NewCallbackGauge emits values in the statsd protocol to the passed writer.
+@@ -110,10 +94,7 @@ func emitEvery(d time.Duration, callback func() float64) <-chan string {
+ 	return c
+ }
+ 
+-type statsdHistogram struct {
+-	key string
+-	h   chan string
+-}
++type statsdHistogram chan string
+ 
+ // NewHistogram returns a Histogram that emits observations in the statsd
+ // protocol to the passed writer. Observations are buffered for the reporting
+@@ -133,25 +114,15 @@ type statsdHistogram struct {
+ //
+ // TODO: support for sampling.
+ func NewHistogram(w io.Writer, key string, reportInterval time.Duration) metrics.Histogram {
+-	h := &statsdHistogram{
+-		key: key,
+-		h:   make(chan string),
+-	}
+-	go fwd(w, key, reportInterval, h.h)
+-	return h
++	h := make(chan string)
++	go fwd(w, key, reportInterval, h)
++	return statsdHistogram(h)
+ }
+ 
+-func (h *statsdHistogram) Name() string { return h.key }
+-
+-func (h *statsdHistogram) With(metrics.Field) metrics.Histogram { return h }
+-
+-func (h *statsdHistogram) Observe(value int64) {
+-	h.h <- fmt.Sprintf("%d|ms", value)
+-}
++func (h statsdHistogram) With(metrics.Field) metrics.Histogram { return h }
+ 
+-func (h *statsdHistogram) Distribution() []metrics.Bucket {
+-	// TODO(pb): no way to do this without introducing e.g. codahale/hdrhistogram
+-	return []metrics.Bucket{}
++func (h statsdHistogram) Observe(value int64) {
++	h <- fmt.Sprintf("%d|ms", value)
+ }
+ 
+ var tick = time.Tick
+diff --git a/metrics/teststat/common.go b/metrics/teststat/common.go
+index 9f2d1af..4ecf403 100644
+--- a/metrics/teststat/common.go
++++ b/metrics/teststat/common.go
+@@ -15,9 +15,9 @@ const population = 1234
+ // PopulateNormalHistogram populates the Histogram with a normal distribution
+ // of observations.
+ func PopulateNormalHistogram(t *testing.T, h metrics.Histogram, seed int64, mean, stdev int64) {
+-	r := rand.New(rand.NewSource(seed))
++	rand.Seed(seed)
+ 	for i := 0; i < population; i++ {
+-		sample := int64(r.NormFloat64()*float64(stdev) + float64(mean))
++		sample := int64(rand.NormFloat64()*float64(stdev) + float64(mean))
+ 		if sample < 0 {
+ 			sample = 0
+ 		}
+diff --git a/metrics/time_histogram_test.go b/metrics/time_histogram_test.go
+index e7ea24b..8103c28 100644
+--- a/metrics/time_histogram_test.go
++++ b/metrics/time_histogram_test.go
+@@ -21,10 +21,9 @@ func TestTimeHistogram(t *testing.T) {
+ 	)
+ 
+ 	const seed, mean, stdev int64 = 321, 100, 20
+-	r := rand.New(rand.NewSource(seed))
+ 
+ 	for i := 0; i < 4321; i++ {
+-		sample := time.Duration(r.NormFloat64()*float64(stdev)+float64(mean)) * time.Millisecond
++		sample := time.Duration(rand.NormFloat64()*float64(stdev)+float64(mean)) * time.Millisecond
+ 		th.Observe(sample)
+ 	}
+ 

@@ -1,0 +1,376 @@
+diff --git a/loadbalancer/cache.go b/loadbalancer/cache.go
+new file mode 100644
+index 0000000..7d01ff6
+--- /dev/null
++++ b/loadbalancer/cache.go
+@@ -0,0 +1,40 @@
++package loadbalancer
++
++import "github.com/go-kit/kit/endpoint"
++
++type cache struct {
++	req  chan []endpoint.Endpoint
++	quit chan struct{}
++}
++
++func newCache(p Publisher) *cache {
++	c := &cache{
++		req:  make(chan []endpoint.Endpoint),
++		quit: make(chan struct{}),
++	}
++	go c.loop(p)
++	return c
++}
++
++func (c *cache) loop(p Publisher) {
++	e := make(chan []endpoint.Endpoint, 1)
++	p.Subscribe(e)
++	defer p.Unsubscribe(e)
++	endpoints := <-e
++	for {
++		select {
++		case endpoints = <-e:
++		case c.req <- endpoints:
++		case <-c.quit:
++			return
++		}
++	}
++}
++
++func (c *cache) get() []endpoint.Endpoint {
++	return <-c.req
++}
++
++func (c *cache) stop() {
++	close(c.quit)
++}
+diff --git a/loadbalancer/dns_srv_publisher.go b/loadbalancer/dns_srv_publisher.go
+new file mode 100644
+index 0000000..154e854
+--- /dev/null
++++ b/loadbalancer/dns_srv_publisher.go
+@@ -0,0 +1,105 @@
++package loadbalancer
++
++import (
++	"crypto/md5"
++	"fmt"
++	"net"
++	"sort"
++	"time"
++
++	"github.com/go-kit/kit/endpoint"
++)
++
++type dnssrvPublisher struct {
++	subscribe   chan chan<- []endpoint.Endpoint
++	unsubscribe chan chan<- []endpoint.Endpoint
++	quit        chan struct{}
++}
++
++// NewDNSSRVPublisher returns a publisher that resolves the SRV name every ttl, and
++func NewDNSSRVPublisher(name string, ttl time.Duration, makeEndpoint func(hostport string) endpoint.Endpoint) Publisher {
++	p := &dnssrvPublisher{
++		subscribe:   make(chan chan<- []endpoint.Endpoint),
++		unsubscribe: make(chan chan<- []endpoint.Endpoint),
++		quit:        make(chan struct{}),
++	}
++	go p.loop(name, ttl, makeEndpoint)
++	return p
++}
++
++func (p *dnssrvPublisher) Subscribe(c chan<- []endpoint.Endpoint) {
++	p.subscribe <- c
++}
++
++func (p *dnssrvPublisher) Unsubscribe(c chan<- []endpoint.Endpoint) {
++	p.unsubscribe <- c
++}
++
++func (p *dnssrvPublisher) Stop() {
++	close(p.quit)
++}
++
++var newTicker = time.NewTicker
++
++func (p *dnssrvPublisher) loop(name string, ttl time.Duration, makeEndpoint func(hostport string) endpoint.Endpoint) {
++	var (
++		subscriptions = map[chan<- []endpoint.Endpoint]struct{}{}
++		addrs, md5, _ = resolve(name)
++		endpoints     = convert(addrs, makeEndpoint)
++		ticker        = newTicker(ttl)
++	)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ticker.C:
++			addrs, newmd5, err := resolve(name)
++			if err == nil && newmd5 != md5 {
++				endpoints = convert(addrs, makeEndpoint)
++				for c := range subscriptions {
++					c <- endpoints
++				}
++				md5 = newmd5
++			}
++
++		case c := <-p.subscribe:
++			subscriptions[c] = struct{}{}
++			c <- endpoints
++
++		case c := <-p.unsubscribe:
++			delete(subscriptions, c)
++
++		case <-p.quit:
++			return
++		}
++	}
++}
++
++// Allow mocking in tests.
++var resolve = func(name string) (addrs []*net.SRV, md5sum string, err error) {
++	_, addrs, err = net.LookupSRV("", "", name)
++	if err != nil {
++		return addrs, "", err
++	}
++	hostports := make([]string, len(addrs))
++	for i, addr := range addrs {
++		hostports[i] = fmt.Sprintf("%s:%d", addr.Target, addr.Port)
++	}
++	sort.Sort(sort.StringSlice(hostports))
++	h := md5.New()
++	for _, hostport := range hostports {
++		fmt.Fprintf(h, hostport)
++	}
++	return addrs, fmt.Sprintf("%x", h.Sum(nil)), nil
++}
++
++func convert(addrs []*net.SRV, makeEndpoint func(hostport string) endpoint.Endpoint) []endpoint.Endpoint {
++	endpoints := make([]endpoint.Endpoint, len(addrs))
++	for i, addr := range addrs {
++		endpoints[i] = makeEndpoint(addr2hostport(addr))
++	}
++	return endpoints
++}
++
++func addr2hostport(addr *net.SRV) string {
++	return net.JoinHostPort(addr.Target, fmt.Sprintf("%d", addr.Port))
++}
+diff --git a/loadbalancer/load_balancer.go b/loadbalancer/load_balancer.go
+new file mode 100644
+index 0000000..d6df040
+--- /dev/null
++++ b/loadbalancer/load_balancer.go
+@@ -0,0 +1,16 @@
++package loadbalancer
++
++import (
++	"errors"
++
++	"github.com/go-kit/kit/endpoint"
++)
++
++// LoadBalancer yields endpoints one-by-one.
++type LoadBalancer interface {
++	Get() (endpoint.Endpoint, error)
++}
++
++// ErrNoEndpointsAvailable is given by a load balancer when no endpoints are
++// available to be returned.
++var ErrNoEndpointsAvailable = errors.New("no endpoints available")
+diff --git a/loadbalancer/publisher.go b/loadbalancer/publisher.go
+new file mode 100644
+index 0000000..f697e10
+--- /dev/null
++++ b/loadbalancer/publisher.go
+@@ -0,0 +1,10 @@
++package loadbalancer
++
++import "github.com/go-kit/kit/endpoint"
++
++// Publisher produces endpoints.
++type Publisher interface {
++	Subscribe(chan<- []endpoint.Endpoint)
++	Unsubscribe(chan<- []endpoint.Endpoint)
++	Stop()
++}
+diff --git a/loadbalancer/random.go b/loadbalancer/random.go
+new file mode 100644
+index 0000000..6f8bc93
+--- /dev/null
++++ b/loadbalancer/random.go
+@@ -0,0 +1,22 @@
++package loadbalancer
++
++import (
++	"math/rand"
++
++	"github.com/go-kit/kit/endpoint"
++)
++
++// Random returns a load balancer that yields random endpoints.
++func Random(p Publisher) LoadBalancer {
++	return random{newCache(p)}
++}
++
++type random struct{ *cache }
++
++func (r random) Get() (endpoint.Endpoint, error) {
++	endpoints := r.cache.get()
++	if len(endpoints) <= 0 {
++		return nil, ErrNoEndpointsAvailable
++	}
++	return endpoints[rand.Intn(len(endpoints))], nil
++}
+diff --git a/loadbalancer/retry.go b/loadbalancer/retry.go
+new file mode 100644
+index 0000000..380d30c
+--- /dev/null
++++ b/loadbalancer/retry.go
+@@ -0,0 +1,52 @@
++package loadbalancer
++
++import (
++	"fmt"
++	"strings"
++	"time"
++
++	"golang.org/x/net/context"
++
++	"github.com/go-kit/kit/endpoint"
++)
++
++// Retry yields an endpoint that takes endpoints from the load balancer.
++// Invocations that return errors will be retried until they succeed, up to
++// max times, or until the timeout is elapsed, whichever comes first.
++func Retry(max int, timeout time.Duration, lb LoadBalancer) endpoint.Endpoint {
++	return func(ctx context.Context, request interface{}) (interface{}, error) {
++		var (
++			newctx, cancel = context.WithTimeout(ctx, timeout)
++			responses      = make(chan interface{}, 1)
++			errs           = make(chan error, 1)
++			a              = []string{}
++		)
++		defer cancel()
++		for i := 1; i <= max; i++ {
++			go func() {
++				e, err := lb.Get()
++				if err != nil {
++					errs <- err
++					return
++				}
++				response, err := e(newctx, request)
++				if err != nil {
++					errs <- err
++					return
++				}
++				responses <- response
++			}()
++
++			select {
++			case <-newctx.Done():
++				return nil, newctx.Err()
++			case response := <-responses:
++				return response, nil
++			case err := <-errs:
++				a = append(a, err.Error())
++				continue
++			}
++		}
++		return nil, fmt.Errorf("retry attempts exceeded (%s)", strings.Join(a, "; "))
++	}
++}
+diff --git a/loadbalancer/round_robin.go b/loadbalancer/round_robin.go
+new file mode 100644
+index 0000000..d329550
+--- /dev/null
++++ b/loadbalancer/round_robin.go
+@@ -0,0 +1,32 @@
++package loadbalancer
++
++import (
++	"sync/atomic"
++
++	"github.com/go-kit/kit/endpoint"
++)
++
++// RoundRobin returns a load balancer that yields endpoints in sequence.
++func RoundRobin(p Publisher) LoadBalancer {
++	return &roundRobin{newCache(p), 0}
++}
++
++type roundRobin struct {
++	*cache
++	uint64
++}
++
++func (r *roundRobin) Get() (endpoint.Endpoint, error) {
++	endpoints := r.cache.get()
++	if len(endpoints) <= 0 {
++		return nil, ErrNoEndpointsAvailable
++	}
++	var old uint64
++	for {
++		old = atomic.LoadUint64(&r.uint64)
++		if atomic.CompareAndSwapUint64(&r.uint64, old, old+1) {
++			break
++		}
++	}
++	return endpoints[old%uint64(len(endpoints))], nil
++}
+diff --git a/loadbalancer/static_publisher.go b/loadbalancer/static_publisher.go
+new file mode 100644
+index 0000000..55d5d31
+--- /dev/null
++++ b/loadbalancer/static_publisher.go
+@@ -0,0 +1,51 @@
++package loadbalancer
++
++import (
++	"sync"
++
++	"github.com/go-kit/kit/endpoint"
++)
++
++// NewStaticPublisher returns a publisher that yields a static set of
++// endpoints, which can be completely replaced.
++func NewStaticPublisher(endpoints []endpoint.Endpoint) *StaticPublisher {
++	return &StaticPublisher{
++		current:     endpoints,
++		subscribers: map[chan<- []endpoint.Endpoint]struct{}{},
++	}
++}
++
++// StaticPublisher holds a static set of endpoints.
++type StaticPublisher struct {
++	sync.Mutex
++	current     []endpoint.Endpoint
++	subscribers map[chan<- []endpoint.Endpoint]struct{}
++}
++
++// Subscribe implements Publisher.
++func (p *StaticPublisher) Subscribe(c chan<- []endpoint.Endpoint) {
++	p.Lock()
++	defer p.Unlock()
++	p.subscribers[c] = struct{}{}
++	c <- p.current
++}
++
++// Unsubscribe implements Publisher.
++func (p *StaticPublisher) Unsubscribe(c chan<- []endpoint.Endpoint) {
++	p.Lock()
++	defer p.Unlock()
++	delete(p.subscribers, c)
++}
++
++// Stop implements Publisher, but is a no-op.
++func (p *StaticPublisher) Stop() {}
++
++// Replace replaces the endpoints and notifies all subscribers.
++func (p *StaticPublisher) Replace(endpoints []endpoint.Endpoint) {
++	p.Lock()
++	defer p.Unlock()
++	p.current = endpoints
++	for c := range p.subscribers {
++		c <- p.current
++	}
++}

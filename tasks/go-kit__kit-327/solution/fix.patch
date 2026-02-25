@@ -1,0 +1,316 @@
+diff --git a/log/README.md b/log/README.md
+index 452157d..70e70a6 100644
+--- a/log/README.md
++++ b/log/README.md
+@@ -29,7 +29,8 @@ logger.Log("transport", "HTTP", "addr", addr, "msg", "listening")
+ ### Typical application logging
+ 
+ ```go
+-logger := log.NewLogfmtLogger(os.Stderr)
++w := log.NewSyncWriter(os.Stderr)
++logger := log.NewLogfmtLogger(w)
+ logger.Log("question", "what is the meaning of life?", "answer", 42)
+ 
+ // Output:
+@@ -41,7 +42,7 @@ logger.Log("question", "what is the meaning of life?", "answer", 42)
+ ```go
+ func main() {
+ 	var logger log.Logger
+-	logger = log.NewLogfmtLogger(os.Stderr)
++	logger = log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
+ 	logger = log.NewContext(logger).With("instance_id", 123)
+ 
+ 	logger.Log("msg", "starting")
+@@ -67,7 +68,7 @@ import (
+ )
+ 
+ func main() {
+-	logger := kitlog.NewJSONLogger(os.Stdout)
++	logger := kitlog.NewJSONLogger(log.NewSyncWriter(os.Stdout))
+ 	stdlog.SetOutput(kitlog.NewStdlibAdapter(logger))
+ 	stdlog.Print("I sure like pie")
+ }
+@@ -92,7 +93,7 @@ logger.Log("legacy", true, "msg", "at least it's something")
+ 
+ ```go
+ var logger log.Logger
+-logger = log.NewLogfmtLogger(os.Stderr)
++logger = log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
+ logger = log.NewContext(logger).With("ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
+ 
+ logger.Log("msg", "hello")
+diff --git a/log/doc.go b/log/doc.go
+index 629f0aa..8907ebd 100644
+--- a/log/doc.go
++++ b/log/doc.go
+@@ -1,9 +1,93 @@
+ // Package log provides a structured logger.
+ //
+-// Services produce logs to be consumed later, either by humans or machines.
+-// Humans might be interested in debugging errors, or tracing specific requests.
+-// Machines might be interested in counting interesting events, or aggregating
+-// information for offline processing. In both cases, it's important that the
+-// log messages be structured and actionable. Package log is designed to
+-// encourage both of these best practices.
++// Structured logging produces logs easily consumed later by humans or
++// machines. Humans might be interested in debugging errors, or tracing
++// specific requests. Machines might be interested in counting interesting
++// events, or aggregating information for off-line processing. In both cases,
++// it is important that the log messages are structured and actionable.
++// Package log is designed to encourage both of these best practices.
++//
++// Basic Usage
++//
++// The fundamental interface is Logger. Loggers create log events from
++// key/value data. The Logger interface has a single method, Log, which
++// accepts a sequence of alternating key/value pairs, which this package names
++// keyvals.
++//
++//    type Logger interface {
++//        Log(keyvals ...interface{}) error
++//    }
++//
++// Here is an example of a function using a Logger to create log events.
++//
++//    func RunTask(task Task, logger log.Logger) string {
++//        logger.Log("taskID", task.ID, "event", "starting task")
++//        ...
++//        logger.Log("taskID", task.ID, "event", "task complete")
++//    }
++//
++// The keys in the above example are "taskID" and "event". The values are
++// task.ID, "starting task", and "task complete". Every key is followed
++// immediately by its value.
++//
++// Keys are usually plain strings. Values may be any type that has a sensible
++// encoding in the chosen log format. With structured logging it is a good
++// idea to log simple values without formatting them. This practice allows
++// the chosen logger to encode values in the most appropriate way.
++//
++// Log Context
++//
++// A log context stores keyvals that it includes in all log events. Building
++// appropriate log contexts reduces repetition and aids consistency in the
++// resulting log output. We can use a context to improve the RunTask example.
++//
++//    func RunTask(task Task, logger log.Logger) string {
++//        logger = log.NewContext(logger).With("taskID", task.ID)
++//        logger.Log("event", "starting task")
++//        ...
++//        taskHelper(task.Cmd, logger)
++//        ...
++//        logger.Log("event", "task complete")
++//    }
++//
++// The improved version emits the same log events as the original for the
++// first and last calls to Log. The call to taskHelper highlights that a
++// context may be passed as a logger to other functions. Each log event
++// created by the called function will include the task.ID even though the
++// function does not have access to that value. Using log contexts this way
++// simplifies producing log output that enables tracing the life cycle of
++// individual tasks. (See the Context example for the full code of the
++// above snippet.)
++//
++// Dynamic Context Values
++//
++// A Valuer function stored in a log context generates a new value each time
++// the context logs an event. The Valuer example demonstrates how this
++// feature works.
++//
++// Valuers provide the basis for consistently logging timestamps and source
++// code location. The log package defines several valuers for that purpose.
++// See Timestamp, DefaultTimestamp, DefaultTimestampUTC, Caller, and
++// DefaultCaller. A common logger initialization sequence that ensures all log
++// entries contain a timestamp and source location looks like this:
++//
++//    logger := log.NewLogfmtLogger(log.SyncWriter(os.Stdout))
++//    logger = log.NewContext(logger).With("ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
++//
++// Concurrent Safety
++//
++// Applications with multiple goroutines want each log event written to the
++// same logger to remain separate from other log events. Package log provides
++// two simple solutions for concurrent safe logging.
++//
++// NewSyncWriter wraps an io.Writer and serializes each call to its Write
++// method. Using a SyncWriter has the benefit that the smallest practical
++// portion of the logging logic is performed within a mutex, but it requires
++// the formatting Logger to make only one call to Write per log event.
++//
++// NewSyncLogger wraps any Logger and serializes each call to its Log method.
++// Using a SyncLogger has the benefit that it guarantees each log event is
++// handled atomically within the wrapped logger, but it typically serializes
++// both the formatting and output logic. Use a SyncLogger if the formatting
++// logger may perform multiple writes per log event.
+ package log
+diff --git a/log/json_logger.go b/log/json_logger.go
+index cef0d19..231e099 100644
+--- a/log/json_logger.go
++++ b/log/json_logger.go
+@@ -13,7 +13,9 @@ type jsonLogger struct {
+ }
+ 
+ // NewJSONLogger returns a Logger that encodes keyvals to the Writer as a
+-// single JSON object.
++// single JSON object. Each log event produces no more than one call to
++// w.Write. The passed Writer must be safe for concurrent use by multiple
++// goroutines if the returned Logger will be used concurrently.
+ func NewJSONLogger(w io.Writer) Logger {
+ 	return &jsonLogger{w}
+ }
+diff --git a/log/log.go b/log/log.go
+index 25e76cb..97990fe 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -1,13 +1,6 @@
+-// Package log provides basic interfaces for structured logging.
+-//
+-// The fundamental interface is Logger. Loggers create log events from
+-// key/value data.
+ package log
+ 
+-import (
+-	"errors"
+-	"sync/atomic"
+-)
++import "errors"
+ 
+ // Logger is the fundamental interface for all log operations. Log creates a
+ // log event from keyvals, a variadic sequence of alternating keys and values.
+@@ -149,33 +142,3 @@ type LoggerFunc func(...interface{}) error
+ func (f LoggerFunc) Log(keyvals ...interface{}) error {
+ 	return f(keyvals...)
+ }
+-
+-// SwapLogger wraps another logger that may be safely replaced while other
+-// goroutines use the SwapLogger concurrently. The zero value for a SwapLogger
+-// will discard all log events without error.
+-//
+-// SwapLogger serves well as a package global logger that can be changed by
+-// importers.
+-type SwapLogger struct {
+-	logger atomic.Value
+-}
+-
+-type loggerStruct struct {
+-	Logger
+-}
+-
+-// Log implements the Logger interface by forwarding keyvals to the currently
+-// wrapped logger. It does not log anything if the wrapped logger is nil.
+-func (l *SwapLogger) Log(keyvals ...interface{}) error {
+-	s, ok := l.logger.Load().(loggerStruct)
+-	if !ok || s.Logger == nil {
+-		return nil
+-	}
+-	return s.Log(keyvals...)
+-}
+-
+-// Swap replaces the currently wrapped logger with logger. Swap may be called
+-// concurrently with calls to Log from other goroutines.
+-func (l *SwapLogger) Swap(logger Logger) {
+-	l.logger.Store(loggerStruct{logger})
+-}
+diff --git a/log/logfmt_logger.go b/log/logfmt_logger.go
+index 4ff5555..a003052 100644
+--- a/log/logfmt_logger.go
++++ b/log/logfmt_logger.go
+@@ -31,8 +31,9 @@ type logfmtLogger struct {
+ }
+ 
+ // NewLogfmtLogger returns a logger that encodes keyvals to the Writer in
+-// logfmt format. The passed Writer must be safe for concurrent use by
+-// multiple goroutines if the returned Logger will be used concurrently.
++// logfmt format. Each log event produces no more than one call to w.Write.
++// The passed Writer must be safe for concurrent use by multiple goroutines if
++// the returned Logger will be used concurrently.
+ func NewLogfmtLogger(w io.Writer) Logger {
+ 	return &logfmtLogger{w}
+ }
+diff --git a/log/sync.go b/log/sync.go
+new file mode 100644
+index 0000000..8ce0db8
+--- /dev/null
++++ b/log/sync.go
+@@ -0,0 +1,81 @@
++package log
++
++import (
++	"io"
++	"sync"
++	"sync/atomic"
++)
++
++// SwapLogger wraps another logger that may be safely replaced while other
++// goroutines use the SwapLogger concurrently. The zero value for a SwapLogger
++// will discard all log events without error.
++//
++// SwapLogger serves well as a package global logger that can be changed by
++// importers.
++type SwapLogger struct {
++	logger atomic.Value
++}
++
++type loggerStruct struct {
++	Logger
++}
++
++// Log implements the Logger interface by forwarding keyvals to the currently
++// wrapped logger. It does not log anything if the wrapped logger is nil.
++func (l *SwapLogger) Log(keyvals ...interface{}) error {
++	s, ok := l.logger.Load().(loggerStruct)
++	if !ok || s.Logger == nil {
++		return nil
++	}
++	return s.Log(keyvals...)
++}
++
++// Swap replaces the currently wrapped logger with logger. Swap may be called
++// concurrently with calls to Log from other goroutines.
++func (l *SwapLogger) Swap(logger Logger) {
++	l.logger.Store(loggerStruct{logger})
++}
++
++// SyncWriter synchronizes concurrent writes to an io.Writer.
++type SyncWriter struct {
++	mu sync.Mutex
++	w  io.Writer
++}
++
++// NewSyncWriter returns a new SyncWriter. The returned writer is safe for
++// concurrent use by multiple goroutines.
++func NewSyncWriter(w io.Writer) *SyncWriter {
++	return &SyncWriter{w: w}
++}
++
++// Write writes p to the underlying io.Writer. If another write is already in
++// progress, the calling goroutine blocks until the SyncWriter is available.
++func (w *SyncWriter) Write(p []byte) (n int, err error) {
++	w.mu.Lock()
++	n, err = w.w.Write(p)
++	w.mu.Unlock()
++	return n, err
++}
++
++// syncLogger provides concurrent safe logging for another Logger.
++type syncLogger struct {
++	mu     sync.Mutex
++	logger Logger
++}
++
++// NewSyncLogger returns a logger that synchronizes concurrent use of the
++// wrapped logger. When multiple goroutines use the SyncLogger concurrently
++// only one goroutine will be allowed to log to the wrapped logger at a time.
++// The other goroutines will block until the logger is available.
++func NewSyncLogger(logger Logger) Logger {
++	return &syncLogger{logger: logger}
++}
++
++// Log logs keyvals to the underlying Logger. If another log is already in
++// progress, the calling goroutine blocks until the syncLogger is available.
++func (l *syncLogger) Log(keyvals ...interface{}) error {
++	l.mu.Lock()
++	err := l.logger.Log(keyvals...)
++	l.mu.Unlock()
++	return err
++}

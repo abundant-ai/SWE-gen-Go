@@ -1,0 +1,161 @@
+diff --git a/log/log.go b/log/log.go
+index 345d9f5..336a0e2 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -4,47 +4,48 @@
+ // key/value data.
+ package log
+ 
+-// Logger is the fundamental interface for all log operations.
+-//
+-// Log creates a log event from keyvals, a variadic sequence of alternating
+-// keys and values.
+-//
+-// Logger implementations must be safe for concurrent use by multiple
+-// goroutines.
++// Logger is the fundamental interface for all log operations. Implementations
++// must be safe for concurrent use by multiple goroutines. Log creates a log
++// event from keyvals, a variadic sequence of alternating keys and values.
+ type Logger interface {
+ 	Log(keyvals ...interface{}) error
+ }
+ 
+-// With returns a new Logger that includes keyvals in all log events.
+-//
+-// If logger implements the Wither interface, the result of
+-// logger.With(keyvals...) is returned.
++// With returns a new Logger that includes keyvals in all log events. The
++// returned Logger replaces all value elements (odd indexes) containing a
++// Valuer with their generated value for each call to its Log method.
+ func With(logger Logger, keyvals ...interface{}) Logger {
+-	w, ok := logger.(Wither)
++	w, ok := logger.(*withLogger)
+ 	if !ok {
+ 		w = &withLogger{logger: logger}
+ 	}
+-	return w.With(keyvals...)
++	return w.with(keyvals...)
+ }
+ 
+ type withLogger struct {
+-	logger  Logger
+-	keyvals []interface{}
++	logger    Logger
++	keyvals   []interface{}
++	hasValuer bool
+ }
+ 
+ func (l *withLogger) Log(keyvals ...interface{}) error {
+-	return l.logger.Log(append(l.keyvals, keyvals...)...)
++	kvs := append(l.keyvals, keyvals...)
++	if l.hasValuer {
++		bindValues(kvs[:len(l.keyvals)])
++	}
++	return l.logger.Log(kvs...)
+ }
+ 
+-func (l *withLogger) With(keyvals ...interface{}) Logger {
++func (l *withLogger) with(keyvals ...interface{}) Logger {
+ 	// Limiting the capacity of the stored keyvals ensures that a new
+ 	// backing array is created if the slice must grow in Log or With.
+ 	// Using the extra capacity without copying risks a data race that
+ 	// would violate the Logger interface contract.
+ 	n := len(l.keyvals) + len(keyvals)
+ 	return &withLogger{
+-		logger:  l.logger,
+-		keyvals: append(l.keyvals, keyvals...)[:n:n],
++		logger:    l.logger,
++		keyvals:   append(l.keyvals, keyvals...)[:n:n],
++		hasValuer: l.hasValuer || containsValuer(keyvals),
+ 	}
+ }
+ 
+@@ -57,17 +58,3 @@ type LoggerFunc func(...interface{}) error
+ func (f LoggerFunc) Log(keyvals ...interface{}) error {
+ 	return f(keyvals...)
+ }
+-
+-// A Wither creates Loggers that include keyvals in all log events.
+-//
+-// The With function uses Wither if available.
+-type Wither interface {
+-	With(keyvals ...interface{}) Logger
+-}
+-
+-// NewDiscardLogger returns a logger that does not log anything.
+-func NewDiscardLogger() Logger {
+-	return LoggerFunc(func(...interface{}) error {
+-		return nil
+-	})
+-}
+diff --git a/log/value.go b/log/value.go
+new file mode 100644
+index 0000000..3ae74f0
+--- /dev/null
++++ b/log/value.go
+@@ -0,0 +1,65 @@
++package log
++
++import (
++	"time"
++
++	"gopkg.in/stack.v1"
++)
++
++// A Valuer generates a log value. When passed to With in a value element (odd
++// indexes), it represents a dynamic value which is re-evaluated with each log
++// event.
++type Valuer func() interface{}
++
++// bindValues replaces all value elements (odd indexes) containing a Valuer
++// with their generated value.
++func bindValues(keyvals []interface{}) {
++	for i := 1; i < len(keyvals); i += 2 {
++		if v, ok := keyvals[i].(Valuer); ok {
++			keyvals[i] = v()
++		}
++	}
++}
++
++// containsValuer returns true if any of the value elements (odd indexes)
++// contain a Valuer.
++func containsValuer(keyvals []interface{}) bool {
++	for i := 1; i < len(keyvals); i += 2 {
++		if _, ok := keyvals[i].(Valuer); ok {
++			return true
++		}
++	}
++	return false
++}
++
++// Timestamp returns a Valuer that invokes the underlying function when bound,
++// returning a time.Time. Users will probably want to use DefaultTimestamp or
++// DefaultTimestampUTC.
++func Timestamp(t func() time.Time) Valuer {
++	return func() interface{} { return t() }
++}
++
++var (
++	// DefaultTimestamp is a Timestamp Valuer that returns the current
++	// wallclock time, respecting time zones, when bound.
++	DefaultTimestamp = Timestamp(time.Now)
++
++	// DefaultTimestampUTC wraps DefaultTimestamp but ensures the returned
++	// time is always in UTC. Note that it invokes DefaultTimestamp, and so
++	// reflects any changes to the DefaultTimestamp package global.
++	DefaultTimestampUTC = Timestamp(func() time.Time {
++		return DefaultTimestamp().(time.Time).UTC()
++	})
++)
++
++// Caller returns a Valuer that returns a file and line from a specified depth
++// in the callstack. Users will probably want to use DefaultCaller.
++func Caller(depth int) Valuer {
++	return func() interface{} { return stack.Caller(depth) }
++}
++
++var (
++	// DefaultCaller is a Valuer that returns the file and line where the Log
++	// method was invoked.
++	DefaultCaller = Caller(3)
++)

@@ -1,0 +1,139 @@
+diff --git a/field.go b/field.go
+index dd558fc..3c0d7d9 100644
+--- a/field.go
++++ b/field.go
+@@ -364,11 +364,17 @@ func Timep(key string, val *time.Time) Field {
+ // expensive (relatively speaking); this function both makes an allocation and
+ // takes about two microseconds.
+ func Stack(key string) Field {
++	return StackSkip(key, 1) // skip Stack
++}
++
++// StackSkip constructs a field similarly to Stack, but also skips the given
++// number of frames from the top of the stacktrace.
++func StackSkip(key string, skip int) Field {
+ 	// Returning the stacktrace as a string costs an allocation, but saves us
+ 	// from expanding the zapcore.Field union struct to include a byte slice. Since
+ 	// taking a stacktrace is already so expensive (~10us), the extra allocation
+ 	// is okay.
+-	return String(key, takeStacktrace())
++	return String(key, takeStacktrace(skip+1)) // skip StackSkip
+ }
+ 
+ // Duration constructs a field with the given key and value. The encoder
+diff --git a/logger.go b/logger.go
+index cd6e195..532968d 100644
+--- a/logger.go
++++ b/logger.go
+@@ -304,7 +304,7 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
+ 		}
+ 	}
+ 	if log.addStack.Enabled(ce.Entry.Level) {
+-		ce.Entry.Stack = Stack("").String
++		ce.Entry.Stack = StackSkip("", log.callerSkip+callerSkipOffset).String
+ 	}
+ 
+ 	return ce
+diff --git a/stacktrace.go b/stacktrace.go
+index 100fac2..0cf8c1d 100644
+--- a/stacktrace.go
++++ b/stacktrace.go
+@@ -22,28 +22,20 @@ package zap
+ 
+ import (
+ 	"runtime"
+-	"strings"
+ 	"sync"
+ 
+ 	"go.uber.org/zap/internal/bufferpool"
+ )
+ 
+-const _zapPackage = "go.uber.org/zap"
+-
+ var (
+ 	_stacktracePool = sync.Pool{
+ 		New: func() interface{} {
+ 			return newProgramCounters(64)
+ 		},
+ 	}
+-
+-	// We add "." and "/" suffixes to the package name to ensure we only match
+-	// the exact package and not any package with the same prefix.
+-	_zapStacktracePrefixes       = addPrefix(_zapPackage, ".", "/")
+-	_zapStacktraceVendorContains = addPrefix("/vendor/", _zapStacktracePrefixes...)
+ )
+ 
+-func takeStacktrace() string {
++func takeStacktrace(skip int) string {
+ 	buffer := bufferpool.Get()
+ 	defer buffer.Free()
+ 	programCounters := _stacktracePool.Get().(*programCounters)
+@@ -51,9 +43,9 @@ func takeStacktrace() string {
+ 
+ 	var numFrames int
+ 	for {
+-		// Skip the call to runtime.Counters and takeStacktrace so that the
++		// Skip the call to runtime.Callers and takeStacktrace so that the
+ 		// program counters start at the caller of takeStacktrace.
+-		numFrames = runtime.Callers(2, programCounters.pcs)
++		numFrames = runtime.Callers(skip+2, programCounters.pcs)
+ 		if numFrames < len(programCounters.pcs) {
+ 			break
+ 		}
+@@ -63,19 +55,12 @@ func takeStacktrace() string {
+ 	}
+ 
+ 	i := 0
+-	skipZapFrames := true // skip all consecutive zap frames at the beginning.
+ 	frames := runtime.CallersFrames(programCounters.pcs[:numFrames])
+ 
+ 	// Note: On the last iteration, frames.Next() returns false, with a valid
+ 	// frame, but we ignore this frame. The last frame is a a runtime frame which
+ 	// adds noise, since it's only either runtime.main or runtime.goexit.
+ 	for frame, more := frames.Next(); more; frame, more = frames.Next() {
+-		if skipZapFrames && isZapFrame(frame.Function) {
+-			continue
+-		} else {
+-			skipZapFrames = false
+-		}
+-
+ 		if i != 0 {
+ 			buffer.AppendByte('\n')
+ 		}
+@@ -91,24 +76,6 @@ func takeStacktrace() string {
+ 	return buffer.String()
+ }
+ 
+-func isZapFrame(function string) bool {
+-	for _, prefix := range _zapStacktracePrefixes {
+-		if strings.HasPrefix(function, prefix) {
+-			return true
+-		}
+-	}
+-
+-	// We can't use a prefix match here since the location of the vendor
+-	// directory affects the prefix. Instead we do a contains match.
+-	for _, contains := range _zapStacktraceVendorContains {
+-		if strings.Contains(function, contains) {
+-			return true
+-		}
+-	}
+-
+-	return false
+-}
+-
+ type programCounters struct {
+ 	pcs []uintptr
+ }
+@@ -116,11 +83,3 @@ type programCounters struct {
+ func newProgramCounters(size int) *programCounters {
+ 	return &programCounters{make([]uintptr, size)}
+ }
+-
+-func addPrefix(prefix string, ss ...string) []string {
+-	withPrefix := make([]string, len(ss))
+-	for i, s := range ss {
+-		withPrefix[i] = prefix + s
+-	}
+-	return withPrefix
+-}

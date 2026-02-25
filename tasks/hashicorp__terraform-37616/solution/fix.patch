@@ -1,0 +1,396 @@
+diff --git a/internal/configs/action.go b/internal/configs/action.go
+index 46d9de39fa..8cd220fc28 100644
+--- a/internal/configs/action.go
++++ b/internal/configs/action.go
+@@ -15,28 +15,6 @@ import (
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+ )
+ 
+-// There are many ways of handling plurality in error messages (linked_resource
+-// vs linked_resources); this is one of them.
+-type diagFn func(*hcl.Range) *hcl.Diagnostic
+-
+-func invalidLinkedResourceDiag(subj *hcl.Range) *hcl.Diagnostic {
+-	return &hcl.Diagnostic{
+-		Severity: hcl.DiagError,
+-		Summary:  `Invalid linked_resource`,
+-		Detail:   `linked_resource must only refer to a managed resource in the current module.`,
+-		Subject:  subj,
+-	}
+-}
+-
+-func invalidLinkedResourcesDiag(subj *hcl.Range) *hcl.Diagnostic {
+-	return &hcl.Diagnostic{
+-		Severity: hcl.DiagError,
+-		Summary:  `Invalid linked_resources`,
+-		Detail:   `linked_resources must only refer to managed resources in the current module.`,
+-		Subject:  subj,
+-	}
+-}
+-
+ func invalidActionDiag(subj *hcl.Range) *hcl.Diagnostic {
+ 	return &hcl.Diagnostic{
+ 		Severity: hcl.DiagError,
+@@ -53,9 +31,6 @@ type Action struct {
+ 	Config  hcl.Body
+ 	Count   hcl.Expression
+ 	ForEach hcl.Expression
+-	// DependsOn []hcl.Traversal // not yet supported
+-
+-	LinkedResources []hcl.Expression
+ 
+ 	ProviderConfigRef *ProviderConfigRef
+ 	Provider          addrs.Provider
+@@ -228,35 +203,6 @@ func decodeActionBlock(block *hcl.Block) (*Action, hcl.Diagnostics) {
+ 		}
+ 	}
+ 
+-	if attr, exists := content.Attributes["linked_resource"]; exists {
+-		if a.LinkedResources != nil {
+-			diags = append(diags, &hcl.Diagnostic{
+-				Severity: hcl.DiagError,
+-				Summary:  `Invalid use of "linked_resource"`,
+-				Detail:   `"linked_resource" and "linked_resources" are mutually exclusive, only one should be used.`,
+-				Subject:  &attr.NameRange,
+-			})
+-		}
+-		lr, lrDiags := decodeLinkedResource(attr.Expr)
+-		diags = append(diags, lrDiags...)
+-		a.LinkedResources = []hcl.Expression{lr}
+-	}
+-
+-	if attr, exists := content.Attributes["linked_resources"]; exists {
+-		if a.LinkedResources != nil {
+-			diags = append(diags, &hcl.Diagnostic{
+-				Severity: hcl.DiagError,
+-				Summary:  `Invalid use of "linked_resources"`,
+-				Detail:   `"linked_resource" and "linked_resources" are mutually exclusive, only one should be used.`,
+-				Subject:  &attr.NameRange,
+-			})
+-		}
+-
+-		lrs, lrDiags := decodeLinkedResources(attr.Expr)
+-		diags = append(diags, lrDiags...)
+-		a.LinkedResources = lrs
+-	}
+-
+ 	for _, block := range content.Blocks {
+ 		switch block.Type {
+ 		case "config":
+@@ -283,13 +229,6 @@ func decodeActionBlock(block *hcl.Block) (*Action, hcl.Diagnostics) {
+ 		diags = append(diags, providerDiags...)
+ 	}
+ 
+-	// depends_on: not yet supported
+-	// if attr, exists := content.Attributes["depends_on"]; exists {
+-	// 	deps, depsDiags := DecodeDependsOn(attr)
+-	// 	diags = append(diags, depsDiags...)
+-	// 	a.DependsOn = append(a.DependsOn, deps...)
+-	// }
+-
+ 	return a, diags
+ }
+ 
+@@ -311,12 +250,6 @@ var commonActionAttributes = []hcl.AttributeSchema{
+ 	{
+ 		Name: "provider",
+ 	},
+-	{
+-		Name: "linked_resource",
+-	},
+-	{
+-		Name: "linked_resources",
+-	},
+ }
+ 
+ var actionTriggerSchema = &hcl.BodySchema{
+@@ -460,106 +393,3 @@ func decodeActionTriggerRef(expr hcl.Expression) ([]ActionRef, hcl.Diagnostics)
+ 
+ 	return actionRefs, diags
+ }
+-
+-// decodeLinkedResources decodes and does basic validation of an Action's
+-// LinkedResources.
+-func decodeLinkedResources(expr hcl.Expression) ([]hcl.Expression, hcl.Diagnostics) {
+-	exprs, diags := hcl.ExprList(expr)
+-	if diags.HasErrors() {
+-		return nil, diags
+-	}
+-
+-	for i, expr := range exprs {
+-		// We are manually parsing config, so we need to handle json configs, in
+-		// which case the values will be json strings rather than hcl.
+-		var jsDiags hcl.Diagnostics
+-		expr, jsDiags = unwrapJSONRefExpr(expr)
+-		diags = diags.Extend(jsDiags)
+-		if diags.HasErrors() {
+-			continue
+-		}
+-
+-		// re-assign the value in case it was modified by unwrapJSONRefExpr
+-		exprs[i] = expr
+-
+-		_, lrDiags := decodeUnwrappedLinkedResource(expr, invalidLinkedResourcesDiag)
+-		diags = append(diags, lrDiags...)
+-
+-	}
+-
+-	return exprs, diags
+-}
+-
+-func decodeLinkedResource(expr hcl.Expression) (hcl.Expression, hcl.Diagnostics) {
+-	// Handle possible json configs
+-	expr, diags := unwrapJSONRefExpr(expr)
+-	if diags.HasErrors() {
+-		return expr, diags
+-	}
+-
+-	return decodeUnwrappedLinkedResource(expr, invalidLinkedResourceDiag)
+-}
+-
+-func decodeUnwrappedLinkedResource(expr hcl.Expression, diagFunc diagFn) (hcl.Expression, hcl.Diagnostics) {
+-	var diags hcl.Diagnostics
+-
+-	refs, refDiags := langrefs.ReferencesInExpr(addrs.ParseRef, expr)
+-	for _, diag := range refDiags {
+-		severity := hcl.DiagError
+-		if diag.Severity() == tfdiags.Warning {
+-			severity = hcl.DiagWarning
+-		}
+-
+-		diags = append(diags, &hcl.Diagnostic{
+-			Severity: severity,
+-			Summary:  diag.Description().Summary,
+-			Detail:   diag.Description().Detail,
+-			Subject:  expr.Range().Ptr(),
+-		})
+-	}
+-
+-	if refDiags.HasErrors() {
+-		return expr, diags
+-	}
+-
+-	resourceCount := 0
+-	for _, ref := range refs {
+-		switch sub := ref.Subject.(type) {
+-		case addrs.ResourceInstance:
+-			if sub.Resource.Mode == addrs.ManagedResourceMode {
+-				diags = append(diags, diagFunc(expr.Range().Ptr()))
+-			} else {
+-				resourceCount++
+-			}
+-		case addrs.Resource:
+-			if sub.Mode != addrs.ManagedResourceMode {
+-				diags = append(diags, diagFunc(expr.Range().Ptr()))
+-			} else {
+-				resourceCount++
+-			}
+-		case addrs.ModuleCall, addrs.ModuleCallInstance, addrs.ModuleCallInstanceOutput:
+-			diags = append(diags, diagFunc(expr.Range().Ptr()))
+-		default:
+-			// we've checked what we can without evaluating references!
+-		}
+-	}
+-
+-	switch {
+-	case resourceCount == 0:
+-		diags = append(diags, &hcl.Diagnostic{
+-			Severity: hcl.DiagError,
+-			Summary:  "Invalid linked_resource expression",
+-			Detail:   "Missing resource reference in linked_resource expression.",
+-			Subject:  expr.Range().Ptr(),
+-		})
+-	case resourceCount > 1:
+-		diags = append(diags, &hcl.Diagnostic{
+-			Severity: hcl.DiagError,
+-			Summary:  "Invalid linked_resource expression",
+-			Detail:   "Multiple resource references in linked_resource expression.",
+-			Subject:  expr.Range().Ptr(),
+-		})
+-	}
+-
+-	return expr, diags
+-}
+diff --git a/internal/configs/module_merge.go b/internal/configs/module_merge.go
+index 764e7029a4..47251b23c7 100644
+--- a/internal/configs/module_merge.go
++++ b/internal/configs/module_merge.go
+@@ -304,24 +304,7 @@ func (a *Action) merge(oa *Action, rps map[string]*RequiredProvider) hcl.Diagnos
+ 		}
+ 	}
+ 
+-	if oa.LinkedResources != nil {
+-		a.LinkedResources = oa.LinkedResources
+-	}
+-
+ 	a.Config = MergeBodies(a.Config, oa.Config)
+ 
+-	/* depends_on: not yet supported in Actions
+-	// We don't allow depends_on to be overridden because that is likely to
+-	// cause confusing misbehavior.
+-	if len(oa.DependsOn) != 0 {
+-		diags = append(diags, &hcl.Diagnostic{
+-			Severity: hcl.DiagError,
+-			Summary:  "Unsupported override",
+-			Detail:   "The depends_on argument may not be overridden.",
+-			Subject:  oa.DependsOn[0].SourceRange().Ptr(), // the first item is the closest range we have
+-		})
+-	}
+-	*/
+-
+ 	return diags
+ }
+diff --git a/internal/lang/eval.go b/internal/lang/eval.go
+index 706a552a6b..730bd822c3 100644
+--- a/internal/lang/eval.go
++++ b/internal/lang/eval.go
+@@ -443,7 +443,7 @@ func (s *Scope) evalContext(refs []*addrs.Reference, selfAddr addrs.Referenceabl
+ 			return nil, diags.Append(&hcl.Diagnostic{
+ 				Severity: hcl.DiagError,
+ 				Summary:  "Invalid reference",
+-				Detail:   "Actions can't be referenced in this context, they can only be referenced from within a resources lifecycle events list.",
++				Detail:   "Actions can not be referenced in this context. They can only be referenced from within a resource's lifecycle actions list.",
+ 				Subject:  rng.ToHCL().Ptr(),
+ 			})
+ 
+diff --git a/internal/plans/changes_src.go b/internal/plans/changes_src.go
+index 9d30946e33..426b062f43 100644
+--- a/internal/plans/changes_src.go
++++ b/internal/plans/changes_src.go
+@@ -558,11 +558,11 @@ func (cs *ChangeSrc) Decode(schema *providers.Schema) (*Change, error) {
+ 	}, nil
+ }
+ 
+-// AppendResourceInstanceChange records the given resource instance change in
++// AppendActionInvocationInstanceChange records the given resource instance change in
+ // the set of planned resource changes.
+ func (c *ChangesSrc) AppendActionInvocationInstanceChange(action *ActionInvocationInstanceSrc) {
+ 	if c == nil {
+-		panic("AppendResourceInstanceChange on nil ChangesSync")
++		panic("AppendActionInvocationInstanceChange on nil ChangesSync")
+ 	}
+ 
+ 	a := action.DeepCopy()
+@@ -579,7 +579,7 @@ type ActionInvocationInstanceSrc struct {
+ 	ProviderAddr addrs.AbsProviderConfig
+ }
+ 
+-// Decode unmarshals the raw representation of any linked resources.
++// Decode unmarshals the raw representation of actions.
+ func (acs *ActionInvocationInstanceSrc) Decode(schema *providers.ActionSchema) (*ActionInvocationInstance, error) {
+ 	ty := cty.DynamicPseudoType
+ 	if schema != nil {
+diff --git a/internal/plans/planproto/planfile.pb.go b/internal/plans/planproto/planfile.pb.go
+index fc3b9a8599..e4351e4964 100644
+--- a/internal/plans/planproto/planfile.pb.go
++++ b/internal/plans/planproto/planfile.pb.go
+@@ -542,8 +542,7 @@ type Plan struct {
+ 	// checks, and each of those may have zero or more dynamic objects that
+ 	// the checks were applied to nested within.
+ 	CheckResults []*CheckResults `protobuf:"bytes,19,rep,name=check_results,json=checkResults,proto3" json:"check_results,omitempty"`
+-	// An unordered set of proposed action invocations. This includes any
+-	// embedded ResourceInstanceActionChanges for LinkedResources
++	// An unordered set of proposed action invocations.
+ 	ActionInvocations []*ActionInvocationInstance `protobuf:"bytes,30,rep,name=action_invocations,json=actionInvocations,proto3" json:"action_invocations,omitempty"`
+ 	// An unordered set of target addresses to include when applying. If no
+ 	// target addresses are present, the plan applies to the whole
+@@ -1733,9 +1732,8 @@ type ActionInvocationInstance struct {
+ 	// provider is the address of the provider configuration that this change
+ 	// was planned with, and thus the configuration that must be used to
+ 	// apply it.
+-	Provider        string                          `protobuf:"bytes,2,opt,name=provider,proto3" json:"provider,omitempty"`
+-	LinkedResources []*ResourceInstanceActionChange `protobuf:"bytes,3,rep,name=linked_resources,json=linkedResources,proto3" json:"linked_resources,omitempty"`
+-	ConfigValue     *DynamicValue                   `protobuf:"bytes,4,opt,name=config_value,json=configValue,proto3" json:"config_value,omitempty"`
++	Provider    string        `protobuf:"bytes,2,opt,name=provider,proto3" json:"provider,omitempty"`
++	ConfigValue *DynamicValue `protobuf:"bytes,4,opt,name=config_value,json=configValue,proto3" json:"config_value,omitempty"`
+ 	// An unordered set of paths into config_value which are marked as
+ 	// sensitive. Values at these paths should be obscured in human-readable
+ 	// output.
+@@ -1793,13 +1791,6 @@ func (x *ActionInvocationInstance) GetProvider() string {
+ 	return ""
+ }
+ 
+-func (x *ActionInvocationInstance) GetLinkedResources() []*ResourceInstanceActionChange {
+-	if x != nil {
+-		return x.LinkedResources
+-	}
+-	return nil
+-}
+-
+ func (x *ActionInvocationInstance) GetConfigValue() *DynamicValue {
+ 	if x != nil {
+ 		return x.ConfigValue
+@@ -2349,11 +2340,10 @@ const file_planfile_proto_rawDesc = "" +
+ 	"\aunknown\x18\x02 \x01(\bR\aunknown\x120\n" +
+ 	"\bidentity\x18\x03 \x01(\v2\x14.tfplan.DynamicValueR\bidentity\":\n" +
+ 	"\bDeferred\x12.\n" +
+-	"\x06reason\x18\x01 \x01(\x0e2\x16.tfplan.DeferredReasonR\x06reason\"\xd9\x03\n" +
++	"\x06reason\x18\x01 \x01(\x0e2\x16.tfplan.DeferredReasonR\x06reason\"\x88\x03\n" +
+ 	"\x18ActionInvocationInstance\x12\x12\n" +
+ 	"\x04addr\x18\x01 \x01(\tR\x04addr\x12\x1a\n" +
+-	"\bprovider\x18\x02 \x01(\tR\bprovider\x12O\n" +
+-	"\x10linked_resources\x18\x03 \x03(\v2$.tfplan.ResourceInstanceActionChangeR\x0flinkedResources\x127\n" +
++	"\bprovider\x18\x02 \x01(\tR\bprovider\x127\n" +
+ 	"\fconfig_value\x18\x04 \x01(\v2\x14.tfplan.DynamicValueR\vconfigValue\x12B\n" +
+ 	"\x16sensitive_config_paths\x18\x05 \x03(\v2\f.tfplan.PathR\x14sensitiveConfigPaths\x12Z\n" +
+ 	"\x18lifecycle_action_trigger\x18\x06 \x01(\v2\x1e.tfplan.LifecycleActionTriggerH\x00R\x16lifecycleActionTrigger\x12Q\n" +
+@@ -2507,22 +2497,21 @@ var file_planfile_proto_depIdxs = []int32{
+ 	29, // 34: tfplan.Path.steps:type_name -> tfplan.Path.Step
+ 	18, // 35: tfplan.Importing.identity:type_name -> tfplan.DynamicValue
+ 	3,  // 36: tfplan.Deferred.reason:type_name -> tfplan.DeferredReason
+-	25, // 37: tfplan.ActionInvocationInstance.linked_resources:type_name -> tfplan.ResourceInstanceActionChange
+-	18, // 38: tfplan.ActionInvocationInstance.config_value:type_name -> tfplan.DynamicValue
+-	19, // 39: tfplan.ActionInvocationInstance.sensitive_config_paths:type_name -> tfplan.Path
+-	23, // 40: tfplan.ActionInvocationInstance.lifecycle_action_trigger:type_name -> tfplan.LifecycleActionTrigger
+-	24, // 41: tfplan.ActionInvocationInstance.invoke_action_trigger:type_name -> tfplan.InvokeActionTrigger
+-	4,  // 42: tfplan.LifecycleActionTrigger.trigger_event:type_name -> tfplan.ActionTriggerEvent
+-	11, // 43: tfplan.ResourceInstanceActionChange.change:type_name -> tfplan.Change
+-	18, // 44: tfplan.Plan.VariablesEntry.value:type_name -> tfplan.DynamicValue
+-	19, // 45: tfplan.Plan.resource_attr.attr:type_name -> tfplan.Path
+-	5,  // 46: tfplan.CheckResults.ObjectResult.status:type_name -> tfplan.CheckResults.Status
+-	18, // 47: tfplan.Path.Step.element_key:type_name -> tfplan.DynamicValue
+-	48, // [48:48] is the sub-list for method output_type
+-	48, // [48:48] is the sub-list for method input_type
+-	48, // [48:48] is the sub-list for extension type_name
+-	48, // [48:48] is the sub-list for extension extendee
+-	0,  // [0:48] is the sub-list for field type_name
++	18, // 37: tfplan.ActionInvocationInstance.config_value:type_name -> tfplan.DynamicValue
++	19, // 38: tfplan.ActionInvocationInstance.sensitive_config_paths:type_name -> tfplan.Path
++	23, // 39: tfplan.ActionInvocationInstance.lifecycle_action_trigger:type_name -> tfplan.LifecycleActionTrigger
++	24, // 40: tfplan.ActionInvocationInstance.invoke_action_trigger:type_name -> tfplan.InvokeActionTrigger
++	4,  // 41: tfplan.LifecycleActionTrigger.trigger_event:type_name -> tfplan.ActionTriggerEvent
++	11, // 42: tfplan.ResourceInstanceActionChange.change:type_name -> tfplan.Change
++	18, // 43: tfplan.Plan.VariablesEntry.value:type_name -> tfplan.DynamicValue
++	19, // 44: tfplan.Plan.resource_attr.attr:type_name -> tfplan.Path
++	5,  // 45: tfplan.CheckResults.ObjectResult.status:type_name -> tfplan.CheckResults.Status
++	18, // 46: tfplan.Path.Step.element_key:type_name -> tfplan.DynamicValue
++	47, // [47:47] is the sub-list for method output_type
++	47, // [47:47] is the sub-list for method input_type
++	47, // [47:47] is the sub-list for extension type_name
++	47, // [47:47] is the sub-list for extension extendee
++	0,  // [0:47] is the sub-list for field type_name
+ }
+ 
+ func init() { file_planfile_proto_init() }
+diff --git a/internal/plans/planproto/planfile.proto b/internal/plans/planproto/planfile.proto
+index d35845de70..71dbe6bf08 100644
+--- a/internal/plans/planproto/planfile.proto
++++ b/internal/plans/planproto/planfile.proto
+@@ -99,8 +99,7 @@ message Plan {
+     // the checks were applied to nested within.
+     repeated CheckResults check_results = 19;
+ 
+-    // An unordered set of proposed action invocations. This includes any
+-    // embedded ResourceInstanceActionChanges for LinkedResources
++    // An unordered set of proposed action invocations.
+     repeated ActionInvocationInstance action_invocations = 30;
+ 
+     // An unordered set of target addresses to include when applying. If no
+@@ -471,7 +470,6 @@ message ActionInvocationInstance {
+     // apply it.
+     string provider = 2;
+ 
+-    repeated ResourceInstanceActionChange linked_resources = 3;
+     DynamicValue config_value = 4;
+     // An unordered set of paths into config_value which are marked as
+     // sensitive. Values at these paths should be obscured in human-readable

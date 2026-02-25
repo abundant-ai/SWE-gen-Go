@@ -1,0 +1,176 @@
+diff --git a/cmd/metacache-entries.go b/cmd/metacache-entries.go
+index 431f76789..2c471010f 100644
+--- a/cmd/metacache-entries.go
++++ b/cmd/metacache-entries.go
+@@ -301,7 +301,7 @@ func (e *metaCacheEntry) fileInfoVersions(bucket string) (FileInfoVersions, erro
+ 		}, nil
+ 	}
+ 	// Too small gains to reuse cache here.
+-	return getFileInfoVersions(e.metadata, bucket, e.name, false, true)
++	return getFileInfoVersions(e.metadata, bucket, e.name, false)
+ }
+ 
+ // metaCacheEntries is a slice of metacache entries.
+diff --git a/cmd/metacache-set.go b/cmd/metacache-set.go
+index db834261e..17259c93d 100644
+--- a/cmd/metacache-set.go
++++ b/cmd/metacache-set.go
+@@ -391,7 +391,7 @@ func (r *metacacheReader) filter(o listPathOptions) (entries metaCacheEntriesSor
+ 			if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() && !entry.isObjectDir() {
+ 				return true
+ 			}
+-			if !o.InclDeleted && entry.isAllFreeVersions() {
++			if entry.isAllFreeVersions() {
+ 				return true
+ 			}
+ 			entries.o = append(entries.o, entry)
+diff --git a/cmd/xl-storage-format-utils.go b/cmd/xl-storage-format-utils.go
+index 455d9f782..11d67a867 100644
+--- a/cmd/xl-storage-format-utils.go
++++ b/cmd/xl-storage-format-utils.go
+@@ -23,40 +23,22 @@ import (
+ 	"github.com/zeebo/xxh3"
+ )
+ 
+-// getFileInfoVersions partitions this object's versions such that,
+-//   - fivs.Versions has all the non-free versions
+-//   - fivs.FreeVersions has all the free versions
+-//
+-// if inclFreeVersions is true all the versions are in fivs.Versions, free and non-free versions alike.
+-//
+-// Note: Only the scanner requires fivs.Versions to have exclusively non-free versions. This is used while enforcing NewerNoncurrentVersions lifecycle element.
+-func getFileInfoVersions(xlMetaBuf []byte, volume, path string, allParts, inclFreeVersions bool) (FileInfoVersions, error) {
++func getFileInfoVersions(xlMetaBuf []byte, volume, path string, allParts bool) (FileInfoVersions, error) {
+ 	fivs, err := getAllFileInfoVersions(xlMetaBuf, volume, path, allParts)
+ 	if err != nil {
+ 		return fivs, err
+ 	}
+-
+-	// If inclFreeVersions is false, partition the versions in fivs.Versions
+-	// such that finally fivs.Versions has
+-	// all the non-free versions and fivs.FreeVersions has all the free
+-	// versions.
+ 	n := 0
+ 	for _, fi := range fivs.Versions {
+-		// filter our tier object delete marker
+-		if fi.TierFreeVersion() {
+-			if !inclFreeVersions {
+-				fivs.FreeVersions = append(fivs.FreeVersions, fi)
+-			}
+-		} else {
+-			if !inclFreeVersions {
+-				fivs.Versions[n] = fi
+-			}
++		// Filter our tier object delete marker
++		if !fi.TierFreeVersion() {
++			fivs.Versions[n] = fi
+ 			n++
++		} else {
++			fivs.FreeVersions = append(fivs.FreeVersions, fi)
+ 		}
+ 	}
+-	if !inclFreeVersions {
+-		fivs.Versions = fivs.Versions[:n]
+-	}
++	fivs.Versions = fivs.Versions[:n]
+ 	// Update numversions
+ 	for i := range fivs.Versions {
+ 		fivs.Versions[i].NumVersions = n
+diff --git a/cmd/xl-storage-format-utils_test.go b/cmd/xl-storage-format-utils_test.go
+index e9462fe51..dfbb43408 100644
+--- a/cmd/xl-storage-format-utils_test.go
++++ b/cmd/xl-storage-format-utils_test.go
+@@ -18,7 +18,6 @@
+ package cmd
+ 
+ import (
+-	"slices"
+ 	"sort"
+ 	"testing"
+ 	"time"
+@@ -146,7 +145,7 @@ func TestGetFileInfoVersions(t *testing.T) {
+ 	}
+ 	xl := xlMetaV2{}
+ 	var versions []FileInfo
+-	var allVersionIDs, freeVersionIDs []string
++	var freeVersionIDs []string
+ 	for i := 0; i < 5; i++ {
+ 		fi := basefi
+ 		fi.VersionID = mustGetUUID()
+@@ -168,31 +167,18 @@ func TestGetFileInfoVersions(t *testing.T) {
+ 			// delete this version leading to a free version
+ 			xl.DeleteVersion(fi)
+ 			freeVersionIDs = append(freeVersionIDs, fi.TierFreeVersionID())
+-			allVersionIDs = append(allVersionIDs, fi.TierFreeVersionID())
+ 		} else {
+ 			versions = append(versions, fi)
+-			allVersionIDs = append(allVersionIDs, fi.VersionID)
+ 		}
+ 	}
+ 	buf, err := xl.AppendTo(nil)
+ 	if err != nil {
+ 		t.Fatalf("Failed to serialize xlmeta %v", err)
+ 	}
+-	fivs, err := getFileInfoVersions(buf, basefi.Volume, basefi.Name, true, false)
++	fivs, err := getFileInfoVersions(buf, basefi.Volume, basefi.Name, true)
+ 	if err != nil {
+ 		t.Fatalf("getFileInfoVersions failed: %v", err)
+ 	}
+-	chkNumVersions := func(fis []FileInfo) bool {
+-		for i := 0; i < len(fis)-1; i++ {
+-			if fis[i].NumVersions != fis[i+1].NumVersions {
+-				return false
+-			}
+-		}
+-		return true
+-	}
+-	if !chkNumVersions(fivs.Versions) {
+-		t.Fatalf("Expected all versions to have the same NumVersions")
+-	}
+ 
+ 	sort.Slice(versions, func(i, j int) bool {
+ 		if versions[i].IsLatest {
+@@ -208,9 +194,6 @@ func TestGetFileInfoVersions(t *testing.T) {
+ 		if fi.VersionID != versions[i].VersionID {
+ 			t.Fatalf("getFileInfoVersions: versions don't match at %d, version id expected %s but got %s", i, fi.VersionID, versions[i].VersionID)
+ 		}
+-		if fi.NumVersions != len(fivs.Versions) {
+-			t.Fatalf("getFileInfoVersions: version with %s version id expected to have %d as NumVersions but got %d", fi.VersionID, len(fivs.Versions), fi.NumVersions)
+-		}
+ 	}
+ 
+ 	for i, free := range fivs.FreeVersions {
+@@ -218,20 +201,4 @@ func TestGetFileInfoVersions(t *testing.T) {
+ 			t.Fatalf("getFileInfoVersions: free versions don't match at %d, version id expected %s but got %s", i, free.VersionID, freeVersionIDs[i])
+ 		}
+ 	}
+-
+-	// versions are stored in xl-meta sorted in descending order of their ModTime
+-	slices.Reverse(allVersionIDs)
+-
+-	fivs, err = getFileInfoVersions(buf, basefi.Volume, basefi.Name, true, true)
+-	if err != nil {
+-		t.Fatalf("getFileInfoVersions failed: %v", err)
+-	}
+-	if !chkNumVersions(fivs.Versions) {
+-		t.Fatalf("Expected all versions to have the same NumVersions")
+-	}
+-	for i, fi := range fivs.Versions {
+-		if fi.VersionID != allVersionIDs[i] {
+-			t.Fatalf("getFileInfoVersions: all versions don't match at %d expected %s but got %s", i, allVersionIDs[i], fi.VersionID)
+-		}
+-	}
+ }
+diff --git a/cmd/xl-storage.go b/cmd/xl-storage.go
+index 0ae54541e..c472a5e70 100644
+--- a/cmd/xl-storage.go
++++ b/cmd/xl-storage.go
+@@ -586,7 +586,7 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
+ 		// Remove filename which is the meta file.
+ 		item.transformMetaDir()
+ 
+-		fivs, err := getFileInfoVersions(buf, item.bucket, item.objectPath(), false, false)
++		fivs, err := getFileInfoVersions(buf, item.bucket, item.objectPath(), false)
+ 		metaDataPoolPut(buf)
+ 		if err != nil {
+ 			res["err"] = err.Error()

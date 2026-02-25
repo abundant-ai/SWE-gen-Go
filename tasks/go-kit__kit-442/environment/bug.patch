@@ -1,0 +1,289 @@
+diff --git a/metrics/circonus/circonus.go b/metrics/circonus/circonus.go
+new file mode 100644
+index 0000000..7ef50d4
+--- /dev/null
++++ b/metrics/circonus/circonus.go
+@@ -0,0 +1,103 @@
++// Package circonus provides a Circonus backend for metrics.
++package circonus
++
++import (
++	"sync"
++
++	"github.com/circonus-labs/circonus-gometrics"
++
++	"github.com/go-kit/kit/metrics"
++)
++
++// Circonus wraps a CirconusMetrics object and provides constructors for each of
++// the Go kit metrics. The CirconusMetrics object manages aggregation of
++// observations and emission to the Circonus server.
++type Circonus struct {
++	m *circonusgometrics.CirconusMetrics
++}
++
++// New creates a new Circonus object wrapping the passed CirconusMetrics, which
++// the caller should create and set in motion. The Circonus object can be used
++// to construct individual Go kit metrics.
++func New(m *circonusgometrics.CirconusMetrics) *Circonus {
++	return &Circonus{
++		m: m,
++	}
++}
++
++// NewCounter returns a counter metric with the given name.
++func (c *Circonus) NewCounter(name string) *Counter {
++	return &Counter{
++		name: name,
++		m:    c.m,
++	}
++}
++
++// NewGauge returns a gauge metric with the given name.
++func (c *Circonus) NewGauge(name string) *Gauge {
++	return &Gauge{
++		name: name,
++		m:    c.m,
++	}
++}
++
++// NewHistogram returns a histogram metric with the given name.
++func (c *Circonus) NewHistogram(name string) *Histogram {
++	return &Histogram{
++		h: c.m.NewHistogram(name),
++	}
++}
++
++// Counter is a Circonus implementation of a counter metric.
++type Counter struct {
++	name string
++	m    *circonusgometrics.CirconusMetrics
++}
++
++// With implements Counter, but is a no-op, because Circonus metrics have no
++// concept of per-observation label values.
++func (c *Counter) With(labelValues ...string) metrics.Counter { return c }
++
++// Add implements Counter. Delta is converted to uint64; precision will be lost.
++func (c *Counter) Add(delta float64) { c.m.Add(c.name, uint64(delta)) }
++
++// Gauge is a Circonus implementation of a gauge metric.
++type Gauge struct {
++	name string
++	m    *circonusgometrics.CirconusMetrics
++	val  float64
++	mtx  sync.RWMutex
++}
++
++// With implements Gauge, but is a no-op, because Circonus metrics have no
++// concept of per-observation label values.
++func (g *Gauge) With(labelValues ...string) metrics.Gauge { return g }
++
++// Set implements Gauge.
++func (g *Gauge) Set(value float64) {
++	g.mtx.Lock()
++	defer g.mtx.Unlock()
++	g.val = value
++	g.m.SetGauge(g.name, value)
++}
++
++// Add implements metrics.Gauge.
++func (g *Gauge) Add(delta float64) {
++	g.mtx.Lock()
++	defer g.mtx.Unlock()
++	value := g.val + delta
++	g.val = value
++	g.m.SetGauge(g.name, value)
++}
++
++// Histogram is a Circonus implementation of a histogram metric.
++type Histogram struct {
++	h *circonusgometrics.Histogram
++}
++
++// With implements Histogram, but is a no-op, because Circonus metrics have no
++// concept of per-observation label values.
++func (h *Histogram) With(labelValues ...string) metrics.Histogram { return h }
++
++// Observe implements Histogram. No precision is lost.
++func (h *Histogram) Observe(value float64) { h.h.RecordValue(value) }
+diff --git a/metrics/circonus/circonus_test.go b/metrics/circonus/circonus_test.go
+new file mode 100644
+index 0000000..263c6b6
+--- /dev/null
++++ b/metrics/circonus/circonus_test.go
+@@ -0,0 +1,120 @@
++package circonus
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"regexp"
++	"strconv"
++	"testing"
++
++	"github.com/circonus-labs/circonus-gometrics"
++	"github.com/circonus-labs/circonus-gometrics/checkmgr"
++
++	"github.com/go-kit/kit/metrics/generic"
++	"github.com/go-kit/kit/metrics/teststat"
++)
++
++func TestCounter(t *testing.T) {
++	// The only way to extract values from Circonus is to pose as a Circonus
++	// server and receive real HTTP writes.
++	const name = "abc"
++	var val int64
++	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var res map[string]struct {
++			Value int64 `json:"_value"` // reverse-engineered :\
++		}
++		json.NewDecoder(r.Body).Decode(&res)
++		val = res[name].Value
++	}))
++	defer s.Close()
++
++	// Set up a Circonus object, submitting to our HTTP server.
++	m := newCirconusMetrics(s.URL)
++	counter := New(m).NewCounter(name).With("label values", "not supported")
++	value := func() float64 { m.Flush(); return float64(val) }
++
++	// Engage.
++	if err := teststat.TestCounter(counter, value); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestGauge(t *testing.T) {
++	const name = "def"
++	var val float64
++	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var res map[string]struct {
++			Value string `json:"_value"`
++		}
++		json.NewDecoder(r.Body).Decode(&res)
++		val, _ = strconv.ParseFloat(res[name].Value, 64)
++	}))
++	defer s.Close()
++
++	m := newCirconusMetrics(s.URL)
++	gauge := New(m).NewGauge(name).With("label values", "not supported")
++	value := func() float64 { m.Flush(); return val }
++
++	if err := teststat.TestGauge(gauge, value); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestHistogram(t *testing.T) {
++	const name = "ghi"
++
++	// Circonus just emits bucketed counts. We'll dump them into a generic
++	// histogram (losing some precision) and take statistics from there. Note
++	// this does assume that the generic histogram computes statistics properly,
++	// but we have another test for that :)
++	re := regexp.MustCompile(`^H\[([0-9\.e\+]+)\]=([0-9]+)$`) // H[1.2e+03]=456
++
++	var p50, p90, p95, p99 float64
++	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var res map[string]struct {
++			Values []string `json:"_value"` // reverse-engineered :\
++		}
++		json.NewDecoder(r.Body).Decode(&res)
++
++		h := generic.NewHistogram("dummy", len(res[name].Values)) // match tbe bucket counts
++		for _, v := range res[name].Values {
++			match := re.FindStringSubmatch(v)
++			f, _ := strconv.ParseFloat(match[1], 64)
++			n, _ := strconv.ParseInt(match[2], 10, 64)
++			for i := int64(0); i < n; i++ {
++				h.Observe(f)
++			}
++		}
++
++		p50 = h.Quantile(0.50)
++		p90 = h.Quantile(0.90)
++		p95 = h.Quantile(0.95)
++		p99 = h.Quantile(0.99)
++	}))
++	defer s.Close()
++
++	m := newCirconusMetrics(s.URL)
++	histogram := New(m).NewHistogram(name).With("label values", "not supported")
++	quantiles := func() (float64, float64, float64, float64) { m.Flush(); return p50, p90, p95, p99 }
++
++	// Circonus metrics, because they do their own bucketing, are less precise
++	// than other systems. So, we bump the tolerance to 5 percent.
++	if err := teststat.TestHistogram(histogram, quantiles, 0.05); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func newCirconusMetrics(url string) *circonusgometrics.CirconusMetrics {
++	m, err := circonusgometrics.NewCirconusMetrics(&circonusgometrics.Config{
++		CheckManager: checkmgr.Config{
++			Check: checkmgr.CheckConfig{
++				SubmissionURL: url,
++			},
++		},
++	})
++	if err != nil {
++		panic(err)
++	}
++	return m
++}
+diff --git a/metrics/doc.go b/metrics/doc.go
+index 3bb7c17..9b17cf2 100644
+--- a/metrics/doc.go
++++ b/metrics/doc.go
+@@ -91,6 +91,7 @@
+ //    expvar      1    atomic                 atomic                 synthetic, batch, in-place expose
+ //    influx      n    custom                 custom                 custom
+ //    prometheus  n    native                 native                 native
++//    circonus    1    native                 native                 native
+ //    pcp         1    native                 native                 native
+ //
+ package metrics
+diff --git a/metrics/provider/circonus.go b/metrics/provider/circonus.go
+new file mode 100644
+index 0000000..7515f39
+--- /dev/null
++++ b/metrics/provider/circonus.go
+@@ -0,0 +1,36 @@
++package provider
++
++import (
++	"github.com/go-kit/kit/metrics"
++	"github.com/go-kit/kit/metrics/circonus"
++)
++
++type circonusProvider struct {
++	c *circonus.Circonus
++}
++
++// NewCirconusProvider takes the given Circonnus object and returns a Provider
++// that produces Circonus metrics.
++func NewCirconusProvider(c *circonus.Circonus) Provider {
++	return &circonusProvider{
++		c: c,
++	}
++}
++
++// NewCounter implements Provider.
++func (p *circonusProvider) NewCounter(name string) metrics.Counter {
++	return p.c.NewCounter(name)
++}
++
++// NewGauge implements Provider.
++func (p *circonusProvider) NewGauge(name string) metrics.Gauge {
++	return p.c.NewGauge(name)
++}
++
++// NewHistogram implements Provider. The buckets parameter is ignored.
++func (p *circonusProvider) NewHistogram(name string, _ int) metrics.Histogram {
++	return p.c.NewHistogram(name)
++}
++
++// Stop implements Provider, but is a no-op.
++func (p *circonusProvider) Stop() {}

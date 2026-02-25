@@ -1,0 +1,264 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 84f0ca9..a6fe06b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,8 +13,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+     a breaking change.
+   - See #553 for more details
+ - Improve output log message for applied up migrations. #562
+-- Fix an issue where `AddMigrationNoTxContext` was registering the wrong source because it skipped
+-  too many frames. #572
+ 
+ ## [v3.13.4] - 2023-07-07
+ 
+diff --git a/migrate.go b/migrate.go
+index b7130a4..0dfb530 100644
+--- a/migrate.go
++++ b/migrate.go
+@@ -140,10 +140,9 @@ type GoMigrationNoTx func(db *sql.DB) error
+ type GoMigrationNoTxContext func(ctx context.Context, db *sql.DB) error
+ 
+ // AddMigration adds Go migrations.
+-//
+-// Deprecated: Use AddMigrationContext.
+ func AddMigration(up, down GoMigration) {
+ 	_, filename, _, _ := runtime.Caller(1)
++	// intentionally don't call to AddMigrationContext so each of these functions can calculate the filename correctly
+ 	AddNamedMigrationContext(filename, withContext(up), withContext(down))
+ }
+ 
+@@ -154,8 +153,6 @@ func AddMigrationContext(up, down GoMigrationContext) {
+ }
+ 
+ // AddNamedMigration adds named Go migrations.
+-//
+-// Deprecated: Use AddNamedMigrationContext.
+ func AddNamedMigration(filename string, up, down GoMigration) {
+ 	AddNamedMigrationContext(filename, withContext(up), withContext(down))
+ }
+@@ -168,22 +165,17 @@ func AddNamedMigrationContext(filename string, up, down GoMigrationContext) {
+ }
+ 
+ // AddMigrationNoTx adds Go migrations that will be run outside transaction.
+-//
+-// Deprecated: Use AddNamedMigrationNoTxContext.
+ func AddMigrationNoTx(up, down GoMigrationNoTx) {
+-	_, filename, _, _ := runtime.Caller(1)
+-	AddNamedMigrationNoTxContext(filename, withContext(up), withContext(down))
++	AddMigrationNoTxContext(withContext(up), withContext(down))
+ }
+ 
+ // AddMigrationNoTxContext adds Go migrations that will be run outside transaction.
+ func AddMigrationNoTxContext(up, down GoMigrationNoTxContext) {
+-	_, filename, _, _ := runtime.Caller(1)
++	_, filename, _, _ := runtime.Caller(2)
+ 	AddNamedMigrationNoTxContext(filename, up, down)
+ }
+ 
+ // AddNamedMigrationNoTx adds named Go migrations that will be run outside transaction.
+-//
+-// Deprecated: Use AddNamedMigrationNoTxContext.
+ func AddNamedMigrationNoTx(filename string, up, down GoMigrationNoTx) {
+ 	AddNamedMigrationNoTxContext(filename, withContext(up), withContext(down))
+ }
+diff --git a/tests/gomigrations/register/register_test.go b/tests/gomigrations/register/register_test.go
+deleted file mode 100644
+index b79209a..0000000
+--- a/tests/gomigrations/register/register_test.go
++++ /dev/null
+@@ -1,113 +0,0 @@
+-package register_test
+-
+-import (
+-	"math"
+-	"path/filepath"
+-	"testing"
+-
+-	"github.com/pressly/goose/v3"
+-	"github.com/pressly/goose/v3/internal/check"
+-	_ "github.com/pressly/goose/v3/tests/gomigrations/register/testdata"
+-)
+-
+-func TestAddFunctions(t *testing.T) {
+-	goMigrations, err := goose.CollectMigrations("testdata", 0, math.MaxInt64)
+-	check.NoError(t, err)
+-	check.Number(t, len(goMigrations), 4)
+-
+-	checkMigration(t, goMigrations[0], &goose.Migration{
+-		Version:    1,
+-		Next:       2,
+-		Previous:   -1,
+-		Source:     "001_addmigration.go",
+-		Registered: true,
+-		UseTx:      true,
+-	})
+-	checkMigration(t, goMigrations[1], &goose.Migration{
+-		Version:    2,
+-		Next:       3,
+-		Previous:   1,
+-		Source:     "002_addmigrationnotx.go",
+-		Registered: true,
+-		UseTx:      false,
+-	})
+-	checkMigration(t, goMigrations[2], &goose.Migration{
+-		Version:    3,
+-		Next:       4,
+-		Previous:   2,
+-		Source:     "003_addmigrationcontext.go",
+-		Registered: true,
+-		UseTx:      true,
+-	})
+-	checkMigration(t, goMigrations[3], &goose.Migration{
+-		Version:    4,
+-		Next:       -1,
+-		Previous:   3,
+-		Source:     "004_addmigrationnotxcontext.go",
+-		Registered: true,
+-		UseTx:      false,
+-	})
+-}
+-
+-func checkMigration(t *testing.T, got *goose.Migration, want *goose.Migration) {
+-	t.Helper()
+-	check.Equal(t, got.Version, want.Version)
+-	check.Equal(t, got.Next, want.Next)
+-	check.Equal(t, got.Previous, want.Previous)
+-	check.Equal(t, filepath.Base(got.Source), want.Source)
+-	check.Equal(t, got.Registered, want.Registered)
+-	check.Bool(t, got.UseTx, want.UseTx)
+-	checkFunctions(t, got)
+-}
+-
+-func checkFunctions(t *testing.T, m *goose.Migration) {
+-	t.Helper()
+-	switch filepath.Base(m.Source) {
+-	case "001_addmigration.go":
+-		// With transaction
+-		check.Bool(t, m.UpFn == nil, false)
+-		check.Bool(t, m.DownFn == nil, false)
+-		check.Bool(t, m.UpFnContext == nil, false)
+-		check.Bool(t, m.DownFnContext == nil, false)
+-		// No transaction
+-		check.Bool(t, m.UpFnNoTx == nil, true)
+-		check.Bool(t, m.DownFnNoTx == nil, true)
+-		check.Bool(t, m.UpFnNoTxContext == nil, true)
+-		check.Bool(t, m.DownFnNoTxContext == nil, true)
+-	case "002_addmigrationnotx.go":
+-		// With transaction
+-		check.Bool(t, m.UpFn == nil, true)
+-		check.Bool(t, m.DownFn == nil, true)
+-		check.Bool(t, m.UpFnContext == nil, true)
+-		check.Bool(t, m.DownFnContext == nil, true)
+-		// No transaction
+-		check.Bool(t, m.UpFnNoTx == nil, false)
+-		check.Bool(t, m.DownFnNoTx == nil, false)
+-		check.Bool(t, m.UpFnNoTxContext == nil, false)
+-		check.Bool(t, m.DownFnNoTxContext == nil, false)
+-	case "003_addmigrationcontext.go":
+-		// With transaction
+-		check.Bool(t, m.UpFn == nil, false)
+-		check.Bool(t, m.DownFn == nil, false)
+-		check.Bool(t, m.UpFnContext == nil, false)
+-		check.Bool(t, m.DownFnContext == nil, false)
+-		// No transaction
+-		check.Bool(t, m.UpFnNoTx == nil, true)
+-		check.Bool(t, m.DownFnNoTx == nil, true)
+-		check.Bool(t, m.UpFnNoTxContext == nil, true)
+-		check.Bool(t, m.DownFnNoTxContext == nil, true)
+-	case "004_addmigrationnotxcontext.go":
+-		// With transaction
+-		check.Bool(t, m.UpFn == nil, true)
+-		check.Bool(t, m.DownFn == nil, true)
+-		check.Bool(t, m.UpFnContext == nil, true)
+-		check.Bool(t, m.DownFnContext == nil, true)
+-		// No transaction
+-		check.Bool(t, m.UpFnNoTx == nil, false)
+-		check.Bool(t, m.DownFnNoTx == nil, false)
+-		check.Bool(t, m.UpFnNoTxContext == nil, false)
+-		check.Bool(t, m.DownFnNoTxContext == nil, false)
+-	default:
+-		t.Fatalf("unexpected migration: %s", filepath.Base(m.Source))
+-	}
+-}
+diff --git a/tests/gomigrations/register/testdata/001_addmigration.go b/tests/gomigrations/register/testdata/001_addmigration.go
+deleted file mode 100644
+index 7bbde79..0000000
+--- a/tests/gomigrations/register/testdata/001_addmigration.go
++++ /dev/null
+@@ -1,14 +0,0 @@
+-package register
+-
+-import (
+-	"database/sql"
+-
+-	"github.com/pressly/goose/v3"
+-)
+-
+-func init() {
+-	goose.AddMigration(
+-		func(_ *sql.Tx) error { return nil },
+-		func(_ *sql.Tx) error { return nil },
+-	)
+-}
+diff --git a/tests/gomigrations/register/testdata/002_addmigrationnotx.go b/tests/gomigrations/register/testdata/002_addmigrationnotx.go
+deleted file mode 100644
+index 5511ca3..0000000
+--- a/tests/gomigrations/register/testdata/002_addmigrationnotx.go
++++ /dev/null
+@@ -1,14 +0,0 @@
+-package register
+-
+-import (
+-	"database/sql"
+-
+-	"github.com/pressly/goose/v3"
+-)
+-
+-func init() {
+-	goose.AddMigrationNoTx(
+-		func(_ *sql.DB) error { return nil },
+-		func(_ *sql.DB) error { return nil },
+-	)
+-}
+diff --git a/tests/gomigrations/register/testdata/003_addmigrationcontext.go b/tests/gomigrations/register/testdata/003_addmigrationcontext.go
+deleted file mode 100644
+index 55ab81e..0000000
+--- a/tests/gomigrations/register/testdata/003_addmigrationcontext.go
++++ /dev/null
+@@ -1,15 +0,0 @@
+-package register
+-
+-import (
+-	"context"
+-	"database/sql"
+-
+-	"github.com/pressly/goose/v3"
+-)
+-
+-func init() {
+-	goose.AddMigrationContext(
+-		func(_ context.Context, _ *sql.Tx) error { return nil },
+-		func(_ context.Context, _ *sql.Tx) error { return nil },
+-	)
+-}
+diff --git a/tests/gomigrations/register/testdata/004_addmigrationnotxcontext.go b/tests/gomigrations/register/testdata/004_addmigrationnotxcontext.go
+deleted file mode 100644
+index f5519df..0000000
+--- a/tests/gomigrations/register/testdata/004_addmigrationnotxcontext.go
++++ /dev/null
+@@ -1,15 +0,0 @@
+-package register
+-
+-import (
+-	"context"
+-	"database/sql"
+-
+-	"github.com/pressly/goose/v3"
+-)
+-
+-func init() {
+-	goose.AddMigrationNoTxContext(
+-		func(_ context.Context, _ *sql.DB) error { return nil },
+-		func(_ context.Context, _ *sql.DB) error { return nil },
+-	)
+-}

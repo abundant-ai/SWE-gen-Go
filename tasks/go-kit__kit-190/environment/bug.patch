@@ -1,0 +1,531 @@
+diff --git a/tracing/zipkin/zipkin.go b/tracing/zipkin/zipkin.go
+index b6052cd..6b94220 100644
+--- a/tracing/zipkin/zipkin.go
++++ b/tracing/zipkin/zipkin.go
+@@ -6,11 +6,9 @@ import (
+ 	"strconv"
+ 
+ 	"golang.org/x/net/context"
+-	"google.golang.org/grpc/metadata"
+ 
+ 	"github.com/go-kit/kit/endpoint"
+ 	"github.com/go-kit/kit/log"
+-	"github.com/go-kit/kit/transport/grpc"
+ )
+ 
+ // In Zipkin, "spans are considered to start and stop with the client." The
+@@ -29,10 +27,6 @@ const (
+ 	traceIDHTTPHeader      = "X-B3-TraceId"
+ 	spanIDHTTPHeader       = "X-B3-SpanId"
+ 	parentSpanIDHTTPHeader = "X-B3-ParentSpanId"
+-	// gRPC keys are always lowercase
+-	traceIDGRPCKey      = "x-b3-traceid"
+-	spanIDGRPCKey       = "x-b3-spanid"
+-	parentSpanIDGRPCKey = "x-b3-parentspanid"
+ 
+ 	// ClientSend is the annotation value used to mark a client sending a
+ 	// request to a server.
+@@ -104,16 +98,6 @@ func ToContext(newSpan NewSpanFunc, logger log.Logger) func(ctx context.Context,
+ 	}
+ }
+ 
+-// ToGRPCContext returns a function that satisfies transport/grpc.BeforeFunc. It
+-// takes a Zipkin span from the incoming GRPC request, and saves it in the
+-// request context. It's designed to be wired into a server's GRPC transport
+-// Before stack. The logger is used to report errors.
+-func ToGRPCContext(newSpan NewSpanFunc, logger log.Logger) func(ctx context.Context, md *metadata.MD) context.Context {
+-	return func(ctx context.Context, md *metadata.MD) context.Context {
+-		return context.WithValue(ctx, SpanContextKey, fromGRPC(newSpan, *md, logger))
+-	}
+-}
+-
+ // ToRequest returns a function that satisfies transport/http.BeforeFunc. It
+ // takes a Zipkin span from the context, and injects it into the HTTP request.
+ // It's designed to be wired into a client's HTTP transport Before stack. It's
+@@ -138,33 +122,6 @@ func ToRequest(newSpan NewSpanFunc) func(ctx context.Context, r *http.Request) c
+ 	}
+ }
+ 
+-// ToGRPCRequest returns a function that satisfies transport/grpc.BeforeFunc. It
+-// takes a Zipkin span from the context, and injects it into the GRPC context.
+-// It's designed to be wired into a client's GRPC transport Before stack. It's
+-// expected that AnnotateClient has already ensured the span in the context is
+-// a child/client span.
+-func ToGRPCRequest(newSpan NewSpanFunc) func(ctx context.Context, md *metadata.MD) context.Context {
+-	return func(ctx context.Context, md *metadata.MD) context.Context {
+-		span, ok := fromContext(ctx)
+-		if !ok {
+-			span = newSpan(newID(), newID(), 0)
+-		}
+-		if id := span.TraceID(); id > 0 {
+-			key, value := grpc.EncodeKeyValue(traceIDGRPCKey, strconv.FormatInt(id, 16))
+-			(*md)[key] = append((*md)[key], value)
+-		}
+-		if id := span.SpanID(); id > 0 {
+-			key, value := grpc.EncodeKeyValue(spanIDGRPCKey, strconv.FormatInt(id, 16))
+-			(*md)[key] = append((*md)[key], value)
+-		}
+-		if id := span.ParentSpanID(); id > 0 {
+-			key, value := grpc.EncodeKeyValue(parentSpanIDGRPCKey, strconv.FormatInt(id, 16))
+-			(*md)[key] = append((*md)[key], value)
+-		}
+-		return ctx
+-	}
+-}
+-
+ func fromHTTP(newSpan NewSpanFunc, r *http.Request, logger log.Logger) *Span {
+ 	traceIDStr := r.Header.Get(traceIDHTTPHeader)
+ 	if traceIDStr == "" {
+@@ -197,49 +154,6 @@ func fromHTTP(newSpan NewSpanFunc, r *http.Request, logger log.Logger) *Span {
+ 	return newSpan(traceID, spanID, parentSpanID)
+ }
+ 
+-func fromGRPC(newSpan NewSpanFunc, md metadata.MD, logger log.Logger) *Span {
+-	traceIDSlc := md[traceIDGRPCKey]
+-	pos := len(traceIDSlc) - 1
+-	if pos < 0 {
+-		return newSpan(newID(), newID(), 0) // normal; just make a new one
+-	}
+-	traceID, err := strconv.ParseInt(traceIDSlc[pos], 16, 64)
+-	if err != nil {
+-		logger.Log(traceIDHTTPHeader, traceIDSlc, "err", err)
+-		return newSpan(newID(), newID(), 0)
+-	}
+-	spanIDSlc := md[spanIDGRPCKey]
+-	pos = len(spanIDSlc) - 1
+-	if pos < 0 {
+-		spanIDSlc = make([]string, 1)
+-		pos = 0
+-	}
+-	if spanIDSlc[pos] == "" {
+-		logger.Log("msg", "trace ID without span ID")   // abnormal
+-		spanIDSlc[pos] = strconv.FormatInt(newID(), 64) // deal with it
+-	}
+-	spanID, err := strconv.ParseInt(spanIDSlc[pos], 16, 64)
+-	if err != nil {
+-		logger.Log(spanIDHTTPHeader, spanIDSlc, "err", err) // abnormal
+-		spanID = newID()                                    // deal with it
+-	}
+-	parentSpanIDSlc := md[parentSpanIDGRPCKey]
+-	pos = len(parentSpanIDSlc) - 1
+-	if pos < 0 {
+-		parentSpanIDSlc = make([]string, 1)
+-		pos = 0
+-	}
+-	if parentSpanIDSlc[pos] == "" {
+-		parentSpanIDSlc[pos] = "0" // normal
+-	}
+-	parentSpanID, err := strconv.ParseInt(parentSpanIDSlc[pos], 16, 64)
+-	if err != nil {
+-		logger.Log(parentSpanIDHTTPHeader, parentSpanIDSlc, "err", err) // abnormal
+-		parentSpanID = 0                                                // the only way to deal with it
+-	}
+-	return newSpan(traceID, spanID, parentSpanID)
+-}
+-
+ func fromContext(ctx context.Context) (*Span, bool) {
+ 	val := ctx.Value(SpanContextKey)
+ 	if val == nil {
+diff --git a/tracing/zipkin/zipkin_test.go b/tracing/zipkin/zipkin_test.go
+index a59efc5..d6952c1 100644
+--- a/tracing/zipkin/zipkin_test.go
++++ b/tracing/zipkin/zipkin_test.go
+@@ -11,7 +11,6 @@ import (
+ 	"testing"
+ 
+ 	"golang.org/x/net/context"
+-	"google.golang.org/grpc/metadata"
+ 
+ 	"github.com/go-kit/kit/endpoint"
+ 	"github.com/go-kit/kit/log"
+@@ -61,50 +60,6 @@ func TestToContext(t *testing.T) {
+ 	}
+ }
+ 
+-func TestToGRPCContext(t *testing.T) {
+-	const (
+-		hostport           = "5.5.5.5:5555"
+-		serviceName        = "foo-service"
+-		methodName         = "foo-method"
+-		traceID      int64 = 12
+-		spanID       int64 = 34
+-		parentSpanID int64 = 56
+-	)
+-
+-	md := metadata.MD{
+-		"x-b3-traceid":      []string{strconv.FormatInt(traceID, 16)},
+-		"x-b3-spanid":       []string{strconv.FormatInt(spanID, 16)},
+-		"x-b3-parentspanid": []string{strconv.FormatInt(parentSpanID, 16)},
+-	}
+-
+-	newSpan := zipkin.MakeNewSpanFunc(hostport, serviceName, methodName)
+-	toContext := zipkin.ToGRPCContext(newSpan, log.NewLogfmtLogger(ioutil.Discard))
+-
+-	ctx := toContext(context.Background(), &md)
+-	val := ctx.Value(zipkin.SpanContextKey)
+-	if val == nil {
+-		t.Fatalf("%s returned no value", zipkin.SpanContextKey)
+-	}
+-	span, ok := val.(*zipkin.Span)
+-	if !ok {
+-		t.Fatalf("%s was not a Span object", zipkin.SpanContextKey)
+-	}
+-
+-	for want, haveFunc := range map[int64]func() int64{
+-		traceID:      span.TraceID,
+-		spanID:       span.SpanID,
+-		parentSpanID: span.ParentSpanID,
+-	} {
+-		if have := haveFunc(); want != have {
+-			name := runtime.FuncForPC(reflect.ValueOf(haveFunc).Pointer()).Name()
+-			name = strings.Split(name, "·")[0]
+-			toks := strings.Split(name, ".")
+-			name = toks[len(toks)-1]
+-			t.Errorf("%s: want %d, have %d", name, want, have)
+-		}
+-	}
+-}
+-
+ func TestToRequest(t *testing.T) {
+ 	const (
+ 		hostport           = "5.5.5.5:5555"
+@@ -132,33 +87,6 @@ func TestToRequest(t *testing.T) {
+ 	}
+ }
+ 
+-func TestToGRPCRequest(t *testing.T) {
+-	const (
+-		hostport           = "5.5.5.5:5555"
+-		serviceName        = "foo-service"
+-		methodName         = "foo-method"
+-		traceID      int64 = 20
+-		spanID       int64 = 40
+-		parentSpanID int64 = 90
+-	)
+-
+-	newSpan := zipkin.MakeNewSpanFunc(hostport, serviceName, methodName)
+-	span := newSpan(traceID, spanID, parentSpanID)
+-	ctx := context.WithValue(context.Background(), zipkin.SpanContextKey, span)
+-	md := &metadata.MD{}
+-	ctx = zipkin.ToGRPCRequest(newSpan)(ctx, md)
+-
+-	for header, wantInt := range map[string]int64{
+-		"x-b3-traceid":      traceID,
+-		"x-b3-spanid":       spanID,
+-		"x-b3-parentspanid": parentSpanID,
+-	} {
+-		if want, have := strconv.FormatInt(wantInt, 16), (*md)[header][0]; want != have {
+-			t.Errorf("%s: want %q, have %q", header, want, have)
+-		}
+-	}
+-}
+-
+ func TestAnnotateServer(t *testing.T) {
+ 	if err := testAnnotate(zipkin.AnnotateServer, zipkin.ServerReceive, zipkin.ServerSend); err != nil {
+ 		t.Fatal(err)
+diff --git a/transport/grpc/client.go b/transport/grpc/client.go
+deleted file mode 100644
+index 5b82f10..0000000
+--- a/transport/grpc/client.go
++++ /dev/null
+@@ -1,78 +0,0 @@
+-package grpc
+-
+-import (
+-	"fmt"
+-
+-	"golang.org/x/net/context"
+-	"google.golang.org/grpc"
+-	"google.golang.org/grpc/metadata"
+-
+-	"github.com/go-kit/kit/endpoint"
+-)
+-
+-// Client wraps a gRPC connection and provides a method that implements
+-// endpoint.Endpoint.
+-type Client struct {
+-	client      *grpc.ClientConn
+-	serviceName string
+-	method      string
+-	enc         EncodeRequestFunc
+-	dec         DecodeResponseFunc
+-	grpcReply   interface{}
+-	before      []RequestFunc
+-}
+-
+-// NewClient returns a
+-func NewClient(cc *grpc.ClientConn, serviceName string, method string, enc EncodeRequestFunc, dec DecodeResponseFunc, grpcReply interface{}, options ...ClientOption) *Client {
+-	c := &Client{
+-		client:    cc,
+-		method:    fmt.Sprintf("/pb.%s/%s", serviceName, method),
+-		enc:       enc,
+-		dec:       dec,
+-		grpcReply: grpcReply,
+-		before:    []RequestFunc{},
+-	}
+-	for _, option := range options {
+-		option(c)
+-	}
+-	return c
+-}
+-
+-// ClientOption sets an optional parameter for clients.
+-type ClientOption func(*Client)
+-
+-// SetClientBefore sets the RequestFuncs that are applied to the outgoing gRPC
+-// request before it's invoked.
+-func SetClientBefore(before ...RequestFunc) ClientOption {
+-	return func(c *Client) { c.before = before }
+-}
+-
+-// Endpoint returns a usable endpoint that will invoke the gRPC specified by the
+-// client.
+-func (c Client) Endpoint() endpoint.Endpoint {
+-	return func(ctx context.Context, request interface{}) (interface{}, error) {
+-		ctx, cancel := context.WithCancel(ctx)
+-		defer cancel()
+-
+-		req, err := c.enc(ctx, request)
+-		if err != nil {
+-			return nil, fmt.Errorf("Encode: %v", err)
+-		}
+-
+-		md := &metadata.MD{}
+-		for _, f := range c.before {
+-			ctx = f(ctx, md)
+-		}
+-		ctx = metadata.NewContext(ctx, *md)
+-
+-		if err = grpc.Invoke(ctx, c.method, req, c.grpcReply, c.client); err != nil {
+-			return nil, fmt.Errorf("Invoke: %v", err)
+-		}
+-
+-		response, err := c.dec(ctx, c.grpcReply)
+-		if err != nil {
+-			return nil, fmt.Errorf("Decode: %v", err)
+-		}
+-		return response, nil
+-	}
+-}
+diff --git a/transport/grpc/encode_decode.go b/transport/grpc/encode_decode.go
+deleted file mode 100644
+index fb16c99..0000000
+--- a/transport/grpc/encode_decode.go
++++ /dev/null
+@@ -1,27 +0,0 @@
+-package grpc
+-
+-import "golang.org/x/net/context"
+-
+-// DecodeRequestFunc extracts a user-domain request object from a gRPC request.
+-// It's designed to be used in gRPC servers, for server-side endpoints. One
+-// straightforward DecodeRequestFunc could be something that
+-// decodes from the gRPC request message to the concrete request type.
+-type DecodeRequestFunc func(context.Context, interface{}) (request interface{}, err error)
+-
+-// EncodeRequestFunc encodes the passed request object into the gRPC request
+-// object. It's designed to be used in gRPC clients, for client-side
+-// endpoints. One straightforward EncodeRequestFunc could something that
+-// encodes the object directly to the gRPC request message.
+-type EncodeRequestFunc func(context.Context, interface{}) (request interface{}, err error)
+-
+-// EncodeResponseFunc encodes the passed response object to the gRPC response
+-// message. It's designed to be used in gRPC servers, for server-side
+-// endpoints. One straightforward EncodeResponseFunc could be something that
+-// encodes the object directly to the gRPC response message.
+-type EncodeResponseFunc func(context.Context, interface{}) (response interface{}, err error)
+-
+-// DecodeResponseFunc extracts a user-domain response object from a gRPC
+-// response object. It's designed to be used in gRPC clients, for client-side
+-// endpoints. One straightforward DecodeResponseFunc could be something that
+-// decodes from the gRPC response message to the concrete response type.
+-type DecodeResponseFunc func(context.Context, interface{}) (response interface{}, err error)
+diff --git a/transport/grpc/request_response_funcs.go b/transport/grpc/request_response_funcs.go
+deleted file mode 100644
+index 6a19420..0000000
+--- a/transport/grpc/request_response_funcs.go
++++ /dev/null
+@@ -1,53 +0,0 @@
+-package grpc
+-
+-import (
+-	"encoding/base64"
+-	"strings"
+-
+-	"golang.org/x/net/context"
+-	"google.golang.org/grpc/metadata"
+-)
+-
+-const (
+-	binHdrSuffix = "-bin"
+-)
+-
+-// RequestFunc may take information from an gRPC request and put it into a
+-// request context. In Servers, BeforeFuncs are executed prior to invoking the
+-// endpoint. In Clients, BeforeFuncs are executed after creating the request
+-// but prior to invoking the gRPC client.
+-type RequestFunc func(context.Context, *metadata.MD) context.Context
+-
+-// ResponseFunc may take information from a request context and use it to
+-// manipulate the gRPC metadata header. ResponseFuncs are only executed in
+-// servers, after invoking the endpoint but prior to writing a response.
+-type ResponseFunc func(context.Context, *metadata.MD)
+-
+-// SetResponseHeader returns a ResponseFunc that sets the specified metadata
+-// key-value pair.
+-func SetResponseHeader(key, val string) ResponseFunc {
+-	return func(_ context.Context, md *metadata.MD) {
+-		key, val := EncodeKeyValue(key, val)
+-		(*md)[key] = append((*md)[key], val)
+-	}
+-}
+-
+-// SetRequestHeader returns a RequestFunc that sets the specified metadata
+-// key-value pair..
+-func SetRequestHeader(key, val string) RequestFunc {
+-	return func(ctx context.Context, md *metadata.MD) context.Context {
+-		key, val := EncodeKeyValue(key, val)
+-		(*md)[key] = append((*md)[key], val)
+-		return ctx
+-	}
+-}
+-
+-// EncodeKeyValue sanitizes a key-value pair for use in gRPC metadata headers.
+-func EncodeKeyValue(key, val string) (string, string) {
+-	key = strings.ToLower(key)
+-	if strings.HasSuffix(key, binHdrSuffix) {
+-		v := base64.StdEncoding.EncodeToString([]byte(val))
+-		val = string(v)
+-	}
+-	return key, val
+-}
+diff --git a/transport/grpc/server.go b/transport/grpc/server.go
+deleted file mode 100644
+index 87deba8..0000000
+--- a/transport/grpc/server.go
++++ /dev/null
+@@ -1,124 +0,0 @@
+-package grpc
+-
+-import (
+-	"golang.org/x/net/context"
+-	"google.golang.org/grpc/metadata"
+-
+-	"github.com/go-kit/kit/endpoint"
+-	"github.com/go-kit/kit/log"
+-)
+-
+-// Handler which should be called from the grpc binding of the service
+-// implementation.
+-type Handler interface {
+-	ServeGRPC(context.Context, interface{}) (context.Context, interface{}, error)
+-}
+-
+-// Server wraps an endpoint and implements grpc.Handler.
+-type Server struct {
+-	ctx    context.Context
+-	e      endpoint.Endpoint
+-	dec    DecodeRequestFunc
+-	enc    EncodeResponseFunc
+-	before []RequestFunc
+-	after  []ResponseFunc
+-	logger log.Logger
+-}
+-
+-// NewServer constructs a new server, which implements grpc.Server and wraps
+-// the provided endpoint.
+-func NewServer(
+-	ctx context.Context,
+-	e endpoint.Endpoint,
+-	dec DecodeRequestFunc,
+-	enc EncodeResponseFunc,
+-	options ...ServerOption,
+-) *Server {
+-	s := &Server{
+-		ctx: ctx,
+-		e:   e,
+-		dec: dec,
+-		enc: enc,
+-		logger: log.NewNopLogger(),
+-	}
+-	for _, option := range options {
+-		option(s)
+-	}
+-	return s
+-}
+-
+-// ServerOption sets an optional parameter for servers.
+-type ServerOption func(*Server)
+-
+-// ServerBefore functions are executed on the HTTP request object before the
+-// request is decoded.
+-func ServerBefore(before ...RequestFunc) ServerOption {
+-	return func(s *Server) { s.before = before }
+-}
+-
+-// ServerAfter functions are executed on the HTTP response writer after the
+-// endpoint is invoked, but before anything is written to the client.
+-func ServerAfter(after ...ResponseFunc) ServerOption {
+-	return func(s *Server) { s.after = after }
+-}
+-
+-// ServerErrorLogger is used to log non-terminal errors. By default, no errors
+-// are logged.
+-func ServerErrorLogger(logger log.Logger) ServerOption {
+-	return func(s *Server) { s.logger = logger }
+-}
+-
+-// ServeGRPC implements grpc.Handler
+-func (s Server) ServeGRPC(grpcCtx context.Context, r interface{}) (context.Context, interface{}, error) {
+-	ctx, cancel := context.WithCancel(s.ctx)
+-	defer cancel()
+-
+-	// retrieve gRPC metadata
+-	md, ok := metadata.FromContext(grpcCtx)
+-	if !ok {
+-		md = metadata.MD{}
+-	}
+-
+-	for _, f := range s.before {
+-		ctx = f(ctx, &md)
+-	}
+-
+-	// store potentially updated metadata in the gRPC context
+-	grpcCtx = metadata.NewContext(grpcCtx, md)
+-
+-	request, err := s.dec(grpcCtx, r)
+-	if err != nil {
+-		s.logger.Log("err", err)
+-		return grpcCtx, nil, BadRequestError{err}
+-	}
+-
+-	response, err := s.e(ctx, request)
+-	if err != nil {
+-		s.logger.Log("err", err)
+-		return grpcCtx, nil, err
+-	}
+-
+-	for _, f := range s.after {
+-		f(ctx, &md)
+-	}
+-
+-	// store potentially updated metadata in the gRPC context
+-	grpcCtx = metadata.NewContext(grpcCtx, md)
+-
+-	grpcResp, err := s.enc(grpcCtx, response)
+-	if err != nil {
+-		s.logger.Log("err", err)
+-		return grpcCtx, nil, err
+-	}
+-	return grpcCtx, grpcResp, nil
+-}
+-
+-// BadRequestError is an error in decoding the request.
+-type BadRequestError struct {
+-	Err error
+-}
+-
+-// Error implements the error interface.
+-func (err BadRequestError) Error() string {
+-	return err.Err.Error()
+-}

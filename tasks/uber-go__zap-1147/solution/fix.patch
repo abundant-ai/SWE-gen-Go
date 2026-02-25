@@ -1,0 +1,302 @@
+diff --git a/internal/level_enabler.go b/internal/level_enabler.go
+new file mode 100644
+index 0000000..5f3e3f1
+--- /dev/null
++++ b/internal/level_enabler.go
+@@ -0,0 +1,35 @@
++// Copyright (c) 2022 Uber Technologies, Inc.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++// THE SOFTWARE.
++
++package internal
++
++import "go.uber.org/zap/zapcore"
++
++// LeveledEnabler is an interface satisfied by LevelEnablers that are able to
++// report their own level.
++//
++// This interface is defined to use more conveniently in tests and non-zapcore
++// packages.
++// This cannot be imported from zapcore because of the cyclic dependency.
++type LeveledEnabler interface {
++	zapcore.LevelEnabler
++
++	Level() zapcore.Level
++}
+diff --git a/level.go b/level.go
+index 8f86c43..db951e1 100644
+--- a/level.go
++++ b/level.go
+@@ -22,6 +22,7 @@ package zap
+ 
+ import (
+ 	"go.uber.org/atomic"
++	"go.uber.org/zap/internal"
+ 	"go.uber.org/zap/zapcore"
+ )
+ 
+@@ -70,6 +71,8 @@ type AtomicLevel struct {
+ 	l *atomic.Int32
+ }
+ 
++var _ internal.LeveledEnabler = AtomicLevel{}
++
+ // NewAtomicLevel creates an AtomicLevel with InfoLevel and above logging
+ // enabled.
+ func NewAtomicLevel() AtomicLevel {
+diff --git a/zapcore/core.go b/zapcore/core.go
+index a1ef8b0..9dfd640 100644
+--- a/zapcore/core.go
++++ b/zapcore/core.go
+@@ -69,6 +69,15 @@ type ioCore struct {
+ 	out WriteSyncer
+ }
+ 
++var (
++	_ Core           = (*ioCore)(nil)
++	_ leveledEnabler = (*ioCore)(nil)
++)
++
++func (c *ioCore) Level() Level {
++	return LevelOf(c.LevelEnabler)
++}
++
+ func (c *ioCore) With(fields []Field) Core {
+ 	clone := c.clone()
+ 	addFields(clone.enc, fields)
+diff --git a/zapcore/hook.go b/zapcore/hook.go
+index 5db4afb..198def9 100644
+--- a/zapcore/hook.go
++++ b/zapcore/hook.go
+@@ -27,6 +27,11 @@ type hooked struct {
+ 	funcs []func(Entry) error
+ }
+ 
++var (
++	_ Core           = (*hooked)(nil)
++	_ leveledEnabler = (*hooked)(nil)
++)
++
+ // RegisterHooks wraps a Core and runs a collection of user-defined callback
+ // hooks each time a message is logged. Execution of the callbacks is blocking.
+ //
+@@ -40,6 +45,10 @@ func RegisterHooks(core Core, hooks ...func(Entry) error) Core {
+ 	}
+ }
+ 
++func (h *hooked) Level() Level {
++	return LevelOf(h.Core)
++}
++
+ func (h *hooked) Check(ent Entry, ce *CheckedEntry) *CheckedEntry {
+ 	// Let the wrapped Core decide whether to log this message or not. This
+ 	// also gives the downstream a chance to register itself directly with the
+diff --git a/zapcore/increase_level.go b/zapcore/increase_level.go
+index 5a17492..7a11237 100644
+--- a/zapcore/increase_level.go
++++ b/zapcore/increase_level.go
+@@ -27,6 +27,11 @@ type levelFilterCore struct {
+ 	level LevelEnabler
+ }
+ 
++var (
++	_ Core           = (*levelFilterCore)(nil)
++	_ leveledEnabler = (*levelFilterCore)(nil)
++)
++
+ // NewIncreaseLevelCore creates a core that can be used to increase the level of
+ // an existing Core. It cannot be used to decrease the logging level, as it acts
+ // as a filter before calling the underlying core. If level decreases the log level,
+@@ -45,6 +50,10 @@ func (c *levelFilterCore) Enabled(lvl Level) bool {
+ 	return c.level.Enabled(lvl)
+ }
+ 
++func (c *levelFilterCore) Level() Level {
++	return LevelOf(c.level)
++}
++
+ func (c *levelFilterCore) With(fields []Field) Core {
+ 	return &levelFilterCore{c.core.With(fields), c.level}
+ }
+diff --git a/zapcore/level.go b/zapcore/level.go
+index 56e88dc..e01a241 100644
+--- a/zapcore/level.go
++++ b/zapcore/level.go
+@@ -53,6 +53,11 @@ const (
+ 
+ 	_minLevel = DebugLevel
+ 	_maxLevel = FatalLevel
++
++	// InvalidLevel is an invalid value for Level.
++	//
++	// Core implementations may panic if they see messages of this level.
++	InvalidLevel = _maxLevel + 1
+ )
+ 
+ // ParseLevel parses a level based on the lower-case or all-caps ASCII
+@@ -67,6 +72,43 @@ func ParseLevel(text string) (Level, error) {
+ 	return level, err
+ }
+ 
++type leveledEnabler interface {
++	LevelEnabler
++
++	Level() Level
++}
++
++// LevelOf reports the minimum enabled log level for the given LevelEnabler
++// from Zap's supported log levels, or [InvalidLevel] if none of them are
++// enabled.
++//
++// A LevelEnabler may implement a 'Level() Level' method to override the
++// behavior of this function.
++//
++//	func (c *core) Level() Level {
++//		return c.currentLevel
++//	}
++//
++// It is recommended that [Core] implementations that wrap other cores use
++// LevelOf to retrieve the level of the wrapped core. For example,
++//
++//	func (c *coreWrapper) Level() Level {
++//		return zapcore.LevelOf(c.wrappedCore)
++//	}
++func LevelOf(enab LevelEnabler) Level {
++	if lvler, ok := enab.(leveledEnabler); ok {
++		return lvler.Level()
++	}
++
++	for lvl := _minLevel; lvl <= _maxLevel; lvl++ {
++		if enab.Enabled(lvl) {
++			return lvl
++		}
++	}
++
++	return InvalidLevel
++}
++
+ // String returns a lower-case ASCII representation of the log level.
+ func (l Level) String() string {
+ 	switch l {
+diff --git a/zapcore/sampler.go b/zapcore/sampler.go
+index a15b7c9..dc51805 100644
+--- a/zapcore/sampler.go
++++ b/zapcore/sampler.go
+@@ -1,4 +1,4 @@
+-// Copyright (c) 2016 Uber Technologies, Inc.
++// Copyright (c) 2016-2022 Uber Technologies, Inc.
+ //
+ // Permission is hereby granted, free of charge, to any person obtaining a copy
+ // of this software and associated documentation files (the "Software"), to deal
+@@ -175,6 +175,11 @@ type sampler struct {
+ 	hook              func(Entry, SamplingDecision)
+ }
+ 
++var (
++	_ Core           = (*sampler)(nil)
++	_ leveledEnabler = (*sampler)(nil)
++)
++
+ // NewSampler creates a Core that samples incoming entries, which
+ // caps the CPU and I/O load of logging while attempting to preserve a
+ // representative subset of your logs.
+@@ -192,6 +197,10 @@ func NewSampler(core Core, tick time.Duration, first, thereafter int) Core {
+ 	return NewSamplerWithOptions(core, tick, first, thereafter)
+ }
+ 
++func (s *sampler) Level() Level {
++	return LevelOf(s.Core)
++}
++
+ func (s *sampler) With(fields []Field) Core {
+ 	return &sampler{
+ 		Core:       s.Core.With(fields),
+diff --git a/zapcore/tee.go b/zapcore/tee.go
+index 07a32ee..9bb32f0 100644
+--- a/zapcore/tee.go
++++ b/zapcore/tee.go
+@@ -1,4 +1,4 @@
+-// Copyright (c) 2016 Uber Technologies, Inc.
++// Copyright (c) 2016-2022 Uber Technologies, Inc.
+ //
+ // Permission is hereby granted, free of charge, to any person obtaining a copy
+ // of this software and associated documentation files (the "Software"), to deal
+@@ -24,6 +24,11 @@ import "go.uber.org/multierr"
+ 
+ type multiCore []Core
+ 
++var (
++	_ leveledEnabler = multiCore(nil)
++	_ Core           = multiCore(nil)
++)
++
+ // NewTee creates a Core that duplicates log entries into two or more
+ // underlying Cores.
+ //
+@@ -48,6 +53,16 @@ func (mc multiCore) With(fields []Field) Core {
+ 	return clone
+ }
+ 
++func (mc multiCore) Level() Level {
++	minLvl := _maxLevel // mc is never empty
++	for i := range mc {
++		if lvl := LevelOf(mc[i]); lvl < minLvl {
++			minLvl = lvl
++		}
++	}
++	return minLvl
++}
++
+ func (mc multiCore) Enabled(lvl Level) bool {
+ 	for i := range mc {
+ 		if mc[i].Enabled(lvl) {
+diff --git a/zaptest/observer/observer.go b/zaptest/observer/observer.go
+index 997f39f..f77f130 100644
+--- a/zaptest/observer/observer.go
++++ b/zaptest/observer/observer.go
+@@ -1,4 +1,4 @@
+-// Copyright (c) 2016 Uber Technologies, Inc.
++// Copyright (c) 2016-2022 Uber Technologies, Inc.
+ //
+ // Permission is hereby granted, free of charge, to any person obtaining a copy
+ // of this software and associated documentation files (the "Software"), to deal
+@@ -29,6 +29,7 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"go.uber.org/zap/internal"
+ 	"go.uber.org/zap/zapcore"
+ )
+ 
+@@ -158,6 +159,15 @@ type contextObserver struct {
+ 	context []zapcore.Field
+ }
+ 
++var (
++	_ zapcore.Core            = (*contextObserver)(nil)
++	_ internal.LeveledEnabler = (*contextObserver)(nil)
++)
++
++func (co *contextObserver) Level() zapcore.Level {
++	return zapcore.LevelOf(co.LevelEnabler)
++}
++
+ func (co *contextObserver) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+ 	if co.Enabled(ent.Level) {
+ 		return ce.AddCore(ent, co)

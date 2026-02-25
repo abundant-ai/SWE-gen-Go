@@ -1,0 +1,166 @@
+diff --git a/internal/command/views/hook_json.go b/internal/command/views/hook_json.go
+index 834cc2396a..edcb96537f 100644
+--- a/internal/command/views/hook_json.go
++++ b/internal/command/views/hook_json.go
+@@ -245,7 +245,7 @@ func (h *jsonHook) PreListQuery(id terraform.HookResourceIdentity, input_config
+ 	return terraform.HookActionContinue, nil
+ }
+ 
+-func (h *jsonHook) PostListQuery(id terraform.HookResourceIdentity, results plans.QueryResults) (terraform.HookAction, error) {
++func (h *jsonHook) PostListQuery(id terraform.HookResourceIdentity, results plans.QueryResults, identityVersion int64) (terraform.HookAction, error) {
+ 	addr := id.Addr
+ 	data := results.Value.GetAttr("data")
+ 	iter := data.ElementIterator()
+@@ -257,7 +257,7 @@ func (h *jsonHook) PostListQuery(id terraform.HookResourceIdentity, results plan
+ 			generated = &results.Generated.Imports[idx]
+ 		}
+ 
+-		result := json.NewQueryResult(addr, value, generated)
++		result := json.NewQueryResult(addr, value, identityVersion, generated)
+ 
+ 		h.view.log.Info(
+ 			fmt.Sprintf("%s: Result found", addr.String()),
+diff --git a/internal/command/views/hook_ui.go b/internal/command/views/hook_ui.go
+index 6f418749a2..bb1df3bde1 100644
+--- a/internal/command/views/hook_ui.go
++++ b/internal/command/views/hook_ui.go
+@@ -511,7 +511,7 @@ func (h *UiHook) PreListQuery(id terraform.HookResourceIdentity, input_config ct
+ 	return terraform.HookActionContinue, nil
+ }
+ 
+-func (h *UiHook) PostListQuery(id terraform.HookResourceIdentity, results plans.QueryResults) (terraform.HookAction, error) {
++func (h *UiHook) PostListQuery(id terraform.HookResourceIdentity, results plans.QueryResults, identityVersion int64) (terraform.HookAction, error) {
+ 	addr := id.Addr
+ 	data := results.Value.GetAttr("data")
+ 
+diff --git a/internal/command/views/json/query.go b/internal/command/views/json/query.go
+index fd9ceae39f..7d5167a798 100644
+--- a/internal/command/views/json/query.go
++++ b/internal/command/views/json/query.go
+@@ -19,13 +19,14 @@ type QueryStart struct {
+ }
+ 
+ type QueryResult struct {
+-	Address        string                     `json:"address"`
+-	DisplayName    string                     `json:"display_name"`
+-	Identity       map[string]json.RawMessage `json:"identity"`
+-	ResourceType   string                     `json:"resource_type"`
+-	ResourceObject map[string]json.RawMessage `json:"resource_object,omitempty"`
+-	Config         string                     `json:"config,omitempty"`
+-	ImportConfig   string                     `json:"import_config,omitempty"`
++	Address         string                     `json:"address"`
++	DisplayName     string                     `json:"display_name"`
++	Identity        map[string]json.RawMessage `json:"identity"`
++	IdentityVersion int64                      `json:"identity_version"`
++	ResourceType    string                     `json:"resource_type"`
++	ResourceObject  map[string]json.RawMessage `json:"resource_object,omitempty"`
++	Config          string                     `json:"config,omitempty"`
++	ImportConfig    string                     `json:"import_config,omitempty"`
+ }
+ 
+ type QueryComplete struct {
+@@ -34,21 +35,22 @@ type QueryComplete struct {
+ 	Total        int    `json:"total"`
+ }
+ 
+-func NewQueryStart(addr addrs.AbsResourceInstance, input_config cty.Value) QueryStart {
++func NewQueryStart(addr addrs.AbsResourceInstance, inputConfig cty.Value) QueryStart {
+ 	return QueryStart{
+ 		Address:      addr.String(),
+ 		ResourceType: addr.Resource.Resource.Type,
+-		InputConfig:  marshalValues(input_config),
++		InputConfig:  marshalValues(inputConfig),
+ 	}
+ }
+ 
+-func NewQueryResult(listAddr addrs.AbsResourceInstance, value cty.Value, generated *genconfig.ResourceImport) QueryResult {
++func NewQueryResult(listAddr addrs.AbsResourceInstance, value cty.Value, identityVersion int64, generated *genconfig.ResourceImport) QueryResult {
+ 	result := QueryResult{
+-		Address:        listAddr.String(),
+-		DisplayName:    value.GetAttr("display_name").AsString(),
+-		Identity:       marshalValues(value.GetAttr("identity")),
+-		ResourceType:   listAddr.Resource.Resource.Type,
+-		ResourceObject: marshalValues(value.GetAttr("state")),
++		Address:         listAddr.String(),
++		DisplayName:     value.GetAttr("display_name").AsString(),
++		Identity:        marshalValues(value.GetAttr("identity")),
++		IdentityVersion: identityVersion,
++		ResourceType:    listAddr.Resource.Resource.Type,
++		ResourceObject:  marshalValues(value.GetAttr("state")),
+ 	}
+ 
+ 	if generated != nil {
+diff --git a/internal/terraform/hook.go b/internal/terraform/hook.go
+index a7b8704900..47cb00c671 100644
+--- a/internal/terraform/hook.go
++++ b/internal/terraform/hook.go
+@@ -117,8 +117,8 @@ type Hook interface {
+ 
+ 	// PreListQuery and PostListQuery are called during a query operation before and after
+ 	// resources are queried from the provider.
+-	PreListQuery(id HookResourceIdentity, input_config cty.Value) (HookAction, error)
+-	PostListQuery(id HookResourceIdentity, results plans.QueryResults) (HookAction, error)
++	PreListQuery(id HookResourceIdentity, inputConfig cty.Value) (HookAction, error)
++	PostListQuery(id HookResourceIdentity, results plans.QueryResults, identityVersion int64) (HookAction, error)
+ 
+ 	// StartAction, ProgressAction, and CompleteAction are called during the
+ 	// lifecycle of an action invocation.
+@@ -236,7 +236,7 @@ func (h *NilHook) PreListQuery(id HookResourceIdentity, input_config cty.Value)
+ 	return HookActionContinue, nil
+ }
+ 
+-func (h *NilHook) PostListQuery(id HookResourceIdentity, results plans.QueryResults) (HookAction, error) {
++func (h *NilHook) PostListQuery(id HookResourceIdentity, results plans.QueryResults, identityVersion int64) (HookAction, error) {
+ 	return HookActionContinue, nil
+ }
+ 
+diff --git a/internal/terraform/hook_mock.go b/internal/terraform/hook_mock.go
+index a0ba7da59a..cc6f5cf532 100644
+--- a/internal/terraform/hook_mock.go
++++ b/internal/terraform/hook_mock.go
+@@ -383,7 +383,7 @@ func (h *MockHook) PreListQuery(id HookResourceIdentity, input_config cty.Value)
+ 	return h.PreListQueryReturn, h.PreListQueryReturnError
+ }
+ 
+-func (h *MockHook) PostListQuery(id HookResourceIdentity, results plans.QueryResults) (HookAction, error) {
++func (h *MockHook) PostListQuery(id HookResourceIdentity, results plans.QueryResults, identityVersion int64) (HookAction, error) {
+ 	h.Lock()
+ 	defer h.Unlock()
+ 
+diff --git a/internal/terraform/hook_stop.go b/internal/terraform/hook_stop.go
+index 18029076ce..fe34bc81f3 100644
+--- a/internal/terraform/hook_stop.go
++++ b/internal/terraform/hook_stop.go
+@@ -102,7 +102,7 @@ func (h *stopHook) PreListQuery(id HookResourceIdentity, input_config cty.Value)
+ 	return h.hook()
+ }
+ 
+-func (h *stopHook) PostListQuery(id HookResourceIdentity, results plans.QueryResults) (HookAction, error) {
++func (h *stopHook) PostListQuery(id HookResourceIdentity, results plans.QueryResults, identityVersion int64) (HookAction, error) {
+ 	return h.hook()
+ }
+ 
+diff --git a/internal/terraform/node_resource_plan_instance_query.go b/internal/terraform/node_resource_plan_instance_query.go
+index 30a6689ba1..2a517f3af8 100644
+--- a/internal/terraform/node_resource_plan_instance_query.go
++++ b/internal/terraform/node_resource_plan_instance_query.go
+@@ -7,6 +7,7 @@ import (
+ 	"fmt"
+ 	"log"
+ 
++	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/plans"
+ 	"github.com/hashicorp/terraform/internal/providers"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+@@ -113,8 +114,10 @@ func (n *NodePlannableResourceInstance) listResourceExecute(ctx EvalContext) (di
+ 		}
+ 	}
+ 
++	identityVersion := providerSchema.SchemaForResourceType(addrs.ManagedResourceMode, addr.Resource.Resource.Type).IdentityVersion
++
+ 	ctx.Hook(func(h Hook) (HookAction, error) {
+-		return h.PostListQuery(rId, results)
++		return h.PostListQuery(rId, results, identityVersion)
+ 	})
+ 	diags = diags.Append(resp.Diagnostics.InConfigBody(config.Config, n.Addr.String()))
+ 	if diags.HasErrors() {

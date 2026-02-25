@@ -1,0 +1,196 @@
+diff --git a/internal/configs/action.go b/internal/configs/action.go
+index 391e6af3a6..f146ed36ca 100644
+--- a/internal/configs/action.go
++++ b/internal/configs/action.go
+@@ -5,6 +5,7 @@ package configs
+ 
+ import (
+ 	"fmt"
++	"slices"
+ 
+ 	"github.com/hashicorp/hcl/v2"
+ 	"github.com/hashicorp/hcl/v2/hclsyntax"
+@@ -151,8 +152,21 @@ func decodeActionTriggerBlock(block *hcl.Block) (*ActionTrigger, hcl.Diagnostics
+ 				})
+ 				continue
+ 			}
++
++			// Check for duplicate events
++			if slices.Contains(events, event) {
++				diags = append(diags, &hcl.Diagnostic{
++					Severity: hcl.DiagError,
++					Summary:  fmt.Sprintf("Duplicate %q event", hcl.ExprAsKeyword(expr)),
++					Detail:   "The event is already defined in this action_trigger block.",
++					Subject:  expr.Range().Ptr(),
++				})
++				continue
++			}
++
+ 			events = append(events, event)
+ 		}
++
+ 		a.Events = events
+ 	}
+ 
+diff --git a/internal/terraform/node_action_trigger_instance_plan.go b/internal/terraform/node_action_trigger_instance_plan.go
+index 8484665a64..4d0dd0cb81 100644
+--- a/internal/terraform/node_action_trigger_instance_plan.go
++++ b/internal/terraform/node_action_trigger_instance_plan.go
+@@ -72,8 +72,7 @@ func (n *nodeActionTriggerPlanInstance) Execute(ctx EvalContext, operation walkO
+ 
+ 	// We need the action invocation early to check if we need to
+ 	ai := plans.ActionInvocationInstance{
+-		Addr: n.actionAddress,
+-
++		Addr:          n.actionAddress,
+ 		ActionTrigger: n.lifecycleActionTrigger.ActionTrigger(configs.Unknown),
+ 	}
+ 	change := ctx.Changes().GetResourceInstanceChange(n.lifecycleActionTrigger.resourceAddress, n.lifecycleActionTrigger.resourceAddress.CurrentObject().DeposedKey)
+@@ -113,16 +112,13 @@ func (n *nodeActionTriggerPlanInstance) Execute(ctx EvalContext, operation walkO
+ 	// provider so we'll do that ourselves now.
+ 	ai.ConfigValue = ephemeral.RemoveEphemeralValues(actionInstance.ConfigValue)
+ 
+-	triggeringEvent, isTriggered := actionIsTriggeredByEvent(n.lifecycleActionTrigger.events, change.Action)
+-	if !isTriggered {
++	triggeredEvents := actionIsTriggeredByEvent(n.lifecycleActionTrigger.events, change.Action)
++	if len(triggeredEvents) == 0 {
+ 		return diags
+ 	}
+-	if triggeringEvent == nil {
+-		panic("triggeringEvent cannot be nil")
+-	}
+ 
+ 	// Evaluate the condition expression if it exists (otherwise it's true)
+-	if n.lifecycleActionTrigger != nil && n.lifecycleActionTrigger.conditionExpr != nil {
++	if n.lifecycleActionTrigger.conditionExpr != nil {
+ 		condition, conditionDiags := evaluateActionCondition(ctx, actionConditionContext{
+ 			events:          n.lifecycleActionTrigger.events,
+ 			conditionExpr:   n.lifecycleActionTrigger.conditionExpr,
+@@ -139,9 +135,6 @@ func (n *nodeActionTriggerPlanInstance) Execute(ctx EvalContext, operation walkO
+ 		}
+ 	}
+ 
+-	// We need to set the triggering event on the action invocation
+-	ai.ActionTrigger = n.lifecycleActionTrigger.ActionTrigger(*triggeringEvent)
+-
+ 	provider, _, err := getProvider(ctx, actionInstance.ProviderAddr)
+ 	if err != nil {
+ 		diags = diags.Append(&hcl.Diagnostic{
+@@ -187,15 +180,23 @@ func (n *nodeActionTriggerPlanInstance) Execute(ctx EvalContext, operation walkO
+ 		return diags
+ 	}
+ 
+-	// If the action is deferred, we need to also defer the resource instance
+-	if resp.Deferred != nil {
+-		deferrals.ReportActionInvocationDeferred(ai, resp.Deferred.Reason)
+-		ctx.Changes().RemoveResourceInstanceChange(change.Addr, change.Addr.CurrentObject().DeposedKey)
+-		deferrals.ReportResourceInstanceDeferred(change.Addr, providers.DeferredReasonDeferredPrereq, change)
+-		return diags
+-	}
++	// We are planning to run this action multiple times so
++	for _, triggeredEvent := range triggeredEvents {
++		eventSpecificAi := ai.DeepCopy()
++		// We need to set the triggering event on the action invocation
++		eventSpecificAi.ActionTrigger = n.lifecycleActionTrigger.ActionTrigger(triggeredEvent)
++
++		// If the action is deferred, we need to also defer the resource instance
++		if resp.Deferred != nil {
++			deferrals.ReportActionInvocationDeferred(*eventSpecificAi, resp.Deferred.Reason)
++			ctx.Changes().RemoveResourceInstanceChange(change.Addr, change.Addr.CurrentObject().DeposedKey)
++			deferrals.ReportResourceInstanceDeferred(change.Addr, providers.DeferredReasonDeferredPrereq, change)
++
++			return diags
++		}
+ 
+-	ctx.Changes().AppendActionInvocation(&ai)
++		ctx.Changes().AppendActionInvocation(eventSpecificAi)
++	}
+ 	return diags
+ }
+ 
+diff --git a/internal/terraform/node_action_trigger_partialexp.go b/internal/terraform/node_action_trigger_partialexp.go
+index de1b408879..742d34db84 100644
+--- a/internal/terraform/node_action_trigger_partialexp.go
++++ b/internal/terraform/node_action_trigger_partialexp.go
+@@ -78,8 +78,8 @@ func (n *NodeActionTriggerPartialExpanded) Execute(ctx EvalContext, op walkOpera
+ 		panic("partialResource is nil")
+ 	}
+ 
+-	triggeringEvent, isTriggered := actionIsTriggeredByEvent(n.lifecycleActionTrigger.events, partialResourceChange.Change.Action)
+-	if !isTriggered {
++	triggeringEvents := actionIsTriggeredByEvent(n.lifecycleActionTrigger.events, partialResourceChange.Change.Action)
++	if len(triggeringEvents) == 0 {
+ 		return nil
+ 	}
+ 
+@@ -114,16 +114,18 @@ func (n *NodeActionTriggerPartialExpanded) Execute(ctx EvalContext, op walkOpera
+ 		return diags
+ 	}
+ 
+-	ctx.Deferrals().ReportActionInvocationDeferred(plans.ActionInvocationInstance{
+-		Addr:         n.addr.UnknownActionInstance(),
+-		ProviderAddr: n.resolvedProvider,
+-		ActionTrigger: &plans.LifecycleActionTrigger{
+-			TriggeringResourceAddr:  n.lifecycleActionTrigger.resourceAddress.UnknownResourceInstance(),
+-			ActionTriggerEvent:      *triggeringEvent,
+-			ActionTriggerBlockIndex: n.lifecycleActionTrigger.actionTriggerBlockIndex,
+-			ActionsListIndex:        n.lifecycleActionTrigger.actionListIndex,
+-		},
+-		ConfigValue: actionInstance.ConfigValue,
+-	}, providers.DeferredReasonInstanceCountUnknown)
++	for _, triggeringEvent := range triggeringEvents {
++		ctx.Deferrals().ReportActionInvocationDeferred(plans.ActionInvocationInstance{
++			Addr:         n.addr.UnknownActionInstance(),
++			ProviderAddr: n.resolvedProvider,
++			ActionTrigger: &plans.LifecycleActionTrigger{
++				TriggeringResourceAddr:  n.lifecycleActionTrigger.resourceAddress.UnknownResourceInstance(),
++				ActionTriggerEvent:      triggeringEvent,
++				ActionTriggerBlockIndex: n.lifecycleActionTrigger.actionTriggerBlockIndex,
++				ActionsListIndex:        n.lifecycleActionTrigger.actionListIndex,
++			},
++			ConfigValue: actionInstance.ConfigValue,
++		}, providers.DeferredReasonInstanceCountUnknown)
++	}
+ 	return nil
+ }
+diff --git a/internal/terraform/node_resource_plan_instance.go b/internal/terraform/node_resource_plan_instance.go
+index ff31fff608..f9c790837a 100644
+--- a/internal/terraform/node_resource_plan_instance.go
++++ b/internal/terraform/node_resource_plan_instance.go
+@@ -1058,24 +1058,25 @@ func depsEqual(a, b []addrs.ConfigResource) bool {
+ 	return true
+ }
+ 
+-func actionIsTriggeredByEvent(events []configs.ActionTriggerEvent, action plans.Action) (*configs.ActionTriggerEvent, bool) {
++func actionIsTriggeredByEvent(events []configs.ActionTriggerEvent, action plans.Action) []configs.ActionTriggerEvent {
++	triggeredEvents := []configs.ActionTriggerEvent{}
+ 	for _, event := range events {
+ 		switch event {
+ 		case configs.BeforeCreate, configs.AfterCreate:
+ 			if action.IsReplace() || action == plans.Create {
+-				return &event, true
++				triggeredEvents = append(triggeredEvents, event)
+ 			} else {
+ 				continue
+ 			}
+ 		case configs.BeforeUpdate, configs.AfterUpdate:
+ 			if action == plans.Update {
+-				return &event, true
++				triggeredEvents = append(triggeredEvents, event)
+ 			} else {
+ 				continue
+ 			}
+ 		case configs.BeforeDestroy, configs.AfterDestroy:
+ 			if action == plans.DeleteThenCreate || action == plans.CreateThenDelete || action == plans.Delete {
+-				return &event, true
++				triggeredEvents = append(triggeredEvents, event)
+ 			} else {
+ 				continue
+ 			}
+@@ -1083,5 +1084,5 @@ func actionIsTriggeredByEvent(events []configs.ActionTriggerEvent, action plans.
+ 			panic(fmt.Sprintf("unknown action trigger event %s", event))
+ 		}
+ 	}
+-	return nil, false
++	return triggeredEvents
+ }

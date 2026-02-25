@@ -1,0 +1,551 @@
+diff --git a/cmd/build-constants.go b/cmd/build-constants.go
+index f262f82a6..7f46baff3 100644
+--- a/cmd/build-constants.go
++++ b/cmd/build-constants.go
+@@ -65,5 +65,5 @@ var (
+ 	MinioBannerName = "MinIO Object Storage Server"
+ 
+ 	// MinioLicense - MinIO server license.
+-	MinioLicense = "GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>"
++	MinioLicense = "GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html"
+ )
+diff --git a/cmd/consolelogger.go b/cmd/consolelogger.go
+index 5bb50c537..a9ba6a380 100644
+--- a/cmd/consolelogger.go
++++ b/cmd/consolelogger.go
+@@ -1,4 +1,4 @@
+-// Copyright (c) 2015-2021 MinIO, Inc.
++// Copyright (c) 2015-2024 MinIO, Inc.
+ //
+ // This file is part of MinIO Object Storage stack
+ //
+@@ -20,6 +20,7 @@ package cmd
+ import (
+ 	"container/ring"
+ 	"context"
++	"io"
+ 	"sync"
+ 	"sync/atomic"
+ 
+@@ -49,10 +50,10 @@ type HTTPConsoleLoggerSys struct {
+ 
+ // NewConsoleLogger - creates new HTTPConsoleLoggerSys with all nodes subscribed to
+ // the console logging pub sub system
+-func NewConsoleLogger(ctx context.Context) *HTTPConsoleLoggerSys {
++func NewConsoleLogger(ctx context.Context, w io.Writer) *HTTPConsoleLoggerSys {
+ 	return &HTTPConsoleLoggerSys{
+ 		pubsub:  pubsub.New[log.Info, madmin.LogMask](8),
+-		console: console.New(),
++		console: console.New(w),
+ 		logBuf:  ring.New(defaultLogBufferCount),
+ 	}
+ }
+diff --git a/cmd/main.go b/cmd/main.go
+index 06f24ff39..9bcdc0f0d 100644
+--- a/cmd/main.go
++++ b/cmd/main.go
+@@ -134,7 +134,6 @@ func newApp(name string) *cli.App {
+ 
+ 	// Register all commands.
+ 	registerCommand(serverCmd)
+-	registerCommand(gatewayCmd) // hidden kept for guiding users.
+ 
+ 	// Set up app.
+ 	cli.HelpFlag = cli.BoolFlag{
+@@ -181,7 +180,7 @@ func versionBanner(c *cli.Context) io.Reader {
+ 	banner := &strings.Builder{}
+ 	fmt.Fprintln(banner, color.Bold("%s version %s (commit-id=%s)", c.App.Name, c.App.Version, CommitID))
+ 	fmt.Fprintln(banner, color.Blue("Runtime:")+color.Bold(" %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
+-	fmt.Fprintln(banner, color.Blue("License:")+color.Bold(" GNU AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>"))
++	fmt.Fprintln(banner, color.Blue("License:")+color.Bold(" GNU AGPLv3 - https://www.gnu.org/licenses/agpl-3.0.html"))
+ 	fmt.Fprintln(banner, color.Blue("Copyright:")+color.Bold(" 2015-%s MinIO, Inc.", CopyrightYear))
+ 	return strings.NewReader(banner.String())
+ }
+diff --git a/cmd/server-main.go b/cmd/server-main.go
+index 7acb8c71e..59e92496e 100644
+--- a/cmd/server-main.go
++++ b/cmd/server-main.go
+@@ -28,6 +28,7 @@ import (
+ 	"net"
+ 	"os"
+ 	"os/signal"
++	"path/filepath"
+ 	"runtime"
+ 	"strings"
+ 	"syscall"
+@@ -191,20 +192,19 @@ var ServerFlags = []cli.Flag{
+ 		EnvVar: "MINIO_RECV_BUF_SIZE",
+ 		Hidden: true,
+ 	},
+-}
+-
+-var gatewayCmd = cli.Command{
+-	Name:            "gateway",
+-	Usage:           "start object storage gateway",
+-	Hidden:          true,
+-	Flags:           append(ServerFlags, GlobalFlags...),
+-	HideHelpCommand: true,
+-	Action:          gatewayMain,
+-}
+-
+-func gatewayMain(ctx *cli.Context) error {
+-	logger.Fatal(errInvalidArgument, "Gateway is deprecated, To continue to use Gateway please use releases no later than 'RELEASE.2022-10-24T18-35-07Z'. We recommend all our users to migrate from gateway mode to server mode. Please read https://blog.min.io/deprecation-of-the-minio-gateway/")
+-	return nil
++	cli.StringFlag{
++		Name:   "log-dir",
++		Usage:  "specify the directory to save the server log",
++		EnvVar: "MINIO_LOG_DIR",
++		Hidden: true,
++	},
++	cli.IntFlag{
++		Name:   "log-size",
++		Usage:  "specify the maximum server log file size in bytes before its rotated",
++		Value:  10 * humanize.MiByte,
++		EnvVar: "MINIO_LOG_SIZE",
++		Hidden: true,
++	},
+ }
+ 
+ var serverCmd = cli.Command{
+@@ -667,6 +667,29 @@ func getServerListenAddrs() []string {
+ 	return addrs.ToSlice()
+ }
+ 
++var globalLoggerOutput io.WriteCloser
++
++func initializeLogRotate(ctx *cli.Context) (io.WriteCloser, error) {
++	lgDir := ctx.String("log-dir")
++	if lgDir == "" {
++		return os.Stderr, nil
++	}
++	lgDirAbs, err := filepath.Abs(lgDir)
++	if err != nil {
++		return nil, err
++	}
++	lgSize := ctx.Int("log-size")
++	output, err := logger.NewDir(logger.Options{
++		Directory:       lgDirAbs,
++		MaximumFileSize: int64(lgSize),
++	})
++	if err != nil {
++		return nil, err
++	}
++	logger.EnableJSON()
++	return output, nil
++}
++
+ // serverMain handler called for 'minio server' command.
+ func serverMain(ctx *cli.Context) {
+ 	var warnings []string
+@@ -679,11 +702,23 @@ func serverMain(ctx *cli.Context) {
+ 
+ 	// Initialize globalConsoleSys system
+ 	bootstrapTrace("newConsoleLogger", func() {
+-		globalConsoleSys = NewConsoleLogger(GlobalContext)
++		output, err := initializeLogRotate(ctx)
++		if err == nil {
++			logger.Output = output
++			globalConsoleSys = NewConsoleLogger(GlobalContext, output)
++			globalLoggerOutput = output
++		} else {
++			logger.Output = os.Stderr
++			globalConsoleSys = NewConsoleLogger(GlobalContext, os.Stderr)
++		}
+ 		logger.AddSystemTarget(GlobalContext, globalConsoleSys)
+ 
+ 		// Set node name, only set for distributed setup.
+ 		globalConsoleSys.SetNodeName(globalLocalNodeName)
++		if err != nil {
++			// We can only log here since we need globalConsoleSys initialized
++			logger.Fatal(err, "invalid --logrorate-dir option")
++		}
+ 	})
+ 
+ 	// Always load ENV variables from files first.
+diff --git a/cmd/signals.go b/cmd/signals.go
+index 097242c7e..db0ead79e 100644
+--- a/cmd/signals.go
++++ b/cmd/signals.go
+@@ -31,6 +31,10 @@ import (
+ func handleSignals() {
+ 	// Custom exit function
+ 	exit := func(success bool) {
++		if globalLoggerOutput != nil {
++			globalLoggerOutput.Close()
++		}
++
+ 		// If global profiler is set stop before we exit.
+ 		globalProfilerMu.Lock()
+ 		defer globalProfilerMu.Unlock()
+diff --git a/internal/color/color.go b/internal/color/color.go
+index 3cd3c1188..d7dae3b4b 100644
+--- a/internal/color/color.go
++++ b/internal/color/color.go
+@@ -149,4 +149,12 @@ var (
+ 		}
+ 		return fmt.Sprintf
+ 	}()
++
++	TurnOff = func() {
++		color.NoColor = true
++	}
++
++	TurnOn = func() {
++		color.NoColor = false
++	}
+ )
+diff --git a/internal/logger/console.go b/internal/logger/console.go
+index 4d8f4940a..9545266e5 100644
+--- a/internal/logger/console.go
++++ b/internal/logger/console.go
+@@ -25,7 +25,6 @@ import (
+ 	"time"
+ 
+ 	"github.com/minio/minio/internal/color"
+-	c "github.com/minio/pkg/v2/console"
+ 	"github.com/minio/pkg/v2/logger/message/log"
+ )
+ 
+@@ -99,8 +98,7 @@ func (f fatalMsg) json(msg string, args ...interface{}) {
+ 	if err != nil {
+ 		panic(err)
+ 	}
+-	fmt.Println(string(logJSON))
+-
++	fmt.Fprintln(Output, string(logJSON))
+ 	ExitFunc(1)
+ }
+ 
+@@ -139,16 +137,16 @@ func (f fatalMsg) pretty(msg string, args ...interface{}) {
+ 			ansiSaveAttributes()
+ 			// Print banner with or without the log tag
+ 			if !tagPrinted {
+-				c.Print(logBanner)
++				fmt.Fprint(Output, logBanner)
+ 				tagPrinted = true
+ 			} else {
+-				c.Print(emptyBanner)
++				fmt.Fprint(Output, emptyBanner)
+ 			}
+ 			// Restore the text color of the error message
+ 			ansiRestoreAttributes()
+ 			ansiMoveRight(bannerWidth)
+ 			// Continue  error message printing
+-			c.Println(line)
++			fmt.Fprintln(Output, line)
+ 			break
+ 		}
+ 	}
+@@ -176,7 +174,7 @@ func (i infoMsg) json(msg string, args ...interface{}) {
+ 	if err != nil {
+ 		panic(err)
+ 	}
+-	fmt.Println(string(logJSON))
++	fmt.Fprintln(Output, string(logJSON))
+ }
+ 
+ func (i infoMsg) quiet(msg string, args ...interface{}) {
+@@ -184,9 +182,9 @@ func (i infoMsg) quiet(msg string, args ...interface{}) {
+ 
+ func (i infoMsg) pretty(msg string, args ...interface{}) {
+ 	if msg == "" {
+-		c.Println(args...)
++		fmt.Fprintln(Output, args...)
+ 	}
+-	c.Printf(msg, args...)
++	fmt.Fprintf(Output, msg, args...)
+ }
+ 
+ type errorMsg struct{}
+@@ -209,7 +207,7 @@ func (i errorMsg) json(msg string, args ...interface{}) {
+ 	if err != nil {
+ 		panic(err)
+ 	}
+-	fmt.Println(string(logJSON))
++	fmt.Fprintln(Output, string(logJSON))
+ }
+ 
+ func (i errorMsg) quiet(msg string, args ...interface{}) {
+@@ -218,9 +216,9 @@ func (i errorMsg) quiet(msg string, args ...interface{}) {
+ 
+ func (i errorMsg) pretty(msg string, args ...interface{}) {
+ 	if msg == "" {
+-		c.Println(args...)
++		fmt.Fprintln(Output, args...)
+ 	}
+-	c.Printf(msg, args...)
++	fmt.Fprintf(Output, msg, args...)
+ }
+ 
+ // Error :
+diff --git a/internal/logger/logger.go b/internal/logger/logger.go
+index 093587526..23de0a269 100644
+--- a/internal/logger/logger.go
++++ b/internal/logger/logger.go
+@@ -23,6 +23,8 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"go/build"
++	"io"
++	"os"
+ 	"path/filepath"
+ 	"reflect"
+ 	"runtime"
+@@ -32,6 +34,7 @@ import (
+ 
+ 	"github.com/minio/highwayhash"
+ 	"github.com/minio/madmin-go/v3"
++	"github.com/minio/minio/internal/color"
+ 	xhttp "github.com/minio/minio/internal/http"
+ 	"github.com/minio/pkg/v2/logger/message/log"
+ )
+@@ -49,8 +52,12 @@ const (
+ 	InfoKind    = madmin.LogKindInfo
+ )
+ 
+-// DisableErrorLog avoids printing error/event/info kind of logs
+-var DisableErrorLog = false
++var (
++	// DisableErrorLog avoids printing error/event/info kind of logs
++	DisableErrorLog = false
++	// Output allows configuring custom writer, defaults to os.Stderr
++	Output io.Writer = os.Stderr
++)
+ 
+ var trimStrings []string
+ 
+@@ -78,6 +85,7 @@ func EnableQuiet() {
+ 
+ // EnableJSON - outputs logs in json format.
+ func EnableJSON() {
++	color.TurnOff() // no colored outputs necessary in JSON mode.
+ 	jsonFlag = true
+ 	quietFlag = true
+ }
+diff --git a/internal/logger/logrotate.go b/internal/logger/logrotate.go
+new file mode 100644
+index 000000000..606d91cf8
+--- /dev/null
++++ b/internal/logger/logrotate.go
+@@ -0,0 +1,161 @@
++// Copyright (c) 2015-2024 MinIO, Inc.
++//
++// This file is part of MinIO Object Storage stack
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++package logger
++
++import (
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"time"
++
++	xioutil "github.com/minio/minio/internal/ioutil"
++)
++
++func defaultFilenameFunc() string {
++	return fmt.Sprintf("minio-%s.log", fmt.Sprintf("%X", time.Now().UTC().UnixNano()))
++}
++
++// Options define configuration options for Writer
++type Options struct {
++	// Directory defines the directory where log files will be written to.
++	// If the directory does not exist, it will be created.
++	Directory string
++
++	// MaximumFileSize defines the maximum size of each log file in bytes.
++	MaximumFileSize int64
++
++	// FileNameFunc specifies the name a new file will take.
++	// FileNameFunc must ensure collisions in filenames do not occur.
++	// Do not rely on timestamps to be unique, high throughput writes
++	// may fall on the same timestamp.
++	// Eg.
++	// 	2020-03-28_15-00-945-<random-hash>.log
++	// When FileNameFunc is not specified, DefaultFilenameFunc will be used.
++	FileNameFunc func() string
++}
++
++// Writer is a concurrency-safe writer with file rotation.
++type Writer struct {
++	// opts are the configuration options for this Writer
++	opts Options
++
++	// f is the currently open file used for appends.
++	// Writes to f are only synchronized once Close() is called,
++	// or when files are being rotated.
++	f *os.File
++
++	pw *xioutil.PipeWriter
++	pr *xioutil.PipeReader
++}
++
++// Write writes p into the current file, rotating if necessary.
++// Write is non-blocking, if the writer's queue is not full.
++// Write is blocking otherwise.
++func (w *Writer) Write(p []byte) (n int, err error) {
++	return w.pw.Write(p)
++}
++
++// Close closes the writer.
++// Any accepted writes will be flushed. Any new writes will be rejected.
++// Once Close() exits, files are synchronized to disk.
++func (w *Writer) Close() error {
++	w.pw.CloseWithError(nil)
++
++	if w.f != nil {
++		if err := w.closeCurrentFile(); err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func (w *Writer) listen() {
++	for {
++		var r io.Reader = w.pr
++		if w.opts.MaximumFileSize > 0 {
++			r = io.LimitReader(w.pr, w.opts.MaximumFileSize)
++		}
++		if _, err := io.Copy(w.f, r); err != nil {
++			fmt.Println("Failed to write to log file", err)
++		}
++		if err := w.rotate(); err != nil {
++			fmt.Println("Failed to rotate log file", err)
++		}
++	}
++}
++
++func (w *Writer) closeCurrentFile() error {
++	if err := w.f.Close(); err != nil {
++		return fmt.Errorf("failed to close current log file: %w", err)
++	}
++
++	return nil
++}
++
++func (w *Writer) rotate() error {
++	if w.f != nil {
++		if err := w.closeCurrentFile(); err != nil {
++			return err
++		}
++	}
++
++	path := filepath.Join(w.opts.Directory, w.opts.FileNameFunc())
++	f, err := newFile(path)
++	if err != nil {
++		return fmt.Errorf("failed to create new file at %v: %w", path, err)
++	}
++
++	w.f = f
++
++	return nil
++}
++
++// NewDir creates a new concurrency safe Writer which performs log rotation.
++func NewDir(opts Options) (io.WriteCloser, error) {
++	if err := os.MkdirAll(opts.Directory, os.ModePerm); err != nil {
++		return nil, fmt.Errorf("directory %v does not exist and could not be created: %w", opts.Directory, err)
++	}
++
++	if opts.FileNameFunc == nil {
++		opts.FileNameFunc = defaultFilenameFunc
++	}
++
++	pr, pw := xioutil.WaitPipe()
++
++	w := &Writer{
++		opts: opts,
++		pw:   pw,
++		pr:   pr,
++	}
++
++	if w.f == nil {
++		if err := w.rotate(); err != nil {
++			return nil, fmt.Errorf("Failed to create log file: %w", err)
++		}
++	}
++
++	go w.listen()
++
++	return w, nil
++}
++
++func newFile(path string) (*os.File, error) {
++	return os.OpenFile(path, os.O_WRONLY|os.O_TRUNC|os.O_CREATE|os.O_SYNC, 0o666)
++}
+diff --git a/internal/logger/target/console/console.go b/internal/logger/target/console/console.go
+diff --git a/internal/logger/target/console/console.go b/internal/logger/target/console/console.go
+index 719c1f991..978fa9d2e 100644
+--- a/internal/logger/target/console/console.go
++++ b/internal/logger/target/console/console.go
+@@ -20,18 +20,20 @@ package console
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"io"
+ 	"strconv"
+ 	"strings"
+ 
+ 	"github.com/minio/minio/internal/color"
+ 	"github.com/minio/minio/internal/logger"
+-	"github.com/minio/pkg/v2/console"
+ 	"github.com/minio/pkg/v2/logger/message/log"
+ )
+ 
+ // Target implements loggerTarget to send log
+ // in plain or json format to the standard output.
+-type Target struct{}
++type Target struct {
++	output io.Writer
++}
+ 
+ // Validate - validate if the tty can be written to
+ func (c *Target) Validate() error {
+@@ -58,12 +60,12 @@ func (c *Target) Send(e interface{}) error {
+ 		if err != nil {
+ 			return err
+ 		}
+-		fmt.Println(string(logJSON))
++		fmt.Fprintln(c.output, string(logJSON))
+ 		return nil
+ 	}
+ 
+ 	if entry.Level == logger.EventKind {
+-		fmt.Println(entry.Message)
++		fmt.Fprintln(c.output, entry.Message)
+ 		return nil
+ 	}
+ 
+@@ -146,13 +148,13 @@ func (c *Target) Send(e interface{}) error {
+ 		apiString, timeString, deploymentID, requestID, remoteHost, host, userAgent,
+ 		msg, tagString, strings.Join(trace, "\n"))
+ 
+-	console.Println(output)
++	fmt.Fprintln(c.output, output)
+ 	return nil
+ }
+ 
+ // New initializes a new logger target
+ // which prints log directly in the standard
+ // output.
+-func New() *Target {
+-	return &Target{}
++func New(w io.Writer) *Target {
++	return &Target{output: w}
+ }

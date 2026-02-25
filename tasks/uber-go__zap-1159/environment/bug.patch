@@ -1,0 +1,336 @@
+diff --git a/sink.go b/sink.go
+index 478c9a1..df46fa8 100644
+--- a/sink.go
++++ b/sink.go
+@@ -1,4 +1,4 @@
+-// Copyright (c) 2016-2022 Uber Technologies, Inc.
++// Copyright (c) 2016 Uber Technologies, Inc.
+ //
+ // Permission is hereby granted, free of charge, to any person obtaining a copy
+ // of this software and associated documentation files (the "Software"), to deal
+@@ -26,7 +26,6 @@ import (
+ 	"io"
+ 	"net/url"
+ 	"os"
+-	"path/filepath"
+ 	"strings"
+ 	"sync"
+ 
+@@ -35,45 +34,52 @@ import (
+ 
+ const schemeFile = "file"
+ 
+-var _sinkRegistry = newSinkRegistry()
++var (
++	_sinkMutex     sync.RWMutex
++	_sinkFactories map[string]func(*url.URL) (Sink, error) // keyed by scheme
++)
+ 
+-// Sink defines the interface to write to and close logger destinations.
+-type Sink interface {
+-	zapcore.WriteSyncer
+-	io.Closer
++func init() {
++	resetSinkRegistry()
+ }
+ 
+-type errSinkNotFound struct {
+-	scheme string
++func resetSinkRegistry() {
++	_sinkMutex.Lock()
++	defer _sinkMutex.Unlock()
++
++	_sinkFactories = map[string]func(*url.URL) (Sink, error){
++		schemeFile: newFileSink,
++	}
+ }
+ 
+-func (e *errSinkNotFound) Error() string {
+-	return fmt.Sprintf("no sink found for scheme %q", e.scheme)
++// Sink defines the interface to write to and close logger destinations.
++type Sink interface {
++	zapcore.WriteSyncer
++	io.Closer
+ }
+ 
+ type nopCloserSink struct{ zapcore.WriteSyncer }
+ 
+ func (nopCloserSink) Close() error { return nil }
+ 
+-type sinkRegistry struct {
+-	mu        sync.Mutex
+-	factories map[string]func(*url.URL) (Sink, error)          // keyed by scheme
+-	openFile  func(string, int, os.FileMode) (*os.File, error) // type matches os.OpenFile
++type errSinkNotFound struct {
++	scheme string
+ }
+ 
+-func newSinkRegistry() *sinkRegistry {
+-	sr := &sinkRegistry{
+-		factories: make(map[string]func(*url.URL) (Sink, error)),
+-		openFile:  os.OpenFile,
+-	}
+-	sr.RegisterSink(schemeFile, sr.newFileSinkFromURL)
+-	return sr
++func (e *errSinkNotFound) Error() string {
++	return fmt.Sprintf("no sink found for scheme %q", e.scheme)
+ }
+ 
+-// RegisterScheme registers the given factory for the specific scheme.
+-func (sr *sinkRegistry) RegisterSink(scheme string, factory func(*url.URL) (Sink, error)) error {
+-	sr.mu.Lock()
+-	defer sr.mu.Unlock()
++// RegisterSink registers a user-supplied factory for all sinks with a
++// particular scheme.
++//
++// All schemes must be ASCII, valid under section 3.1 of RFC 3986
++// (https://tools.ietf.org/html/rfc3986#section-3.1), and must not already
++// have a factory registered. Zap automatically registers a factory for the
++// "file" scheme.
++func RegisterSink(scheme string, factory func(*url.URL) (Sink, error)) error {
++	_sinkMutex.Lock()
++	defer _sinkMutex.Unlock()
+ 
+ 	if scheme == "" {
+ 		return errors.New("can't register a sink factory for empty string")
+@@ -82,22 +88,14 @@ func (sr *sinkRegistry) RegisterSink(scheme string, factory func(*url.URL) (Sink
+ 	if err != nil {
+ 		return fmt.Errorf("%q is not a valid scheme: %v", scheme, err)
+ 	}
+-	if _, ok := sr.factories[normalized]; ok {
++	if _, ok := _sinkFactories[normalized]; ok {
+ 		return fmt.Errorf("sink factory already registered for scheme %q", normalized)
+ 	}
+-	sr.factories[normalized] = factory
++	_sinkFactories[normalized] = factory
+ 	return nil
+ }
+ 
+-func (sr *sinkRegistry) newSink(rawURL string) (Sink, error) {
+-	// URL parsing doesn't work well for Windows paths such as `c:\log.txt`, as scheme is set to
+-	// the drive, and path is unset unless `c:/log.txt` is used.
+-	// To avoid Windows-specific URL handling, we instead check IsAbs to open as a file.
+-	// filepath.IsAbs is OS-specific, so IsAbs('c:/log.txt') is false outside of Windows.
+-	if filepath.IsAbs(rawURL) {
+-		return sr.newFileSinkFromPath(rawURL)
+-	}
+-
++func newSink(rawURL string) (Sink, error) {
+ 	u, err := url.Parse(rawURL)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("can't parse %q as a URL: %v", rawURL, err)
+@@ -106,27 +104,16 @@ func (sr *sinkRegistry) newSink(rawURL string) (Sink, error) {
+ 		u.Scheme = schemeFile
+ 	}
+ 
+-	sr.mu.Lock()
+-	factory, ok := sr.factories[u.Scheme]
+-	sr.mu.Unlock()
++	_sinkMutex.RLock()
++	factory, ok := _sinkFactories[u.Scheme]
++	_sinkMutex.RUnlock()
+ 	if !ok {
+ 		return nil, &errSinkNotFound{u.Scheme}
+ 	}
+ 	return factory(u)
+ }
+ 
+-// RegisterSink registers a user-supplied factory for all sinks with a
+-// particular scheme.
+-//
+-// All schemes must be ASCII, valid under section 0.1 of RFC 3986
+-// (https://tools.ietf.org/html/rfc3983#section-3.1), and must not already
+-// have a factory registered. Zap automatically registers a factory for the
+-// "file" scheme.
+-func RegisterSink(scheme string, factory func(*url.URL) (Sink, error)) error {
+-	return _sinkRegistry.RegisterSink(scheme, factory)
+-}
+-
+-func (sr *sinkRegistry) newFileSinkFromURL(u *url.URL) (Sink, error) {
++func newFileSink(u *url.URL) (Sink, error) {
+ 	if u.User != nil {
+ 		return nil, fmt.Errorf("user and password not allowed with file URLs: got %v", u)
+ 	}
+@@ -143,18 +130,13 @@ func (sr *sinkRegistry) newFileSinkFromURL(u *url.URL) (Sink, error) {
+ 	if hn := u.Hostname(); hn != "" && hn != "localhost" {
+ 		return nil, fmt.Errorf("file URLs must leave host empty or use localhost: got %v", u)
+ 	}
+-
+-	return sr.newFileSinkFromPath(u.Path)
+-}
+-
+-func (sr *sinkRegistry) newFileSinkFromPath(path string) (Sink, error) {
+-	switch path {
++	switch u.Path {
+ 	case "stdout":
+ 		return nopCloserSink{os.Stdout}, nil
+ 	case "stderr":
+ 		return nopCloserSink{os.Stderr}, nil
+ 	}
+-	return sr.openFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
++	return os.OpenFile(u.Path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
+ }
+ 
+ func normalizeScheme(s string) (string, error) {
+diff --git a/sink_test.go b/sink_test.go
+index 0dfa616..f174f86 100644
+--- a/sink_test.go
++++ b/sink_test.go
+@@ -33,22 +33,9 @@ import (
+ 	"go.uber.org/zap/zapcore"
+ )
+ 
+-func stubSinkRegistry(t testing.TB) *sinkRegistry {
+-	origSinkRegistry := _sinkRegistry
+-	t.Cleanup(func() {
+-		_sinkRegistry = origSinkRegistry
+-	})
+-
+-	r := newSinkRegistry()
+-	_sinkRegistry = r
+-	return r
+-}
+-
+ func TestRegisterSink(t *testing.T) {
+-	stubSinkRegistry(t)
+-
+ 	const (
+-		memScheme = "mem"
++		memScheme = "m"
+ 		nopScheme = "no-op.1234"
+ 	)
+ 	var memCalls, nopCalls int
+@@ -65,14 +52,16 @@ func TestRegisterSink(t *testing.T) {
+ 		return nopCloserSink{zapcore.AddSync(io.Discard)}, nil
+ 	}
+ 
++	defer resetSinkRegistry()
++
+ 	require.NoError(t, RegisterSink(strings.ToUpper(memScheme), memFactory), "Failed to register scheme %q.", memScheme)
+-	require.NoError(t, RegisterSink(nopScheme, nopFactory), "Failed to register scheme %q.", nopScheme)
++	require.NoError(t, RegisterSink(nopScheme, nopFactory), "Failed to register scheme %q.", memScheme)
+ 
+ 	sink, close, err := Open(
+ 		memScheme+"://somewhere",
+ 		nopScheme+"://somewhere-else",
+ 	)
+-	require.NoError(t, err, "Unexpected error opening URLs with registered schemes.")
++	assert.NoError(t, err, "Unexpected error opening URLs with registered schemes.")
+ 
+ 	defer close()
+ 
+@@ -100,8 +89,9 @@ func TestRegisterSinkErrors(t *testing.T) {
+ 
+ 	for _, tt := range tests {
+ 		t.Run("scheme-"+tt.scheme, func(t *testing.T) {
+-			r := newSinkRegistry()
+-			err := r.RegisterSink(tt.scheme, nopFactory)
++			defer resetSinkRegistry()
++
++			err := RegisterSink(tt.scheme, nopFactory)
+ 			assert.ErrorContains(t, err, tt.err)
+ 		})
+ 	}
+diff --git a/sink_windows_test.go b/sink_windows_test.go
+deleted file mode 100644
+index fd6a475..0000000
+--- a/sink_windows_test.go
++++ /dev/null
+@@ -1,71 +0,0 @@
+-// Copyright (c) 2022 Uber Technologies, Inc.
+-//
+-// Permission is hereby granted, free of charge, to any person obtaining a copy
+-// of this software and associated documentation files (the "Software"), to deal
+-// in the Software without restriction, including without limitation the rights
+-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-// copies of the Software, and to permit persons to whom the Software is
+-// furnished to do so, subject to the following conditions:
+-//
+-// The above copyright notice and this permission notice shall be included in
+-// all copies or substantial portions of the Software.
+-//
+-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+-// THE SOFTWARE.
+-
+-//go:build windows
+-
+-package zap
+-
+-import (
+-	"os"
+-	"testing"
+-
+-	"github.com/stretchr/testify/assert"
+-)
+-
+-func TestWindowsPaths(t *testing.T) {
+-	// See https://docs.microsoft.com/en-us/dotnet/standard/io/file-path-formats
+-	tests := []struct {
+-		msg  string
+-		path string
+-	}{
+-		{
+-			msg:  "local path with drive",
+-			path: `c:\log.json`,
+-		},
+-		{
+-			msg:  "local path with drive using forward slash",
+-			path: `c:/log.json`,
+-		},
+-		{
+-			msg:  "local path without drive",
+-			path: `\Temp\log.json`,
+-		},
+-		{
+-			msg:  "unc path",
+-			path: `\\Server2\Logs\log.json`,
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.msg, func(t *testing.T) {
+-			sr := newSinkRegistry()
+-
+-			openFilename := "<not called>"
+-			sr.openFile = func(filename string, _ int, _ os.FileMode) (*os.File, error) {
+-				openFilename = filename
+-				return nil, assert.AnError
+-			}
+-
+-			_, err := sr.newSink(tt.path)
+-			assert.Equal(t, assert.AnError, err, "expect stub error from OpenFile")
+-			assert.Equal(t, tt.path, openFilename, "unexpected path opened")
+-		})
+-	}
+-}
+diff --git a/writer.go b/writer.go
+index f08728e..2c3dbd4 100644
+--- a/writer.go
++++ b/writer.go
+@@ -68,7 +68,7 @@ func open(paths []string) ([]zapcore.WriteSyncer, func(), error) {
+ 
+ 	var openErr error
+ 	for _, path := range paths {
+-		sink, err := _sinkRegistry.newSink(path)
++		sink, err := newSink(path)
+ 		if err != nil {
+ 			openErr = multierr.Append(openErr, fmt.Errorf("open sink %q: %w", path, err))
+ 			continue
+diff --git a/writer_test.go b/writer_test.go
+index b743455..9123edb 100644
+--- a/writer_test.go
++++ b/writer_test.go
+@@ -240,7 +240,7 @@ func (w *testWriter) Sync() error {
+ }
+ 
+ func TestOpenWithErroringSinkFactory(t *testing.T) {
+-	stubSinkRegistry(t)
++	defer resetSinkRegistry()
+ 
+ 	msg := "expected factory error"
+ 	factory := func(_ *url.URL) (Sink, error) {

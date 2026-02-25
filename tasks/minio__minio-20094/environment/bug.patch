@@ -1,0 +1,221 @@
+diff --git a/cmd/metrics-router.go b/cmd/metrics-router.go
+index f8b85c254..e3078a7fc 100644
+--- a/cmd/metrics-router.go
++++ b/cmd/metrics-router.go
+@@ -38,8 +38,7 @@ const (
+ 
+ // Standard env prometheus auth type
+ const (
+-	EnvPrometheusAuthType    = "MINIO_PROMETHEUS_AUTH_TYPE"
+-	EnvPrometheusOpenMetrics = "MINIO_PROMETHEUS_OPEN_METRICS"
++	EnvPrometheusAuthType = "MINIO_PROMETHEUS_AUTH_TYPE"
+ )
+ 
+ type prometheusAuthType string
+@@ -59,15 +58,14 @@ func registerMetricsRouter(router *mux.Router) {
+ 	if authType == prometheusPublic {
+ 		auth = NoAuthMiddleware
+ 	}
+-
+ 	metricsRouter.Handle(prometheusMetricsPathLegacy, auth(metricsHandler()))
+ 	metricsRouter.Handle(prometheusMetricsV2ClusterPath, auth(metricsServerHandler()))
+ 	metricsRouter.Handle(prometheusMetricsV2BucketPath, auth(metricsBucketHandler()))
+ 	metricsRouter.Handle(prometheusMetricsV2NodePath, auth(metricsNodeHandler()))
+ 	metricsRouter.Handle(prometheusMetricsV2ResourcePath, auth(metricsResourceHandler()))
+ 
+-	// Metrics v3
+-	metricsV3Server := newMetricsV3Server(auth)
++	// Metrics v3!
++	metricsV3Server := newMetricsV3Server(authType)
+ 
+ 	// Register metrics v3 handler. It also accepts an optional query
+ 	// parameter `?list` - see handler for details.
+diff --git a/cmd/metrics-v3-handler.go b/cmd/metrics-v3-handler.go
+index 0c9a775a6..68a3160d5 100644
+--- a/cmd/metrics-v3-handler.go
++++ b/cmd/metrics-v3-handler.go
+@@ -23,12 +23,9 @@ import (
+ 	"net/http"
+ 	"slices"
+ 	"strings"
+-	"sync"
+ 
+-	"github.com/minio/minio/internal/config"
+ 	"github.com/minio/minio/internal/mcontext"
+ 	"github.com/minio/mux"
+-	"github.com/minio/pkg/v3/env"
+ 	"github.com/prometheus/client_golang/prometheus"
+ 	"github.com/prometheus/client_golang/prometheus/promhttp"
+ )
+@@ -36,39 +33,41 @@ import (
+ type promLogger struct{}
+ 
+ func (p promLogger) Println(v ...interface{}) {
+-	metricsLogIf(GlobalContext, fmt.Errorf("metrics handler error: %v", v))
++	s := make([]string, 0, len(v))
++	for _, val := range v {
++		s = append(s, fmt.Sprintf("%v", val))
++	}
++	err := fmt.Errorf("metrics handler error: %v", strings.Join(s, " "))
++	metricsLogIf(GlobalContext, err)
+ }
+ 
+ type metricsV3Server struct {
+ 	registry *prometheus.Registry
+ 	opts     promhttp.HandlerOpts
+-	auth     func(http.Handler) http.Handler
++	authFn   func(http.Handler) http.Handler
+ 
+ 	metricsData *metricsV3Collection
+ }
+ 
+-var (
+-	globalMetricsV3CollectorPaths []collectorPath
+-	globalMetricsV3Once           sync.Once
+-)
+-
+-func newMetricsV3Server(auth func(h http.Handler) http.Handler) *metricsV3Server {
++func newMetricsV3Server(authType prometheusAuthType) *metricsV3Server {
+ 	registry := prometheus.NewRegistry()
++	authFn := AuthMiddleware
++	if authType == prometheusPublic {
++		authFn = NoAuthMiddleware
++	}
++
+ 	metricGroups := newMetricGroups(registry)
+-	globalMetricsV3Once.Do(func() {
+-		globalMetricsV3CollectorPaths = metricGroups.collectorPaths
+-	})
++
+ 	return &metricsV3Server{
+ 		registry: registry,
+ 		opts: promhttp.HandlerOpts{
+ 			ErrorLog:            promLogger{},
+-			ErrorHandling:       promhttp.ContinueOnError,
++			ErrorHandling:       promhttp.HTTPErrorOnError,
+ 			Registry:            registry,
+ 			MaxRequestsInFlight: 2,
+-			EnableOpenMetrics:   env.Get(EnvPrometheusOpenMetrics, config.EnableOff) == config.EnableOn,
+-			ProcessStartTime:    globalBootTime,
+ 		},
+-		auth:        auth,
++		authFn: authFn,
++
+ 		metricsData: metricGroups,
+ 	}
+ }
+@@ -222,7 +221,7 @@ func (h *metricsV3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	pathComponents := mux.Vars(r)["pathComps"]
+ 	isListingRequest := r.Form.Has("list")
+ 
+-	var buckets []string
++	buckets := []string{}
+ 	if strings.HasPrefix(pathComponents, "/bucket/") {
+ 		// bucket specific metrics, extract the bucket name from the path.
+ 		// it's the last part of the path. e.g. /bucket/api/<bucket-name>
+@@ -247,5 +246,5 @@ func (h *metricsV3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	})
+ 
+ 	// Add authentication
+-	h.auth(tracedHandler).ServeHTTP(w, r)
++	h.authFn(tracedHandler).ServeHTTP(w, r)
+ }
+diff --git a/cmd/metrics-v3-types.go b/cmd/metrics-v3-types.go
+index f891cf947..07bc1d616 100644
+--- a/cmd/metrics-v3-types.go
++++ b/cmd/metrics-v3-types.go
+@@ -35,8 +35,8 @@ type collectorPath string
+ // converted to snake-case (by replaced '/' and '-' with '_') and prefixed with
+ // `minio_`.
+ func (cp collectorPath) metricPrefix() string {
+-	s := strings.TrimPrefix(string(cp), SlashSeparator)
+-	s = strings.ReplaceAll(s, SlashSeparator, "_")
++	s := strings.TrimPrefix(string(cp), "/")
++	s = strings.ReplaceAll(s, "/", "_")
+ 	s = strings.ReplaceAll(s, "-", "_")
+ 	return "minio_" + s
+ }
+@@ -56,8 +56,8 @@ func (cp collectorPath) isDescendantOf(arg string) bool {
+ 	if len(arg) >= len(descendant) {
+ 		return false
+ 	}
+-	if !strings.HasSuffix(arg, SlashSeparator) {
+-		arg += SlashSeparator
++	if !strings.HasSuffix(arg, "/") {
++		arg += "/"
+ 	}
+ 	return strings.HasPrefix(descendant, arg)
+ }
+@@ -72,11 +72,10 @@ const (
+ 	GaugeMT
+ 	// HistogramMT - represents a histogram metric.
+ 	HistogramMT
++	// rangeL - represents a range label.
++	rangeL = "range"
+ )
+ 
+-// rangeL - represents a range label.
+-const rangeL = "range"
+-
+ func (mt MetricType) String() string {
+ 	switch mt {
+ 	case CounterMT:
+diff --git a/cmd/server_test.go b/cmd/server_test.go
+index 77be4038b..b5a57ccc3 100644
+--- a/cmd/server_test.go
++++ b/cmd/server_test.go
+@@ -35,7 +35,6 @@ import (
+ 	"time"
+ 
+ 	"github.com/dustin/go-humanize"
+-	jwtgo "github.com/golang-jwt/jwt/v4"
+ 	"github.com/minio/minio-go/v7/pkg/set"
+ 	xhttp "github.com/minio/minio/internal/http"
+ 	"github.com/minio/pkg/v3/policy"
+@@ -123,9 +122,6 @@ func runAllTests(suite *TestSuiteCommon, c *check) {
+ 	suite.TestObjectMultipartListError(c)
+ 	suite.TestObjectValidMD5(c)
+ 	suite.TestObjectMultipart(c)
+-	suite.TestMetricsV3Handler(c)
+-	suite.TestBucketSQSNotificationWebHook(c)
+-	suite.TestBucketSQSNotificationAMQP(c)
+ 	suite.TearDownSuite(c)
+ }
+ 
+@@ -193,36 +189,6 @@ func (s *TestSuiteCommon) TearDownSuite(c *check) {
+ 	s.testServer.Stop()
+ }
+ 
+-const (
+-	defaultPrometheusJWTExpiry = 100 * 365 * 24 * time.Hour
+-)
+-
+-func (s *TestSuiteCommon) TestMetricsV3Handler(c *check) {
+-	jwt := jwtgo.NewWithClaims(jwtgo.SigningMethodHS512, jwtgo.StandardClaims{
+-		ExpiresAt: time.Now().UTC().Add(defaultPrometheusJWTExpiry).Unix(),
+-		Subject:   s.accessKey,
+-		Issuer:    "prometheus",
+-	})
+-
+-	token, err := jwt.SignedString([]byte(s.secretKey))
+-	c.Assert(err, nil)
+-
+-	for _, cpath := range globalMetricsV3CollectorPaths {
+-		request, err := newTestSignedRequest(http.MethodGet, s.endPoint+minioReservedBucketPath+metricsV3Path+string(cpath),
+-			0, nil, s.accessKey, s.secretKey, s.signer)
+-		c.Assert(err, nil)
+-
+-		request.Header.Set("Authorization", "Bearer "+token)
+-
+-		// execute the request.
+-		response, err := s.client.Do(request)
+-		c.Assert(err, nil)
+-
+-		// assert the http response status code.
+-		c.Assert(response.StatusCode, http.StatusOK)
+-	}
+-}
+-
+ func (s *TestSuiteCommon) TestBucketSQSNotificationWebHook(c *check) {
+ 	// Sample bucket notification.
+ 	bucketNotificationBuf := `<NotificationConfiguration><QueueConfiguration><Event>s3:ObjectCreated:Put</Event><Filter><S3Key><FilterRule><Name>prefix</Name><Value>images/</Value></FilterRule></S3Key></Filter><Id>1</Id><Queue>arn:minio:sqs:us-east-1:444455556666:webhook</Queue></QueueConfiguration></NotificationConfiguration>`

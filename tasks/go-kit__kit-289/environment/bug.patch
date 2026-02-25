@@ -1,0 +1,255 @@
+diff --git a/examples/addsvc/client/grpc/client.go b/examples/addsvc/client/grpc/client.go
+index f21a9f5..e72bbe4 100644
+--- a/examples/addsvc/client/grpc/client.go
++++ b/examples/addsvc/client/grpc/client.go
+@@ -39,7 +39,7 @@ func New(conn *grpc.ClientConn, tracer stdopentracing.Tracer, logger log.Logger)
+ 			addsvc.EncodeGRPCSumRequest,
+ 			addsvc.DecodeGRPCSumResponse,
+ 			pb.SumReply{},
+-			grpctransport.ClientBefore(opentracing.FromGRPCRequest(tracer, "Sum", logger)),
++			grpctransport.SetClientBefore(opentracing.FromGRPCRequest(tracer, "Sum", logger)),
+ 		).Endpoint()
+ 		sumEndpoint = opentracing.TraceClient(tracer, "Sum")(sumEndpoint)
+ 		sumEndpoint = limiter(sumEndpoint)
+@@ -58,7 +58,7 @@ func New(conn *grpc.ClientConn, tracer stdopentracing.Tracer, logger log.Logger)
+ 			addsvc.EncodeGRPCConcatRequest,
+ 			addsvc.DecodeGRPCConcatResponse,
+ 			pb.ConcatReply{},
+-			grpctransport.ClientBefore(opentracing.FromGRPCRequest(tracer, "Concat", logger)),
++			grpctransport.SetClientBefore(opentracing.FromGRPCRequest(tracer, "Concat", logger)),
+ 		).Endpoint()
+ 		concatEndpoint = opentracing.TraceClient(tracer, "Concat")(concatEndpoint)
+ 		concatEndpoint = limiter(concatEndpoint)
+diff --git a/examples/addsvc/client/http/client.go b/examples/addsvc/client/http/client.go
+index cb349fb..c597c98 100644
+--- a/examples/addsvc/client/http/client.go
++++ b/examples/addsvc/client/http/client.go
+@@ -46,7 +46,7 @@ func New(instance string, tracer stdopentracing.Tracer, logger log.Logger) (adds
+ 			copyURL(u, "/sum"),
+ 			addsvc.EncodeHTTPGenericRequest,
+ 			addsvc.DecodeHTTPSumResponse,
+-			httptransport.ClientBefore(opentracing.FromHTTPRequest(tracer, "Sum", logger)),
++			httptransport.SetClientBefore(opentracing.FromHTTPRequest(tracer, "Sum", logger)),
+ 		).Endpoint()
+ 		sumEndpoint = opentracing.TraceClient(tracer, "Sum")(sumEndpoint)
+ 		sumEndpoint = limiter(sumEndpoint)
+@@ -63,7 +63,7 @@ func New(instance string, tracer stdopentracing.Tracer, logger log.Logger) (adds
+ 			copyURL(u, "/concat"),
+ 			addsvc.EncodeHTTPGenericRequest,
+ 			addsvc.DecodeHTTPConcatResponse,
+-			httptransport.ClientBefore(opentracing.FromHTTPRequest(tracer, "Concat", logger)),
++			httptransport.SetClientBefore(opentracing.FromHTTPRequest(tracer, "Concat", logger)),
+ 		).Endpoint()
+ 		concatEndpoint = opentracing.TraceClient(tracer, "Concat")(concatEndpoint)
+ 		concatEndpoint = limiter(concatEndpoint)
+diff --git a/transport/grpc/client.go b/transport/grpc/client.go
+index 2dffb4f..b1c9af3 100644
+--- a/transport/grpc/client.go
++++ b/transport/grpc/client.go
+@@ -64,9 +64,9 @@ func NewClient(
+ // ClientOption sets an optional parameter for clients.
+ type ClientOption func(*Client)
+ 
+-// ClientBefore sets the RequestFuncs that are applied to the outgoing gRPC
++// SetClientBefore sets the RequestFuncs that are applied to the outgoing gRPC
+ // request before it's invoked.
+-func ClientBefore(before ...RequestFunc) ClientOption {
++func SetClientBefore(before ...RequestFunc) ClientOption {
+ 	return func(c *Client) { c.before = before }
+ }
+ 
+diff --git a/transport/http/client.go b/transport/http/client.go
+index a8aca26..6652319 100644
+--- a/transport/http/client.go
++++ b/transport/http/client.go
+@@ -18,7 +18,6 @@ type Client struct {
+ 	enc            EncodeRequestFunc
+ 	dec            DecodeResponseFunc
+ 	before         []RequestFunc
+-	after          []ClientResponseFunc
+ 	bufferedStream bool
+ }
+ 
+@@ -37,7 +36,6 @@ func NewClient(
+ 		enc:            enc,
+ 		dec:            dec,
+ 		before:         []RequestFunc{},
+-		after:          []ClientResponseFunc{},
+ 		bufferedStream: false,
+ 	}
+ 	for _, option := range options {
+@@ -55,22 +53,15 @@ func SetClient(client *http.Client) ClientOption {
+ 	return func(c *Client) { c.client = client }
+ }
+ 
+-// ClientBefore sets the RequestFuncs that are applied to the outgoing HTTP
++// SetClientBefore sets the RequestFuncs that are applied to the outgoing HTTP
+ // request before it's invoked.
+-func ClientBefore(before ...RequestFunc) ClientOption {
++func SetClientBefore(before ...RequestFunc) ClientOption {
+ 	return func(c *Client) { c.before = before }
+ }
+ 
+-// ClientAfter sets the ClientResponseFuncs applied to the incoming HTTP
+-// request prior to it being decoded. This is useful for obtaining anything off
+-// of the response and adding onto the context prior to decoding.
+-func ClientAfter(after ...ClientResponseFunc) ClientOption {
+-	return func(c *Client) { c.after = after }
+-}
+-
+-// BufferedStream sets whether the Response.Body is left open, allowing it
++// SetBufferedStream sets whether the Response.Body is left open, allowing it
+ // to be read from later. Useful for transporting a file as a buffered stream.
+-func BufferedStream(buffered bool) ClientOption {
++func SetBufferedStream(buffered bool) ClientOption {
+ 	return func(c *Client) { c.bufferedStream = buffered }
+ }
+ 
+@@ -101,10 +92,6 @@ func (c Client) Endpoint() endpoint.Endpoint {
+ 			defer resp.Body.Close()
+ 		}
+ 
+-		for _, f := range c.after {
+-			ctx = f(ctx, resp)
+-		}
+-
+ 		response, err := c.dec(ctx, resp)
+ 		if err != nil {
+ 			return nil, Error{Domain: DomainDecode, Err: err}
+diff --git a/transport/http/client_test.go b/transport/http/client_test.go
+index 5569681..26d4634 100644
+--- a/transport/http/client_test.go
++++ b/transport/http/client_test.go
+@@ -30,18 +30,10 @@ func TestHTTPClient(t *testing.T) {
+ 		headers   = make(chan string, 1)
+ 		headerKey = "X-Foo"
+ 		headerVal = "abcde"
+-		afterHeaderKey = "X-The-Dude"
+-		afterHeaderVal = "Abides"
+-		afterVal       = ""
+-		afterFunc      = func(ctx context.Context, r *http.Response) context.Context {
+-			afterVal = r.Header.Get(afterHeaderKey)
+-			return ctx
+-		}
+ 	)
+ 
+ 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		headers <- r.Header.Get(headerKey)
+-		w.Header().Set(afterHeaderKey, afterHeaderVal)
+ 		w.WriteHeader(http.StatusOK)
+ 		w.Write([]byte(testbody))
+ 	}))
+@@ -51,8 +43,7 @@ func TestHTTPClient(t *testing.T) {
+ 		mustParse(server.URL),
+ 		encode,
+ 		decode,
+-		httptransport.ClientBefore(httptransport.SetRequestHeader(headerKey, headerVal)),
+-		httptransport.ClientAfter(afterFunc),
++		httptransport.SetClientBefore(httptransport.SetRequestHeader(headerKey, headerVal)),
+ 	)
+ 
+ 	res, err := client.Endpoint()(context.Background(), struct{}{})
+@@ -71,11 +62,6 @@ func TestHTTPClient(t *testing.T) {
+ 		t.Errorf("want %q, have %q", want, have)
+ 	}
+ 
+-	// Check that Response header set from server was received in SetClientAfter
+-	if want, have := afterVal, afterHeaderVal; want != have {
+-		t.Errorf("want %q, have %q", want, have)
+-	}
+-
+ 	// Check that the response was successfully decoded
+ 	response, ok := res.(TestResponse)
+ 	if !ok {
+@@ -115,7 +101,7 @@ func TestHTTPClientBufferedStream(t *testing.T) {
+ 		mustParse(server.URL),
+ 		encode,
+ 		decode,
+-		httptransport.BufferedStream(true),
++		httptransport.SetBufferedStream(true),
+ 	)
+ 
+ 	res, err := client.Endpoint()(context.Background(), struct{}{})
+diff --git a/transport/http/request_response_funcs.go b/transport/http/request_response_funcs.go
+index 1a3ef9b..892dcbf 100644
+--- a/transport/http/request_response_funcs.go
++++ b/transport/http/request_response_funcs.go
+@@ -12,27 +12,21 @@ import (
+ // but prior to invoking the HTTP client.
+ type RequestFunc func(context.Context, *http.Request) context.Context
+ 
+-// ServerResponseFunc may take information from a request context and use it to
+-// manipulate a ResponseWriter. ServerResponseFuncs are only executed in
+-// servers, after invoking the endpoint but prior to writing a response.
+-type ServerResponseFunc func(context.Context, http.ResponseWriter) context.Context
+-
+-// ClientResponseFunc may take information from an HTTP request and make the
+-// response available for consumption. ClientResponseFuncs are only executed in
+-// clients, after a request has been made, but prior to it being decoded.
+-type ClientResponseFunc func(context.Context, *http.Response) context.Context
++// ResponseFunc may take information from a request context and use it to
++// manipulate a ResponseWriter. ResponseFuncs are only executed in servers,
++// after invoking the endpoint but prior to writing a response.
++type ResponseFunc func(context.Context, http.ResponseWriter)
+ 
+ // SetContentType returns a ResponseFunc that sets the Content-Type header to
+ // the provided value.
+-func SetContentType(contentType string) ServerResponseFunc {
++func SetContentType(contentType string) ResponseFunc {
+ 	return SetResponseHeader("Content-Type", contentType)
+ }
+ 
+ // SetResponseHeader returns a ResponseFunc that sets the specified header.
+-func SetResponseHeader(key, val string) ServerResponseFunc {
+-	return func(ctx context.Context, w http.ResponseWriter) context.Context {
++func SetResponseHeader(key, val string) ResponseFunc {
++	return func(_ context.Context, w http.ResponseWriter) {
+ 		w.Header().Set(key, val)
+-		return ctx
+ 	}
+ }
+ 
+diff --git a/transport/http/server.go b/transport/http/server.go
+index 4b1b734..9c21ab9 100644
+--- a/transport/http/server.go
++++ b/transport/http/server.go
+@@ -16,7 +16,7 @@ type Server struct {
+ 	dec          DecodeRequestFunc
+ 	enc          EncodeResponseFunc
+ 	before       []RequestFunc
+-	after        []ServerResponseFunc
++	after        []ResponseFunc
+ 	errorEncoder ErrorEncoder
+ 	logger       log.Logger
+ }
+@@ -55,7 +55,7 @@ func ServerBefore(before ...RequestFunc) ServerOption {
+ 
+ // ServerAfter functions are executed on the HTTP response writer after the
+ // endpoint is invoked, but before anything is written to the client.
+-func ServerAfter(after ...ServerResponseFunc) ServerOption {
++func ServerAfter(after ...ResponseFunc) ServerOption {
+ 	return func(s *Server) { s.after = after }
+ }
+ 
+@@ -98,7 +98,7 @@ func (s Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	for _, f := range s.after {
+-		ctx = f(ctx, w)
++		f(ctx, w)
+ 	}
+ 
+ 	if err := s.enc(ctx, w, response); err != nil {
+diff --git a/transport/http/server_test.go b/transport/http/server_test.go
+index 752f010..82cdaf6 100644
+--- a/transport/http/server_test.go
++++ b/transport/http/server_test.go
+@@ -103,7 +103,7 @@ func testServer(t *testing.T) (cancel, step func(), resp <-chan *http.Response)
+ 			func(context.Context, *http.Request) (interface{}, error) { return struct{}{}, nil },
+ 			func(context.Context, http.ResponseWriter, interface{}) error { return nil },
+ 			httptransport.ServerBefore(func(ctx context.Context, r *http.Request) context.Context { return ctx }),
+-			httptransport.ServerAfter(func(ctx context.Context, w http.ResponseWriter) context.Context { return ctx }),
++			httptransport.ServerAfter(func(ctx context.Context, w http.ResponseWriter) { return }),
+ 		)
+ 	)
+ 	go func() {

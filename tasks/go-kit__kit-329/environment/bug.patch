@@ -1,0 +1,720 @@
+diff --git a/sd/etcd/client.go b/sd/etcd/client.go
+index 0508723..3e52f24 100644
+--- a/sd/etcd/client.go
++++ b/sd/etcd/client.go
+@@ -14,32 +14,21 @@ import (
+ )
+ 
+ var (
+-	// ErrNoKey indicates a client method needs a key but receives none.
+-	ErrNoKey = errors.New("no key provided")
+-
+-	// ErrNoValue indicates a client method needs a value but receives none.
++	ErrNoKey   = errors.New("no key provided")
+ 	ErrNoValue = errors.New("no value provided")
+ )
+ 
+ // Client is a wrapper around the etcd client.
+ type Client interface {
+-	// GetEntries queries the given prefix in etcd and returns a slice
+-	// containing the values of all keys found, recursively, underneath that
+-	// prefix.
++	// GetEntries will query the given prefix in etcd and returns a set of entries.
+ 	GetEntries(prefix string) ([]string, error)
+ 
+-	// WatchPrefix watches the given prefix in etcd for changes. When a change
+-	// is detected, it will signal on the passed channel. Clients are expected
+-	// to call GetEntries to update themselves with the latest set of complete
+-	// values. WatchPrefix will always send an initial sentinel value on the
+-	// channel after establishing the watch, to ensure that clients always
+-	// receive the latest set of values. WatchPrefix will block until the
+-	// context passed to the NewClient constructor is terminated.
+-	WatchPrefix(prefix string, ch chan struct{})
++	// WatchPrefix starts watching every change for given prefix in etcd. When an
++	// change is detected it will populate the responseChan when an *etcd.Response.
++	WatchPrefix(prefix string, responseChan chan *etcd.Response)
+ 
+ 	// Register a service with etcd.
+ 	Register(s Service) error
+-
+ 	// Deregister a service with etcd.
+ 	Deregister(s Service) error
+ }
+@@ -49,71 +38,81 @@ type client struct {
+ 	ctx     context.Context
+ }
+ 
+-// ClientOptions defines options for the etcd client. All values are optional.
+-// If any duration is not specified, a default of 3 seconds will be used.
++// ClientOptions defines options for the etcd client.
+ type ClientOptions struct {
+ 	Cert                    string
+ 	Key                     string
+-	CACert                  string
++	CaCert                  string
+ 	DialTimeout             time.Duration
+ 	DialKeepAlive           time.Duration
+ 	HeaderTimeoutPerRequest time.Duration
+ }
+ 
+-// NewClient returns Client with a connection to the named machines. It will
+-// return an error if a connection to the cluster cannot be made. The parameter
+-// machines needs to be a full URL with schemas. e.g. "http://localhost:2379"
+-// will work, but "localhost:2379" will not.
++// NewClient returns an *etcd.Client with a connection to the named machines.
++// It will return an error if a connection to the cluster cannot be made.
++// The parameter machines needs to be a full URL with schemas.
++// e.g. "http://localhost:2379" will work, but "localhost:2379" will not.
+ func NewClient(ctx context.Context, machines []string, options ClientOptions) (Client, error) {
+-	if options.DialTimeout == 0 {
+-		options.DialTimeout = 3 * time.Second
+-	}
+-	if options.DialKeepAlive == 0 {
+-		options.DialKeepAlive = 3 * time.Second
+-	}
+-	if options.HeaderTimeoutPerRequest == 0 {
+-		options.HeaderTimeoutPerRequest = 3 * time.Second
+-	}
++	var (
++		c        etcd.KeysAPI
++		err      error
++		caCertCt []byte
++		tlsCert  tls.Certificate
++	)
+ 
+-	transport := etcd.DefaultTransport
+ 	if options.Cert != "" && options.Key != "" {
+-		tlsCert, err := tls.LoadX509KeyPair(options.Cert, options.Key)
++		tlsCert, err = tls.LoadX509KeyPair(options.Cert, options.Key)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		caCertCt, err := ioutil.ReadFile(options.CACert)
++
++		caCertCt, err = ioutil.ReadFile(options.CaCert)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		caCertPool := x509.NewCertPool()
+ 		caCertPool.AppendCertsFromPEM(caCertCt)
+-		transport = &http.Transport{
+-			TLSClientConfig: &tls.Config{
+-				Certificates: []tls.Certificate{tlsCert},
+-				RootCAs:      caCertPool,
+-			},
+-			Dial: func(network, address string) (net.Conn, error) {
+-				return (&net.Dialer{
++
++		tlsConfig := &tls.Config{
++			Certificates: []tls.Certificate{tlsCert},
++			RootCAs:      caCertPool,
++		}
++
++		transport := &http.Transport{
++			TLSClientConfig: tlsConfig,
++			Dial: func(network, addr string) (net.Conn, error) {
++				dial := &net.Dialer{
+ 					Timeout:   options.DialTimeout,
+ 					KeepAlive: options.DialKeepAlive,
+-				}).Dial(network, address)
++				}
++				return dial.Dial(network, addr)
+ 			},
+ 		}
+-	}
+ 
+-	ce, err := etcd.New(etcd.Config{
+-		Endpoints:               machines,
+-		Transport:               transport,
+-		HeaderTimeoutPerRequest: options.HeaderTimeoutPerRequest,
+-	})
+-	if err != nil {
+-		return nil, err
++		cfg := etcd.Config{
++			Endpoints:               machines,
++			Transport:               transport,
++			HeaderTimeoutPerRequest: options.HeaderTimeoutPerRequest,
++		}
++		ce, err := etcd.New(cfg)
++		if err != nil {
++			return nil, err
++		}
++		c = etcd.NewKeysAPI(ce)
++	} else {
++		cfg := etcd.Config{
++			Endpoints:               machines,
++			Transport:               etcd.DefaultTransport,
++			HeaderTimeoutPerRequest: options.HeaderTimeoutPerRequest,
++		}
++		ce, err := etcd.New(cfg)
++		if err != nil {
++			return nil, err
++		}
++		c = etcd.NewKeysAPI(ce)
+ 	}
+ 
+-	return &client{
+-		keysAPI: etcd.NewKeysAPI(ce),
+-		ctx:     ctx,
+-	}, nil
++	return &client{c, ctx}, nil
+ }
+ 
+ // GetEntries implements the etcd Client interface.
+@@ -123,29 +122,28 @@ func (c *client) GetEntries(key string) ([]string, error) {
+ 		return nil, err
+ 	}
+ 
+-	// Special case. Note that it's possible that len(resp.Node.Nodes) == 0 and
+-	// resp.Node.Value is also empty, in which case the key is empty and we
+-	// should not return any entries.
+-	if len(resp.Node.Nodes) == 0 && resp.Node.Value != "" {
+-		return []string{resp.Node.Value}, nil
+-	}
+-
+ 	entries := make([]string, len(resp.Node.Nodes))
+-	for i, node := range resp.Node.Nodes {
+-		entries[i] = node.Value
++
++	if len(entries) > 0 {
++		for i, node := range resp.Node.Nodes {
++			entries[i] = node.Value
++		}
++	} else {
++		entries = append(entries, resp.Node.Value)
+ 	}
+ 	return entries, nil
++
+ }
+ 
+ // WatchPrefix implements the etcd Client interface.
+-func (c *client) WatchPrefix(prefix string, ch chan struct{}) {
++func (c *client) WatchPrefix(prefix string, responseChan chan *etcd.Response) {
+ 	watch := c.keysAPI.Watcher(prefix, &etcd.WatcherOptions{AfterIndex: 0, Recursive: true})
+-	ch <- struct{}{} // make sure caller invokes GetEntries
+ 	for {
+-		if _, err := watch.Next(c.ctx); err != nil {
++		res, err := watch.Next(c.ctx)
++		if err != nil {
+ 			return
+ 		}
+-		ch <- struct{}{}
++		responseChan <- res
+ 	}
+ }
+ 
+diff --git a/sd/etcd/client_test.go b/sd/etcd/client_test.go
+index 6ac2a94..1caeb59 100644
+--- a/sd/etcd/client_test.go
++++ b/sd/etcd/client_test.go
+@@ -8,14 +8,19 @@ import (
+ )
+ 
+ func TestNewClient(t *testing.T) {
++	ClientOptions := ClientOptions{
++		Cert:                    "",
++		Key:                     "",
++		CaCert:                  "",
++		DialTimeout:             (2 * time.Second),
++		DialKeepAlive:           (2 * time.Second),
++		HeaderTimeoutPerRequest: (2 * time.Second),
++	}
++
+ 	client, err := NewClient(
+ 		context.Background(),
+ 		[]string{"http://irrelevant:12345"},
+-		ClientOptions{
+-			DialTimeout:             2 * time.Second,
+-			DialKeepAlive:           2 * time.Second,
+-			HeaderTimeoutPerRequest: 2 * time.Second,
+-		},
++		ClientOptions,
+ 	)
+ 	if err != nil {
+ 		t.Fatalf("unexpected error creating client: %v", err)
+@@ -25,20 +30,20 @@ func TestNewClient(t *testing.T) {
+ 	}
+ }
+ 
+-// NewClient should fail when providing invalid or missing endpoints.
+ func TestOptions(t *testing.T) {
++	//creating new client should fail when providing invalid or missing endpoints
+ 	a, err := NewClient(
+ 		context.Background(),
+ 		[]string{},
+ 		ClientOptions{
+ 			Cert:                    "",
+ 			Key:                     "",
+-			CACert:                  "",
+-			DialTimeout:             2 * time.Second,
+-			DialKeepAlive:           2 * time.Second,
+-			HeaderTimeoutPerRequest: 2 * time.Second,
+-		},
+-	)
++			CaCert:                  "",
++			DialTimeout:             (2 * time.Second),
++			DialKeepAlive:           (2 * time.Second),
++			HeaderTimeoutPerRequest: (2 * time.Second),
++		})
++
+ 	if err == nil {
+ 		t.Errorf("expected error: %v", err)
+ 	}
+@@ -46,18 +51,19 @@ func TestOptions(t *testing.T) {
+ 		t.Fatalf("expected client to be nil on failure")
+ 	}
+ 
++	//creating new client should fail when providing invalid or missing endpoints
+ 	_, err = NewClient(
+ 		context.Background(),
+ 		[]string{"http://irrelevant:12345"},
+ 		ClientOptions{
+ 			Cert:                    "blank.crt",
+ 			Key:                     "blank.key",
+-			CACert:                  "blank.CACert",
+-			DialTimeout:             2 * time.Second,
+-			DialKeepAlive:           2 * time.Second,
+-			HeaderTimeoutPerRequest: 2 * time.Second,
+-		},
+-	)
++			CaCert:                  "blank.cacert",
++			DialTimeout:             (2 * time.Second),
++			DialKeepAlive:           (2 * time.Second),
++			HeaderTimeoutPerRequest: (2 * time.Second),
++		})
++
+ 	if err == nil {
+ 		t.Errorf("expected error: %v", err)
+ 	}
+diff --git a/sd/etcd/doc.go b/sd/etcd/doc.go
+index 11add79..f8bd5bf 100644
+--- a/sd/etcd/doc.go
++++ b/sd/etcd/doc.go
+@@ -1,4 +1,2 @@
+-// Package etcd provides a Subscriber and Registrar implementation for etcd. If
+-// you use etcd as your service discovery system, this package will help you
+-// implement the registration and client-side load balancing patterns.
++// Package etcd provides a subscriber implementation for etcd.
+ package etcd
+diff --git a/sd/etcd/example_test.go b/sd/etcd/example_test.go
+index 795164c..6272720 100644
+--- a/sd/etcd/example_test.go
++++ b/sd/etcd/example_test.go
+@@ -1,67 +1,69 @@
+ package etcd
+ 
+ import (
+-	"io"
++	"fmt"
+ 	"time"
++	"io"
+ 
+-	"golang.org/x/net/context"
+-
+-	"github.com/go-kit/kit/endpoint"
+ 	"github.com/go-kit/kit/log"
+-	"github.com/go-kit/kit/sd/lb"
++	"github.com/go-kit/kit/endpoint"
++	"golang.org/x/net/context"
+ )
+ 
++// Package sd/etcd provides a wrapper around the coroes/etcd key value store (https://github.com/coreos/etcd)
++// This example assumes the user has an instance of etcd installed and running locally on port 2379
+ func Example() {
+-	// Let's say this is a service that means to register itself.
+-	// First, we will set up some context.
++
+ 	var (
+-		etcdServer = "http://10.0.0.1:2379" // don't forget schema and port!
+-		prefix     = "/services/foosvc/"    // known at compile time
+-		instance   = "1.2.3.4:8080"         // taken from runtime or platform, somehow
+-		key        = prefix + instance      // should be globally unique
+-		value      = "http://" + instance   // based on our transport
+-		ctx        = context.Background()
++		prefix   = "/services/foosvc/" // known at compile time
++		instance = "1.2.3.4:8080"      // taken from runtime or platform, somehow
++		key      = prefix + instance
++		value    = "http://" + instance // based on our transport
+ 	)
+ 
+-	// Build the client.
+-	client, err := NewClient(ctx, []string{etcdServer}, ClientOptions{})
+-	if err != nil {
+-		panic(err)
+-	}
++	client, err := NewClient(context.Background(), []string{"http://:2379"}, ClientOptions{
++		DialTimeout:             2 * time.Second,
++		DialKeepAlive:           2 * time.Second,
++		HeaderTimeoutPerRequest: 2 * time.Second,
++	})
+ 
+-	// Build the registrar.
++	// Instantiate new instance of *Registrar passing in test data
+ 	registrar := NewRegistrar(client, Service{
+ 		Key:   key,
+ 		Value: value,
+ 	}, log.NewNopLogger())
+-
+-	// Register our instance.
++	// Register new test data to etcd
+ 	registrar.Register()
+ 
+-	// At the end of our service lifecycle, for example at the end of func main,
+-	// we should make sure to deregister ourselves. This is important! Don't
+-	// accidentally skip this step by invoking a log.Fatal or os.Exit in the
+-	// interim, which bypasses the defer stack.
+-	defer registrar.Deregister()
++	//Retrieve entries from etcd
++	_, err = client.GetEntries(key)
++	if err != nil {
++		fmt.Println(err)
++	}
++
++	factory := func(string) (endpoint.Endpoint, io.Closer, error) {
++		return endpoint.Nop, nil, nil
++	}
++	subscriber, _ := NewSubscriber(client, prefix, factory, log.NewNopLogger())
++
++	endpoints, err := subscriber.Endpoints()
++	if err != nil {
++		fmt.Printf("err: %v", err)
++	}
++	fmt.Println(len(endpoints)) // hopefully 1
++
++	// Deregister first instance of test data
++	registrar.Deregister()
+ 
+-	// It's likely that we'll also want to connect to other services and call
+-	// their methods. We can build a subscriber to listen for changes from etcd
+-	// and build endpoints, wrap it with a load-balancer to pick a single
+-	// endpoint, and finally wrap it with a retry strategy to get something that
+-	// can be used as an endpoint directly.
+-	barPrefix := "/services/barsvc"
+-	subscriber, err := NewSubscriber(client, barPrefix, barFactory, log.NewNopLogger())
++	endpoints, err = subscriber.Endpoints()
+ 	if err != nil {
+-		panic(err)
++		fmt.Printf("err: %v", err)
+ 	}
+-	balancer := lb.NewRoundRobin(subscriber)
+-	retry := lb.Retry(3, 3*time.Second, balancer)
++	fmt.Println(len(endpoints)) // hopefully 0
+ 
+-	// And now retry can be used like any other endpoint.
+-	req := struct{}{}
+-	if _, err = retry(ctx, req); err != nil {
+-		panic(err)
++	// Verify test data no longer exists in etcd
++	_, err = client.GetEntries(key)
++	if err != nil {
++		fmt.Println(err)
+ 	}
+ }
+-
+-func barFactory(string) (endpoint.Endpoint, io.Closer, error) { return endpoint.Nop, nil, nil }
+diff --git a/sd/etcd/integration_test.go b/sd/etcd/integration_test.go
+index e65840d..aab8672 100644
+--- a/sd/etcd/integration_test.go
++++ b/sd/etcd/integration_test.go
+@@ -3,118 +3,115 @@
+ package etcd
+ 
+ import (
+-	"io"
++	"flag"
++	"kit/log"
+ 	"os"
+ 	"testing"
+ 	"time"
+ 
++	etcdc "github.com/coreos/etcd/client"
++	etcdi "github.com/coreos/etcd/integration"
+ 	"golang.org/x/net/context"
++)
+ 
+-	"github.com/go-kit/kit/endpoint"
+-	"github.com/go-kit/kit/log"
++var (
++	host             []string
++	kitClientOptions ClientOptions
+ )
+ 
+-// Package sd/etcd provides a wrapper around the etcd key/value store. This
+-// example assumes the user has an instance of etcd installed and running
+-// locally on port 2379.
+-func TestIntegration(t *testing.T) {
+-	addr := os.Getenv("ETCD_ADDR")
+-	if addr == "" {
+-		t.Skip("ETCD_ADDR not set; skipping integration test")
+-	}
++func TestMain(m *testing.M) {
++	flag.Parse()
+ 
+-	var (
+-		prefix   = "/services/foosvc/" // known at compile time
+-		instance = "1.2.3.4:8080"      // taken from runtime or platform, somehow
+-		key      = prefix + instance
+-		value    = "http://" + instance // based on our transport
+-	)
+-
+-	client, err := NewClient(context.Background(), []string{addr}, ClientOptions{
+-		DialTimeout:             2 * time.Second,
+-		DialKeepAlive:           2 * time.Second,
+-		HeaderTimeoutPerRequest: 2 * time.Second,
+-	})
+-	if err != nil {
+-		t.Fatalf("NewClient(%q): %v", addr, err)
++	kitClientOptions = ClientOptions{
++		Cert:                    "",
++		Key:                     "",
++		CaCert:                  "",
++		DialTimeout:             (2 * time.Second),
++		DialKeepAlive:           (2 * time.Second),
++		HeaderTimeoutPerRequest: (2 * time.Second),
+ 	}
+ 
+-	// Verify test data is initially empty.
+-	entries, err := client.GetEntries(key)
+-	if err == nil {
+-		t.Fatalf("GetEntries(%q): expected error, got none", key)
+-	}
+-	t.Logf("GetEntries(%q): %v (OK)", key, err)
++	code := m.Run()
+ 
+-	// Instantiate a new Registrar, passing in test data.
+-	registrar := NewRegistrar(client, Service{
+-		Key:   key,
+-		Value: value,
+-	}, log.NewContext(log.NewLogfmtLogger(os.Stderr)).With("component", "registrar"))
++	os.Exit(code)
++}
+ 
+-	// Register our instance.
+-	registrar.Register()
+-	t.Logf("Registered")
++func TestRegistrar(t *testing.T) {
++	ts := etcdi.NewCluster(t, 1)
++	ts.Launch(t)
++	kitClient, err := NewClient(context.Background(), []string{ts.URL(0)}, kitClientOptions)
++
++	// Valid registrar should pass
++	registrar := NewRegistrar(kitClient, Service{
++		Key:   "somekey",
++		Value: "somevalue",
++		DeleteOptions: &etcdc.DeleteOptions{
++			PrevValue: "",
++			PrevIndex: 0,
++			Recursive: true,
++			Dir:       false,
++		},
++	}, log.NewNopLogger())
+ 
+-	// Retrieve entries from etcd manually.
+-	entries, err = client.GetEntries(key)
++	registrar.Register()
++	r1, err := kitClient.GetEntries(registrar.service.Key)
+ 	if err != nil {
+-		t.Fatalf("client.GetEntries(%q): %v", key, err)
+-	}
+-	if want, have := 1, len(entries); want != have {
+-		t.Fatalf("client.GetEntries(%q): want %d, have %d", key, want, have)
++		t.Fatalf("unexpected error when getting value for deregistered key: %v", err)
+ 	}
+-	if want, have := value, entries[0]; want != have {
++
++	if want, have := registrar.service.Value, r1[0]; want != have {
+ 		t.Fatalf("want %q, have %q", want, have)
+ 	}
+ 
+-	subscriber, err := NewSubscriber(
+-		client,
+-		prefix,
+-		func(string) (endpoint.Endpoint, io.Closer, error) { return endpoint.Nop, nil, nil },
+-		log.NewContext(log.NewLogfmtLogger(os.Stderr)).With("component", "subscriber"),
+-	)
+-	if err != nil {
+-		t.Fatalf("NewSubscriber: %v", err)
++	registrar.Deregister()
++	r2, err := kitClient.GetEntries(registrar.service.Key)
++	if len(r2) > 0 {
++		t.Fatalf("unexpected value found for deregistered key: %s", r2)
+ 	}
+-	t.Logf("Constructed Subscriber OK")
+ 
+-	if !within(time.Second, func() bool {
+-		endpoints, err := subscriber.Endpoints()
+-		return err == nil && len(endpoints) == 1
+-	}) {
+-		t.Fatalf("Subscriber didn't see Register in time")
++	// Registrar with no key should register but value will be blank
++	registrarNoKey := NewRegistrar(kitClient, Service{
++		Key:   "",
++		Value: "somevalue",
++		DeleteOptions: &etcdc.DeleteOptions{
++			PrevValue: "",
++			PrevIndex: 0,
++			Recursive: true,
++			Dir:       false,
++		},
++	}, log.NewNopLogger())
++
++	registrarNoKey.Register()
++	r3, err := kitClient.GetEntries(registrarNoKey.service.Key)
++	if err != nil {
++		t.Errorf("unexpected error when getting value for entry with no key: %v", err)
+ 	}
+-	t.Logf("Subscriber saw Register OK")
+ 
+-	// Deregister first instance of test data.
+-	registrar.Deregister()
+-	t.Logf("Deregistered")
+-
+-	// Check it was deregistered.
+-	if !within(time.Second, func() bool {
+-		endpoints, err := subscriber.Endpoints()
+-		t.Logf("Checking Deregister: len(endpoints) = %d, err = %v", len(endpoints), err)
+-		return err == nil && len(endpoints) == 0
+-	}) {
+-		t.Fatalf("Subscriber didn't see Deregister in time")
++	if want, have := "", r3[0]; want != have {
++		t.Fatalf("want %q, have %q", want, have)
+ 	}
+ 
+-	// Verify test data no longer exists in etcd.
+-	entries, err = client.GetEntries(key)
++	// Registrar with no value should not register anything
++	registrarNoValue := NewRegistrar(kitClient, Service{
++		Key:   "somekey",
++		Value: "",
++		DeleteOptions: &etcdc.DeleteOptions{
++			PrevValue: "",
++			PrevIndex: 0,
++			Recursive: true,
++			Dir:       false,
++		},
++	}, log.NewNopLogger())
++
++	registrarNoValue.Register()
++	r4, err := kitClient.GetEntries(registrarNoValue.service.Key)
+ 	if err == nil {
+-		t.Fatalf("GetEntries(%q): expected error, got none", key)
++		t.Errorf("expected error when getting value for entry key which attempted to register with no value")
+ 	}
+-	t.Logf("GetEntries(%q): %v (OK)", key, err)
+-}
+ 
+-func within(d time.Duration, f func() bool) bool {
+-	deadline := time.Now().Add(d)
+-	for time.Now().Before(deadline) {
+-		if f() {
+-			return true
+-		}
+-		time.Sleep(d / 10)
++	if len(r4) > 0 {
++		t.Fatalf("unexpected value retreived when getting value for entry with no value")
+ 	}
+-	return false
++
++	ts.Terminate(t)
+ }
+diff --git a/sd/etcd/registrar.go b/sd/etcd/registrar.go
+index 52b632a..4e3d15b 100644
+--- a/sd/etcd/registrar.go
++++ b/sd/etcd/registrar.go
+@@ -2,7 +2,6 @@ package etcd
+ 
+ import (
+ 	etcd "github.com/coreos/etcd/client"
+-
+ 	"github.com/go-kit/kit/log"
+ )
+ 
+@@ -13,30 +12,28 @@ type Registrar struct {
+ 	logger  log.Logger
+ }
+ 
+-// Service holds the instance identifying data you want to publish to etcd. Key
+-// must be unique, and value is the string returned to subscribers, typically
+-// called the "instance" string in other parts of package sd.
++// Service holds the key, value and instance identifying data you
++// want to publish to etcd.
+ type Service struct {
+-	Key           string // unique key, e.g. "/service/foobar/1.2.3.4:8080"
+-	Value         string // returned to subscribers, e.g. "http://1.2.3.4:8080"
++	Key           string // discovery key, example: /myorganization/myplatform/
++	Value         string // service name value, example: addsvc
+ 	DeleteOptions *etcd.DeleteOptions
+ }
+ 
+ // NewRegistrar returns a etcd Registrar acting on the provided catalog
+-// registration (service).
++// registration.
+ func NewRegistrar(client Client, service Service, logger log.Logger) *Registrar {
+ 	return &Registrar{
+ 		client:  client,
+ 		service: service,
+ 		logger: log.NewContext(logger).With(
+-			"key", service.Key,
+ 			"value", service.Value,
++			"key", service.Key,
+ 		),
+ 	}
+ }
+ 
+-// Register implements the sd.Registrar interface. Call it when you want your
+-// service to be registered in etcd, typically at startup.
++// Register implements sd.Registrar interface.
+ func (r *Registrar) Register() {
+ 	if err := r.client.Register(r.service); err != nil {
+ 		r.logger.Log("err", err)
+@@ -45,8 +42,7 @@ func (r *Registrar) Register() {
+ 	}
+ }
+ 
+-// Deregister implements the sd.Registrar interface. Call it when you want your
+-// service to be deregistered from etcd, typically just prior to shutdown.
++// Deregister implements sd.Registrar interface.
+ func (r *Registrar) Deregister() {
+ 	if err := r.client.Deregister(r.service); err != nil {
+ 		r.logger.Log("err", err)
+diff --git a/sd/etcd/subscriber.go b/sd/etcd/subscriber.go
+index 1b91872..1d579eb 100644
+--- a/sd/etcd/subscriber.go
++++ b/sd/etcd/subscriber.go
+@@ -1,6 +1,8 @@
+ package etcd
+ 
+ import (
++	etcd "github.com/coreos/etcd/client"
++
+ 	"github.com/go-kit/kit/endpoint"
+ 	"github.com/go-kit/kit/log"
+ 	"github.com/go-kit/kit/sd"
+@@ -43,11 +45,11 @@ func NewSubscriber(c Client, prefix string, factory sd.Factory, logger log.Logge
+ }
+ 
+ func (s *Subscriber) loop() {
+-	ch := make(chan struct{})
+-	go s.client.WatchPrefix(s.prefix, ch)
++	responseChan := make(chan *etcd.Response)
++	go s.client.WatchPrefix(s.prefix, responseChan)
+ 	for {
+ 		select {
+-		case <-ch:
++		case <-responseChan:
+ 			instances, err := s.client.GetEntries(s.prefix)
+ 			if err != nil {
+ 				s.logger.Log("msg", "failed to retrieve entries", "err", err)
+diff --git a/sd/etcd/subscriber_test.go b/sd/etcd/subscriber_test.go
+index dad320b..84f7813 100644
+--- a/sd/etcd/subscriber_test.go
++++ b/sd/etcd/subscriber_test.go
+@@ -86,7 +86,7 @@ func (c *fakeClient) GetEntries(prefix string) ([]string, error) {
+ 	return entries, nil
+ }
+ 
+-func (c *fakeClient) WatchPrefix(prefix string, ch chan struct{}) {}
++func (c *fakeClient) WatchPrefix(prefix string, responseChan chan *stdetcd.Response) {}
+ 
+ func (c *fakeClient) Register(Service) error {
+ 	return nil

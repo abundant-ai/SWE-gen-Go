@@ -1,0 +1,935 @@
+diff --git a/.travis.yml b/.travis.yml
+index a7f6c97..bd6d284 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -4,3 +4,4 @@ go:
+     - 1.4.2
+     - 1.5
+     - tip
++
+diff --git a/loadbalancer/zk/client.go b/loadbalancer/zk/client.go
+deleted file mode 100644
+index 8220817..0000000
+--- a/loadbalancer/zk/client.go
++++ /dev/null
+@@ -1,231 +0,0 @@
+-package zk
+-
+-import (
+-	"errors"
+-	"net"
+-	"strings"
+-	"time"
+-
+-	"github.com/samuel/go-zookeeper/zk"
+-
+-	"github.com/go-kit/kit/log"
+-)
+-
+-// DefaultACL is the default ACL to use for creating znodes.
+-var (
+-	DefaultACL            = zk.WorldACL(zk.PermAll)
+-	ErrInvalidCredentials = errors.New("invalid credentials provided")
+-	ErrClientClosed       = errors.New("client service closed")
+-)
+-
+-const (
+-	// DefaultConnectTimeout is the default timeout to establish a connection to
+-	// a ZooKeeper node.
+-	DefaultConnectTimeout = 2 * time.Second
+-	// DefaultSessionTimeout is the default timeout to keep the current
+-	// ZooKeeper session alive during a temporary disconnect.
+-	DefaultSessionTimeout = 5 * time.Second
+-)
+-
+-// Client is a wrapper around a lower level ZooKeeper client implementation.
+-type Client interface {
+-	// GetEntries should query the provided path in ZooKeeper, place a watch on
+-	// it and retrieve data from its current child nodes.
+-	GetEntries(path string) ([]string, <-chan zk.Event, error)
+-	// CreateParentNodes should try to create the path in case it does not exist
+-	// yet on ZooKeeper.
+-	CreateParentNodes(path string) error
+-	// Stop should properly shutdown the client implementation
+-	Stop()
+-}
+-
+-type clientConfig struct {
+-	logger          log.Logger
+-	acl             []zk.ACL
+-	credentials     []byte
+-	connectTimeout  time.Duration
+-	sessionTimeout  time.Duration
+-	rootNodePayload [][]byte
+-	eventHandler    func(zk.Event)
+-}
+-
+-// Option functions enable friendly APIs.
+-type Option func(*clientConfig) error
+-
+-type client struct {
+-	*zk.Conn
+-	clientConfig
+-	active bool
+-	quit   chan struct{}
+-}
+-
+-// ACL returns an Option specifying a non-default ACL for creating parent nodes.
+-func ACL(acl []zk.ACL) Option {
+-	return func(c *clientConfig) error {
+-		c.acl = acl
+-		return nil
+-	}
+-}
+-
+-// Credentials returns an Option specifying a user/password combination which
+-// the client will use to authenticate itself with.
+-func Credentials(user, pass string) Option {
+-	return func(c *clientConfig) error {
+-		if user == "" || pass == "" {
+-			return ErrInvalidCredentials
+-		}
+-		c.credentials = []byte(user + ":" + pass)
+-		return nil
+-	}
+-}
+-
+-// ConnectTimeout returns an Option specifying a non-default connection timeout
+-// when we try to establish a connection to a ZooKeeper server.
+-func ConnectTimeout(t time.Duration) Option {
+-	return func(c *clientConfig) error {
+-		if t.Seconds() < 1 {
+-			return errors.New("invalid connect timeout (minimum value is 1 second)")
+-		}
+-		c.connectTimeout = t
+-		return nil
+-	}
+-}
+-
+-// SessionTimeout returns an Option specifying a non-default session timeout.
+-func SessionTimeout(t time.Duration) Option {
+-	return func(c *clientConfig) error {
+-		if t.Seconds() < 1 {
+-			return errors.New("invalid session timeout (minimum value is 1 second)")
+-		}
+-		c.sessionTimeout = t
+-		return nil
+-	}
+-}
+-
+-// Payload returns an Option specifying non-default data values for each znode
+-// created by CreateParentNodes.
+-func Payload(payload [][]byte) Option {
+-	return func(c *clientConfig) error {
+-		c.rootNodePayload = payload
+-		return nil
+-	}
+-}
+-
+-// EventHandler returns an Option specifying a callback function to handle
+-// incoming zk.Event payloads (ZooKeeper connection events).
+-func EventHandler(handler func(zk.Event)) Option {
+-	return func(c *clientConfig) error {
+-		c.eventHandler = handler
+-		return nil
+-	}
+-}
+-
+-// NewClient returns a ZooKeeper client with a connection to the server cluster.
+-// It will return an error if the server cluster cannot be resolved.
+-func NewClient(servers []string, logger log.Logger, options ...Option) (Client, error) {
+-	defaultEventHandler := func(event zk.Event) {
+-		logger.Log("eventtype", event.Type.String(), "server", event.Server, "state", event.State.String(), "err", event.Err)
+-	}
+-	config := clientConfig{
+-		acl:            DefaultACL,
+-		connectTimeout: DefaultConnectTimeout,
+-		sessionTimeout: DefaultSessionTimeout,
+-		eventHandler:   defaultEventHandler,
+-		logger:         logger,
+-	}
+-	for _, option := range options {
+-		if err := option(&config); err != nil {
+-			return nil, err
+-		}
+-	}
+-	// dialer overrides the default ZooKeeper library Dialer so we can configure
+-	// the connectTimeout. The current library has a hardcoded value of 1 second
+-	// and there are reports of race conditions, due to slow DNS resolvers and
+-	// other network latency issues.
+-	dialer := func(network, address string, _ time.Duration) (net.Conn, error) {
+-		return net.DialTimeout(network, address, config.connectTimeout)
+-	}
+-	conn, eventc, err := zk.Connect(servers, config.sessionTimeout, withLogger(logger), zk.WithDialer(dialer))
+-
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	if len(config.credentials) > 0 {
+-		err = conn.AddAuth("digest", config.credentials)
+-		if err != nil {
+-			return nil, err
+-		}
+-	}
+-
+-	c := &client{conn, config, true, make(chan struct{})}
+-
+-	// Start listening for incoming Event payloads and callback the set
+-	// eventHandler.
+-	go func() {
+-		for {
+-			select {
+-			case event := <-eventc:
+-				config.eventHandler(event)
+-			case <-c.quit:
+-				return
+-			}
+-		}
+-	}()
+-	return c, nil
+-}
+-
+-// CreateParentNodes implements the ZooKeeper Client interface.
+-func (c *client) CreateParentNodes(path string) error {
+-	if !c.active {
+-		return ErrClientClosed
+-	}
+-	if path[0] != '/' {
+-		return zk.ErrInvalidPath
+-	}
+-	payload := []byte("")
+-	pathString := ""
+-	pathNodes := strings.Split(path, "/")
+-	for i := 1; i < len(pathNodes); i++ {
+-		if i <= len(c.rootNodePayload) {
+-			payload = c.rootNodePayload[i-1]
+-		} else {
+-			payload = []byte("")
+-		}
+-		pathString += "/" + pathNodes[i]
+-		_, err := c.Create(pathString, payload, 0, c.acl)
+-		// not being able to create the node because it exists or not having
+-		// sufficient rights is not an issue. It is ok for the node to already
+-		// exist and/or us to only have read rights
+-		if err != nil && err != zk.ErrNodeExists && err != zk.ErrNoAuth {
+-			return err
+-		}
+-	}
+-	return nil
+-}
+-
+-// GetEntries implements the ZooKeeper Client interface.
+-func (c *client) GetEntries(path string) ([]string, <-chan zk.Event, error) {
+-	// retrieve list of child nodes for given path and add watch to path
+-	znodes, _, eventc, err := c.ChildrenW(path)
+-
+-	if err != nil {
+-		return nil, eventc, err
+-	}
+-
+-	var resp []string
+-	for _, znode := range znodes {
+-		// retrieve payload for child znode and add to response array
+-		if data, _, err := c.Get(path + "/" + znode); err == nil {
+-			resp = append(resp, string(data))
+-		}
+-	}
+-	return resp, eventc, nil
+-}
+-
+-// Stop implements the ZooKeeper Client interface.
+-func (c *client) Stop() {
+-	c.active = false
+-	close(c.quit)
+-	c.Close()
+-}
+diff --git a/loadbalancer/zk/client_test.go b/loadbalancer/zk/client_test.go
+deleted file mode 100644
+index 970f923..0000000
+--- a/loadbalancer/zk/client_test.go
++++ /dev/null
+@@ -1,143 +0,0 @@
+-package zk
+-
+-import (
+-	"bytes"
+-	"testing"
+-	"time"
+-
+-	stdzk "github.com/samuel/go-zookeeper/zk"
+-)
+-
+-func TestNewClient(t *testing.T) {
+-	var (
+-		acl            = stdzk.WorldACL(stdzk.PermRead)
+-		connectTimeout = 3 * time.Second
+-		sessionTimeout = 20 * time.Second
+-		payload        = [][]byte{[]byte("Payload"), []byte("Test")}
+-	)
+-
+-	c, err := NewClient(
+-		[]string{"FailThisInvalidHost!!!"},
+-		logger,
+-	)
+-
+-	time.Sleep(1 * time.Millisecond)
+-	if err == nil {
+-		t.Errorf("expected error, got nil")
+-	}
+-	calledEventHandler := false
+-	eventHandler := func(event stdzk.Event) {
+-		calledEventHandler = true
+-	}
+-	c, err = NewClient(
+-		[]string{"localhost"},
+-		logger,
+-		ACL(acl),
+-		ConnectTimeout(connectTimeout),
+-		SessionTimeout(sessionTimeout),
+-		Payload(payload),
+-		EventHandler(eventHandler),
+-	)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	defer c.Stop()
+-	clientImpl, ok := c.(*client)
+-	if !ok {
+-		t.Errorf("retrieved incorrect Client implementation")
+-	}
+-	if want, have := acl, clientImpl.acl; want[0] != have[0] {
+-		t.Errorf("want %+v, have %+v", want, have)
+-	}
+-	if want, have := connectTimeout, clientImpl.connectTimeout; want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-	if want, have := sessionTimeout, clientImpl.sessionTimeout; want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-	if want, have := payload, clientImpl.rootNodePayload; bytes.Compare(want[0], have[0]) != 0 || bytes.Compare(want[1], have[1]) != 0 {
+-		t.Errorf("want %s, have %s", want, have)
+-	}
+-	// Allow EventHandler to be called
+-	time.Sleep(1 * time.Millisecond)
+-
+-	if want, have := true, calledEventHandler; want != have {
+-		t.Errorf("want %t, have %t", want, have)
+-	}
+-}
+-
+-func TestOptions(t *testing.T) {
+-	_, err := NewClient([]string{"localhost"}, logger, Credentials("valid", "credentials"))
+-	if err != nil && err != stdzk.ErrNoServer {
+-		t.Errorf("unexpected error: %v", err)
+-	}
+-
+-	_, err = NewClient([]string{"localhost"}, logger, Credentials("nopass", ""))
+-	if want, have := err, ErrInvalidCredentials; want != have {
+-		t.Errorf("want %v, have %v", want, have)
+-	}
+-
+-	_, err = NewClient([]string{"localhost"}, logger, ConnectTimeout(0))
+-	if err == nil {
+-		t.Errorf("expected connect timeout error")
+-	}
+-
+-	_, err = NewClient([]string{"localhost"}, logger, SessionTimeout(0))
+-	if err == nil {
+-		t.Errorf("expected connect timeout error")
+-	}
+-}
+-
+-func TestCreateParentNodes(t *testing.T) {
+-	payload := [][]byte{[]byte("Payload"), []byte("Test")}
+-
+-	c, err := NewClient([]string{"localhost:65500"}, logger)
+-	if err != nil {
+-		t.Errorf("unexpected error: %v", err)
+-	}
+-	if c == nil {
+-		t.Fatalf("expected new Client, got nil")
+-	}
+-	p, err := NewPublisher(c, "/validpath", newFactory(""), logger)
+-	if err != stdzk.ErrNoServer {
+-		t.Errorf("unexpected error: %v", err)
+-	}
+-	if p != nil {
+-		t.Errorf("expected failed new Publisher")
+-	}
+-	p, err = NewPublisher(c, "invalidpath", newFactory(""), logger)
+-	if err != stdzk.ErrInvalidPath {
+-		t.Errorf("unexpected error: %v", err)
+-	}
+-	_, _, err = c.GetEntries("/validpath")
+-	if err != stdzk.ErrNoServer {
+-		t.Errorf("unexpected error: %v", err)
+-	}
+-	// stopping Client
+-	c.Stop()
+-	err = c.CreateParentNodes("/validpath")
+-	if err != ErrClientClosed {
+-		t.Errorf("unexpected error: %v", err)
+-	}
+-	p, err = NewPublisher(c, "/validpath", newFactory(""), logger)
+-	if err != ErrClientClosed {
+-		t.Errorf("unexpected error: %v", err)
+-	}
+-	if p != nil {
+-		t.Errorf("expected failed new Publisher")
+-	}
+-	c, err = NewClient([]string{"localhost:65500"}, logger, Payload(payload))
+-	if err != nil {
+-		t.Errorf("unexpected error: %v", err)
+-	}
+-	if c == nil {
+-		t.Fatalf("expected new Client, got nil")
+-	}
+-	p, err = NewPublisher(c, "/validpath", newFactory(""), logger)
+-	if err != stdzk.ErrNoServer {
+-		t.Errorf("unexpected error: %v", err)
+-	}
+-	if p != nil {
+-		t.Errorf("expected failed new Publisher")
+-	}
+-}
+diff --git a/loadbalancer/zk/integration_test.go b/loadbalancer/zk/integration_test.go
+deleted file mode 100644
+index 67e2c44..0000000
+--- a/loadbalancer/zk/integration_test.go
++++ /dev/null
+@@ -1,195 +0,0 @@
+-// +build integration
+-
+-package zk
+-
+-import (
+-	"bytes"
+-	"fmt"
+-	"os"
+-	"testing"
+-	"time"
+-
+-	stdzk "github.com/samuel/go-zookeeper/zk"
+-)
+-
+-var (
+-	host []string
+-)
+-
+-func TestMain(m *testing.M) {
+-	fmt.Println("ZooKeeper Integration Test Initializing. Starting ZooKeeper Server...")
+-	ts, err := stdzk.StartTestCluster(1, nil, nil)
+-	if err != nil {
+-		fmt.Printf("Unable to start ZooKeeper Server: %v\n", err)
+-		os.Exit(-1)
+-	}
+-	defer ts.Stop()
+-	host = []string{fmt.Sprintf("localhost:%d", ts.Servers[0].Port)}
+-	code := m.Run()
+-	os.Exit(code)
+-}
+-
+-func TestCreateParentNodesOnServer(t *testing.T) {
+-	payload := [][]byte{[]byte("Payload"), []byte("Test")}
+-	c1, err := NewClient(host, logger, Payload(payload))
+-	if err != nil {
+-		t.Fatalf("Connect returned error: %v", err)
+-	}
+-	if c1 == nil {
+-		t.Fatal("Expected pointer to client, got nil")
+-	}
+-	defer c1.Stop()
+-
+-	p, err := NewPublisher(c1, path, newFactory(""), logger)
+-	if err != nil {
+-		t.Fatalf("Unable to create Publisher: %v", err)
+-	}
+-	defer p.Stop()
+-
+-	endpoints, err := p.Endpoints()
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if want, have := 0, len(endpoints); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-
+-	c2, err := NewClient(host, logger)
+-	if err != nil {
+-		t.Fatalf("Connect returned error: %v", err)
+-	}
+-	defer c2.Stop()
+-	data, _, err := c2.(*client).Get(path)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	// test Client implementation of CreateParentNodes. It should have created
+-	// our payload
+-	if bytes.Compare(data, payload[1]) != 0 {
+-		t.Errorf("want %s, have %s", payload[1], data)
+-	}
+-
+-}
+-
+-func TestCreateBadParentNodesOnServer(t *testing.T) {
+-	c, _ := NewClient(host, logger)
+-	defer c.Stop()
+-
+-	_, err := NewPublisher(c, "invalid/path", newFactory(""), logger)
+-
+-	if want, have := stdzk.ErrInvalidPath, err; want != have {
+-		t.Errorf("want %v, have %v", want, have)
+-	}
+-}
+-
+-func TestCredentials1(t *testing.T) {
+-	acl := stdzk.DigestACL(stdzk.PermAll, "user", "secret")
+-	c, _ := NewClient(host, logger, ACL(acl), Credentials("user", "secret"))
+-	defer c.Stop()
+-
+-	_, err := NewPublisher(c, "/acl-issue-test", newFactory(""), logger)
+-
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-}
+-
+-func TestCredentials2(t *testing.T) {
+-	acl := stdzk.DigestACL(stdzk.PermAll, "user", "secret")
+-	c, _ := NewClient(host, logger, ACL(acl))
+-	defer c.Stop()
+-
+-	_, err := NewPublisher(c, "/acl-issue-test", newFactory(""), logger)
+-
+-	if err != stdzk.ErrNoAuth {
+-		t.Errorf("want %v, have %v", stdzk.ErrNoAuth, err)
+-	}
+-}
+-
+-func TestConnection(t *testing.T) {
+-	c, _ := NewClient(host, logger)
+-	c.Stop()
+-
+-	_, err := NewPublisher(c, "/acl-issue-test", newFactory(""), logger)
+-
+-	if err != ErrClientClosed {
+-		t.Errorf("want %v, have %v", ErrClientClosed, err)
+-	}
+-}
+-
+-func TestGetEntriesOnServer(t *testing.T) {
+-	var instancePayload = "protocol://hostname:port/routing"
+-
+-	c1, err := NewClient(host, logger)
+-	if err != nil {
+-		t.Fatalf("Connect returned error: %v", err)
+-	}
+-
+-	defer c1.Stop()
+-
+-	c2, err := NewClient(host, logger)
+-	p, err := NewPublisher(c2, path, newFactory(""), logger)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	defer c2.Stop()
+-
+-	c2impl, _ := c2.(*client)
+-	_, err = c2impl.Create(
+-		path+"/instance1",
+-		[]byte(instancePayload),
+-		stdzk.FlagEphemeral|stdzk.FlagSequence,
+-		stdzk.WorldACL(stdzk.PermAll),
+-	)
+-	if err != nil {
+-		t.Fatalf("Unable to create test ephemeral znode 1: %v", err)
+-	}
+-	_, err = c2impl.Create(
+-		path+"/instance2",
+-		[]byte(instancePayload+"2"),
+-		stdzk.FlagEphemeral|stdzk.FlagSequence,
+-		stdzk.WorldACL(stdzk.PermAll),
+-	)
+-	if err != nil {
+-		t.Fatalf("Unable to create test ephemeral znode 2: %v", err)
+-	}
+-
+-	time.Sleep(50 * time.Millisecond)
+-
+-	endpoints, err := p.Endpoints()
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if want, have := 2, len(endpoints); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-}
+-
+-func TestGetEntriesPayloadOnServer(t *testing.T) {
+-	c, err := NewClient(host, logger)
+-	if err != nil {
+-		t.Fatalf("Connect returned error: %v", err)
+-	}
+-	_, eventc, err := c.GetEntries(path)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	_, err = c.(*client).Create(
+-		path+"/instance3",
+-		[]byte("just some payload"),
+-		stdzk.FlagEphemeral|stdzk.FlagSequence,
+-		stdzk.WorldACL(stdzk.PermAll),
+-	)
+-	if err != nil {
+-		t.Fatalf("Unable to create test ephemeral znode: %v", err)
+-	}
+-	select {
+-	case event := <-eventc:
+-		if want, have := stdzk.EventNodeChildrenChanged.String(), event.Type.String(); want != have {
+-			t.Errorf("want %s, have %s", want, have)
+-		}
+-	case <-time.After(20 * time.Millisecond):
+-		t.Errorf("expected incoming watch event, timeout occurred")
+-	}
+-
+-}
+diff --git a/loadbalancer/zk/logwrapper.go b/loadbalancer/zk/logwrapper.go
+deleted file mode 100644
+index e4fd3c4..0000000
+--- a/loadbalancer/zk/logwrapper.go
++++ /dev/null
+@@ -1,27 +0,0 @@
+-package zk
+-
+-import (
+-	"fmt"
+-
+-	"github.com/samuel/go-zookeeper/zk"
+-
+-	"github.com/go-kit/kit/log"
+-)
+-
+-// wrapLogger wraps a go-kit logger so we can use it as the logging service for
+-// the ZooKeeper library (which expects a Printf method to be available)
+-type wrapLogger struct {
+-	log.Logger
+-}
+-
+-func (logger wrapLogger) Printf(str string, vars ...interface{}) {
+-	logger.Log("msg", fmt.Sprintf(str, vars...))
+-}
+-
+-// withLogger replaces the ZooKeeper library's default logging service for our
+-// own go-kit logger
+-func withLogger(logger log.Logger) func(c *zk.Conn) {
+-	return func(c *zk.Conn) {
+-		c.SetLogger(wrapLogger{logger})
+-	}
+-}
+diff --git a/loadbalancer/zk/publisher.go b/loadbalancer/zk/publisher.go
+deleted file mode 100644
+index 977a03c..0000000
+--- a/loadbalancer/zk/publisher.go
++++ /dev/null
+@@ -1,83 +0,0 @@
+-package zk
+-
+-import (
+-	"github.com/go-kit/kit/endpoint"
+-	"github.com/go-kit/kit/loadbalancer"
+-	"github.com/go-kit/kit/log"
+-	"github.com/samuel/go-zookeeper/zk"
+-)
+-
+-// Publisher yield endpoints stored in a certain ZooKeeper path. Any kind of
+-// change in that path is watched and will update the Publisher endpoints.
+-type Publisher struct {
+-	client Client
+-	path   string
+-	cache  *loadbalancer.EndpointCache
+-	logger log.Logger
+-	quit   chan struct{}
+-}
+-
+-// NewPublisher returns a ZooKeeper publisher. ZooKeeper will start watching the
+-// given path for changes and update the Publisher endpoints.
+-func NewPublisher(c Client, path string, f loadbalancer.Factory, logger log.Logger) (*Publisher, error) {
+-	p := &Publisher{
+-		client: c,
+-		path:   path,
+-		cache:  loadbalancer.NewEndpointCache(f, logger),
+-		logger: logger,
+-		quit:   make(chan struct{}),
+-	}
+-
+-	err := p.client.CreateParentNodes(p.path)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	// intial node retrieval and cache fill
+-	instances, eventc, err := p.client.GetEntries(p.path)
+-	if err != nil {
+-		logger.Log("path", p.path, "msg", "failed to retrieve entries", "err", err)
+-		return nil, err
+-	}
+-	logger.Log("path", p.path, "instances", len(instances))
+-	p.cache.Replace(instances)
+-
+-	// handle incoming path updates
+-	go p.loop(eventc)
+-
+-	return p, nil
+-}
+-
+-func (p *Publisher) loop(eventc <-chan zk.Event) {
+-	var (
+-		instances []string
+-		err       error
+-	)
+-	for {
+-		select {
+-		case <-eventc:
+-			// we received a path update notification, call GetEntries to
+-			// retrieve child node data and set new watch as zk watches are one
+-			// time triggers
+-			instances, eventc, err = p.client.GetEntries(p.path)
+-			if err != nil {
+-				p.logger.Log("path", p.path, "msg", "failed to retrieve entries", "err", err)
+-				continue
+-			}
+-			p.logger.Log("path", p.path, "instances", len(instances))
+-			p.cache.Replace(instances)
+-		case <-p.quit:
+-			return
+-		}
+-	}
+-}
+-
+-// Endpoints implements the Publisher interface.
+-func (p *Publisher) Endpoints() ([]endpoint.Endpoint, error) {
+-	return p.cache.Endpoints()
+-}
+-
+-// Stop terminates the Publisher.
+-func (p *Publisher) Stop() {
+-	close(p.quit)
+-}
+diff --git a/loadbalancer/zk/publisher_test.go b/loadbalancer/zk/publisher_test.go
+deleted file mode 100644
+index 6d8ff2f..0000000
+--- a/loadbalancer/zk/publisher_test.go
++++ /dev/null
+@@ -1,211 +0,0 @@
+-package zk
+-
+-import (
+-	"errors"
+-	"io"
+-	"testing"
+-	"time"
+-
+-	"golang.org/x/net/context"
+-
+-	"github.com/go-kit/kit/endpoint"
+-	"github.com/go-kit/kit/loadbalancer"
+-	"github.com/go-kit/kit/log"
+-	"github.com/samuel/go-zookeeper/zk"
+-)
+-
+-var (
+-	path   = "/gokit.test/service.name"
+-	e      = func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil }
+-	logger = log.NewNopLogger()
+-)
+-
+-func TestPublisher(t *testing.T) {
+-	client := newFakeClient()
+-
+-	p, err := NewPublisher(client, path, newFactory(""), logger)
+-	if err != nil {
+-		t.Fatalf("failed to create new publisher: %v", err)
+-	}
+-	defer p.Stop()
+-
+-	if _, err := p.Endpoints(); err != nil {
+-		t.Fatal(err)
+-	}
+-}
+-
+-func TestBadFactory(t *testing.T) {
+-	client := newFakeClient()
+-
+-	p, err := NewPublisher(client, path, newFactory("kaboom"), logger)
+-	if err != nil {
+-		t.Fatalf("failed to create new publisher: %v", err)
+-	}
+-	defer p.Stop()
+-
+-	endpoints, err := p.Endpoints()
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	// instance1 came online
+-	client.AddService(path+"/instance1", "zookeeper_node_data")
+-
+-	if want, have := 0, len(endpoints); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-}
+-
+-func TestServiceUpdate(t *testing.T) {
+-	client := newFakeClient()
+-
+-	p, err := NewPublisher(client, path, newFactory(""), logger)
+-	if err != nil {
+-		t.Fatalf("failed to create new publisher: %v", err)
+-	}
+-	defer p.Stop()
+-
+-	endpoints, err := p.Endpoints()
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if want, have := 0, len(endpoints); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-
+-	// instance1 came online
+-	client.AddService(path+"/instance1", "zookeeper_node_data")
+-
+-	// test if we received the instance
+-	endpoints, err = p.Endpoints()
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if want, have := 1, len(endpoints); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-
+-	// instance2 came online
+-	client.AddService(path+"/instance2", "zookeeper_node_data2")
+-
+-	// test if we received the instance
+-	endpoints, err = p.Endpoints()
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if want, have := 2, len(endpoints); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-
+-	// watch triggers an error...
+-	client.SendErrorOnWatch()
+-
+-	// test if we ignored the empty instance response due to the error
+-	endpoints, err = p.Endpoints()
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if want, have := 2, len(endpoints); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-
+-	// instances go offline
+-	client.RemoveService(path + "/instance1")
+-	client.RemoveService(path + "/instance2")
+-
+-	endpoints, err = p.Endpoints()
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if want, have := 0, len(endpoints); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-}
+-
+-func TestBadPublisherCreate(t *testing.T) {
+-	client := newFakeClient()
+-	client.SendErrorOnWatch()
+-	p, err := NewPublisher(client, path, newFactory(""), logger)
+-	if err == nil {
+-		t.Errorf("expected error on new publisher")
+-	}
+-	if p != nil {
+-		t.Errorf("expected publisher not to be created")
+-	}
+-	p, err = NewPublisher(client, "BadPath", newFactory(""), logger)
+-	if err == nil {
+-		t.Errorf("expected error on new publisher")
+-	}
+-	if p != nil {
+-		t.Errorf("expected publisher not to be created")
+-	}
+-}
+-
+-type fakeClient struct {
+-	ch        chan zk.Event
+-	responses map[string]string
+-	result    bool
+-}
+-
+-func newFakeClient() *fakeClient {
+-	return &fakeClient{
+-		make(chan zk.Event, 1),
+-		make(map[string]string),
+-		true,
+-	}
+-}
+-
+-func (c *fakeClient) CreateParentNodes(path string) error {
+-	if path == "BadPath" {
+-		return errors.New("Dummy Error")
+-	}
+-	return nil
+-}
+-
+-func (c *fakeClient) GetEntries(path string) ([]string, <-chan zk.Event, error) {
+-	responses := []string{}
+-	if c.result == false {
+-		c.result = true
+-		return responses, c.ch, errors.New("Dummy Error")
+-	}
+-	for _, data := range c.responses {
+-		responses = append(responses, data)
+-	}
+-	return responses, c.ch, nil
+-}
+-
+-func (c *fakeClient) AddService(node, data string) {
+-	c.responses[node] = data
+-	c.triggerWatch()
+-}
+-
+-func (c *fakeClient) RemoveService(node string) {
+-	delete(c.responses, node)
+-	c.triggerWatch()
+-}
+-
+-func (c *fakeClient) SendErrorOnWatch() {
+-	c.result = false
+-	c.triggerWatch()
+-}
+-
+-func (c *fakeClient) Stop() {}
+-
+-func newFactory(fakeError string) loadbalancer.Factory {
+-	return func(string) (endpoint.Endpoint, io.Closer, error) {
+-		if fakeError == "" {
+-			return e, nil, nil
+-		}
+-		return nil, nil, errors.New(fakeError)
+-	}
+-}
+-
+-func (c *fakeClient) triggerWatch() {
+-	c.ch <- zk.Event{}
+-	// watches on ZooKeeper Nodes trigger once, most ZooKeeper libraries also
+-	// implement "fire once" channels for these watches
+-	close(c.ch)
+-	c.ch = make(chan zk.Event, 1)
+-
+-	// make sure we allow the Publisher to handle this update
+-	time.Sleep(1 * time.Millisecond)
+-}

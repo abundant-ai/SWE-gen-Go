@@ -1,0 +1,565 @@
+diff --git a/cluster.go b/cluster.go
+index 2759d8fd..ea312284 100644
+--- a/cluster.go
++++ b/cluster.go
+@@ -6,10 +6,8 @@ import (
+ 	"fmt"
+ 	"math"
+ 	"net"
+-	"net/url"
+ 	"runtime"
+ 	"sort"
+-	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -133,123 +131,6 @@ func (opt *ClusterOptions) init() {
+ 	}
+ }
+ 
+-// ParseClusterURL parses a URL into ClusterOptions that can be used to connect to Redis.
+-// The URL must be in the form:
+-//		redis://<user>:<password>@<host>:<port>
+-//		or
+-//		rediss://<user>:<password>@<host>:<port>
+-// To add additional addresses, specify the query parameter, "addr" one or more times. e.g:
+-//		redis://<user>:<password>@<host>:<port>?addr=<host2>:<port2>&addr=<host3>:<port3>
+-//		or
+-//		rediss://<user>:<password>@<host>:<port>?addr=<host2>:<port2>&addr=<host3>:<port3>
+-//
+-// Most Option fields can be set using query parameters, with the following restrictions:
+-//	- field names are mapped using snake-case conversion: to set MaxRetries, use max_retries
+-//	- only scalar type fields are supported (bool, int, time.Duration)
+-//	- for time.Duration fields, values must be a valid input for time.ParseDuration();
+-//	  additionally a plain integer as value (i.e. without unit) is intepreted as seconds
+-//	- to disable a duration field, use value less than or equal to 0; to use the default
+-//	  value, leave the value blank or remove the parameter
+-//	- only the last value is interpreted if a parameter is given multiple times
+-//	- fields "network", "addr", "username" and "password" can only be set using other
+-//	  URL attributes (scheme, host, userinfo, resp.), query paremeters using these
+-//	  names will be treated as unknown parameters
+-//	- unknown parameter names will result in an error
+-// Example:
+-//		redis://user:password@localhost:6789?dial_timeout=3&read_timeout=6s&addr=localhost:6790&addr=localhost:6791
+-//		is equivalent to:
+-//		&ClusterOptions{
+-//			Addr:        ["localhost:6789", "localhost:6790", "localhost:6791"]
+-//			DialTimeout: 3 * time.Second, // no time unit = seconds
+-//			ReadTimeout: 6 * time.Second,
+-//		}
+-func ParseClusterURL(redisURL string) (*ClusterOptions, error) {
+-	o := &ClusterOptions{}
+-
+-	u, err := url.Parse(redisURL)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	// add base URL to the array of addresses
+-	// more addresses may be added through the URL params
+-	h, p := getHostPortWithDefaults(u)
+-	o.Addrs = append(o.Addrs, net.JoinHostPort(h, p))
+-
+-	// setup username, password, and other configurations
+-	o, err = setupClusterConn(u, h, o)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return o, nil
+-}
+-
+-// setupClusterConn gets the username and password from the URL and the query parameters.
+-func setupClusterConn(u *url.URL, host string, o *ClusterOptions) (*ClusterOptions, error) {
+-	switch u.Scheme {
+-	case "rediss":
+-		o.TLSConfig = &tls.Config{ServerName: host}
+-		fallthrough
+-	case "redis":
+-		o.Username, o.Password = getUserPassword(u)
+-	default:
+-		return nil, fmt.Errorf("redis: invalid URL scheme: %s", u.Scheme)
+-	}
+-
+-	// retrieve the configuration from the query parameters
+-	o, err := setupClusterQueryParams(u, o)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return o, nil
+-}
+-
+-// setupClusterQueryParams converts query parameters in u to option value in o.
+-func setupClusterQueryParams(u *url.URL, o *ClusterOptions) (*ClusterOptions, error) {
+-	q := queryOptions{q: u.Query()}
+-
+-	o.MaxRedirects = q.int("max_redirects")
+-	o.ReadOnly = q.bool("read_only")
+-	o.RouteByLatency = q.bool("route_by_latency")
+-	o.RouteByLatency = q.bool("route_randomly")
+-	o.MaxRetries = q.int("max_retries")
+-	o.MinRetryBackoff = q.duration("min_retry_backoff")
+-	o.MaxRetryBackoff = q.duration("max_retry_backoff")
+-	o.DialTimeout = q.duration("dial_timeout")
+-	o.ReadTimeout = q.duration("read_timeout")
+-	o.WriteTimeout = q.duration("write_timeout")
+-	o.PoolFIFO = q.bool("pool_fifo")
+-	o.PoolSize = q.int("pool_size")
+-	o.MinIdleConns = q.int("min_idle_conns")
+-	o.PoolTimeout = q.duration("pool_timeout")
+-	o.ConnMaxLifetime = q.duration("conn_max_lifetime")
+-	o.ConnMaxIdleTime = q.duration("conn_max_idle_time")
+-
+-	if q.err != nil {
+-		return nil, q.err
+-	}
+-
+-	// addr can be specified as many times as needed
+-	addrs := q.strings("addr")
+-	for _, addr := range addrs {
+-		h, p, err := net.SplitHostPort(addr)
+-		if err != nil || h == "" || p == "" {
+-			return nil, fmt.Errorf("redis: unable to parse addr param: %s", addr)
+-		}
+-
+-		o.Addrs = append(o.Addrs, net.JoinHostPort(h, p))
+-	}
+-
+-	// any parameters left?
+-	if r := q.remaining(); len(r) > 0 {
+-		return nil, fmt.Errorf("redis: unexpected option: %s", strings.Join(r, ", "))
+-	}
+-
+-	return o, nil
+-}
+-
+ func (opt *ClusterOptions) clientOptions() *Options {
+ 	return &Options{
+ 		Dialer:    opt.Dialer,
+@@ -1656,6 +1537,7 @@ func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) *Pub
+ 	return pubsub
+ }
+ 
++
+ func (c *ClusterClient) retryBackoff(attempt int) time.Duration {
+ 	return internal.RetryBackoff(attempt, c.opt.MinRetryBackoff, c.opt.MaxRetryBackoff)
+ }
+diff --git a/cluster_test.go b/cluster_test.go
+index 72938a2b..e503ea84 100644
+--- a/cluster_test.go
++++ b/cluster_test.go
+@@ -2,19 +2,15 @@ package redis_test
+ 
+ import (
+ 	"context"
+-	"crypto/tls"
+-	"errors"
+ 	"fmt"
+ 	"net"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+-	"testing"
+ 	"time"
+ 
+ 	. "github.com/onsi/ginkgo"
+ 	. "github.com/onsi/gomega"
+-	"github.com/stretchr/testify/assert"
+ 
+ 	"github.com/go-redis/redis/v9"
+ 	"github.com/go-redis/redis/v9/internal/hashtag"
+@@ -1300,138 +1296,3 @@ var _ = Describe("ClusterClient timeout", func() {
+ 		testTimeout()
+ 	})
+ })
+-
+-func TestParseClusterURL(t *testing.T) {
+-	cases := []struct {
+-		test string
+-		url  string
+-		o    *redis.ClusterOptions // expected value
+-		err  error
+-	}{
+-		{
+-			test: "ParseRedisURL",
+-			url:  "redis://localhost:123",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123"}},
+-		}, {
+-			test: "ParseRedissURL",
+-			url:  "rediss://localhost:123",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123"}, TLSConfig: &tls.Config{ServerName: "localhost"}},
+-		}, {
+-			test: "MissingRedisPort",
+-			url:  "redis://localhost",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:6379"}},
+-		}, {
+-			test: "MissingRedissPort",
+-			url:  "rediss://localhost",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:6379"}, TLSConfig: &tls.Config{ServerName: "localhost"}},
+-		}, {
+-			test: "MultipleRedisURLs",
+-			url:  "redis://localhost:123?addr=localhost:1234&addr=localhost:12345",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123", "localhost:1234", "localhost:12345"}},
+-		}, {
+-			test: "MultipleRedissURLs",
+-			url:  "rediss://localhost:123?addr=localhost:1234&addr=localhost:12345",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123", "localhost:1234", "localhost:12345"}, TLSConfig: &tls.Config{ServerName: "localhost"}},
+-		}, {
+-			test: "OnlyPassword",
+-			url:  "redis://:bar@localhost:123",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123"}, Password: "bar"},
+-		}, {
+-			test: "OnlyUser",
+-			url:  "redis://foo@localhost:123",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123"}, Username: "foo"},
+-		}, {
+-			test: "RedisUsernamePassword",
+-			url:  "redis://foo:bar@localhost:123",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123"}, Username: "foo", Password: "bar"},
+-		}, {
+-			test: "RedissUsernamePassword",
+-			url:  "rediss://foo:bar@localhost:123?addr=localhost:1234",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123", "localhost:1234"}, Username: "foo", Password: "bar", TLSConfig: &tls.Config{ServerName: "localhost"}},
+-		}, {
+-			test: "QueryParameters",
+-			url:  "redis://localhost:123?read_timeout=2&pool_fifo=true&addr=localhost:1234",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123", "localhost:1234"}, ReadTimeout: 2 * time.Second, PoolFIFO: true},
+-		}, {
+-			test: "DisabledTimeout",
+-			url:  "redis://localhost:123?conn_max_idle_time=0",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123"}, ConnMaxIdleTime: -1},
+-		}, {
+-			test: "DisabledTimeoutNeg",
+-			url:  "redis://localhost:123?conn_max_idle_time=-1",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123"}, ConnMaxIdleTime: -1},
+-		}, {
+-			test: "UseDefault",
+-			url:  "redis://localhost:123?conn_max_idle_time=",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123"}, ConnMaxIdleTime: 0},
+-		}, {
+-			test: "UseDefaultMissing=",
+-			url:  "redis://localhost:123?conn_max_idle_time",
+-			o:    &redis.ClusterOptions{Addrs: []string{"localhost:123"}, ConnMaxIdleTime: 0},
+-		}, {
+-			test: "InvalidQueryAddr",
+-			url:  "rediss://foo:bar@localhost:123?addr=rediss://foo:barr@localhost:1234",
+-			err:  errors.New(`redis: unable to parse addr param: rediss://foo:barr@localhost:1234`),
+-		}, {
+-			test: "InvalidInt",
+-			url:  "redis://localhost?pool_size=five",
+-			err:  errors.New(`redis: invalid pool_size number: strconv.Atoi: parsing "five": invalid syntax`),
+-		}, {
+-			test: "InvalidBool",
+-			url:  "redis://localhost?pool_fifo=yes",
+-			err:  errors.New(`redis: invalid pool_fifo boolean: expected true/false/1/0 or an empty string, got "yes"`),
+-		}, {
+-			test: "UnknownParam",
+-			url:  "redis://localhost?abc=123",
+-			err:  errors.New("redis: unexpected option: abc"),
+-		}, {
+-			test: "InvalidScheme",
+-			url:  "https://google.com",
+-			err:  errors.New("redis: invalid URL scheme: https"),
+-		},
+-	}
+-
+-	for i := range cases {
+-		tc := cases[i]
+-		t.Run(tc.test, func(t *testing.T) {
+-			t.Parallel()
+-
+-			actual, err := redis.ParseClusterURL(tc.url)
+-			if tc.err == nil && err != nil {
+-				t.Fatalf("unexpected error: %q", err)
+-				return
+-			}
+-			if tc.err != nil && err == nil {
+-				t.Fatalf("expected error: got %+v", actual)
+-				return
+-			}
+-			if tc.err != nil && err != nil {
+-				if tc.err.Error() != err.Error() {
+-					t.Fatalf("got %q, expected %q", err, tc.err)
+-				}
+-				return
+-			}
+-			comprareOptions(t, actual, tc.o)
+-		})
+-	}
+-}
+-
+-func comprareOptions(t *testing.T, actual, expected *redis.ClusterOptions) {
+-	t.Helper()
+-	assert.Equal(t, expected.Addrs, actual.Addrs)
+-	assert.Equal(t, expected.TLSConfig, actual.TLSConfig)
+-	assert.Equal(t, expected.Username, actual.Username)
+-	assert.Equal(t, expected.Password, actual.Password)
+-	assert.Equal(t, expected.MaxRetries, actual.MaxRetries)
+-	assert.Equal(t, expected.MinRetryBackoff, actual.MinRetryBackoff)
+-	assert.Equal(t, expected.MaxRetryBackoff, actual.MaxRetryBackoff)
+-	assert.Equal(t, expected.DialTimeout, actual.DialTimeout)
+-	assert.Equal(t, expected.ReadTimeout, actual.ReadTimeout)
+-	assert.Equal(t, expected.WriteTimeout, actual.WriteTimeout)
+-	assert.Equal(t, expected.PoolFIFO, actual.PoolFIFO)
+-	assert.Equal(t, expected.PoolSize, actual.PoolSize)
+-	assert.Equal(t, expected.MinIdleConns, actual.MinIdleConns)
+-	assert.Equal(t, expected.ConnMaxLifetime, actual.ConnMaxLifetime)
+-	assert.Equal(t, expected.ConnMaxIdleTime, actual.ConnMaxIdleTime)
+-	assert.Equal(t, expected.PoolTimeout, actual.PoolTimeout)
+-}
+diff --git a/go.mod b/go.mod
+index bc8294b7..08694d0f 100644
+--- a/go.mod
++++ b/go.mod
+@@ -7,19 +7,15 @@ require (
+ 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f
+ 	github.com/onsi/ginkgo v1.16.5
+ 	github.com/onsi/gomega v1.20.2
+-	github.com/stretchr/testify v1.5.1
+ )
+ 
+ require (
+-	github.com/davecgh/go-spew v1.1.1 // indirect
+ 	github.com/fsnotify/fsnotify v1.4.9 // indirect
+ 	github.com/google/go-cmp v0.5.8 // indirect
+ 	github.com/nxadm/tail v1.4.8 // indirect
+-	github.com/pmezard/go-difflib v1.0.0 // indirect
+ 	golang.org/x/net v0.0.0-20220722155237-a158d28d115b // indirect
+ 	golang.org/x/sys v0.0.0-20220722155257-8c9f86f7a55f // indirect
+ 	golang.org/x/text v0.3.7 // indirect
+ 	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 // indirect
+-	gopkg.in/yaml.v2 v2.3.0 // indirect
+ 	gopkg.in/yaml.v3 v3.0.1 // indirect
+ )
+diff --git a/go.sum b/go.sum
+index 6c39f42e..3524872a 100644
+--- a/go.sum
++++ b/go.sum
+@@ -1,7 +1,9 @@
+ github.com/cespare/xxhash/v2 v2.1.2 h1:YRXhKfTDauu4ajMg1TPgFO5jnlC2HCbmLXMcTG5cbYE=
+ github.com/cespare/xxhash/v2 v2.1.2/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
++github.com/chzyer/logex v1.1.10/go.mod h1:+Ywpsq7O8HXn0nuIou7OrIPyXbp3wmkHB+jjWRnGsAI=
++github.com/chzyer/readline v0.0.0-20180603132655-2972be24d48e/go.mod h1:nSuG5e5PlCu98SY8svDHJxuZscDgtXS6KTTbou5AhLI=
++github.com/chzyer/test v0.0.0-20180213035817-a1ea475d72b1/go.mod h1:Q3SI9o4m/ZMnBNeIyt5eFwwo7qiLfzFZmjNmxjkiQlU=
+ github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+-github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
+ github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/rVNCu3HqELle0jiPLLBs70cWOduZpkS1E78=
+ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
+@@ -16,63 +18,99 @@ github.com/golang/protobuf v1.4.0-rc.2/go.mod h1:LlEzMj4AhA7rCAGe4KMBDvJI+AwstrU
+ github.com/golang/protobuf v1.4.0-rc.4.0.20200313231945-b860323f09d0/go.mod h1:WU3c8KckQ9AFe+yFwt9sWVRKCVIyN9cPHBJSNnbL67w=
+ github.com/golang/protobuf v1.4.0/go.mod h1:jodUvKwWbYaEsadDk5Fwe5c77LiNKVO9IDvqG2KuDX0=
+ github.com/golang/protobuf v1.4.2/go.mod h1:oDoupMAO8OvCJWAcko0GGGIgR6R6ocIYbsSw735rRwI=
++github.com/golang/protobuf v1.5.0/go.mod h1:FsONVRAS9T7sI+LIUmWTfcYkHO4aIWwzhcaSAoJOfIk=
+ github.com/golang/protobuf v1.5.2 h1:ROPKBNFfQgOUMifHyP+KYbvpjbdoFNs+aK7DXlji0Tw=
++github.com/golang/protobuf v1.5.2/go.mod h1:XVQd3VNwM+JqD3oG2Ue2ip4fOMUkwXdXDdiuN0vRsmY=
+ github.com/google/go-cmp v0.3.0/go.mod h1:8QqcDgzrUqlUb/G2PQTWiueGozuR1884gddMywk6iLU=
+ github.com/google/go-cmp v0.3.1/go.mod h1:8QqcDgzrUqlUb/G2PQTWiueGozuR1884gddMywk6iLU=
+ github.com/google/go-cmp v0.4.0/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=
++github.com/google/go-cmp v0.5.5/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=
+ github.com/google/go-cmp v0.5.8 h1:e6P7q2lk1O+qJJb4BtCQXlK8vWEO8V1ZeuEdJNOqZyg=
+ github.com/google/go-cmp v0.5.8/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
++github.com/google/pprof v0.0.0-20210407192527-94a9f03dee38/go.mod h1:kpwsk12EmLew5upagYY7GY0pfYCcupk39gWOCRROcvE=
+ github.com/hpcloud/tail v1.0.0/go.mod h1:ab1qPbhIpdTxEkNHXyeSf5vhxWSCs/tWer42PpOxQnU=
++github.com/ianlancetaylor/demangle v0.0.0-20200824232613-28f6c0f3b639/go.mod h1:aSSvb/t6k1mPoxDqO4vJh6VOCGPwU4O0C2/Eqndh1Sc=
+ github.com/nxadm/tail v1.4.4/go.mod h1:kenIhsEOeOJmVchQTgglprH7qJGnHDVpk1VPCcaMI8A=
+ github.com/nxadm/tail v1.4.8 h1:nPr65rt6Y5JFSKQO7qToXr7pePgD6Gwiw05lkbyAQTE=
+ github.com/nxadm/tail v1.4.8/go.mod h1:+ncqLTQzXmGhMZNUePPaPqPvBxHAIsmXswZKocGu+AU=
+ github.com/onsi/ginkgo v1.6.0/go.mod h1:lLunBs/Ym6LB5Z9jYTR76FiuTmxDTDusOGeTQH+WWjE=
+ github.com/onsi/ginkgo v1.12.1/go.mod h1:zj2OWP4+oCPe1qIXoGWkgMRwljMUYCdkwsT2108oapk=
++github.com/onsi/ginkgo v1.16.4/go.mod h1:dX+/inL/fNMqNlz0e9LfyB9TswhZpCVdJM/Z6Vvnwo0=
+ github.com/onsi/ginkgo v1.16.5 h1:8xi0RTUf59SOSfEtZMvwTvXYMzG4gV23XVHOZiXNtnE=
+ github.com/onsi/ginkgo v1.16.5/go.mod h1:+E8gABHa3K6zRBolWtd+ROzc/U5bkGt0FwiG042wbpU=
++github.com/onsi/ginkgo/v2 v2.1.3/go.mod h1:vw5CSIxN1JObi/U8gcbwft7ZxR2dgaR70JSE3/PpL4c=
++github.com/onsi/ginkgo/v2 v2.1.4/go.mod h1:um6tUpWM/cxCK3/FK8BXqEiUMUwRgSM4JXG47RKZmLU=
+ github.com/onsi/ginkgo/v2 v2.1.6 h1:Fx2POJZfKRQcM1pH49qSZiYeu319wji004qX+GDovrU=
++github.com/onsi/ginkgo/v2 v2.1.6/go.mod h1:MEH45j8TBi6u9BMogfbp0stKC5cdGjumZj5Y7AG4VIk=
+ github.com/onsi/gomega v1.7.1/go.mod h1:XdKZgCCFLUoM/7CFJVPcG8C1xQ1AJ0vpAezJrB7JYyY=
+ github.com/onsi/gomega v1.10.1/go.mod h1:iN09h71vgCQne3DLsj+A5owkum+a2tYe+TOCB1ybHNo=
++github.com/onsi/gomega v1.17.0/go.mod h1:HnhC7FXeEQY45zxNK3PPoIUhzk/80Xly9PcubAlGdZY=
++github.com/onsi/gomega v1.19.0/go.mod h1:LY+I3pBVzYsTBU1AnDwOSxaYi9WoWiqgwooUqq9yPro=
++github.com/onsi/gomega v1.20.1/go.mod h1:DtrZpjmvpn2mPm4YWQa0/ALMDj9v4YxLgojwPeREyVo=
+ github.com/onsi/gomega v1.20.2 h1:8uQq0zMgLEfa0vRrrBgaJF2gyW9Da9BmfGV+OyUzfkY=
+ github.com/onsi/gomega v1.20.2/go.mod h1:iYAIXgPSaDHak0LCMA+AWBpIKBr8WZicMxnE8luStNc=
+-github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
+ github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+ github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
+-github.com/stretchr/testify v1.5.1 h1:nOGnQDM7FYENwehXlg/kFVnos3rEvtKTjRvOWSzb6H4=
+ github.com/stretchr/testify v1.5.1/go.mod h1:5W2xD1RspED5o8YsWQXVCued0rvSQ+mT+I5cxcmMvtA=
+ github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
++github.com/yuin/goldmark v1.4.1/go.mod h1:mwnBkeHKe2W/ZEtQ+71ViKU8L12m81fl3OWwC1Zlc8k=
++github.com/yuin/goldmark v1.4.13/go.mod h1:6yULJ656Px+3vBD8DxQVa3kxgyrAnzto9xy5taEt/CY=
+ golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0+w=
+ golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550/go.mod h1:yigFU9vqHzYiE8UmvKecakEJjdnWj3jj499lnFckfCI=
+ golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9/go.mod h1:LzIPMQfyMNhhGPhUkYOs5KpL4U8rLKemX1yGLhDgUto=
++golang.org/x/crypto v0.0.0-20210921155107-089bfa567519/go.mod h1:GvvjBRRGRdwPK5ydBHafDWAxML/pGHZbMvKqRZ5+Abc=
+ golang.org/x/mod v0.3.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
++golang.org/x/mod v0.6.0-dev.0.20220106191415-9b9b3d81d5e3/go.mod h1:3p9vT2HGsQu2K1YbXdKPJLVgG5VJdoTa1poYQBtP1AY=
++golang.org/x/mod v0.6.0-dev.0.20220419223038-86c51ed26bb4/go.mod h1:jJ57K6gSWd91VN4djpZkiMVwK6gcyfeH4XE8wZrZaV4=
+ golang.org/x/net v0.0.0-20180906233101-161cd47e91fd/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+ golang.org/x/net v0.0.0-20190404232315-eb5bcb51f2a3/go.mod h1:t9HGtf8HONx5eT2rtn7q6eTqICYqUVnKs3thJo3Qplg=
+ golang.org/x/net v0.0.0-20190620200207-3b0461eec859/go.mod h1:z5CRVTTTmAJ677TzLLGU+0bjPO0LkuOLi4/5GtJWs/s=
+ golang.org/x/net v0.0.0-20200520004742-59133d7f0dd7/go.mod h1:qpuaurCH72eLCgpAm/N6yyVIVM9cpaDIP3A8BGJEC5A=
+ golang.org/x/net v0.0.0-20201021035429-f5854403a974/go.mod h1:sp8m0HH+o8qH0wwXwYZr8TS3Oi6o0r6Gce1SSxlDquU=
++golang.org/x/net v0.0.0-20210226172049-e18ecbb05110/go.mod h1:m0MpNAwzfU5UDzcl9v0D8zg8gWTRqZa9RBIspLL5mdg=
++golang.org/x/net v0.0.0-20210428140749-89ef3d95e781/go.mod h1:OJAsFXCWl8Ukc7SiCT/9KSuxbyM7479/AVlXFRxuMCk=
++golang.org/x/net v0.0.0-20211015210444-4f30a5c0130f/go.mod h1:9nx3DQGgdP8bBQD5qxJ1jj9UTztislL4KSBs9R2vV5Y=
++golang.org/x/net v0.0.0-20220225172249-27dd8689420f/go.mod h1:CfG3xpIq0wQ8r1q4Su4UZFWDARRcnwPjda9FqA0JpMk=
++golang.org/x/net v0.0.0-20220425223048-2871e0cb64e4/go.mod h1:CfG3xpIq0wQ8r1q4Su4UZFWDARRcnwPjda9FqA0JpMk=
+ golang.org/x/net v0.0.0-20220722155237-a158d28d115b h1:PxfKdU9lEEDYjdIzOtC4qFWgkU2rGHdKlKowJSMN9h0=
+ golang.org/x/net v0.0.0-20220722155237-a158d28d115b/go.mod h1:XRhObCWvk6IyKnWLug+ECip1KBveYUHfp+8e9klMJ9c=
+ golang.org/x/sync v0.0.0-20180314180146-1d60e4601c6f/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.0.0-20190423024810-112230192c58/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
++golang.org/x/sync v0.0.0-20210220032951-036812b2e83c/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
++golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sys v0.0.0-20180909124046-d0be0721c37e/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
+ golang.org/x/sys v0.0.0-20190215142949-d0b11bdaac8a/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
+ golang.org/x/sys v0.0.0-20190412213103-97732733099d/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20190904154756-749cb33beabd/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20191005200804-aed5e4c7ecf9/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20191120155948-bd437916bb0e/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
++golang.org/x/sys v0.0.0-20191204072324-ce4227a45e2e/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200323222414-85ca7c5b95cd/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20200930185726-fdedc70b468f/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
++golang.org/x/sys v0.0.0-20201119102817-f84b799fce68/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20210112080510-489259a85091/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
++golang.org/x/sys v0.0.0-20210423082822-04245dca01da/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
++golang.org/x/sys v0.0.0-20210615035016-665e8c7367d1/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
++golang.org/x/sys v0.0.0-20211019181941-9d821ace8654/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
++golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
++golang.org/x/sys v0.0.0-20220319134239-a9b59b0215f8/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
++golang.org/x/sys v0.0.0-20220422013727-9388b58f7150/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
++golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20220722155257-8c9f86f7a55f h1:v4INt8xihDGvnrfjMDVXGxw9wrfxYyCjk0KbXjhR55s=
+ golang.org/x/sys v0.0.0-20220722155257-8c9f86f7a55f/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
++golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1/go.mod h1:bj7SfCRtBDWHUb9snDiAeCFNEtKQo2Wmx5Cou7ajbmo=
++golang.org/x/term v0.0.0-20210927222741-03fcf44c2211/go.mod h1:jbD1KX2456YbFQfuXm/mYQcufACuNUgVhRMnK/tPxf8=
+ golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
+ golang.org/x/text v0.3.3/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=
++golang.org/x/text v0.3.6/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=
+ golang.org/x/text v0.3.7 h1:olpwvP2KacW1ZWvsR7uQhoyTYvKAupfQrRGBFM352Gk=
+ golang.org/x/text v0.3.7/go.mod h1:u+2+/6zg+i71rQMx5EYifcz6MCKuco9NR6JIITiCfzQ=
+ golang.org/x/tools v0.0.0-20180917221912-90fa682c2a6e/go.mod h1:n7NCudcB/nEzxVGmLbDWY5pfWTLqBcC2KZ6jyYvM4mQ=
+ golang.org/x/tools v0.0.0-20191119224855-298f0cb1881e/go.mod h1:b+2E5dAYhXwXZwtnZ6UAqBI28+e2cm9otk0dWdXHAEo=
+ golang.org/x/tools v0.0.0-20201224043029-2b0845dc783e/go.mod h1:emZCQorbCU4vsT4fOWvOPXz4eW1wZW4PmDk9uLelYpA=
++golang.org/x/tools v0.1.10/go.mod h1:Uh6Zz+xoGYZom868N8YTex3t7RhtHDBrE8Gzo9bV56E=
++golang.org/x/tools v0.1.12/go.mod h1:hNGJHUnrk76NpqgfD5Aqm5Crs+Hm0VOH/i9J2+nxYbc=
+ golang.org/x/xerrors v0.0.0-20190717185122-a985d3407aa7/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+ golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+ golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+@@ -83,7 +121,10 @@ google.golang.org/protobuf v0.0.0-20200228230310-ab0ca4ff8a60/go.mod h1:cfTl7dwQ
+ google.golang.org/protobuf v1.20.1-0.20200309200217-e05f789c0967/go.mod h1:A+miEFZTKqfCUM6K7xSMQL9OKL/b6hQv+e19PK+JZNE=
+ google.golang.org/protobuf v1.21.0/go.mod h1:47Nbq4nVaFHyn7ilMalzfO3qCViNmqZ2kzikPIcrTAo=
+ google.golang.org/protobuf v1.23.0/go.mod h1:EGpADcykh3NcUnDUJcl1+ZksZNG86OlYog2l/sGQquU=
++google.golang.org/protobuf v1.26.0-rc.1/go.mod h1:jlhhOSvTdKEhbULTjvd4ARK9grFBp09yW+WbY/TyQbw=
++google.golang.org/protobuf v1.26.0/go.mod h1:9q0QmTI4eRPtz6boOQmLYwt+qCgq0jsYwAQnmE0givc=
+ google.golang.org/protobuf v1.28.0 h1:w43yiav+6bVFTBQFZX0r7ipe9JQ1QsbMgHwbBziscLw=
++google.golang.org/protobuf v1.28.0/go.mod h1:HV8QOd/L58Z+nl8r43ehVNZIU/HEI6OcFqwMG9pJV4I=
+ gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
+ gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+ gopkg.in/fsnotify.v1 v1.4.7/go.mod h1:Tz8NjZHkW78fSQdbUxIjBTcgA1z1m8ZHf0WmKUhAMys=
+@@ -91,7 +132,7 @@ gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 h1:uRGJdciOHaEIrze2W8Q3AKkep
+ gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7/go.mod h1:dt/ZhP58zS4L8KSrWDmTeBkI65Dw0HsyUHuEVlX15mw=
+ gopkg.in/yaml.v2 v2.2.2/go.mod h1:hI93XBmqTisBFMUTm0b8Fm+jr3Dg1NNxqwp+5A1VGuI=
+ gopkg.in/yaml.v2 v2.2.4/go.mod h1:hI93XBmqTisBFMUTm0b8Fm+jr3Dg1NNxqwp+5A1VGuI=
+-gopkg.in/yaml.v2 v2.3.0 h1:clyUAQHOM3G0M3f5vQj7LuJrETvjVot3Z5el9nffUtU=
+ gopkg.in/yaml.v2 v2.3.0/go.mod h1:hI93XBmqTisBFMUTm0b8Fm+jr3Dg1NNxqwp+5A1VGuI=
++gopkg.in/yaml.v2 v2.4.0/go.mod h1:RDklbk79AGWmwhnvt/jBztapEOGDOx6ZbXqjP6csGnQ=
+ gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+ gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+diff --git a/options.go b/options.go
+index 56791289..c2f9c64c 100644
+--- a/options.go
++++ b/options.go
+@@ -255,7 +255,16 @@ func setupTCPConn(u *url.URL) (*Options, error) {
+ 
+ 	o.Username, o.Password = getUserPassword(u)
+ 
+-	h, p := getHostPortWithDefaults(u)
++	h, p, err := net.SplitHostPort(u.Host)
++	if err != nil {
++		h = u.Host
++	}
++	if h == "" {
++		h = "localhost"
++	}
++	if p == "" {
++		p = "6379"
++	}
+ 	o.Addr = net.JoinHostPort(h, p)
+ 
+ 	f := strings.FieldsFunc(u.Path, func(r rune) bool {
+@@ -265,7 +274,6 @@ func setupTCPConn(u *url.URL) (*Options, error) {
+ 	case 0:
+ 		o.DB = 0
+ 	case 1:
+-		var err error
+ 		if o.DB, err = strconv.Atoi(f[0]); err != nil {
+ 			return nil, fmt.Errorf("redis: invalid database number: %q", f[0])
+ 		}
+@@ -283,23 +291,6 @@ func setupTCPConn(u *url.URL) (*Options, error) {
+ 	return setupConnParams(u, o)
+ }
+ 
+-// getHostPortWithDefaults is a helper function that splits the url into
+-// a host and a port. If the host is missing, it defaults to localhost
+-// and if the port is missing, it defaults to 6379.
+-func getHostPortWithDefaults(u *url.URL) (string, string) {
+-	host, port, err := net.SplitHostPort(u.Host)
+-	if err != nil {
+-		host = u.Host
+-	}
+-	if host == "" {
+-		host = "localhost"
+-	}
+-	if port == "" {
+-		port = "6379"
+-	}
+-	return host, port
+-}
+-
+ func setupUnixConn(u *url.URL) (*Options, error) {
+ 	o := &Options{
+ 		Network: "unix",
+@@ -331,12 +322,6 @@ func (o *queryOptions) string(name string) string {
+ 	return vs[len(vs)-1]
+ }
+ 
+-func (o *queryOptions) strings(name string) []string {
+-	vs := o.q[name]
+-	delete(o.q, name)
+-	return vs
+-}
+-
+ func (o *queryOptions) int(name string) int {
+ 	s := o.string(name)
+ 	if s == "" {
+diff --git a/options_test.go b/options_test.go
+index 47fa9cbc..f9c69a48 100644
+--- a/options_test.go
++++ b/options_test.go
+@@ -46,18 +46,18 @@ func TestParseURL(t *testing.T) {
+ 			o:   &Options{Addr: "localhost:123", DB: 2, ReadTimeout: 2 * time.Second, PoolFIFO: true},
+ 		}, {
+ 			// special case handling for disabled timeouts
+-			url: "redis://localhost:123/?db=2&conn_max_idle_time=0",
++			url: "redis://localhost:123/?db=2&idle_timeout=0",
+ 			o:   &Options{Addr: "localhost:123", DB: 2, ConnMaxIdleTime: -1},
+ 		}, {
+ 			// negative values disable timeouts as well
+-			url: "redis://localhost:123/?db=2&conn_max_idle_time=-1",
++			url: "redis://localhost:123/?db=2&idle_timeout=-1",
+ 			o:   &Options{Addr: "localhost:123", DB: 2, ConnMaxIdleTime: -1},
+ 		}, {
+ 			// absent timeout values will use defaults
+-			url: "redis://localhost:123/?db=2&conn_max_idle_time=",
++			url: "redis://localhost:123/?db=2&idle_timeout=",
+ 			o:   &Options{Addr: "localhost:123", DB: 2, ConnMaxIdleTime: 0},
+ 		}, {
+-			url: "redis://localhost:123/?db=2&conn_max_idle_time", // missing "=" at the end
++			url: "redis://localhost:123/?db=2&idle_timeout", // missing "=" at the end
+ 			o:   &Options{Addr: "localhost:123", DB: 2, ConnMaxIdleTime: 0},
+ 		}, {
+ 			url: "unix:///tmp/redis.sock",

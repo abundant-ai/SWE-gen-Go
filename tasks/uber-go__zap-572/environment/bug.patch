@@ -1,0 +1,359 @@
+diff --git a/sink.go b/sink.go
+deleted file mode 100644
+index 8f3670d..0000000
+--- a/sink.go
++++ /dev/null
+@@ -1,94 +0,0 @@
+-// Copyright (c) 2016 Uber Technologies, Inc.
+-//
+-// Permission is hereby granted, free of charge, to any person obtaining a copy
+-// of this software and associated documentation files (the "Software"), to deal
+-// in the Software without restriction, including without limitation the rights
+-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-// copies of the Software, and to permit persons to whom the Software is
+-// furnished to do so, subject to the following conditions:
+-//
+-// The above copyright notice and this permission notice shall be included in
+-// all copies or substantial portions of the Software.
+-//
+-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+-// THE SOFTWARE.
+-
+-package zap
+-
+-import (
+-	"errors"
+-	"fmt"
+-	"io"
+-	"os"
+-	"sync"
+-
+-	"go.uber.org/zap/zapcore"
+-)
+-
+-var (
+-	_sinkMutex     sync.RWMutex
+-	_sinkFactories map[string]func() (Sink, error)
+-)
+-
+-func init() {
+-	resetSinkRegistry()
+-}
+-
+-func resetSinkRegistry() {
+-	_sinkMutex.Lock()
+-	defer _sinkMutex.Unlock()
+-	_sinkFactories = map[string]func() (Sink, error){
+-		"stdout": func() (Sink, error) { return nopCloserSink{os.Stdout}, nil },
+-		"stderr": func() (Sink, error) { return nopCloserSink{os.Stderr}, nil },
+-	}
+-}
+-
+-type errSinkNotFound struct {
+-	key string
+-}
+-
+-func (e *errSinkNotFound) Error() string {
+-	return fmt.Sprintf("no sink found for %q", e.key)
+-}
+-
+-// Sink defines the interface to write to and close logger destinations.
+-type Sink interface {
+-	zapcore.WriteSyncer
+-	io.Closer
+-}
+-
+-// RegisterSink adds a Sink at the given key so it can be referenced
+-// in config OutputPaths.
+-func RegisterSink(key string, sinkFactory func() (Sink, error)) error {
+-	_sinkMutex.Lock()
+-	defer _sinkMutex.Unlock()
+-	if key == "" {
+-		return errors.New("sink key cannot be blank")
+-	}
+-	if _, ok := _sinkFactories[key]; ok {
+-		return fmt.Errorf("sink already registered for key %q", key)
+-	}
+-	_sinkFactories[key] = sinkFactory
+-	return nil
+-}
+-
+-// newSink invokes the registered sink factory to create and return the
+-// sink for the given key. Returns errSinkNotFound if the key cannot be found.
+-func newSink(key string) (Sink, error) {
+-	_sinkMutex.RLock()
+-	defer _sinkMutex.RUnlock()
+-	sinkFactory, ok := _sinkFactories[key]
+-	if !ok {
+-		return nil, &errSinkNotFound{key}
+-	}
+-	return sinkFactory()
+-}
+-
+-type nopCloserSink struct{ zapcore.WriteSyncer }
+-
+-func (nopCloserSink) Close() error { return nil }
+diff --git a/sink_test.go b/sink_test.go
+deleted file mode 100644
+index c3169b2..0000000
+--- a/sink_test.go
++++ /dev/null
+@@ -1,76 +0,0 @@
+-// Copyright (c) 2016 Uber Technologies, Inc.
+-//
+-// Permission is hereby granted, free of charge, to any person obtaining a copy
+-// of this software and associated documentation files (the "Software"), to deal
+-// in the Software without restriction, including without limitation the rights
+-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-// copies of the Software, and to permit persons to whom the Software is
+-// furnished to do so, subject to the following conditions:
+-//
+-// The above copyright notice and this permission notice shall be included in
+-// all copies or substantial portions of the Software.
+-//
+-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+-// THE SOFTWARE.
+-
+-package zap
+-
+-import (
+-	"errors"
+-	"os"
+-	"testing"
+-
+-	"github.com/stretchr/testify/assert"
+-)
+-
+-func TestRegisterSink(t *testing.T) {
+-	tests := []struct {
+-		name      string
+-		key       string
+-		factory   func() (Sink, error)
+-		wantError bool
+-	}{
+-		{"valid", "valid", func() (Sink, error) { return nopCloserSink{os.Stdout}, nil }, false},
+-		{"empty", "", func() (Sink, error) { return nopCloserSink{os.Stdout}, nil }, true},
+-		{"stdout", "stdout", func() (Sink, error) { return nopCloserSink{os.Stdout}, nil }, true},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.name, func(t *testing.T) {
+-			err := RegisterSink(tt.key, tt.factory)
+-			if tt.wantError {
+-				assert.NotNil(t, err)
+-			} else {
+-				assert.Nil(t, err)
+-				assert.NotNil(t, _sinkFactories[tt.key], "expected the factory to be present")
+-			}
+-		})
+-	}
+-}
+-
+-func TestNewSink(t *testing.T) {
+-	defer resetSinkRegistry()
+-	errTestSink := errors.New("test erroring")
+-	err := RegisterSink("errors", func() (Sink, error) { return nil, errTestSink })
+-	assert.Nil(t, err)
+-	tests := []struct {
+-		key string
+-		err error
+-	}{
+-		{"stdout", nil},
+-		{"errors", errTestSink},
+-		{"nonexistent", &errSinkNotFound{"nonexistent"}},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.key, func(t *testing.T) {
+-			_, err := newSink(tt.key)
+-			assert.Equal(t, tt.err, err)
+-		})
+-	}
+-}
+diff --git a/writer.go b/writer.go
+index 559d070..16f55ce 100644
+--- a/writer.go
++++ b/writer.go
+@@ -21,7 +21,6 @@
+ package zap
+ 
+ import (
+-	"io"
+ 	"io/ioutil"
+ 	"os"
+ 
+@@ -50,32 +49,29 @@ func Open(paths ...string) (zapcore.WriteSyncer, func(), error) {
+ func open(paths []string) ([]zapcore.WriteSyncer, func(), error) {
+ 	var openErr error
+ 	writers := make([]zapcore.WriteSyncer, 0, len(paths))
+-	closers := make([]io.Closer, 0, len(paths))
++	files := make([]*os.File, 0, len(paths))
+ 	close := func() {
+-		for _, c := range closers {
+-			c.Close()
++		for _, f := range files {
++			f.Close()
+ 		}
+ 	}
+ 	for _, path := range paths {
+-		sink, err := newSink(path)
+-		if err == nil {
+-			// Using a registered sink constructor.
+-			writers = append(writers, sink)
+-			closers = append(closers, sink)
++		switch path {
++		case "stdout":
++			writers = append(writers, os.Stdout)
++			// Don't close standard out.
+ 			continue
+-		}
+-		if _, ok := err.(*errSinkNotFound); ok {
+-			// No named sink constructor, use key as path to log file.
+-			f, e := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+-			openErr = multierr.Append(openErr, e)
+-			if e == nil {
+-				writers = append(writers, f)
+-				closers = append(closers, f)
+-			}
++		case "stderr":
++			writers = append(writers, os.Stderr)
++			// Don't close standard error.
+ 			continue
+ 		}
+-		// Sink constructor failed.
++		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+ 		openErr = multierr.Append(openErr, err)
++		if err == nil {
++			writers = append(writers, f)
++			files = append(files, f)
++		}
+ 	}
+ 
+ 	if openErr != nil {
+diff --git a/writer_test.go b/writer_test.go
+index 6efd609..1293832 100644
+--- a/writer_test.go
++++ b/writer_test.go
+@@ -21,12 +21,8 @@
+ package zap
+ 
+ import (
+-	"encoding/hex"
+-	"errors"
+ 	"io/ioutil"
+-	"math/rand"
+ 	"os"
+-	"path/filepath"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
+@@ -48,25 +44,28 @@ func TestOpenNoPaths(t *testing.T) {
+ }
+ 
+ func TestOpen(t *testing.T) {
+-	tempName := tempFileName("", "zap-open-test")
+-	assert.False(t, fileExists(tempName))
++	temp, err := ioutil.TempFile("", "zap-open-test")
++	require.NoError(t, err, "Couldn't create a temporary file for test.")
++	defer os.Remove(temp.Name())
+ 
+ 	tests := []struct {
+-		paths []string
+-		error string
++		paths     []string
++		filenames []string
++		error     string
+ 	}{
+-		{[]string{"stdout"}, ""},
+-		{[]string{"stderr"}, ""},
+-		{[]string{tempName}, ""},
+-		{[]string{"/foo/bar/baz"}, "open /foo/bar/baz: no such file or directory"},
++		{[]string{"stdout"}, []string{os.Stdout.Name()}, ""},
++		{[]string{"stderr"}, []string{os.Stderr.Name()}, ""},
++		{[]string{temp.Name()}, []string{temp.Name()}, ""},
++		{[]string{"/foo/bar/baz"}, []string{}, "open /foo/bar/baz: no such file or directory"},
+ 		{
+-			paths: []string{"stdout", "/foo/bar/baz", tempName, "/baz/quux"},
+-			error: "open /foo/bar/baz: no such file or directory; open /baz/quux: no such file or directory",
++			paths:     []string{"stdout", "/foo/bar/baz", temp.Name(), "/baz/quux"},
++			filenames: []string{os.Stdout.Name(), temp.Name()},
++			error:     "open /foo/bar/baz: no such file or directory; open /baz/quux: no such file or directory",
+ 		},
+ 	}
+ 
+ 	for _, tt := range tests {
+-		_, cleanup, err := Open(tt.paths...)
++		wss, cleanup, err := open(tt.paths)
+ 		if err == nil {
+ 			defer cleanup()
+ 		}
+@@ -76,10 +75,14 @@ func TestOpen(t *testing.T) {
+ 		} else {
+ 			assert.Equal(t, tt.error, err.Error(), "Unexpected error opening paths %v.", tt.paths)
+ 		}
++		names := make([]string, len(wss))
++		for i, ws := range wss {
++			f, ok := ws.(*os.File)
++			require.True(t, ok, "Expected all WriteSyncers returned from open() to be files.")
++			names[i] = f.Name()
++		}
++		assert.Equal(t, tt.filenames, names, "Opened unexpected files given paths %v.", tt.paths)
+ 	}
+-
+-	assert.True(t, fileExists(tempName))
+-	os.Remove(tempName)
+ }
+ 
+ func TestOpenFails(t *testing.T) {
+@@ -115,41 +118,8 @@ func (w *testWriter) Sync() error {
+ 	return nil
+ }
+ 
+-func TestOpenWithCustomSink(t *testing.T) {
+-	defer resetSinkRegistry()
+-	tw := &testWriter{"test", t}
+-	ctr := func() (Sink, error) { return nopCloserSink{tw}, nil }
+-	assert.Nil(t, RegisterSink("TestOpenWithCustomSink", ctr))
+-	w, cleanup, err := Open("TestOpenWithCustomSink")
+-	assert.Nil(t, err)
+-	defer cleanup()
+-	w.Write([]byte("test"))
+-}
+-
+-func TestOpenWithErroringSinkFactory(t *testing.T) {
+-	defer resetSinkRegistry()
+-	expectedErr := errors.New("expected factory error")
+-	ctr := func() (Sink, error) { return nil, expectedErr }
+-	assert.Nil(t, RegisterSink("TestOpenWithErroringSinkFactory", ctr))
+-	_, _, err := Open("TestOpenWithErroringSinkFactory")
+-	assert.Equal(t, expectedErr, err)
+-}
+-
+ func TestCombineWriteSyncers(t *testing.T) {
+ 	tw := &testWriter{"test", t}
+ 	w := CombineWriteSyncers(tw)
+ 	w.Write([]byte("test"))
+ }
+-
+-func tempFileName(prefix, suffix string) string {
+-	randBytes := make([]byte, 16)
+-	rand.Read(randBytes)
+-	return filepath.Join(os.TempDir(), prefix+hex.EncodeToString(randBytes)+suffix)
+-}
+-
+-func fileExists(name string) bool {
+-	if _, err := os.Stat(name); os.IsNotExist(err) {
+-		return false
+-	}
+-	return true
+-}

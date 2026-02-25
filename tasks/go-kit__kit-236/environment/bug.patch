@@ -1,0 +1,1115 @@
+diff --git a/examples/addsvc/main.go b/examples/addsvc/main.go
+index d504043..e62350d 100644
+--- a/examples/addsvc/main.go
++++ b/examples/addsvc/main.go
+@@ -36,17 +36,20 @@ func main() {
+ 	// of glog. So, we define a new flag set, to keep those domains distinct.
+ 	fs := flag.NewFlagSet("", flag.ExitOnError)
+ 	var (
+-		debugAddr           = fs.String("debug.addr", ":8000", "Address for HTTP debug/instrumentation server")
+-		httpAddr            = fs.String("http.addr", ":8001", "Address for HTTP (JSON) server")
+-		grpcAddr            = fs.String("grpc.addr", ":8002", "Address for gRPC server")
+-		netrpcAddr          = fs.String("netrpc.addr", ":8003", "Address for net/rpc server")
+-		thriftAddr          = fs.String("thrift.addr", ":8004", "Address for Thrift server")
+-		thriftProtocol      = fs.String("thrift.protocol", "binary", "binary, compact, json, simplejson")
+-		thriftBufferSize    = fs.Int("thrift.buffer.size", 0, "0 for unbuffered")
+-		thriftFramed        = fs.Bool("thrift.framed", false, "true to enable framing")
+-		zipkinHostPort      = fs.String("zipkin.host.port", "my.service.domain:12345", "Zipkin host:port")
+-		zipkinServiceName   = fs.String("zipkin.service.name", "addsvc", "Zipkin service name")
+-		zipkinCollectorAddr = fs.String("zipkin.collector.addr", "", "Zipkin Kafka collector address (empty will log spans)")
++		debugAddr                    = fs.String("debug.addr", ":8000", "Address for HTTP debug/instrumentation server")
++		httpAddr                     = fs.String("http.addr", ":8001", "Address for HTTP (JSON) server")
++		grpcAddr                     = fs.String("grpc.addr", ":8002", "Address for gRPC server")
++		netrpcAddr                   = fs.String("netrpc.addr", ":8003", "Address for net/rpc server")
++		thriftAddr                   = fs.String("thrift.addr", ":8004", "Address for Thrift server")
++		thriftProtocol               = fs.String("thrift.protocol", "binary", "binary, compact, json, simplejson")
++		thriftBufferSize             = fs.Int("thrift.buffer.size", 0, "0 for unbuffered")
++		thriftFramed                 = fs.Bool("thrift.framed", false, "true to enable framing")
++		zipkinHostPort               = fs.String("zipkin.host.port", "my.service.domain:12345", "Zipkin host:port")
++		zipkinServiceName            = fs.String("zipkin.service.name", "addsvc", "Zipkin service name")
++		zipkinCollectorAddr          = fs.String("zipkin.collector.addr", "", "Zipkin Scribe collector address (empty will log spans)")
++		zipkinCollectorTimeout       = fs.Duration("zipkin.collector.timeout", time.Second, "Zipkin collector timeout")
++		zipkinCollectorBatchSize     = fs.Int("zipkin.collector.batch.size", 100, "Zipkin collector batch size")
++		zipkinCollectorBatchInterval = fs.Duration("zipkin.collector.batch.interval", time.Second, "Zipkin collector batch interval")
+ 	)
+ 	flag.Usage = fs.Usage // only show our flags
+ 	if err := fs.Parse(os.Args[1:]); err != nil {
+@@ -85,9 +88,12 @@ func main() {
+ 		collector = loggingCollector{zipkinLogger} // TODO(pb)
+ 		if *zipkinCollectorAddr != "" {
+ 			var err error
+-			if collector, err = zipkin.NewKafkaCollector(
+-				[]string{*zipkinCollectorAddr},
+-				zipkin.KafkaLogger(zipkinLogger),
++			if collector, err = zipkin.NewScribeCollector(
++				*zipkinCollectorAddr,
++				*zipkinCollectorTimeout,
++				zipkin.ScribeBatchSize(*zipkinCollectorBatchSize),
++				zipkin.ScribeBatchInterval(*zipkinCollectorBatchInterval),
++				zipkin.ScribeLogger(zipkinLogger),
+ 			); err != nil {
+ 				zipkinLogger.Log("err", err)
+ 				os.Exit(1)
+@@ -251,6 +257,4 @@ func (c loggingCollector) Collect(s *zipkin.Span) error {
+ 	return nil
+ }
+ 
+-func (c loggingCollector) ShouldSample(*zipkin.Span) bool { return true }
+-
+ func (c loggingCollector) Close() error { return nil }
+diff --git a/tracing/README.md b/tracing/README.md
+index 6a7879e..c1e0c95 100644
+--- a/tracing/README.md
++++ b/tracing/README.md
+@@ -14,3 +14,97 @@ applications. It's instrumental in understanding request flows, identifying
+ hot spots, and diagnosing errors. All microservice infrastructures will
+ benefit from request tracing; sufficiently large infrastructures will require
+ it.
++
++## Test Setup
++
++Setting up [Zipkin] is not an easy thing to do. It will also demand quite some
++resources. To help you get started with development and testing we've made a
++[VirtualBox] image available through [Vagrant] (*The box will require about 6GB
++internal memory*).
++
++First make sure you've installed [Vagrant] on your machine. Then you can
++download and run the [Vagrant] image like this from the command line:
++
++```
++# create a new directory to store your vagrant configuration and image files
++mkdir zipkin
++cd zipkin
++vagrant init bas303/zipkin
++vagrant up --provider virtualbox
++```
++
++[Zipkin]: http://zipkin.io/
++[VirtualBox]: https://www.virtualbox.org/
++[Vagrant]: https://www.vagrantup.com/
++
++You probably need to adjust the `Vagrantfile` configuration to meet your
++networking needs. The file itself is documented so should not be hard to get
++configured. After the change you can reload your box with the updated settings
++like this:
++
++```
++vagrant reload
++```
++
++As mentioned the box is quite heavy and may take a few minutes to fully boot up.
++To get into the box connect through ssh and use `vagrant` for both username and
++password.
++
++The following services have been set-up to run:
++- Apache ZooKeeper (port: 2181)
++- Apache Kafka (port: 9092)
++- MySQL Server 5.5 (port: 3306)
++- Zipkin Collector (Kafka, MySQL)
++- Zipkin Query (MySQL)
++- Zipkin Web (port: 8080, 9990)
++
++To inspect if everything booted up properly check the log files in these
++directories:
++```
++/var/log/zookeeper
++/var/log/kafka
++/var/log/mysql
++/var/log/zipkin
++```
++
++The individual services can be managed with the `service` command:
++- zookeeper
++- kafka
++- mysql
++- collector
++- query
++- web
++
++## Usage
++
++Wrap a server- or client-side [endpoint][] so that it emits traces to a Zipkin
++collector.
++
++[endpoint]: http://godoc.org/github.com/go-kit/kit/endpoint#Endpoint
++
++```go
++func main() {
++	var (
++		myHost        = "instance01.addsvc.internal.net"
++		myMethod      = "ADD"
++		scribeHost    = "scribe.internal.net"
++		timeout       = 50 * time.Millisecond
++		batchSize     = 100
++		batchInterval = 5 * time.Second
++	)
++	spanFunc := zipkin.NewSpanFunc(myHost, myMethod)
++	collector, _ := zipkin.NewScribeCollector(scribeHost, timeout, batchSize, batchInterval)
++
++	// Server-side
++	var server endpoint.Endpoint
++	server = makeEndpoint() // for your service
++	server = zipkin.AnnotateServer(spanFunc, collector)(server)
++	go serveViaHTTP(server)
++
++	// Client-side
++	before := httptransport.ClientBefore(zipkin.ToRequest(spanFunc))
++	var client endpoint.Endpoint
++	client = httptransport.NewClient(addr, codec, factory, before)
++	client = zipkin.AnnotateClient(spanFunc, collector)(client)
++}
++```
+diff --git a/tracing/zipkin/README.md b/tracing/zipkin/README.md
+deleted file mode 100644
+index c62cc0c..0000000
+--- a/tracing/zipkin/README.md
++++ /dev/null
+@@ -1,166 +0,0 @@
+-# Zipkin
+-
+-## Development and Testing Set-up
+-
+-Setting up [Zipkin] is not an easy thing to do. It will also demand quite some
+-resources. To help you get started with development and testing we've made a
+-docker-compose file available for running a full Zipkin stack. See the
+-`kit/tracing/zipkin/_docker` subdirectory.
+-
+-You will need [docker-compose] 1.6.0+ and [docker-engine] 1.10.0+.
+-
+-If running on Linux `HOSTNAME` can be set to `localhost`. If running on Mac OS X
+-or Windows you probably need to set the hostname environment variable to the
+-hostname of the VM running the docker containers.
+-
+-```sh
+-cd tracing/zipkin/_docker
+-HOSTNAME=localhost docker-compose -f docker-compose-zipkin.yml up
+-```
+-
+-[Zipkin]: http://zipkin.io/
+-[docker-compose]: https://docs.docker.com/compose/
+-[docker-engine]: https://docs.docker.com/engine/
+-
+-As mentioned the [Zipkin] stack is quite heavy and may take a few minutes to
+-fully initialize.
+-
+-The following services have been set-up to run:
+-- Apache Cassandra (port: 9160 (thrift), 9042 (native))
+-- Apache ZooKeeper (port: 2181)
+-- Apache Kafka (port: 9092)
+-- Zipkin Collector
+-- Zipkin Query
+-- Zipkin Web (port: 8080, 9990)
+-
+-
+-## Middleware Usage
+-
+-Wrap a server- or client-side [endpoint][] so that it emits traces to a Zipkin
+-collector. Make sure the host given to `MakeNewSpanFunc` resolves to an IP. If
+-not your span will silently fail!
+-
+-[endpoint]: http://godoc.org/github.com/go-kit/kit/endpoint#Endpoint
+-
+-If needing to create child spans in methods or calling another service from your
+-service method, it is highly recommended to request a context parameter so you
+-can transfer the needed metadata for traces across service boundaries.
+-
+-It is also wise to always return error parameters with your service method
+-calls, even if your service method implementations will not throw errors
+-themselves. The error return parameter can be wired to pass the potential
+-transport errors when consuming your service API in a networked environment.
+-
+-```go
+-func main() {
+-	var (
+-		// myHost MUST resolve to an IP or your span will not show up in Zipkin.
+-		myHost        = "instance01.addsvc.internal.net:8000"
+-		myService     = "AddService"
+-		myMethod      = "Add"
+-		url           = myHost + "/add/"
+-		kafkaHost     = []string{"kafka.internal.net:9092"}
+-	)
+-
+-	ctx := context.Background()
+-
+-	// Set Up Zipkin Collector and Span factory
+-	spanFunc := zipkin.MakeNewSpanFunc(myHost, myService, myMethod)
+-	collector, _ := zipkin.NewKafkaCollector(kafkaHost)
+-
+-	// Server-side Wiring
+-	var server endpoint.Endpoint
+-	server = makeEndpoint() // for your service
+-	// wrap endpoint with Zipkin tracing middleware
+-	server = zipkin.AnnotateServer(spanFunc, collector)(server)
+-
+-	http.Handle(
+-		"/add/",
+-		httptransport.NewServer(
+-			ctx,
+-			server,
+-			decodeRequestFunc,
+-			encodeResponseFunc,
+-			httptransport.ServerBefore(
+-				zipkin.ToContext(spanFunc),
+-			),
+-		),
+-	)
+-	...
+-
+-	// Client-side
+-	var client endpoint.Endpoint
+-	client = httptransport.NewClient(
+-		"GET",
+-		URL,
+-		encodeRequestFunc,
+-		decodeResponseFunc,
+-		httptransport.ClientBefore(zipkin.ToRequest(spanFunc)),
+-	).Endpoint()
+-	client = zipkin.AnnotateClient(spanFunc, collector)(client)
+-
+-	ctx, cancel := context.WithTimeout(ctx, myTimeout)
+-	defer cancel()
+-
+-	reply, err := client(ctx, param1, param2)
+-	// do something with the response/error
+-	...
+-}
+-```
+-
+-## Annotating Remote Resources
+-
+-Next to the above shown examples of wiring server-side and client-side tracing
+-middlewares, you can also span resources called from your service methods.
+-
+-To do this, the service method needs to include a context parameter. From your
+-endpoint wrapper you can inject the endpoint context which will hold the parent
+-span already created by the server-side middleware. If the resource is a remote
+-database you can use the `zipkin.ServerAddr` spanOption to identify the remote
+-host:port and the display name of this resource.
+-
+-```go
+-type MyService struct {
+-	// add a Zipkin Collector to your service implementation's properties.
+-	Collector zipkin.Collector
+-}
+-
+-// Example of the endpoint.Endpoint to service method wrapper, injecting the
+-// context provided by the transport server.
+-func makeComplexEndpoint() endpoint.Endpoint {
+-	return func(ctx context.Context, request interface{}) (interface{}, error) {
+-		req := request.(ComplexRequest)
+-		v, err := svc.Complex(ctx, req.A, req.B)
+-		return ComplexResponse{V: v, Err: err}, nil
+-	}
+-}
+-
+-// Complex is an example method of our service, displaying the tracing of a
+-// remote database resource.
+-func (s *MyService) Complex(ctx context.Context, A someType, B otherType) (returnType, error) {
+-	// we've parsed the incoming parameters and now we need to query the database.
+-	// we wish to include this action into our trace.
+-	span, collect := zipkin.NewChildSpan(
+-		ctx,
+-		s.Collector,
+-		"complexQuery",
+-		zipkin.ServerAddr(
+-			"mysql01.internal.net:3306",
+-			"MySQL",
+-		),
+-	)
+-	// you probably want to binary annotate your query
+-	span.AnnotateBinary("query", "SELECT ... FROM ... WHERE ... ORDER BY ..."),
+-	// annotate the start of the query
+-	span.Annotate("complexQuery:start")
+-	// do the query and handle resultset
+-	...
+-	// annotate we are done with the query
+-	span.Annotate("complexQuery:end")
+-	// maybe binary annotate some items returned by the resultset
+-	...
+-	// when done with all annotations, collect the span
+-	collect()
+-	...
+-}
+-```
+diff --git a/tracing/zipkin/_docker/docker-compose-zipkin.yml b/tracing/zipkin/_docker/docker-compose-zipkin.yml
+deleted file mode 100644
+index 6e0fa4c..0000000
+--- a/tracing/zipkin/_docker/docker-compose-zipkin.yml
++++ /dev/null
+@@ -1,76 +0,0 @@
+- # This file uses the version 2 docker-compose file format, described here:
+-# https://docs.docker.com/compose/compose-file/#version-2
+-#
+-# It runs the zipkin-cassandra, zipkin-collector, zipkin-query, zipkin-web, and
+-# zookeeper-exhibitor containers.
+-#
+-# On linux you probably want to start this composition like this:
+-#
+-#   HOSTNAME=localhost docker-compose -f docker-compose-zipkin.yml up
+-#
+-# On OS X you will probably start like this:
+-#
+-#   HOSTNAME=default docker-compose -f docker-compose-zipkin.yml up
+-
+-version: '2'
+-services:
+-  cassandra:
+-    image: openzipkin/zipkin-cassandra:1.39.4
+-    network_mode: host
+-
+-  zookeeper:
+-    image: mbabineau/zookeeper-exhibitor:latest
+-    network_mode: host
+-    environment:
+-      HOSTNAME: ${HOSTNAME}
+-
+-  kafka:
+-    image: wurstmeister/kafka
+-    network_mode: host
+-    environment:
+-      KAFKA_CREATE_TOPICS: "zipkin:1:1"
+-      KAFKA_ZOOKEEPER_CONNECTION_TIMEOUT_MS: 60000
+-      KAFKA_ADVERTISED_PORT: 9092
+-      KAFKA_ADVERTISED_HOST_NAME: ${HOSTNAME}
+-      KAFKA_ZOOKEEPER_CONNECT: ${HOSTNAME}:2181
+-    depends_on:
+-      - zookeeper
+-
+-  collector:
+-    image: openzipkin/zipkin-collector:1.39.4
+-    network_mode: host
+-    environment:
+-      STORAGE_TYPE: cassandra
+-      TRANSPORT_TYPE: kafka
+-      CASSANDRA_CONTACT_POINTS: ${HOSTNAME}
+-      KAFKA_ZOOKEEPER: ${HOSTNAME}:2181
+-      METADATA_BROKER_LIST: ${HOSTNAME}:9092
+-    depends_on:
+-      - cassandra
+-      - kafka
+-
+-  query:
+-    image: openzipkin/zipkin-query:1.39.4
+-    network_mode: host
+-    environment:
+-      STORAGE_TYPE: cassandra
+-      TRANSPORT_TYPE: kafka
+-      CASSANDRA_CONTACT_POINTS: ${HOSTNAME}
+-      KAFKA_ZOOKEEPER: ${HOSTNAME}:2181
+-      METADATA_BROKER_LIST: ${HOSTNAME}:9092
+-    depends_on:
+-      - cassandra
+-      - kafka
+-
+-  web:
+-    image: openzipkin/zipkin-web:1.39.4
+-    network_mode: host
+-    environment:
+-      TRANSPORT_TYPE: kafka
+-      KAFKA_ZOOKEEPER: ${HOSTNAME}:2181
+-      METADATA_BROKER_LIST: ${HOSTNAME}:9092
+-      QUERY_PORT_9411_TCP_ADDR: ${HOSTNAME}
+-      ROOTURL: http://${HOSTNAME}:8080
+-    depends_on:
+-      - cassandra
+-      - kafka
+diff --git a/tracing/zipkin/collector.go b/tracing/zipkin/collector.go
+index b7064ad..495b1b4 100644
+--- a/tracing/zipkin/collector.go
++++ b/tracing/zipkin/collector.go
+@@ -6,7 +6,6 @@ import "strings"
+ // remote endpoints.
+ type Collector interface {
+ 	Collect(*Span) error
+-	ShouldSample(*Span) bool
+ 	Close() error
+ }
+ 
+@@ -16,9 +15,6 @@ type NopCollector struct{}
+ // Collect implements Collector.
+ func (NopCollector) Collect(*Span) error { return nil }
+ 
+-// ShouldSample implements Collector.
+-func (n NopCollector) ShouldSample(span *Span) bool { return false }
+-
+ // Close implements Collector.
+ func (NopCollector) Close() error { return nil }
+ 
+@@ -30,9 +26,6 @@ func (c MultiCollector) Collect(s *Span) error {
+ 	return c.aggregateErrors(func(coll Collector) error { return coll.Collect(s) })
+ }
+ 
+-// ShouldSample implements Collector.
+-func (c MultiCollector) ShouldSample(s *Span) bool { return false }
+-
+ // Close implements Collector.
+ func (c MultiCollector) Close() error {
+ 	return c.aggregateErrors(func(coll Collector) error { return coll.Close() })
+diff --git a/tracing/zipkin/collector_test.go b/tracing/zipkin/collector_test.go
+index 0a1402d..9ee35aa 100644
+--- a/tracing/zipkin/collector_test.go
++++ b/tracing/zipkin/collector_test.go
+@@ -33,8 +33,6 @@ func (c *stubCollector) Collect(*zipkin.Span) error {
+ 	return nil
+ }
+ 
+-func (c *stubCollector) ShouldSample(*zipkin.Span) bool { return true }
+-
+ func (c *stubCollector) Close() error {
+ 	c.closed = true
+ 	if c.errid != 0 {
+diff --git a/tracing/zipkin/kafka.go b/tracing/zipkin/kafka.go
+index 7c0d613..91fb7a2 100644
+--- a/tracing/zipkin/kafka.go
++++ b/tracing/zipkin/kafka.go
+@@ -84,7 +84,7 @@ func (c *KafkaCollector) logErrors() {
+ 
+ // Collect implements Collector.
+ func (c *KafkaCollector) Collect(s *Span) error {
+-	if c.ShouldSample(s) || s.debug {
++	if c.shouldSample(s.traceID) {
+ 		c.producer.Input() <- &sarama.ProducerMessage{
+ 			Topic: c.topic,
+ 			Key:   nil,
+@@ -94,15 +94,6 @@ func (c *KafkaCollector) Collect(s *Span) error {
+ 	return nil
+ }
+ 
+-// ShouldSample implements Collector.
+-func (c *KafkaCollector) ShouldSample(s *Span) bool {
+-	if !s.sampled && s.runSampler {
+-		s.runSampler = false
+-		s.sampled = c.shouldSample(s.TraceID())
+-	}
+-	return s.sampled
+-}
+-
+ // Close implements Collector.
+ func (c *KafkaCollector) Close() error {
+ 	return c.producer.Close()
+diff --git a/tracing/zipkin/sample_test.go b/tracing/zipkin/sample_test.go
+index 98103c6..28506e6 100644
+--- a/tracing/zipkin/sample_test.go
++++ b/tracing/zipkin/sample_test.go
+@@ -1,10 +1,6 @@
+-package zipkin_test
++package zipkin
+ 
+-import (
+-	"testing"
+-
+-	"github.com/go-kit/kit/tracing/zipkin"
+-)
++import "testing"
+ 
+ func TestSampleRate(t *testing.T) {
+ 	type triple struct {
+@@ -28,7 +24,7 @@ func TestSampleRate(t *testing.T) {
+ 		triple{999, 0, 0.99}:     true,
+ 		triple{9999, 0, 0.99}:    false,
+ 	} {
+-		sampler := zipkin.SampleRate(input.rate, input.salt)
++		sampler := SampleRate(input.rate, input.salt)
+ 		if have := sampler(input.id); want != have {
+ 			t.Errorf("%#+v: want %v, have %v", input, want, have)
+ 		}
+diff --git a/tracing/zipkin/scribe.go b/tracing/zipkin/scribe.go
+index e11f71d..f2c02fa 100644
+--- a/tracing/zipkin/scribe.go
++++ b/tracing/zipkin/scribe.go
+@@ -70,21 +70,10 @@ func NewScribeCollector(addr string, timeout time.Duration, options ...ScribeOpt
+ 
+ // Collect implements Collector.
+ func (c *ScribeCollector) Collect(s *Span) error {
+-	if c.ShouldSample(s) || s.debug {
+-		c.spanc <- s
+-	}
++	c.spanc <- s
+ 	return nil // accepted
+ }
+ 
+-// ShouldSample implements Collector.
+-func (c *ScribeCollector) ShouldSample(s *Span) bool {
+-	if !s.sampled && s.runSampler {
+-		s.runSampler = false
+-		s.sampled = c.shouldSample(s.TraceID())
+-	}
+-	return s.sampled
+-}
+-
+ // Close implements Collector.
+ func (c *ScribeCollector) Close() error {
+ 	close(c.quit)
+@@ -97,6 +86,9 @@ func (c *ScribeCollector) loop() {
+ 	for {
+ 		select {
+ 		case span := <-c.spanc:
++			if !c.shouldSample(span.traceID) {
++				continue
++			}
+ 			c.batch = append(c.batch, &scribe.LogEntry{
+ 				Category: c.category,
+ 				Message:  scribeSerialize(span),
+diff --git a/tracing/zipkin/scribe_test.go b/tracing/zipkin/scribe_test.go
+index d480270..97f7d2b 100644
+--- a/tracing/zipkin/scribe_test.go
++++ b/tracing/zipkin/scribe_test.go
+@@ -33,10 +33,11 @@ func TestScribeCollector(t *testing.T) {
+ 		spanID       = int64(456)
+ 		parentSpanID = int64(0)
+ 		value        = "foo"
++		duration     = 42 * time.Millisecond
+ 	)
+ 
+ 	span := zipkin.NewSpan("1.2.3.4:1234", serviceName, methodName, traceID, spanID, parentSpanID)
+-	span.Annotate("foo")
++	span.AnnotateDuration("foo", 42*time.Millisecond)
+ 	if err := c.Collect(span); err != nil {
+ 		t.Errorf("error during collection: %v", err)
+ 	}
+@@ -79,6 +80,9 @@ func TestScribeCollector(t *testing.T) {
+ 	if want, have := value, gotAnnotation.GetValue(); want != have {
+ 		t.Errorf("want %q, have %q", want, have)
+ 	}
++	if want, have := duration, time.Duration(gotAnnotation.GetDuration())*time.Microsecond; want != have {
++		t.Errorf("want %s, have %s", want, have)
++	}
+ }
+ 
+ type scribeServer struct {
+diff --git a/tracing/zipkin/span.go b/tracing/zipkin/span.go
+index 38f1f2c..5db5510 100644
+--- a/tracing/zipkin/span.go
++++ b/tracing/zipkin/span.go
+@@ -8,8 +8,6 @@ import (
+ 	"strconv"
+ 	"time"
+ 
+-	"golang.org/x/net/context"
+-
+ 	"github.com/go-kit/kit/tracing/zipkin/_thrift/gen-go/zipkincore"
+ )
+ 
+@@ -27,10 +25,6 @@ type Span struct {
+ 
+ 	annotations       []annotation
+ 	binaryAnnotations []binaryAnnotation
+-
+-	debug      bool
+-	sampled    bool
+-	runSampler bool
+ }
+ 
+ // NewSpan returns a new Span, which can be annotated and collected by a
+@@ -43,7 +37,6 @@ func NewSpan(hostport, serviceName, methodName string, traceID, spanID, parentSp
+ 		traceID:      traceID,
+ 		spanID:       spanID,
+ 		parentSpanID: parentSpanID,
+-		runSampler:   true,
+ 	}
+ }
+ 
+@@ -102,23 +95,9 @@ func (s *Span) SpanID() int64 { return s.spanID }
+ // It may be zero.
+ func (s *Span) ParentSpanID() int64 { return s.parentSpanID }
+ 
+-// Sample forces sampling of this span.
+-func (s *Span) Sample() {
+-	s.sampled = true
+-}
+-
+-// SetDebug forces debug mode on this span.
+-func (s *Span) SetDebug() {
+-	s.debug = true
+-}
+-
+ // Annotate annotates the span with the given value.
+ func (s *Span) Annotate(value string) {
+-	s.annotations = append(s.annotations, annotation{
+-		timestamp: time.Now(),
+-		value:     value,
+-		host:      s.host,
+-	})
++	s.AnnotateDuration(value, 0)
+ }
+ 
+ // AnnotateBinary annotates the span with a key and a value that will be []byte
+@@ -209,7 +188,6 @@ func (s *Span) AnnotateBinary(key string, value interface{}) {
+ }
+ 
+ // AnnotateString annotates the span with a key and a string value.
+-// Deprecated: use AnnotateBinary instead.
+ func (s *Span) AnnotateString(key, value string) {
+ 	s.binaryAnnotations = append(s.binaryAnnotations, binaryAnnotation{
+ 		key:            key,
+@@ -219,77 +197,14 @@ func (s *Span) AnnotateString(key, value string) {
+ 	})
+ }
+ 
+-// SpanOption sets an optional parameter for Spans.
+-type SpanOption func(s *Span)
+-
+-// ServerAddr will create a ServerAddr annotation with its own zipkin Endpoint
+-// when used with NewChildSpan. This is typically used when the NewChildSpan is
+-// used to annotate non Zipkin aware resources like databases and caches.
+-func ServerAddr(hostport, serviceName string) SpanOption {
+-	return func(s *Span) {
+-		e := makeEndpoint(hostport, serviceName)
+-		if e != nil {
+-			host := s.host
+-			s.host = e                            // set temporary Endpoint
+-			s.AnnotateBinary(ServerAddress, true) // use
+-			s.host = host                         // reset
+-		}
+-	}
+-}
+-
+-// Host will update the default zipkin Endpoint of the Span it is used with.
+-func Host(hostport, serviceName string) SpanOption {
+-	return func(s *Span) {
+-		e := makeEndpoint(hostport, serviceName)
+-		if e != nil {
+-			s.host = e // update
+-		}
+-	}
+-}
+-
+-// Debug will set the Span to debug mode forcing Samplers to pass the Span.
+-func Debug(debug bool) SpanOption {
+-	return func(s *Span) {
+-		s.debug = debug
+-	}
+-}
+-
+-// CollectFunc will collect the span created with NewChildSpan.
+-type CollectFunc func()
+-
+-// NewChildSpan returns a new child Span of a parent Span extracted from the
+-// passed context. It can be used to annotate resources like databases, caches,
+-// etc. and treat them as if they are a regular service. For tracing client
+-// endpoints use AnnotateClient instead.
+-func NewChildSpan(ctx context.Context, collector Collector, methodName string, options ...SpanOption) (*Span, CollectFunc) {
+-	span, ok := FromContext(ctx)
+-	if !ok {
+-		return nil, func() {}
+-	}
+-	childSpan := &Span{
+-		host:         span.host,
+-		methodName:   methodName,
+-		traceID:      span.traceID,
+-		spanID:       newID(),
+-		parentSpanID: span.spanID,
+-	}
+-	childSpan.Annotate(ClientSend)
+-	for _, option := range options {
+-		option(childSpan)
+-	}
+-	collectFunc := func() {
+-		if childSpan != nil {
+-			childSpan.Annotate(ClientReceive)
+-			collector.Collect(childSpan)
+-			childSpan = nil
+-		}
+-	}
+-	return childSpan, collectFunc
+-}
+-
+-// IsSampled returns if the span is set to be sampled.
+-func (s *Span) IsSampled() bool {
+-	return s.sampled
++// AnnotateDuration annotates the span with the given value and duration.
++func (s *Span) AnnotateDuration(value string, duration time.Duration) {
++	s.annotations = append(s.annotations, annotation{
++		timestamp: time.Now(),
++		value:     value,
++		duration:  duration,
++		host:      s.host,
++	})
+ }
+ 
+ // Encode creates a Thrift Span from the gokit Span.
+@@ -300,7 +215,7 @@ func (s *Span) Encode() *zipkincore.Span {
+ 		TraceId: s.traceID,
+ 		Name:    s.methodName,
+ 		Id:      s.spanID,
+-		Debug:   s.debug,
++		Debug:   true, // TODO
+ 	}
+ 
+ 	if s.parentSpanID != 0 {
+@@ -315,6 +230,11 @@ func (s *Span) Encode() *zipkincore.Span {
+ 			Value:     a.value,
+ 			Host:      a.host,
+ 		}
++
++		if a.duration > 0 {
++			zs.Annotations[i].Duration = new(int32)
++			*(zs.Annotations[i].Duration) = int32(a.duration / time.Microsecond)
++		}
+ 	}
+ 
+ 	zs.BinaryAnnotations = make([]*zipkincore.BinaryAnnotation, len(s.binaryAnnotations))
+@@ -333,6 +253,7 @@ func (s *Span) Encode() *zipkincore.Span {
+ type annotation struct {
+ 	timestamp time.Time
+ 	value     string
++	duration  time.Duration // optional
+ 	host      *zipkincore.Endpoint
+ }
+ 
+diff --git a/tracing/zipkin/zipkin.go b/tracing/zipkin/zipkin.go
+index cd11c1b..2f4ddc8 100644
+--- a/tracing/zipkin/zipkin.go
++++ b/tracing/zipkin/zipkin.go
+@@ -10,6 +10,7 @@ import (
+ 
+ 	"github.com/go-kit/kit/endpoint"
+ 	"github.com/go-kit/kit/log"
++	"github.com/go-kit/kit/transport/grpc"
+ )
+ 
+ // In Zipkin, "spans are considered to start and stop with the client." The
+@@ -31,13 +32,10 @@ const (
+ 	traceIDHTTPHeader      = "X-B3-TraceId"
+ 	spanIDHTTPHeader       = "X-B3-SpanId"
+ 	parentSpanIDHTTPHeader = "X-B3-ParentSpanId"
+-	sampledHTTPHeader      = "X-B3-Sampled"
+-
+ 	// gRPC keys are always lowercase
+ 	traceIDGRPCKey      = "x-b3-traceid"
+ 	spanIDGRPCKey       = "x-b3-spanid"
+ 	parentSpanIDGRPCKey = "x-b3-parentspanid"
+-	sampledGRPCKey      = "x-b3-sampled"
+ 
+ 	// ClientSend is the annotation value used to mark a client sending a
+ 	// request to a server.
+@@ -54,15 +52,6 @@ const (
+ 	// ClientReceive is the annotation value used to mark a client's receipt
+ 	// of a completed request from a server.
+ 	ClientReceive = "cr"
+-
+-	// ServerAddress allows to annotate the server endpoint in case the server
+-	// side trace is not instrumented as with resources like caches and
+-	// databases.
+-	ServerAddress = "sa"
+-
+-	// ClientAddress allows to annotate the client origin in case the client was
+-	// forwarded by a proxy which does not instrument itself.
+-	ClientAddress = "ca"
+ )
+ 
+ // AnnotateServer returns a server.Middleware that extracts a span from the
+@@ -74,11 +63,9 @@ func AnnotateServer(newSpan NewSpanFunc, c Collector) endpoint.Middleware {
+ 		return func(ctx context.Context, request interface{}) (interface{}, error) {
+ 			span, ok := FromContext(ctx)
+ 			if !ok {
+-				traceID := newID()
+-				span = newSpan(traceID, traceID, 0)
++				span = newSpan(newID(), newID(), 0)
+ 				ctx = context.WithValue(ctx, SpanContextKey, span)
+ 			}
+-			c.ShouldSample(span)
+ 			span.Annotate(ServerReceive)
+ 			defer func() { span.Annotate(ServerSend); c.Collect(span) }()
+ 			return next(ctx, request)
+@@ -98,15 +85,8 @@ func AnnotateClient(newSpan NewSpanFunc, c Collector) endpoint.Middleware {
+ 			parentSpan, ok := FromContext(ctx)
+ 			if ok {
+ 				clientSpan = newSpan(parentSpan.TraceID(), newID(), parentSpan.SpanID())
+-				clientSpan.runSampler = false
+-				clientSpan.sampled = c.ShouldSample(parentSpan)
+ 			} else {
+-				// Abnormal operation. Traces should always start server side.
+-				// We create a root span but annotate with a warning.
+-				traceID := newID()
+-				clientSpan = newSpan(traceID, traceID, 0)
+-				c.ShouldSample(clientSpan)
+-				clientSpan.AnnotateBinary("warning", "missing server side trace")
++				clientSpan = newSpan(newID(), newID(), 0)
+ 			}
+ 			ctx = context.WithValue(ctx, SpanContextKey, clientSpan)                    // set
+ 			defer func() { ctx = context.WithValue(ctx, SpanContextKey, parentSpan) }() // reset
+@@ -123,11 +103,7 @@ func AnnotateClient(newSpan NewSpanFunc, c Collector) endpoint.Middleware {
+ // Before stack. The logger is used to report errors.
+ func ToContext(newSpan NewSpanFunc, logger log.Logger) func(ctx context.Context, r *http.Request) context.Context {
+ 	return func(ctx context.Context, r *http.Request) context.Context {
+-		span := fromHTTP(newSpan, r, logger)
+-		if span == nil {
+-			return ctx
+-		}
+-		return context.WithValue(ctx, SpanContextKey, span)
++		return context.WithValue(ctx, SpanContextKey, fromHTTP(newSpan, r, logger))
+ 	}
+ }
+ 
+@@ -137,11 +113,7 @@ func ToContext(newSpan NewSpanFunc, logger log.Logger) func(ctx context.Context,
+ // Before stack. The logger is used to report errors.
+ func ToGRPCContext(newSpan NewSpanFunc, logger log.Logger) func(ctx context.Context, md *metadata.MD) context.Context {
+ 	return func(ctx context.Context, md *metadata.MD) context.Context {
+-		span := fromGRPC(newSpan, *md, logger)
+-		if span == nil {
+-			return ctx
+-		}
+-		return context.WithValue(ctx, SpanContextKey, span)
++		return context.WithValue(ctx, SpanContextKey, fromGRPC(newSpan, *md, logger))
+ 	}
+ }
+ 
+@@ -154,7 +126,7 @@ func ToRequest(newSpan NewSpanFunc) func(ctx context.Context, r *http.Request) c
+ 	return func(ctx context.Context, r *http.Request) context.Context {
+ 		span, ok := FromContext(ctx)
+ 		if !ok {
+-			return ctx
++			span = newSpan(newID(), newID(), 0)
+ 		}
+ 		if id := span.TraceID(); id > 0 {
+ 			r.Header.Set(traceIDHTTPHeader, strconv.FormatInt(id, 16))
+@@ -165,11 +137,6 @@ func ToRequest(newSpan NewSpanFunc) func(ctx context.Context, r *http.Request) c
+ 		if id := span.ParentSpanID(); id > 0 {
+ 			r.Header.Set(parentSpanIDHTTPHeader, strconv.FormatInt(id, 16))
+ 		}
+-		if span.IsSampled() {
+-			r.Header.Set(sampledHTTPHeader, "1")
+-		} else {
+-			r.Header.Set(sampledHTTPHeader, "0")
+-		}
+ 		return ctx
+ 	}
+ }
+@@ -183,21 +150,19 @@ func ToGRPCRequest(newSpan NewSpanFunc) func(ctx context.Context, md *metadata.M
+ 	return func(ctx context.Context, md *metadata.MD) context.Context {
+ 		span, ok := FromContext(ctx)
+ 		if !ok {
+-			return ctx
++			span = newSpan(newID(), newID(), 0)
+ 		}
+ 		if id := span.TraceID(); id > 0 {
+-			(*md)[traceIDGRPCKey] = append((*md)[traceIDGRPCKey], strconv.FormatInt(id, 16))
++			key, value := grpc.EncodeKeyValue(traceIDGRPCKey, strconv.FormatInt(id, 16))
++			(*md)[key] = append((*md)[key], value)
+ 		}
+ 		if id := span.SpanID(); id > 0 {
+-			(*md)[spanIDGRPCKey] = append((*md)[spanIDGRPCKey], strconv.FormatInt(id, 16))
++			key, value := grpc.EncodeKeyValue(spanIDGRPCKey, strconv.FormatInt(id, 16))
++			(*md)[key] = append((*md)[key], value)
+ 		}
+ 		if id := span.ParentSpanID(); id > 0 {
+-			(*md)[parentSpanIDGRPCKey] = append((*md)[parentSpanIDGRPCKey], strconv.FormatInt(id, 16))
+-		}
+-		if span.IsSampled() {
+-			(*md)[sampledGRPCKey] = append((*md)[sampledGRPCKey], "1")
+-		} else {
+-			(*md)[sampledGRPCKey] = append((*md)[sampledGRPCKey], "0")
++			key, value := grpc.EncodeKeyValue(parentSpanIDGRPCKey, strconv.FormatInt(id, 16))
++			(*md)[key] = append((*md)[key], value)
+ 		}
+ 		return ctx
+ 	}
+@@ -206,12 +171,12 @@ func ToGRPCRequest(newSpan NewSpanFunc) func(ctx context.Context, md *metadata.M
+ func fromHTTP(newSpan NewSpanFunc, r *http.Request, logger log.Logger) *Span {
+ 	traceIDStr := r.Header.Get(traceIDHTTPHeader)
+ 	if traceIDStr == "" {
+-		return nil
++		return newSpan(newID(), newID(), 0) // normal; just make a new one
+ 	}
+ 	traceID, err := strconv.ParseInt(traceIDStr, 16, 64)
+ 	if err != nil {
+-		logger.Log("msg", "invalid trace id found, ignoring trace", "err", err)
+-		return nil
++		logger.Log(traceIDHTTPHeader, traceIDStr, "err", err)
++		return newSpan(newID(), newID(), 0)
+ 	}
+ 	spanIDStr := r.Header.Get(spanIDHTTPHeader)
+ 	if spanIDStr == "" {
+@@ -232,31 +197,19 @@ func fromHTTP(newSpan NewSpanFunc, r *http.Request, logger log.Logger) *Span {
+ 		logger.Log(parentSpanIDHTTPHeader, parentSpanIDStr, "err", err) // abnormal
+ 		parentSpanID = 0                                                // the only way to deal with it
+ 	}
+-	span := newSpan(traceID, spanID, parentSpanID)
+-	switch r.Header.Get(sampledHTTPHeader) {
+-	case "0":
+-		span.runSampler = false
+-		span.sampled = false
+-	case "1":
+-		span.runSampler = false
+-		span.sampled = true
+-	default:
+-		// we don't know if the upstream trace was sampled. use our sampler
+-		span.runSampler = true
+-	}
+-	return span
++	return newSpan(traceID, spanID, parentSpanID)
+ }
+ 
+ func fromGRPC(newSpan NewSpanFunc, md metadata.MD, logger log.Logger) *Span {
+ 	traceIDSlc := md[traceIDGRPCKey]
+ 	pos := len(traceIDSlc) - 1
+ 	if pos < 0 {
+-		return nil
++		return newSpan(newID(), newID(), 0) // normal; just make a new one
+ 	}
+ 	traceID, err := strconv.ParseInt(traceIDSlc[pos], 16, 64)
+ 	if err != nil {
+-		logger.Log("msg", "invalid trace id found, ignoring trace", "err", err)
+-		return nil
++		logger.Log(traceIDHTTPHeader, traceIDSlc, "err", err)
++		return newSpan(newID(), newID(), 0)
+ 	}
+ 	spanIDSlc := md[spanIDGRPCKey]
+ 	pos = len(spanIDSlc) - 1
+@@ -287,25 +240,7 @@ func fromGRPC(newSpan NewSpanFunc, md metadata.MD, logger log.Logger) *Span {
+ 		logger.Log(parentSpanIDHTTPHeader, parentSpanIDSlc, "err", err) // abnormal
+ 		parentSpanID = 0                                                // the only way to deal with it
+ 	}
+-	span := newSpan(traceID, spanID, parentSpanID)
+-	var sampledHdr string
+-	sampledSlc := md[sampledGRPCKey]
+-	pos = len(sampledSlc) - 1
+-	if pos >= 0 {
+-		sampledHdr = sampledSlc[pos]
+-	}
+-	switch sampledHdr {
+-	case "0":
+-		span.runSampler = false
+-		span.sampled = false
+-	case "1":
+-		span.runSampler = false
+-		span.sampled = true
+-	default:
+-		// we don't know if the upstream trace was sampled. use our sampler
+-		span.runSampler = true
+-	}
+-	return span
++	return newSpan(traceID, spanID, parentSpanID)
+ }
+ 
+ // FromContext extracts an existing Zipkin span if it is stored in the provided
+diff --git a/tracing/zipkin/zipkin_test.go b/tracing/zipkin/zipkin_test.go
+index b501cfc..f5c9562 100644
+--- a/tracing/zipkin/zipkin_test.go
++++ b/tracing/zipkin/zipkin_test.go
+@@ -26,14 +26,12 @@ func TestToContext(t *testing.T) {
+ 		traceID      int64 = 12
+ 		spanID       int64 = 34
+ 		parentSpanID int64 = 56
+-		sampled            = "1"
+ 	)
+ 
+ 	r, _ := http.NewRequest("GET", "https://best.horse", nil)
+ 	r.Header.Set("X-B3-TraceId", strconv.FormatInt(traceID, 16))
+ 	r.Header.Set("X-B3-SpanId", strconv.FormatInt(spanID, 16))
+ 	r.Header.Set("X-B3-ParentSpanId", strconv.FormatInt(parentSpanID, 16))
+-	r.Header.Set("X-B3-Sampled", sampled)
+ 
+ 	newSpan := zipkin.MakeNewSpanFunc(hostport, serviceName, methodName)
+ 	toContext := zipkin.ToContext(newSpan, log.NewLogfmtLogger(ioutil.Discard))
+@@ -61,9 +59,6 @@ func TestToContext(t *testing.T) {
+ 			t.Errorf("%s: want %d, have %d", name, want, have)
+ 		}
+ 	}
+-	if want, have := true, span.IsSampled(); want != have {
+-		t.Errorf("IsSampled: want %v, have %v", want, have)
+-	}
+ }
+ 
+ func TestFromContext(t *testing.T) {
+@@ -76,12 +71,10 @@ func TestFromContext(t *testing.T) {
+ 		parentSpanID int64 = 58
+ 	)
+ 
+-	newSpan := zipkin.NewSpan(hostport, serviceName, methodName, traceID, spanID, parentSpanID)
+-	newSpan.Sample()
+ 	ctx := context.WithValue(
+ 		context.Background(),
+ 		zipkin.SpanContextKey,
+-		newSpan,
++		zipkin.NewSpan(hostport, serviceName, methodName, traceID, spanID, parentSpanID),
+ 	)
+ 
+ 	span, ok := zipkin.FromContext(ctx)
+@@ -104,9 +97,6 @@ func TestFromContext(t *testing.T) {
+ 			t.Errorf("%s: want %d, have %d", name, want, have)
+ 		}
+ 	}
+-	if want, have := true, span.IsSampled(); want != have {
+-		t.Errorf("IsSampled: want %v, have %v", want, have)
+-	}
+ }
+ 
+ func TestToGRPCContext(t *testing.T) {
+@@ -123,7 +113,6 @@ func TestToGRPCContext(t *testing.T) {
+ 		"x-b3-traceid":      []string{strconv.FormatInt(traceID, 16)},
+ 		"x-b3-spanid":       []string{strconv.FormatInt(spanID, 16)},
+ 		"x-b3-parentspanid": []string{strconv.FormatInt(parentSpanID, 16)},
+-		"x-b3-sampled":      []string{"1"},
+ 	}
+ 
+ 	newSpan := zipkin.MakeNewSpanFunc(hostport, serviceName, methodName)
+@@ -152,9 +141,6 @@ func TestToGRPCContext(t *testing.T) {
+ 			t.Errorf("%s: want %d, have %d", name, want, have)
+ 		}
+ 	}
+-	if want, have := true, span.IsSampled(); want != have {
+-		t.Errorf("IsSampled: want %v, have %v", want, have)
+-	}
+ }
+ 
+ func TestToRequest(t *testing.T) {
+@@ -165,12 +151,10 @@ func TestToRequest(t *testing.T) {
+ 		traceID      int64 = 20
+ 		spanID       int64 = 40
+ 		parentSpanID int64 = 90
+-		sampled            = "1"
+ 	)
+ 
+ 	newSpan := zipkin.MakeNewSpanFunc(hostport, serviceName, methodName)
+ 	span := newSpan(traceID, spanID, parentSpanID)
+-	span.Sample()
+ 	ctx := context.WithValue(context.Background(), zipkin.SpanContextKey, span)
+ 	r, _ := http.NewRequest("GET", "https://best.horse", nil)
+ 	ctx = zipkin.ToRequest(newSpan)(ctx, r)
+@@ -184,9 +168,6 @@ func TestToRequest(t *testing.T) {
+ 			t.Errorf("%s: want %q, have %q", header, want, have)
+ 		}
+ 	}
+-	if want, have := sampled, r.Header.Get("X-B3-Sampled"); want != have {
+-		t.Errorf("X-B3-Sampled: want %q, have %q", want, have)
+-	}
+ }
+ 
+ func TestToGRPCRequest(t *testing.T) {
+@@ -197,12 +178,10 @@ func TestToGRPCRequest(t *testing.T) {
+ 		traceID      int64 = 20
+ 		spanID       int64 = 40
+ 		parentSpanID int64 = 90
+-		sampled            = "1"
+ 	)
+ 
+ 	newSpan := zipkin.MakeNewSpanFunc(hostport, serviceName, methodName)
+ 	span := newSpan(traceID, spanID, parentSpanID)
+-	span.Sample()
+ 	ctx := context.WithValue(context.Background(), zipkin.SpanContextKey, span)
+ 	md := &metadata.MD{}
+ 	ctx = zipkin.ToGRPCRequest(newSpan)(ctx, md)
+@@ -216,10 +195,6 @@ func TestToGRPCRequest(t *testing.T) {
+ 			t.Errorf("%s: want %q, have %q", header, want, have)
+ 		}
+ 	}
+-	if want, have := sampled, (*md)["x-b3-sampled"][0]; want != have {
+-		t.Errorf("x-b3-sampled: want %q, have %q", want, have)
+-	}
+-
+ }
+ 
+ func TestAnnotateServer(t *testing.T) {
+@@ -273,10 +248,6 @@ func (c *countingCollector) Collect(s *zipkin.Span) error {
+ 	return nil
+ }
+ 
+-func (c *countingCollector) ShouldSample(s *zipkin.Span) bool {
+-	return true
+-}
+-
+ func (c *countingCollector) Close() error {
+ 	return nil
+ }

@@ -1,0 +1,330 @@
+diff --git a/internal/exit/exit.go b/internal/exit/exit.go
+index 187fe5b..dfc5b05 100644
+--- a/internal/exit/exit.go
++++ b/internal/exit/exit.go
+@@ -24,32 +24,24 @@ package exit
+ 
+ import "os"
+ 
+-var _exit = os.Exit
++var real = func() { os.Exit(1) }
+ 
+ // Exit normally terminates the process by calling os.Exit(1). If the package
+ // is stubbed, it instead records a call in the testing spy.
+-// Deprecated: use With() instead.
+ func Exit() {
+-	With(1)
+-}
+-
+-// With terminates the process by calling os.Exit(code). If the package is
+-// stubbed, it instead records a call in the testing spy.
+-func With(code int) {
+-	_exit(code)
++	real()
+ }
+ 
+ // A StubbedExit is a testing fake for os.Exit.
+ type StubbedExit struct {
+ 	Exited bool
+-	Code   int
+-	prev   func(code int)
++	prev   func()
+ }
+ 
+ // Stub substitutes a fake for the call to os.Exit(1).
+ func Stub() *StubbedExit {
+-	s := &StubbedExit{prev: _exit}
+-	_exit = s.exit
++	s := &StubbedExit{prev: real}
++	real = s.exit
+ 	return s
+ }
+ 
+@@ -64,10 +56,9 @@ func WithStub(f func()) *StubbedExit {
+ 
+ // Unstub restores the previous exit function.
+ func (se *StubbedExit) Unstub() {
+-	_exit = se.prev
++	real = se.prev
+ }
+ 
+-func (se *StubbedExit) exit(code int) {
++func (se *StubbedExit) exit() {
+ 	se.Exited = true
+-	se.Code = code
+ }
+diff --git a/internal/exit/exit_test.go b/internal/exit/exit_test.go
+index 0f86a88..300cdc3 100644
+--- a/internal/exit/exit_test.go
++++ b/internal/exit/exit_test.go
+@@ -18,32 +18,25 @@
+ // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ // THE SOFTWARE.
+ 
+-package exit_test
++package exit
+ 
+ import (
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
+-	"go.uber.org/zap/internal/exit"
+ )
+ 
+ func TestStub(t *testing.T) {
+-	type want struct {
+-		exit bool
+-		code int
+-	}
+ 	tests := []struct {
+ 		f    func()
+-		want want
++		want bool
+ 	}{
+-		{func() { exit.With(42) }, want{exit: true, code: 42}},
+-		{exit.Exit, want{exit: true, code: 1}},
+-		{func() {}, want{}},
++		{Exit, true},
++		{func() {}, false},
+ 	}
+ 
+ 	for _, tt := range tests {
+-		s := exit.WithStub(tt.f)
+-		assert.Equal(t, tt.want.exit, s.Exited, "Stub captured unexpected exit value.")
+-		assert.Equal(t, tt.want.code, s.Code, "Stub captured unexpected exit value.")
++		s := WithStub(tt.f)
++		assert.Equal(t, tt.want, s.Exited, "Stub captured unexpected exit value.")
+ 	}
+ }
+diff --git a/logger.go b/logger.go
+index e04de7c..087c742 100644
+--- a/logger.go
++++ b/logger.go
+@@ -42,7 +42,7 @@ type Logger struct {
+ 
+ 	development bool
+ 	addCaller   bool
+-	onFatal     zapcore.CheckWriteHook // default is WriteThenFatal
++	onFatal     zapcore.CheckWriteAction // default is WriteThenFatal
+ 
+ 	name        string
+ 	errorOutput zapcore.WriteSyncer
+@@ -288,12 +288,12 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
+ 		ce = ce.Should(ent, zapcore.WriteThenPanic)
+ 	case zapcore.FatalLevel:
+ 		onFatal := log.onFatal
+-		// nil is the default value for CheckWriteAction, and it leads to
++		// Noop is the default value for CheckWriteAction, and it leads to
+ 		// continued execution after a Fatal which is unexpected.
+-		if onFatal == nil {
++		if onFatal == zapcore.WriteThenNoop {
+ 			onFatal = zapcore.WriteThenFatal
+ 		}
+-		ce = ce.After(ent, onFatal)
++		ce = ce.Should(ent, onFatal)
+ 	case zapcore.DPanicLevel:
+ 		if log.development {
+ 			ce = ce.Should(ent, zapcore.WriteThenPanic)
+diff --git a/logger_test.go b/logger_test.go
+index 50f8c65..6fbf122 100644
+--- a/logger_test.go
++++ b/logger_test.go
+@@ -579,23 +579,6 @@ func TestLoggerCustomOnFatal(t *testing.T) {
+ 	}
+ }
+ 
+-type customWriteHook struct {
+-	called bool
+-}
+-
+-func (h *customWriteHook) OnWrite(_ *zapcore.CheckedEntry, _ []Field) {
+-	h.called = true
+-}
+-
+-func TestLoggerWithFatalHook(t *testing.T) {
+-	var h customWriteHook
+-	withLogger(t, InfoLevel, opts(WithFatalHook(&h)), func(logger *Logger, logs *observer.ObservedLogs) {
+-		logger.Fatal("great sadness")
+-		assert.True(t, h.called)
+-		assert.Equal(t, 1, logs.FilterLevelExact(FatalLevel).Len())
+-	})
+-}
+-
+ func TestNopLogger(t *testing.T) {
+ 	logger := NewNop()
+ 
+diff --git a/options.go b/options.go
+index d6c3449..e9e6616 100644
+--- a/options.go
++++ b/options.go
+@@ -133,15 +133,9 @@ func IncreaseLevel(lvl zapcore.LevelEnabler) Option {
+ }
+ 
+ // OnFatal sets the action to take on fatal logs.
+-// Deprecated: Use WithFatalHook instead.
+ func OnFatal(action zapcore.CheckWriteAction) Option {
+-	return WithFatalHook(action)
+-}
+-
+-// WithFatalHook sets a CheckWriteHook to run on fatal logs.
+-func WithFatalHook(hook zapcore.CheckWriteHook) Option {
+ 	return optionFunc(func(log *Logger) {
+-		log.onFatal = hook
++		log.onFatal = action
+ 	})
+ }
+ 
+diff --git a/zapcore/entry.go b/zapcore/entry.go
+index b035915..0885505 100644
+--- a/zapcore/entry.go
++++ b/zapcore/entry.go
+@@ -27,9 +27,10 @@ import (
+ 	"sync"
+ 	"time"
+ 
+-	"go.uber.org/multierr"
+ 	"go.uber.org/zap/internal/bufferpool"
+ 	"go.uber.org/zap/internal/exit"
++
++	"go.uber.org/multierr"
+ )
+ 
+ var (
+@@ -151,13 +152,6 @@ type Entry struct {
+ 	Stack      string
+ }
+ 
+-// CheckWriteHook allows to customize the action to take after a Fatal log entry
+-// is processed.
+-type CheckWriteHook interface {
+-	// OnWrite gets invoked when an entry is written
+-	OnWrite(*CheckedEntry, []Field)
+-}
+-
+ // CheckWriteAction indicates what action to take after a log entry is
+ // processed. Actions are ordered in increasing severity.
+ type CheckWriteAction uint8
+@@ -170,25 +164,10 @@ const (
+ 	WriteThenGoexit
+ 	// WriteThenPanic causes a panic after Write.
+ 	WriteThenPanic
+-	// WriteThenFatal causes an os.Exit(1) after Write.
++	// WriteThenFatal causes a fatal os.Exit after Write.
+ 	WriteThenFatal
+ )
+ 
+-// OnWrite implements the OnWrite method to keep CheckWriteAction compatible
+-// with the new CheckWriteHook interface which deprecates CheckWriteAction.
+-func (a CheckWriteAction) OnWrite(ce *CheckedEntry, _ []Field) {
+-	switch a {
+-	case WriteThenGoexit:
+-		runtime.Goexit()
+-	case WriteThenPanic:
+-		panic(ce.Message)
+-	case WriteThenFatal:
+-		exit.Exit()
+-	}
+-}
+-
+-var _ CheckWriteHook = CheckWriteAction(0)
+-
+ // CheckedEntry is an Entry together with a collection of Cores that have
+ // already agreed to log it.
+ //
+@@ -199,7 +178,7 @@ type CheckedEntry struct {
+ 	Entry
+ 	ErrorOutput WriteSyncer
+ 	dirty       bool // best-effort detection of pool misuse
+-	after       CheckWriteHook
++	should      CheckWriteAction
+ 	cores       []Core
+ }
+ 
+@@ -207,7 +186,7 @@ func (ce *CheckedEntry) reset() {
+ 	ce.Entry = Entry{}
+ 	ce.ErrorOutput = nil
+ 	ce.dirty = false
+-	ce.after = nil
++	ce.should = WriteThenNoop
+ 	for i := range ce.cores {
+ 		// don't keep references to cores
+ 		ce.cores[i] = nil
+@@ -245,11 +224,17 @@ func (ce *CheckedEntry) Write(fields ...Field) {
+ 		ce.ErrorOutput.Sync()
+ 	}
+ 
+-	hook := ce.after
+-	if hook != nil {
+-		hook.OnWrite(ce, fields)
+-	}
++	should, msg := ce.should, ce.Message
+ 	putCheckedEntry(ce)
++
++	switch should {
++	case WriteThenPanic:
++		panic(msg)
++	case WriteThenFatal:
++		exit.Exit()
++	case WriteThenGoexit:
++		runtime.Goexit()
++	}
+ }
+ 
+ // AddCore adds a Core that has agreed to log this CheckedEntry. It's intended to be
+@@ -267,19 +252,11 @@ func (ce *CheckedEntry) AddCore(ent Entry, core Core) *CheckedEntry {
+ // Should sets this CheckedEntry's CheckWriteAction, which controls whether a
+ // Core will panic or fatal after writing this log entry. Like AddCore, it's
+ // safe to call on nil CheckedEntry references.
+-// Deprecated: Use After(ent Entry, after CheckWriteHook) instead.
+ func (ce *CheckedEntry) Should(ent Entry, should CheckWriteAction) *CheckedEntry {
+-	return ce.After(ent, should)
+-}
+-
+-// After sets this CheckEntry's CheckWriteHook, which will be called after this
+-// log entry has been written. It's safe to call this on nil CheckedEntry
+-// references.
+-func (ce *CheckedEntry) After(ent Entry, hook CheckWriteHook) *CheckedEntry {
+ 	if ce == nil {
+ 		ce = getCheckedEntry()
+ 		ce.Entry = ent
+ 	}
+-	ce.after = hook
++	ce.should = should
+ 	return ce
+ }
+diff --git a/zapcore/entry_test.go b/zapcore/entry_test.go
+index d04cad9..4c2d67e 100644
+--- a/zapcore/entry_test.go
++++ b/zapcore/entry_test.go
+@@ -64,7 +64,7 @@ func TestPutNilEntry(t *testing.T) {
+ 			assert.NotNil(t, ce, "Expected only non-nil CheckedEntries in pool.")
+ 			assert.False(t, ce.dirty, "Unexpected dirty bit set.")
+ 			assert.Nil(t, ce.ErrorOutput, "Non-nil ErrorOutput.")
+-			assert.Nil(t, ce.after, "Unexpected terminal behavior.")
++			assert.Equal(t, WriteThenNoop, ce.should, "Unexpected terminal behavior.")
+ 			assert.Equal(t, 0, len(ce.cores), "Expected empty slice of cores.")
+ 			assert.True(t, cap(ce.cores) > 0, "Expected pooled CheckedEntries to pre-allocate slice of Cores.")
+ 		}
+@@ -128,22 +128,5 @@ func TestCheckedEntryWrite(t *testing.T) {
+ 			ce.Write()
+ 		})
+ 		assert.True(t, stub.Exited, "Expected to exit when WriteThenFatal is set.")
+-		assert.Equal(t, 1, stub.Code, "Expected to exit when WriteThenFatal is set.")
+ 	})
+-
+-	t.Run("After", func(t *testing.T) {
+-		var ce *CheckedEntry
+-		hook := &customHook{}
+-		ce = ce.After(Entry{}, hook)
+-		ce.Write()
+-		assert.True(t, hook.called, "Expected to call custom action after Write.")
+-	})
+-}
+-
+-type customHook struct {
+-	called bool
+-}
+-
+-func (c *customHook) OnWrite(_ *CheckedEntry, _ []Field) {
+-	c.called = true
+ }

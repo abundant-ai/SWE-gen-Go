@@ -1,0 +1,241 @@
+diff --git a/tracing/opentracing/endpoint.go b/tracing/opentracing/endpoint.go
+index ef7fa63..9f626a7 100644
+--- a/tracing/opentracing/endpoint.go
++++ b/tracing/opentracing/endpoint.go
+@@ -37,10 +37,10 @@ func TraceClient(tracer opentracing.Tracer, operationName string) endpoint.Middl
+ 	return func(next endpoint.Endpoint) endpoint.Endpoint {
+ 		return func(ctx context.Context, request interface{}) (interface{}, error) {
+ 			parentSpan := opentracing.SpanFromContext(ctx)
+-			clientSpan := tracer.StartSpan(
+-				operationName,
+-				opentracing.ChildOf(parentSpan.Context()),
+-			)
++			clientSpan := tracer.StartSpanWithOptions(opentracing.StartSpanOptions{
++				OperationName: operationName,
++				Parent:        parentSpan, // may be nil
++			})
+ 			defer clientSpan.Finish()
+ 			otext.SpanKind.Set(clientSpan, otext.SpanKindRPCClient)
+ 			ctx = opentracing.ContextWithSpan(ctx, clientSpan)
+diff --git a/tracing/opentracing/endpoint_test.go b/tracing/opentracing/endpoint_test.go
+index f7727b4..d89136c 100644
+--- a/tracing/opentracing/endpoint_test.go
++++ b/tracing/opentracing/endpoint_test.go
+@@ -33,10 +33,9 @@ func TestTraceServer(t *testing.T) {
+ 	if want, have := "testOp", endpointSpan.OperationName; want != have {
+ 		t.Fatalf("Want %q, have %q", want, have)
+ 	}
+-	contextContext := contextSpan.Context().(*mocktracer.MockSpanContext)
+-	endpointContext := endpointSpan.Context().(*mocktracer.MockSpanContext)
++
+ 	// ...and that the ID is unmodified.
+-	if want, have := contextContext.SpanID, endpointContext.SpanID; want != have {
++	if want, have := contextSpan.SpanID, endpointSpan.SpanID; want != have {
+ 		t.Errorf("Want SpanID %q, have %q", want, have)
+ 	}
+ }
+@@ -86,11 +85,8 @@ func TestTraceClient(t *testing.T) {
+ 		t.Fatalf("Want %q, have %q", want, have)
+ 	}
+ 
+-	parentContext := parentSpan.Context().(*mocktracer.MockSpanContext)
+-	endpointContext := parentSpan.Context().(*mocktracer.MockSpanContext)
+-
+ 	// ... and that the parent ID is set appropriately.
+-	if want, have := parentContext.SpanID, endpointContext.SpanID; want != have {
++	if want, have := parentSpan.SpanID, endpointSpan.ParentID; want != have {
+ 		t.Errorf("Want ParentID %q, have %q", want, have)
+ 	}
+ }
+diff --git a/tracing/opentracing/grpc.go b/tracing/opentracing/grpc.go
+index e678e30..258dff2 100644
+--- a/tracing/opentracing/grpc.go
++++ b/tracing/opentracing/grpc.go
+@@ -5,7 +5,6 @@ import (
+ 	"strings"
+ 
+ 	"github.com/opentracing/opentracing-go"
+-	"github.com/opentracing/opentracing-go/ext"
+ 	"golang.org/x/net/context"
+ 	"google.golang.org/grpc/metadata"
+ 
+@@ -21,7 +20,7 @@ func ToGRPCRequest(tracer opentracing.Tracer, logger log.Logger) func(ctx contex
+ 	return func(ctx context.Context, md *metadata.MD) context.Context {
+ 		if span := opentracing.SpanFromContext(ctx); span != nil {
+ 			// There's nothing we can do with an error here.
+-			if err := tracer.Inject(span.Context(), opentracing.TextMap, metadataReaderWriter{md}); err != nil {
++			if err := tracer.Inject(span, opentracing.TextMap, metadataReaderWriter{md}); err != nil {
+ 				logger.Log("err", err)
+ 			}
+ 		}
+@@ -38,12 +37,13 @@ func ToGRPCRequest(tracer opentracing.Tracer, logger log.Logger) func(ctx contex
+ // The logger is used to report errors and may be nil.
+ func FromGRPCRequest(tracer opentracing.Tracer, operationName string, logger log.Logger) func(ctx context.Context, md *metadata.MD) context.Context {
+ 	return func(ctx context.Context, md *metadata.MD) context.Context {
+-		var span opentracing.Span
+-		wireContext, err := tracer.Extract(opentracing.TextMap, metadataReaderWriter{md})
++		span, err := tracer.Join(operationName, opentracing.TextMap, metadataReaderWriter{md})
+ 		if err != nil {
+-			logger.Log("err", err)
++			span = tracer.StartSpan(operationName)
++			if err != opentracing.ErrTraceNotFound {
++				logger.Log("err", err)
++			}
+ 		}
+-		span = tracer.StartSpan(operationName, ext.RPCServerOption(wireContext))
+ 		return opentracing.ContextWithSpan(ctx, span)
+ 	}
+ }
+diff --git a/tracing/opentracing/grpc_test.go b/tracing/opentracing/grpc_test.go
+index c23b63b..2db9db3 100644
+--- a/tracing/opentracing/grpc_test.go
++++ b/tracing/opentracing/grpc_test.go
+@@ -8,21 +8,19 @@ import (
+ 	"golang.org/x/net/context"
+ 	"google.golang.org/grpc/metadata"
+ 
+-	"github.com/go-kit/kit/log"
+ 	kitot "github.com/go-kit/kit/tracing/opentracing"
+ )
+ 
+ func TestTraceGRPCRequestRoundtrip(t *testing.T) {
+-	logger := log.NewNopLogger()
+ 	tracer := mocktracer.New()
+ 
+ 	// Initialize the ctx with a Span to inject.
+ 	beforeSpan := tracer.StartSpan("to_inject").(*mocktracer.MockSpan)
+ 	defer beforeSpan.Finish()
+-	beforeSpan.Context().SetBaggageItem("baggage", "check")
++	beforeSpan.SetBaggageItem("baggage", "check")
+ 	beforeCtx := opentracing.ContextWithSpan(context.Background(), beforeSpan)
+ 
+-	toGRPCFunc := kitot.ToGRPCRequest(tracer, logger)
++	toGRPCFunc := kitot.ToGRPCRequest(tracer, nil)
+ 	md := metadata.Pairs()
+ 	// Call the RequestFunc.
+ 	afterCtx := toGRPCFunc(beforeCtx, &md)
+@@ -40,25 +38,22 @@ func TestTraceGRPCRequestRoundtrip(t *testing.T) {
+ 	}
+ 
+ 	// Use FromGRPCRequest to verify that we can join with the trace given MD.
+-	fromGRPCFunc := kitot.FromGRPCRequest(tracer, "joined", logger)
++	fromGRPCFunc := kitot.FromGRPCRequest(tracer, "joined", nil)
+ 	joinCtx := fromGRPCFunc(afterCtx, &md)
+ 	joinedSpan := opentracing.SpanFromContext(joinCtx).(*mocktracer.MockSpan)
+ 
+-	joinedContext := joinedSpan.Context().(*mocktracer.MockSpanContext)
+-	beforeContext := beforeSpan.Context().(*mocktracer.MockSpanContext)
+-
+-	if joinedContext.SpanID == beforeContext.SpanID {
+-		t.Error("SpanID should have changed", joinedContext.SpanID, beforeContext.SpanID)
++	if joinedSpan.SpanID == beforeSpan.SpanID {
++		t.Error("SpanID should have changed", joinedSpan.SpanID, beforeSpan.SpanID)
+ 	}
+ 
+ 	// Check that the parent/child relationship is as expected for the joined span.
+-	if want, have := beforeContext.SpanID, joinedSpan.ParentID; want != have {
++	if want, have := beforeSpan.SpanID, joinedSpan.ParentID; want != have {
+ 		t.Errorf("Want ParentID %q, have %q", want, have)
+ 	}
+ 	if want, have := "joined", joinedSpan.OperationName; want != have {
+ 		t.Errorf("Want %q, have %q", want, have)
+ 	}
+-	if want, have := "check", joinedSpan.Context().BaggageItem("baggage"); want != have {
++	if want, have := "check", joinedSpan.BaggageItem("baggage"); want != have {
+ 		t.Errorf("Want %q, have %q", want, have)
+ 	}
+ }
+diff --git a/tracing/opentracing/http.go b/tracing/opentracing/http.go
+index 49fb711..63c59f8 100644
+--- a/tracing/opentracing/http.go
++++ b/tracing/opentracing/http.go
+@@ -36,7 +36,7 @@ func ToHTTPRequest(tracer opentracing.Tracer, logger log.Logger) kithttp.Request
+ 
+ 			// There's nothing we can do with any errors here.
+ 			if err = tracer.Inject(
+-				span.Context(),
++				span,
+ 				opentracing.TextMap,
+ 				opentracing.HTTPHeaderTextMapCarrier(req.Header),
+ 			); err != nil {
+@@ -57,15 +57,17 @@ func ToHTTPRequest(tracer opentracing.Tracer, logger log.Logger) kithttp.Request
+ func FromHTTPRequest(tracer opentracing.Tracer, operationName string, logger log.Logger) kithttp.RequestFunc {
+ 	return func(ctx context.Context, req *http.Request) context.Context {
+ 		// Try to join to a trace propagated in `req`.
+-		var span opentracing.Span
+-		wireContext, err := tracer.Extract(
++		span, err := tracer.Join(
++			operationName,
+ 			opentracing.TextMap,
+ 			opentracing.HTTPHeaderTextMapCarrier(req.Header),
+ 		)
+ 		if err != nil {
+-			logger.Log("err", err)
++			span = tracer.StartSpan(operationName)
++			if err != opentracing.ErrTraceNotFound {
++				logger.Log("err", err)
++			}
+ 		}
+-		span = tracer.StartSpan(operationName, ext.RPCServerOption(wireContext))
+ 		return opentracing.ContextWithSpan(ctx, span)
+ 	}
+ }
+diff --git a/tracing/opentracing/http_test.go b/tracing/opentracing/http_test.go
+index 5035db8..a6f22bf 100644
+--- a/tracing/opentracing/http_test.go
++++ b/tracing/opentracing/http_test.go
+@@ -8,21 +8,19 @@ import (
+ 	"github.com/opentracing/opentracing-go/mocktracer"
+ 	"golang.org/x/net/context"
+ 
+-	"github.com/go-kit/kit/log"
+ 	kitot "github.com/go-kit/kit/tracing/opentracing"
+ )
+ 
+ func TestTraceHTTPRequestRoundtrip(t *testing.T) {
+-	logger := log.NewNopLogger()
+ 	tracer := mocktracer.New()
+ 
+ 	// Initialize the ctx with a Span to inject.
+ 	beforeSpan := tracer.StartSpan("to_inject").(*mocktracer.MockSpan)
+ 	defer beforeSpan.Finish()
+-	beforeSpan.Context().SetBaggageItem("baggage", "check")
++	beforeSpan.SetBaggageItem("baggage", "check")
+ 	beforeCtx := opentracing.ContextWithSpan(context.Background(), beforeSpan)
+ 
+-	toHTTPFunc := kitot.ToHTTPRequest(tracer, logger)
++	toHTTPFunc := kitot.ToHTTPRequest(tracer, nil)
+ 	req, _ := http.NewRequest("GET", "http://test.biz/url", nil)
+ 	// Call the RequestFunc.
+ 	afterCtx := toHTTPFunc(beforeCtx, req)
+@@ -40,25 +38,22 @@ func TestTraceHTTPRequestRoundtrip(t *testing.T) {
+ 	}
+ 
+ 	// Use FromHTTPRequest to verify that we can join with the trace given a req.
+-	fromHTTPFunc := kitot.FromHTTPRequest(tracer, "joined", logger)
++	fromHTTPFunc := kitot.FromHTTPRequest(tracer, "joined", nil)
+ 	joinCtx := fromHTTPFunc(afterCtx, req)
+ 	joinedSpan := opentracing.SpanFromContext(joinCtx).(*mocktracer.MockSpan)
+ 
+-	joinedContext := joinedSpan.Context().(*mocktracer.MockSpanContext)
+-	beforeContext := beforeSpan.Context().(*mocktracer.MockSpanContext)
+-
+-	if joinedContext.SpanID == beforeContext.SpanID {
+-		t.Error("SpanID should have changed", joinedContext.SpanID, beforeContext.SpanID)
++	if joinedSpan.SpanID == beforeSpan.SpanID {
++		t.Error("SpanID should have changed", joinedSpan.SpanID, beforeSpan.SpanID)
+ 	}
+ 
+ 	// Check that the parent/child relationship is as expected for the joined span.
+-	if want, have := beforeContext.SpanID, joinedSpan.ParentID; want != have {
++	if want, have := beforeSpan.SpanID, joinedSpan.ParentID; want != have {
+ 		t.Errorf("Want ParentID %q, have %q", want, have)
+ 	}
+ 	if want, have := "joined", joinedSpan.OperationName; want != have {
+ 		t.Errorf("Want %q, have %q", want, have)
+ 	}
+-	if want, have := "check", joinedSpan.Context().BaggageItem("baggage"); want != have {
++	if want, have := "check", joinedSpan.BaggageItem("baggage"); want != have {
+ 		t.Errorf("Want %q, have %q", want, have)
+ 	}
+ }

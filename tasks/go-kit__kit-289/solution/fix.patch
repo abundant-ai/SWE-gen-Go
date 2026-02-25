@@ -1,0 +1,188 @@
+diff --git a/examples/addsvc/client/grpc/client.go b/examples/addsvc/client/grpc/client.go
+index e72bbe4..f21a9f5 100644
+--- a/examples/addsvc/client/grpc/client.go
++++ b/examples/addsvc/client/grpc/client.go
+@@ -39,7 +39,7 @@ func New(conn *grpc.ClientConn, tracer stdopentracing.Tracer, logger log.Logger)
+ 			addsvc.EncodeGRPCSumRequest,
+ 			addsvc.DecodeGRPCSumResponse,
+ 			pb.SumReply{},
+-			grpctransport.SetClientBefore(opentracing.FromGRPCRequest(tracer, "Sum", logger)),
++			grpctransport.ClientBefore(opentracing.FromGRPCRequest(tracer, "Sum", logger)),
+ 		).Endpoint()
+ 		sumEndpoint = opentracing.TraceClient(tracer, "Sum")(sumEndpoint)
+ 		sumEndpoint = limiter(sumEndpoint)
+@@ -58,7 +58,7 @@ func New(conn *grpc.ClientConn, tracer stdopentracing.Tracer, logger log.Logger)
+ 			addsvc.EncodeGRPCConcatRequest,
+ 			addsvc.DecodeGRPCConcatResponse,
+ 			pb.ConcatReply{},
+-			grpctransport.SetClientBefore(opentracing.FromGRPCRequest(tracer, "Concat", logger)),
++			grpctransport.ClientBefore(opentracing.FromGRPCRequest(tracer, "Concat", logger)),
+ 		).Endpoint()
+ 		concatEndpoint = opentracing.TraceClient(tracer, "Concat")(concatEndpoint)
+ 		concatEndpoint = limiter(concatEndpoint)
+diff --git a/examples/addsvc/client/http/client.go b/examples/addsvc/client/http/client.go
+index c597c98..cb349fb 100644
+--- a/examples/addsvc/client/http/client.go
++++ b/examples/addsvc/client/http/client.go
+@@ -46,7 +46,7 @@ func New(instance string, tracer stdopentracing.Tracer, logger log.Logger) (adds
+ 			copyURL(u, "/sum"),
+ 			addsvc.EncodeHTTPGenericRequest,
+ 			addsvc.DecodeHTTPSumResponse,
+-			httptransport.SetClientBefore(opentracing.FromHTTPRequest(tracer, "Sum", logger)),
++			httptransport.ClientBefore(opentracing.FromHTTPRequest(tracer, "Sum", logger)),
+ 		).Endpoint()
+ 		sumEndpoint = opentracing.TraceClient(tracer, "Sum")(sumEndpoint)
+ 		sumEndpoint = limiter(sumEndpoint)
+@@ -63,7 +63,7 @@ func New(instance string, tracer stdopentracing.Tracer, logger log.Logger) (adds
+ 			copyURL(u, "/concat"),
+ 			addsvc.EncodeHTTPGenericRequest,
+ 			addsvc.DecodeHTTPConcatResponse,
+-			httptransport.SetClientBefore(opentracing.FromHTTPRequest(tracer, "Concat", logger)),
++			httptransport.ClientBefore(opentracing.FromHTTPRequest(tracer, "Concat", logger)),
+ 		).Endpoint()
+ 		concatEndpoint = opentracing.TraceClient(tracer, "Concat")(concatEndpoint)
+ 		concatEndpoint = limiter(concatEndpoint)
+diff --git a/transport/grpc/client.go b/transport/grpc/client.go
+index b1c9af3..2dffb4f 100644
+--- a/transport/grpc/client.go
++++ b/transport/grpc/client.go
+@@ -64,9 +64,9 @@ func NewClient(
+ // ClientOption sets an optional parameter for clients.
+ type ClientOption func(*Client)
+ 
+-// SetClientBefore sets the RequestFuncs that are applied to the outgoing gRPC
++// ClientBefore sets the RequestFuncs that are applied to the outgoing gRPC
+ // request before it's invoked.
+-func SetClientBefore(before ...RequestFunc) ClientOption {
++func ClientBefore(before ...RequestFunc) ClientOption {
+ 	return func(c *Client) { c.before = before }
+ }
+ 
+diff --git a/transport/http/client.go b/transport/http/client.go
+index 6652319..a8aca26 100644
+--- a/transport/http/client.go
++++ b/transport/http/client.go
+@@ -18,6 +18,7 @@ type Client struct {
+ 	enc            EncodeRequestFunc
+ 	dec            DecodeResponseFunc
+ 	before         []RequestFunc
++	after          []ClientResponseFunc
+ 	bufferedStream bool
+ }
+ 
+@@ -36,6 +37,7 @@ func NewClient(
+ 		enc:            enc,
+ 		dec:            dec,
+ 		before:         []RequestFunc{},
++		after:          []ClientResponseFunc{},
+ 		bufferedStream: false,
+ 	}
+ 	for _, option := range options {
+@@ -53,15 +55,22 @@ func SetClient(client *http.Client) ClientOption {
+ 	return func(c *Client) { c.client = client }
+ }
+ 
+-// SetClientBefore sets the RequestFuncs that are applied to the outgoing HTTP
++// ClientBefore sets the RequestFuncs that are applied to the outgoing HTTP
+ // request before it's invoked.
+-func SetClientBefore(before ...RequestFunc) ClientOption {
++func ClientBefore(before ...RequestFunc) ClientOption {
+ 	return func(c *Client) { c.before = before }
+ }
+ 
+-// SetBufferedStream sets whether the Response.Body is left open, allowing it
++// ClientAfter sets the ClientResponseFuncs applied to the incoming HTTP
++// request prior to it being decoded. This is useful for obtaining anything off
++// of the response and adding onto the context prior to decoding.
++func ClientAfter(after ...ClientResponseFunc) ClientOption {
++	return func(c *Client) { c.after = after }
++}
++
++// BufferedStream sets whether the Response.Body is left open, allowing it
+ // to be read from later. Useful for transporting a file as a buffered stream.
+-func SetBufferedStream(buffered bool) ClientOption {
++func BufferedStream(buffered bool) ClientOption {
+ 	return func(c *Client) { c.bufferedStream = buffered }
+ }
+ 
+@@ -92,6 +101,10 @@ func (c Client) Endpoint() endpoint.Endpoint {
+ 			defer resp.Body.Close()
+ 		}
+ 
++		for _, f := range c.after {
++			ctx = f(ctx, resp)
++		}
++
+ 		response, err := c.dec(ctx, resp)
+ 		if err != nil {
+ 			return nil, Error{Domain: DomainDecode, Err: err}
+diff --git a/transport/http/request_response_funcs.go b/transport/http/request_response_funcs.go
+index 892dcbf..1a3ef9b 100644
+--- a/transport/http/request_response_funcs.go
++++ b/transport/http/request_response_funcs.go
+@@ -12,21 +12,27 @@ import (
+ // but prior to invoking the HTTP client.
+ type RequestFunc func(context.Context, *http.Request) context.Context
+ 
+-// ResponseFunc may take information from a request context and use it to
+-// manipulate a ResponseWriter. ResponseFuncs are only executed in servers,
+-// after invoking the endpoint but prior to writing a response.
+-type ResponseFunc func(context.Context, http.ResponseWriter)
++// ServerResponseFunc may take information from a request context and use it to
++// manipulate a ResponseWriter. ServerResponseFuncs are only executed in
++// servers, after invoking the endpoint but prior to writing a response.
++type ServerResponseFunc func(context.Context, http.ResponseWriter) context.Context
++
++// ClientResponseFunc may take information from an HTTP request and make the
++// response available for consumption. ClientResponseFuncs are only executed in
++// clients, after a request has been made, but prior to it being decoded.
++type ClientResponseFunc func(context.Context, *http.Response) context.Context
+ 
+ // SetContentType returns a ResponseFunc that sets the Content-Type header to
+ // the provided value.
+-func SetContentType(contentType string) ResponseFunc {
++func SetContentType(contentType string) ServerResponseFunc {
+ 	return SetResponseHeader("Content-Type", contentType)
+ }
+ 
+ // SetResponseHeader returns a ResponseFunc that sets the specified header.
+-func SetResponseHeader(key, val string) ResponseFunc {
+-	return func(_ context.Context, w http.ResponseWriter) {
++func SetResponseHeader(key, val string) ServerResponseFunc {
++	return func(ctx context.Context, w http.ResponseWriter) context.Context {
+ 		w.Header().Set(key, val)
++		return ctx
+ 	}
+ }
+ 
+diff --git a/transport/http/server.go b/transport/http/server.go
+index 9c21ab9..4b1b734 100644
+--- a/transport/http/server.go
++++ b/transport/http/server.go
+@@ -16,7 +16,7 @@ type Server struct {
+ 	dec          DecodeRequestFunc
+ 	enc          EncodeResponseFunc
+ 	before       []RequestFunc
+-	after        []ResponseFunc
++	after        []ServerResponseFunc
+ 	errorEncoder ErrorEncoder
+ 	logger       log.Logger
+ }
+@@ -55,7 +55,7 @@ func ServerBefore(before ...RequestFunc) ServerOption {
+ 
+ // ServerAfter functions are executed on the HTTP response writer after the
+ // endpoint is invoked, but before anything is written to the client.
+-func ServerAfter(after ...ResponseFunc) ServerOption {
++func ServerAfter(after ...ServerResponseFunc) ServerOption {
+ 	return func(s *Server) { s.after = after }
+ }
+ 
+@@ -98,7 +98,7 @@ func (s Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	for _, f := range s.after {
+-		f(ctx, w)
++		ctx = f(ctx, w)
+ 	}
+ 
+ 	if err := s.enc(ctx, w, response); err != nil {

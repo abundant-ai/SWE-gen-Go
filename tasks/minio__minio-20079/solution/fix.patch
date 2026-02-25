@@ -1,0 +1,319 @@
+diff --git a/cmd/admin-handlers.go b/cmd/admin-handlers.go
+index 9715db0aa..8b031e732 100644
+--- a/cmd/admin-handlers.go
++++ b/cmd/admin-handlers.go
+@@ -2186,7 +2186,7 @@ func (a adminAPIHandlers) KMSCreateKeyHandler(w http.ResponseWriter, r *http.Req
+ 	writeSuccessResponseHeadersOnly(w)
+ }
+ 
+-// KMSKeyStatusHandler - GET /minio/admin/v3/kms/status
++// KMSStatusHandler - GET /minio/admin/v3/kms/status
+ func (a adminAPIHandlers) KMSStatusHandler(w http.ResponseWriter, r *http.Request) {
+ 	ctx := r.Context()
+ 
+diff --git a/cmd/kms-handlers.go b/cmd/kms-handlers.go
+index e77a3ea68..39fe31fdd 100644
+--- a/cmd/kms-handlers.go
++++ b/cmd/kms-handlers.go
+@@ -24,6 +24,7 @@ import (
+ 
+ 	"github.com/minio/kms-go/kes"
+ 	"github.com/minio/madmin-go/v3"
++	"github.com/minio/minio/internal/auth"
+ 	"github.com/minio/minio/internal/kms"
+ 	"github.com/minio/minio/internal/logger"
+ 	"github.com/minio/pkg/v3/policy"
+@@ -56,7 +57,7 @@ func (a kmsAPIHandlers) KMSStatusHandler(w http.ResponseWriter, r *http.Request)
+ 	writeSuccessResponseJSON(w, resp)
+ }
+ 
+-// KMSMetricsHandler - POST /minio/kms/v1/metrics
++// KMSMetricsHandler - GET /minio/kms/v1/metrics
+ func (a kmsAPIHandlers) KMSMetricsHandler(w http.ResponseWriter, r *http.Request) {
+ 	ctx := newContext(r, w, "KMSMetrics")
+ 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+@@ -83,7 +84,7 @@ func (a kmsAPIHandlers) KMSMetricsHandler(w http.ResponseWriter, r *http.Request
+ 	}
+ }
+ 
+-// KMSAPIsHandler - POST /minio/kms/v1/apis
++// KMSAPIsHandler - GET /minio/kms/v1/apis
+ func (a kmsAPIHandlers) KMSAPIsHandler(w http.ResponseWriter, r *http.Request) {
+ 	ctx := newContext(r, w, "KMSAPIs")
+ 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+@@ -114,7 +115,7 @@ type versionResponse struct {
+ 	Version string `json:"version"`
+ }
+ 
+-// KMSVersionHandler - POST /minio/kms/v1/version
++// KMSVersionHandler - GET /minio/kms/v1/version
+ func (a kmsAPIHandlers) KMSVersionHandler(w http.ResponseWriter, r *http.Request) {
+ 	ctx := newContext(r, w, "KMSVersion")
+ 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+@@ -159,7 +160,20 @@ func (a kmsAPIHandlers) KMSCreateKeyHandler(w http.ResponseWriter, r *http.Reque
+ 		return
+ 	}
+ 
+-	if err := GlobalKMS.CreateKey(ctx, &kms.CreateKeyRequest{Name: r.Form.Get("key-id")}); err != nil {
++	keyID := r.Form.Get("key-id")
++
++	// Ensure policy allows the user to create this key name
++	cred, owner, s3Err := validateAdminSignature(ctx, r, "")
++	if s3Err != ErrNone {
++		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
++		return
++	}
++	if !checkKMSActionAllowed(r, owner, cred, policy.KMSCreateKeyAction, keyID) {
++		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
++		return
++	}
++
++	if err := GlobalKMS.CreateKey(ctx, &kms.CreateKeyRequest{Name: keyID}); err != nil {
+ 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+ 		return
+ 	}
+@@ -171,6 +185,9 @@ func (a kmsAPIHandlers) KMSListKeysHandler(w http.ResponseWriter, r *http.Reques
+ 	ctx := newContext(r, w, "KMSListKeys")
+ 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+ 
++	// This only checks if the action (kms:ListKeys) is allowed, it does not check
++	// each key name against the policy's Resources. We check that below, once
++	// we have the list of key names from the KMS.
+ 	objectAPI, _ := validateAdminReq(ctx, w, r, policy.KMSListKeysAction)
+ 	if objectAPI == nil {
+ 		return
+@@ -180,7 +197,7 @@ func (a kmsAPIHandlers) KMSListKeysHandler(w http.ResponseWriter, r *http.Reques
+ 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrKMSNotConfigured), r.URL)
+ 		return
+ 	}
+-	names, _, err := GlobalKMS.ListKeyNames(ctx, &kms.ListRequest{
++	allKeyNames, _, err := GlobalKMS.ListKeyNames(ctx, &kms.ListRequest{
+ 		Prefix: r.Form.Get("pattern"),
+ 	})
+ 	if err != nil {
+@@ -188,8 +205,24 @@ func (a kmsAPIHandlers) KMSListKeysHandler(w http.ResponseWriter, r *http.Reques
+ 		return
+ 	}
+ 
+-	values := make([]kes.KeyInfo, 0, len(names))
+-	for _, name := range names {
++	// Get the cred and owner for checking authz below.
++	cred, owner, s3Err := validateAdminSignature(ctx, r, "")
++	if s3Err != ErrNone {
++		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
++		return
++	}
++
++	// Now we have all the key names, for each of them, check whether the policy grants permission for
++	// the user to list it.
++	keyNames := []string{}
++	for _, name := range allKeyNames {
++		if checkKMSActionAllowed(r, owner, cred, policy.KMSListKeysAction, name) {
++			keyNames = append(keyNames, name)
++		}
++	}
++
++	values := make([]kes.KeyInfo, 0, len(keyNames))
++	for _, name := range keyNames {
+ 		values = append(values, kes.KeyInfo{
+ 			Name: name,
+ 		})
+@@ -224,6 +257,17 @@ func (a kmsAPIHandlers) KMSKeyStatusHandler(w http.ResponseWriter, r *http.Reque
+ 		KeyID: keyID,
+ 	}
+ 
++	// Ensure policy allows the user to get this key's status
++	cred, owner, s3Err := validateAdminSignature(ctx, r, "")
++	if s3Err != ErrNone {
++		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
++		return
++	}
++	if !checkKMSActionAllowed(r, owner, cred, policy.KMSKeyStatusAction, keyID) {
++		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
++		return
++	}
++
+ 	kmsContext := kms.Context{"MinIO admin API": "KMSKeyStatusHandler"} // Context for a test key operation
+ 	// 1. Generate a new key using the KMS.
+ 	key, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{Name: keyID, AssociatedData: kmsContext})
+@@ -274,3 +318,16 @@ func (a kmsAPIHandlers) KMSKeyStatusHandler(w http.ResponseWriter, r *http.Reque
+ 	}
+ 	writeSuccessResponseJSON(w, resp)
+ }
++
++// checkKMSActionAllowed checks for authorization for a specific action on a resource.
++func checkKMSActionAllowed(r *http.Request, owner bool, cred auth.Credentials, action policy.KMSAction, resource string) bool {
++	return globalIAMSys.IsAllowed(policy.Args{
++		AccountName:     cred.AccessKey,
++		Groups:          cred.Groups,
++		Action:          policy.Action(action),
++		ConditionValues: getConditionValues(r, "", cred),
++		IsOwner:         owner,
++		Claims:          cred.Claims,
++		BucketName:      resource, // overloading BucketName as that's what the policy engine uses to assemble a Resource.
++	})
++}
+diff --git a/go.mod b/go.mod
+index c7c570ae9..140dd8463 100644
+--- a/go.mod
++++ b/go.mod
+@@ -55,7 +55,7 @@ require (
+ 	github.com/minio/madmin-go/v3 v3.0.58
+ 	github.com/minio/minio-go/v7 v7.0.73
+ 	github.com/minio/mux v1.9.0
+-	github.com/minio/pkg/v3 v3.0.7
++	github.com/minio/pkg/v3 v3.0.8
+ 	github.com/minio/selfupdate v0.6.0
+ 	github.com/minio/simdjson-go v0.4.5
+ 	github.com/minio/sio v0.4.0
+diff --git a/go.sum b/go.sum
+index 07936554a..2bb960122 100644
+--- a/go.sum
++++ b/go.sum
+@@ -472,8 +472,8 @@ github.com/minio/mux v1.9.0 h1:dWafQFyEfGhJvK6AwLOt83bIG5bxKxKJnKMCi0XAaoA=
+ github.com/minio/mux v1.9.0/go.mod h1:1pAare17ZRL5GpmNL+9YmqHoWnLmMZF9C/ioUCfy0BQ=
+ github.com/minio/pkg/v2 v2.0.19 h1:r187/k/oVH9H0DDwvLY5WipkJaZ4CLd4KI3KgIUExR0=
+ github.com/minio/pkg/v2 v2.0.19/go.mod h1:luK9LAhQlAPzSuF6F326XSCKjMc1G3Tbh+a9JYwqh8M=
+-github.com/minio/pkg/v3 v3.0.7 h1:1I2CbFKO+brioB6Pbnw0jLlFxo+YPy6hCTTXTSitgI8=
+-github.com/minio/pkg/v3 v3.0.7/go.mod h1:njlf539caYrgXqn/CXewqvkqBIMDTQo9oBBEL34LzY0=
++github.com/minio/pkg/v3 v3.0.8 h1:trJw6D3LzKQ96Hl5nWLwBpstaO56VNdsOmR5rowmDjc=
++github.com/minio/pkg/v3 v3.0.8/go.mod h1:njlf539caYrgXqn/CXewqvkqBIMDTQo9oBBEL34LzY0=
+ github.com/minio/selfupdate v0.6.0 h1:i76PgT0K5xO9+hjzKcacQtO7+MjJ4JKA8Ak8XQ9DDwU=
+ github.com/minio/selfupdate v0.6.0/go.mod h1:bO02GTIPCMQFTEvE5h4DjYB58bCoZ35XLeBf0buTDdM=
+ github.com/minio/sha256-simd v0.1.1/go.mod h1:B5e1o+1/KgNmWrSQK08Y6Z1Vb5pwIktudl0J58iy0KM=
+diff --git a/internal/kms/errors.go b/internal/kms/errors.go
+index 4f7b87d6a..9583651ed 100644
+--- a/internal/kms/errors.go
++++ b/internal/kms/errors.go
+@@ -44,7 +44,7 @@ var (
+ 	ErrKeyNotFound = Error{
+ 		Code:    http.StatusNotFound,
+ 		APICode: "kms:KeyNotFound",
+-		Err:     "key with given key ID does not exit",
++		Err:     "key with given key ID does not exist",
+ 	}
+ 
+ 	// ErrDecrypt is an error returned by the KMS when the decryption
+diff --git a/internal/kms/stub.go b/internal/kms/stub.go
+new file mode 100644
+index 000000000..545af6c63
+--- /dev/null
++++ b/internal/kms/stub.go
+@@ -0,0 +1,117 @@
++// Copyright (c) 2015-2024 MinIO, Inc.
++//
++// This file is part of MinIO Object Storage stack
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++package kms
++
++import (
++	"context"
++	"net/http"
++	"slices"
++	"sync/atomic"
++
++	"github.com/minio/madmin-go/v3"
++	"github.com/minio/pkg/v3/wildcard"
++)
++
++// NewStub returns a stub of KMS for testing
++func NewStub(defaultKeyName string) *KMS {
++	return &KMS{
++		Type:           Builtin,
++		DefaultKey:     defaultKeyName,
++		latencyBuckets: defaultLatencyBuckets,
++		latency:        make([]atomic.Uint64, len(defaultLatencyBuckets)),
++		conn: &StubKMS{
++			KeyNames: []string{defaultKeyName},
++		},
++	}
++}
++
++// StubKMS is a KMS implementation for tests
++type StubKMS struct {
++	KeyNames []string
++}
++
++// Version returns the type of the KMS.
++func (s StubKMS) Version(ctx context.Context) (string, error) {
++	return "stub", nil
++}
++
++// APIs returns supported APIs
++func (s StubKMS) APIs(ctx context.Context) ([]madmin.KMSAPI, error) {
++	return []madmin.KMSAPI{
++		{Method: http.MethodGet, Path: "stub/path"},
++	}, nil
++}
++
++// Status returns a set of endpoints and their KMS status.
++func (s StubKMS) Status(context.Context) (map[string]madmin.ItemState, error) {
++	return map[string]madmin.ItemState{
++		"127.0.0.1": madmin.ItemOnline,
++	}, nil
++}
++
++// ListKeyNames returns a list of key names.
++func (s StubKMS) ListKeyNames(ctx context.Context, req *ListRequest) ([]string, string, error) {
++	matches := []string{}
++	if req.Prefix == "" {
++		req.Prefix = "*"
++	}
++	for _, keyName := range s.KeyNames {
++		if wildcard.MatchAsPatternPrefix(req.Prefix, keyName) {
++			matches = append(matches, keyName)
++		}
++	}
++
++	return matches, "", nil
++}
++
++// CreateKey creates a new key with the given name.
++func (s *StubKMS) CreateKey(_ context.Context, req *CreateKeyRequest) error {
++	if s.containsKeyName(req.Name) {
++		return ErrKeyExists
++	}
++	s.KeyNames = append(s.KeyNames, req.Name)
++	return nil
++}
++
++// GenerateKey is a non-functional stub.
++func (s StubKMS) GenerateKey(_ context.Context, req *GenerateKeyRequest) (DEK, error) {
++	if !s.containsKeyName(req.Name) {
++		return DEK{}, ErrKeyNotFound
++	}
++	return DEK{
++		KeyID:      req.Name,
++		Version:    0,
++		Plaintext:  []byte("stubplaincharswhichare32bytelong"),
++		Ciphertext: []byte("stubplaincharswhichare32bytelong"),
++	}, nil
++}
++
++// Decrypt is a non-functional stub.
++func (s StubKMS) Decrypt(_ context.Context, req *DecryptRequest) ([]byte, error) {
++	return req.Ciphertext, nil
++}
++
++// MAC is a non-functional stub.
++func (s StubKMS) MAC(_ context.Context, m *MACRequest) ([]byte, error) {
++	return m.Message, nil
++}
++
++// containsKeyName returns true if the given key name exists in the stub KMS.
++func (s *StubKMS) containsKeyName(keyName string) bool {
++	return slices.Contains(s.KeyNames, keyName)
++}

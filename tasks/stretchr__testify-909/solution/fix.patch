@@ -1,0 +1,160 @@
+diff --git a/suite/interfaces.go b/suite/interfaces.go
+index b37cb04..8b98a8a 100644
+--- a/suite/interfaces.go
++++ b/suite/interfaces.go
+@@ -44,3 +44,10 @@ type BeforeTest interface {
+ type AfterTest interface {
+ 	AfterTest(suiteName, testName string)
+ }
++
++// WithStats implements HandleStats, a function that will be executed
++// when a test suite is finished. The stats contain information about
++// the execution of that suite and its tests.
++type WithStats interface {
++	HandleStats(suiteName string, stats *SuiteInformation)
++}
+diff --git a/suite/stats.go b/suite/stats.go
+new file mode 100644
+index 0000000..261da37
+--- /dev/null
++++ b/suite/stats.go
+@@ -0,0 +1,46 @@
++package suite
++
++import "time"
++
++// SuiteInformation stats stores stats for the whole suite execution.
++type SuiteInformation struct {
++	Start, End time.Time
++	TestStats  map[string]*TestInformation
++}
++
++// TestInformation stores information about the execution of each test.
++type TestInformation struct {
++	TestName   string
++	Start, End time.Time
++	Passed     bool
++}
++
++func newSuiteInformation() *SuiteInformation {
++	testStats := make(map[string]*TestInformation)
++
++	return &SuiteInformation{
++		TestStats: testStats,
++	}
++}
++
++func (s SuiteInformation) start(testName string) {
++	s.TestStats[testName] = &TestInformation{
++		TestName: testName,
++		Start:    time.Now(),
++	}
++}
++
++func (s SuiteInformation) end(testName string, passed bool) {
++	s.TestStats[testName].End = time.Now()
++	s.TestStats[testName].Passed = passed
++}
++
++func (s SuiteInformation) Passed() bool {
++	for _, stats := range s.TestStats {
++		if !stats.Passed {
++			return false
++		}
++	}
++
++	return true
++}
+diff --git a/suite/suite.go b/suite/suite.go
+index 6195301..cdaf9a9 100644
+--- a/suite/suite.go
++++ b/suite/suite.go
+@@ -9,6 +9,7 @@ import (
+ 	"runtime/debug"
+ 	"sync"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+@@ -87,6 +88,12 @@ func Run(t *testing.T, suite TestingSuite) {
+ 
+ 	suiteSetupDone := false
+ 
++	var stats *SuiteInformation
++
++	if _, ok := suite.(WithStats); ok {
++		stats = newSuiteInformation()
++	}
++
+ 	methodFinder := reflect.TypeOf(suite)
+ 	tests := []testing.InternalTest{}
+ 	for index := 0; index < methodFinder.NumMethod(); index++ {
+@@ -96,21 +103,36 @@ func Run(t *testing.T, suite TestingSuite) {
+ 			fmt.Fprintf(os.Stderr, "testify: invalid regexp for -m: %s\n", err)
+ 			os.Exit(1)
+ 		}
++
+ 		if !ok {
+ 			continue
+ 		}
++
++		suiteName := methodFinder.Elem().Name()
++
+ 		if !suiteSetupDone {
++			if stats != nil {
++				stats.Start = time.Now()
++			}
++
+ 			if setupAllSuite, ok := suite.(SetupAllSuite); ok {
+ 				setupAllSuite.SetupSuite()
+ 			}
++
+ 			defer func() {
+ 				if tearDownAllSuite, ok := suite.(TearDownAllSuite); ok {
+ 					testsSync.Wait()
+ 					tearDownAllSuite.TearDownSuite()
+ 				}
++
++				if suiteWithStats, measureStats := suite.(WithStats); measureStats {
++					stats.End = time.Now()
++					suiteWithStats.HandleStats(suiteName, stats)
++				}
+ 			}()
+ 			suiteSetupDone = true
+ 		}
++
+ 		test := testing.InternalTest{
+ 			Name: method.Name,
+ 			F: func(t *testing.T) {
+@@ -122,16 +144,29 @@ func Run(t *testing.T, suite TestingSuite) {
+ 				if setupTestSuite, ok := suite.(SetupTestSuite); ok {
+ 					setupTestSuite.SetupTest()
+ 				}
++
+ 				if beforeTestSuite, ok := suite.(BeforeTest); ok {
+ 					beforeTestSuite.BeforeTest(methodFinder.Elem().Name(), method.Name)
+ 				}
++
++				if stats != nil {
++					stats.start(method.Name)
++				}
++
+ 				defer func() {
++					if stats != nil {
++						passed := !t.Failed()
++						stats.end(method.Name, passed)
++					}
++
+ 					if afterTestSuite, ok := suite.(AfterTest); ok {
+-						afterTestSuite.AfterTest(methodFinder.Elem().Name(), method.Name)
++						afterTestSuite.AfterTest(suiteName, method.Name)
+ 					}
++
+ 					if tearDownTestSuite, ok := suite.(TearDownTestSuite); ok {
+ 						tearDownTestSuite.TearDownTest()
+ 					}
++
+ 					suite.SetT(parentT)
+ 				}()
+ 				method.Func.Call([]reflect.Value{reflect.ValueOf(suite)})

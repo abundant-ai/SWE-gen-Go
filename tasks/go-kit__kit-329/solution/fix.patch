@@ -1,0 +1,303 @@
+diff --git a/sd/etcd/client.go b/sd/etcd/client.go
+index 3e52f24..0508723 100644
+--- a/sd/etcd/client.go
++++ b/sd/etcd/client.go
+@@ -14,21 +14,32 @@ import (
+ )
+ 
+ var (
+-	ErrNoKey   = errors.New("no key provided")
++	// ErrNoKey indicates a client method needs a key but receives none.
++	ErrNoKey = errors.New("no key provided")
++
++	// ErrNoValue indicates a client method needs a value but receives none.
+ 	ErrNoValue = errors.New("no value provided")
+ )
+ 
+ // Client is a wrapper around the etcd client.
+ type Client interface {
+-	// GetEntries will query the given prefix in etcd and returns a set of entries.
++	// GetEntries queries the given prefix in etcd and returns a slice
++	// containing the values of all keys found, recursively, underneath that
++	// prefix.
+ 	GetEntries(prefix string) ([]string, error)
+ 
+-	// WatchPrefix starts watching every change for given prefix in etcd. When an
+-	// change is detected it will populate the responseChan when an *etcd.Response.
+-	WatchPrefix(prefix string, responseChan chan *etcd.Response)
++	// WatchPrefix watches the given prefix in etcd for changes. When a change
++	// is detected, it will signal on the passed channel. Clients are expected
++	// to call GetEntries to update themselves with the latest set of complete
++	// values. WatchPrefix will always send an initial sentinel value on the
++	// channel after establishing the watch, to ensure that clients always
++	// receive the latest set of values. WatchPrefix will block until the
++	// context passed to the NewClient constructor is terminated.
++	WatchPrefix(prefix string, ch chan struct{})
+ 
+ 	// Register a service with etcd.
+ 	Register(s Service) error
++
+ 	// Deregister a service with etcd.
+ 	Deregister(s Service) error
+ }
+@@ -38,81 +49,71 @@ type client struct {
+ 	ctx     context.Context
+ }
+ 
+-// ClientOptions defines options for the etcd client.
++// ClientOptions defines options for the etcd client. All values are optional.
++// If any duration is not specified, a default of 3 seconds will be used.
+ type ClientOptions struct {
+ 	Cert                    string
+ 	Key                     string
+-	CaCert                  string
++	CACert                  string
+ 	DialTimeout             time.Duration
+ 	DialKeepAlive           time.Duration
+ 	HeaderTimeoutPerRequest time.Duration
+ }
+ 
+-// NewClient returns an *etcd.Client with a connection to the named machines.
+-// It will return an error if a connection to the cluster cannot be made.
+-// The parameter machines needs to be a full URL with schemas.
+-// e.g. "http://localhost:2379" will work, but "localhost:2379" will not.
++// NewClient returns Client with a connection to the named machines. It will
++// return an error if a connection to the cluster cannot be made. The parameter
++// machines needs to be a full URL with schemas. e.g. "http://localhost:2379"
++// will work, but "localhost:2379" will not.
+ func NewClient(ctx context.Context, machines []string, options ClientOptions) (Client, error) {
+-	var (
+-		c        etcd.KeysAPI
+-		err      error
+-		caCertCt []byte
+-		tlsCert  tls.Certificate
+-	)
++	if options.DialTimeout == 0 {
++		options.DialTimeout = 3 * time.Second
++	}
++	if options.DialKeepAlive == 0 {
++		options.DialKeepAlive = 3 * time.Second
++	}
++	if options.HeaderTimeoutPerRequest == 0 {
++		options.HeaderTimeoutPerRequest = 3 * time.Second
++	}
+ 
++	transport := etcd.DefaultTransport
+ 	if options.Cert != "" && options.Key != "" {
+-		tlsCert, err = tls.LoadX509KeyPair(options.Cert, options.Key)
++		tlsCert, err := tls.LoadX509KeyPair(options.Cert, options.Key)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-
+-		caCertCt, err = ioutil.ReadFile(options.CaCert)
++		caCertCt, err := ioutil.ReadFile(options.CACert)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		caCertPool := x509.NewCertPool()
+ 		caCertPool.AppendCertsFromPEM(caCertCt)
+-
+-		tlsConfig := &tls.Config{
+-			Certificates: []tls.Certificate{tlsCert},
+-			RootCAs:      caCertPool,
+-		}
+-
+-		transport := &http.Transport{
+-			TLSClientConfig: tlsConfig,
+-			Dial: func(network, addr string) (net.Conn, error) {
+-				dial := &net.Dialer{
++		transport = &http.Transport{
++			TLSClientConfig: &tls.Config{
++				Certificates: []tls.Certificate{tlsCert},
++				RootCAs:      caCertPool,
++			},
++			Dial: func(network, address string) (net.Conn, error) {
++				return (&net.Dialer{
+ 					Timeout:   options.DialTimeout,
+ 					KeepAlive: options.DialKeepAlive,
+-				}
+-				return dial.Dial(network, addr)
++				}).Dial(network, address)
+ 			},
+ 		}
++	}
+ 
+-		cfg := etcd.Config{
+-			Endpoints:               machines,
+-			Transport:               transport,
+-			HeaderTimeoutPerRequest: options.HeaderTimeoutPerRequest,
+-		}
+-		ce, err := etcd.New(cfg)
+-		if err != nil {
+-			return nil, err
+-		}
+-		c = etcd.NewKeysAPI(ce)
+-	} else {
+-		cfg := etcd.Config{
+-			Endpoints:               machines,
+-			Transport:               etcd.DefaultTransport,
+-			HeaderTimeoutPerRequest: options.HeaderTimeoutPerRequest,
+-		}
+-		ce, err := etcd.New(cfg)
+-		if err != nil {
+-			return nil, err
+-		}
+-		c = etcd.NewKeysAPI(ce)
++	ce, err := etcd.New(etcd.Config{
++		Endpoints:               machines,
++		Transport:               transport,
++		HeaderTimeoutPerRequest: options.HeaderTimeoutPerRequest,
++	})
++	if err != nil {
++		return nil, err
+ 	}
+ 
+-	return &client{c, ctx}, nil
++	return &client{
++		keysAPI: etcd.NewKeysAPI(ce),
++		ctx:     ctx,
++	}, nil
+ }
+ 
+ // GetEntries implements the etcd Client interface.
+@@ -122,28 +123,29 @@ func (c *client) GetEntries(key string) ([]string, error) {
+ 		return nil, err
+ 	}
+ 
+-	entries := make([]string, len(resp.Node.Nodes))
++	// Special case. Note that it's possible that len(resp.Node.Nodes) == 0 and
++	// resp.Node.Value is also empty, in which case the key is empty and we
++	// should not return any entries.
++	if len(resp.Node.Nodes) == 0 && resp.Node.Value != "" {
++		return []string{resp.Node.Value}, nil
++	}
+ 
+-	if len(entries) > 0 {
+-		for i, node := range resp.Node.Nodes {
+-			entries[i] = node.Value
+-		}
+-	} else {
+-		entries = append(entries, resp.Node.Value)
++	entries := make([]string, len(resp.Node.Nodes))
++	for i, node := range resp.Node.Nodes {
++		entries[i] = node.Value
+ 	}
+ 	return entries, nil
+-
+ }
+ 
+ // WatchPrefix implements the etcd Client interface.
+-func (c *client) WatchPrefix(prefix string, responseChan chan *etcd.Response) {
++func (c *client) WatchPrefix(prefix string, ch chan struct{}) {
+ 	watch := c.keysAPI.Watcher(prefix, &etcd.WatcherOptions{AfterIndex: 0, Recursive: true})
++	ch <- struct{}{} // make sure caller invokes GetEntries
+ 	for {
+-		res, err := watch.Next(c.ctx)
+-		if err != nil {
++		if _, err := watch.Next(c.ctx); err != nil {
+ 			return
+ 		}
+-		responseChan <- res
++		ch <- struct{}{}
+ 	}
+ }
+ 
+diff --git a/sd/etcd/doc.go b/sd/etcd/doc.go
+index f8bd5bf..11add79 100644
+--- a/sd/etcd/doc.go
++++ b/sd/etcd/doc.go
+@@ -1,2 +1,4 @@
+-// Package etcd provides a subscriber implementation for etcd.
++// Package etcd provides a Subscriber and Registrar implementation for etcd. If
++// you use etcd as your service discovery system, this package will help you
++// implement the registration and client-side load balancing patterns.
+ package etcd
+diff --git a/sd/etcd/registrar.go b/sd/etcd/registrar.go
+index 4e3d15b..52b632a 100644
+--- a/sd/etcd/registrar.go
++++ b/sd/etcd/registrar.go
+@@ -2,6 +2,7 @@ package etcd
+ 
+ import (
+ 	etcd "github.com/coreos/etcd/client"
++
+ 	"github.com/go-kit/kit/log"
+ )
+ 
+@@ -12,28 +13,30 @@ type Registrar struct {
+ 	logger  log.Logger
+ }
+ 
+-// Service holds the key, value and instance identifying data you
+-// want to publish to etcd.
++// Service holds the instance identifying data you want to publish to etcd. Key
++// must be unique, and value is the string returned to subscribers, typically
++// called the "instance" string in other parts of package sd.
+ type Service struct {
+-	Key           string // discovery key, example: /myorganization/myplatform/
+-	Value         string // service name value, example: addsvc
++	Key           string // unique key, e.g. "/service/foobar/1.2.3.4:8080"
++	Value         string // returned to subscribers, e.g. "http://1.2.3.4:8080"
+ 	DeleteOptions *etcd.DeleteOptions
+ }
+ 
+ // NewRegistrar returns a etcd Registrar acting on the provided catalog
+-// registration.
++// registration (service).
+ func NewRegistrar(client Client, service Service, logger log.Logger) *Registrar {
+ 	return &Registrar{
+ 		client:  client,
+ 		service: service,
+ 		logger: log.NewContext(logger).With(
+-			"value", service.Value,
+ 			"key", service.Key,
++			"value", service.Value,
+ 		),
+ 	}
+ }
+ 
+-// Register implements sd.Registrar interface.
++// Register implements the sd.Registrar interface. Call it when you want your
++// service to be registered in etcd, typically at startup.
+ func (r *Registrar) Register() {
+ 	if err := r.client.Register(r.service); err != nil {
+ 		r.logger.Log("err", err)
+@@ -42,7 +45,8 @@ func (r *Registrar) Register() {
+ 	}
+ }
+ 
+-// Deregister implements sd.Registrar interface.
++// Deregister implements the sd.Registrar interface. Call it when you want your
++// service to be deregistered from etcd, typically just prior to shutdown.
+ func (r *Registrar) Deregister() {
+ 	if err := r.client.Deregister(r.service); err != nil {
+ 		r.logger.Log("err", err)
+diff --git a/sd/etcd/subscriber.go b/sd/etcd/subscriber.go
+index 1d579eb..1b91872 100644
+--- a/sd/etcd/subscriber.go
++++ b/sd/etcd/subscriber.go
+@@ -1,8 +1,6 @@
+ package etcd
+ 
+ import (
+-	etcd "github.com/coreos/etcd/client"
+-
+ 	"github.com/go-kit/kit/endpoint"
+ 	"github.com/go-kit/kit/log"
+ 	"github.com/go-kit/kit/sd"
+@@ -45,11 +43,11 @@ func NewSubscriber(c Client, prefix string, factory sd.Factory, logger log.Logge
+ }
+ 
+ func (s *Subscriber) loop() {
+-	responseChan := make(chan *etcd.Response)
+-	go s.client.WatchPrefix(s.prefix, responseChan)
++	ch := make(chan struct{})
++	go s.client.WatchPrefix(s.prefix, ch)
+ 	for {
+ 		select {
+-		case <-responseChan:
++		case <-ch:
+ 			instances, err := s.client.GetEntries(s.prefix)
+ 			if err != nil {
+ 				s.logger.Log("msg", "failed to retrieve entries", "err", err)

@@ -1,0 +1,720 @@
+diff --git a/log/README.md b/log/README.md
+index 70e70a6..452157d 100644
+--- a/log/README.md
++++ b/log/README.md
+@@ -29,8 +29,7 @@ logger.Log("transport", "HTTP", "addr", addr, "msg", "listening")
+ ### Typical application logging
+ 
+ ```go
+-w := log.NewSyncWriter(os.Stderr)
+-logger := log.NewLogfmtLogger(w)
++logger := log.NewLogfmtLogger(os.Stderr)
+ logger.Log("question", "what is the meaning of life?", "answer", 42)
+ 
+ // Output:
+@@ -42,7 +41,7 @@ logger.Log("question", "what is the meaning of life?", "answer", 42)
+ ```go
+ func main() {
+ 	var logger log.Logger
+-	logger = log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
++	logger = log.NewLogfmtLogger(os.Stderr)
+ 	logger = log.NewContext(logger).With("instance_id", 123)
+ 
+ 	logger.Log("msg", "starting")
+@@ -68,7 +67,7 @@ import (
+ )
+ 
+ func main() {
+-	logger := kitlog.NewJSONLogger(log.NewSyncWriter(os.Stdout))
++	logger := kitlog.NewJSONLogger(os.Stdout)
+ 	stdlog.SetOutput(kitlog.NewStdlibAdapter(logger))
+ 	stdlog.Print("I sure like pie")
+ }
+@@ -93,7 +92,7 @@ logger.Log("legacy", true, "msg", "at least it's something")
+ 
+ ```go
+ var logger log.Logger
+-logger = log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
++logger = log.NewLogfmtLogger(os.Stderr)
+ logger = log.NewContext(logger).With("ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
+ 
+ logger.Log("msg", "hello")
+diff --git a/log/concurrency_test.go b/log/concurrency_test.go
+index 95a749e..e68d16a 100644
+--- a/log/concurrency_test.go
++++ b/log/concurrency_test.go
+@@ -1,7 +1,8 @@
+ package log_test
+ 
+ import (
+-	"math"
++	"strconv"
++	"sync"
+ 	"testing"
+ 
+ 	"github.com/go-kit/kit/log"
+@@ -9,32 +10,19 @@ import (
+ 
+ // These test are designed to be run with the race detector.
+ 
+-func testConcurrency(t *testing.T, logger log.Logger, total int) {
+-	n := int(math.Sqrt(float64(total)))
+-	share := total / n
+-
+-	errC := make(chan error, n)
+-
+-	for i := 0; i < n; i++ {
+-		go func() {
+-			errC <- spam(logger, share)
+-		}()
+-	}
+-
+-	for i := 0; i < n; i++ {
+-		err := <-errC
+-		if err != nil {
+-			t.Fatalf("concurrent logging error: %v", err)
++func testConcurrency(t *testing.T, logger log.Logger) {
++	for _, n := range []int{10, 100, 500} {
++		wg := sync.WaitGroup{}
++		wg.Add(n)
++		for i := 0; i < n; i++ {
++			go func() { spam(logger); wg.Done() }()
+ 		}
++		wg.Wait()
+ 	}
+ }
+ 
+-func spam(logger log.Logger, count int) error {
+-	for i := 0; i < count; i++ {
+-		err := logger.Log("key", i)
+-		if err != nil {
+-			return err
+-		}
++func spam(logger log.Logger) {
++	for i := 0; i < 100; i++ {
++		logger.Log("key", strconv.FormatInt(int64(i), 10))
+ 	}
+-	return nil
+ }
+diff --git a/log/doc.go b/log/doc.go
+index 8907ebd..629f0aa 100644
+--- a/log/doc.go
++++ b/log/doc.go
+@@ -1,93 +1,9 @@
+ // Package log provides a structured logger.
+ //
+-// Structured logging produces logs easily consumed later by humans or
+-// machines. Humans might be interested in debugging errors, or tracing
+-// specific requests. Machines might be interested in counting interesting
+-// events, or aggregating information for off-line processing. In both cases,
+-// it is important that the log messages are structured and actionable.
+-// Package log is designed to encourage both of these best practices.
+-//
+-// Basic Usage
+-//
+-// The fundamental interface is Logger. Loggers create log events from
+-// key/value data. The Logger interface has a single method, Log, which
+-// accepts a sequence of alternating key/value pairs, which this package names
+-// keyvals.
+-//
+-//    type Logger interface {
+-//        Log(keyvals ...interface{}) error
+-//    }
+-//
+-// Here is an example of a function using a Logger to create log events.
+-//
+-//    func RunTask(task Task, logger log.Logger) string {
+-//        logger.Log("taskID", task.ID, "event", "starting task")
+-//        ...
+-//        logger.Log("taskID", task.ID, "event", "task complete")
+-//    }
+-//
+-// The keys in the above example are "taskID" and "event". The values are
+-// task.ID, "starting task", and "task complete". Every key is followed
+-// immediately by its value.
+-//
+-// Keys are usually plain strings. Values may be any type that has a sensible
+-// encoding in the chosen log format. With structured logging it is a good
+-// idea to log simple values without formatting them. This practice allows
+-// the chosen logger to encode values in the most appropriate way.
+-//
+-// Log Context
+-//
+-// A log context stores keyvals that it includes in all log events. Building
+-// appropriate log contexts reduces repetition and aids consistency in the
+-// resulting log output. We can use a context to improve the RunTask example.
+-//
+-//    func RunTask(task Task, logger log.Logger) string {
+-//        logger = log.NewContext(logger).With("taskID", task.ID)
+-//        logger.Log("event", "starting task")
+-//        ...
+-//        taskHelper(task.Cmd, logger)
+-//        ...
+-//        logger.Log("event", "task complete")
+-//    }
+-//
+-// The improved version emits the same log events as the original for the
+-// first and last calls to Log. The call to taskHelper highlights that a
+-// context may be passed as a logger to other functions. Each log event
+-// created by the called function will include the task.ID even though the
+-// function does not have access to that value. Using log contexts this way
+-// simplifies producing log output that enables tracing the life cycle of
+-// individual tasks. (See the Context example for the full code of the
+-// above snippet.)
+-//
+-// Dynamic Context Values
+-//
+-// A Valuer function stored in a log context generates a new value each time
+-// the context logs an event. The Valuer example demonstrates how this
+-// feature works.
+-//
+-// Valuers provide the basis for consistently logging timestamps and source
+-// code location. The log package defines several valuers for that purpose.
+-// See Timestamp, DefaultTimestamp, DefaultTimestampUTC, Caller, and
+-// DefaultCaller. A common logger initialization sequence that ensures all log
+-// entries contain a timestamp and source location looks like this:
+-//
+-//    logger := log.NewLogfmtLogger(log.SyncWriter(os.Stdout))
+-//    logger = log.NewContext(logger).With("ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
+-//
+-// Concurrent Safety
+-//
+-// Applications with multiple goroutines want each log event written to the
+-// same logger to remain separate from other log events. Package log provides
+-// two simple solutions for concurrent safe logging.
+-//
+-// NewSyncWriter wraps an io.Writer and serializes each call to its Write
+-// method. Using a SyncWriter has the benefit that the smallest practical
+-// portion of the logging logic is performed within a mutex, but it requires
+-// the formatting Logger to make only one call to Write per log event.
+-//
+-// NewSyncLogger wraps any Logger and serializes each call to its Log method.
+-// Using a SyncLogger has the benefit that it guarantees each log event is
+-// handled atomically within the wrapped logger, but it typically serializes
+-// both the formatting and output logic. Use a SyncLogger if the formatting
+-// logger may perform multiple writes per log event.
++// Services produce logs to be consumed later, either by humans or machines.
++// Humans might be interested in debugging errors, or tracing specific requests.
++// Machines might be interested in counting interesting events, or aggregating
++// information for offline processing. In both cases, it's important that the
++// log messages be structured and actionable. Package log is designed to
++// encourage both of these best practices.
+ package log
+diff --git a/log/example_test.go b/log/example_test.go
+index b07ef8e..1741615 100644
+--- a/log/example_test.go
++++ b/log/example_test.go
+@@ -2,101 +2,22 @@ package log_test
+ 
+ import (
+ 	"os"
+-	"time"
+ 
+ 	"github.com/go-kit/kit/log"
+ )
+ 
+-func Example_basic() {
++func ExampleContext() {
+ 	logger := log.NewLogfmtLogger(os.Stdout)
+-
+-	type Task struct {
+-		ID int
+-	}
+-
+-	RunTask := func(task Task, logger log.Logger) {
+-		logger.Log("taskID", task.ID, "event", "starting task")
+-
+-		logger.Log("taskID", task.ID, "event", "task complete")
+-	}
+-
+-	RunTask(Task{ID: 1}, logger)
+-
+-	// Output:
+-	// taskID=1 event="starting task"
+-	// taskID=1 event="task complete"
+-}
+-
+-func Example_context() {
+-	logger := log.NewLogfmtLogger(os.Stdout)
+-
+-	type Task struct {
+-		ID  int
+-		Cmd string
+-	}
+-
+-	taskHelper := func(cmd string, logger log.Logger) {
+-		// execute(cmd)
+-		logger.Log("cmd", cmd, "dur", 42*time.Millisecond)
+-	}
+-
+-	RunTask := func(task Task, logger log.Logger) {
+-		logger = log.NewContext(logger).With("taskID", task.ID)
+-		logger.Log("event", "starting task")
+-
+-		taskHelper(task.Cmd, logger)
+-
+-		logger.Log("event", "task complete")
+-	}
+-
+-	RunTask(Task{ID: 1, Cmd: "echo Hello, world!"}, logger)
+-
+-	// Output:
+-	// taskID=1 event="starting task"
+-	// taskID=1 cmd="echo Hello, world!" dur=42ms
+-	// taskID=1 event="task complete"
+-}
+-
+-func Example_valuer() {
+-	logger := log.NewLogfmtLogger(os.Stdout)
+-
+-	count := 0
+-	counter := func() interface{} {
+-		count++
+-		return count
+-	}
+-
+-	logger = log.NewContext(logger).With("count", log.Valuer(counter))
+-
+-	logger.Log("call", "first")
+-	logger.Log("call", "second")
+-
+-	// Output:
+-	// count=1 call=first
+-	// count=2 call=second
+-}
+-
+-func Example_debugInfo() {
+-	logger := log.NewLogfmtLogger(os.Stdout)
+-
+-	// make time predictable for this test
+-	baseTime := time.Date(2015, time.February, 3, 10, 0, 0, 0, time.UTC)
+-	mockTime := func() time.Time {
+-		baseTime = baseTime.Add(time.Second)
+-		return baseTime
+-	}
+-
+-	logger = log.NewContext(logger).With("time", log.Timestamp(mockTime), "caller", log.DefaultCaller)
+-
+-	logger.Log("call", "first")
+-	logger.Log("call", "second")
+-
+-	// ...
+-
+-	logger.Log("call", "third")
++	logger.Log("foo", 123)
++	ctx := log.NewContext(logger).With("level", "info")
++	ctx.Log()
++	ctx = ctx.With("msg", "hello")
++	ctx.Log()
++	ctx.With("a", 1).Log("b", 2)
+ 
+ 	// Output:
+-	// time=2015-02-03T10:00:01Z caller=example_test.go:91 call=first
+-	// time=2015-02-03T10:00:02Z caller=example_test.go:92 call=second
+-	// time=2015-02-03T10:00:03Z caller=example_test.go:96 call=third
++	// foo=123
++	// level=info
++	// level=info msg=hello
++	// level=info msg=hello a=1 b=2
+ }
+diff --git a/log/json_logger.go b/log/json_logger.go
+index 231e099..cef0d19 100644
+--- a/log/json_logger.go
++++ b/log/json_logger.go
+@@ -13,9 +13,7 @@ type jsonLogger struct {
+ }
+ 
+ // NewJSONLogger returns a Logger that encodes keyvals to the Writer as a
+-// single JSON object. Each log event produces no more than one call to
+-// w.Write. The passed Writer must be safe for concurrent use by multiple
+-// goroutines if the returned Logger will be used concurrently.
++// single JSON object.
+ func NewJSONLogger(w io.Writer) Logger {
+ 	return &jsonLogger{w}
+ }
+diff --git a/log/json_logger_test.go b/log/json_logger_test.go
+index 42df70c..2911577 100644
+--- a/log/json_logger_test.go
++++ b/log/json_logger_test.go
+@@ -100,7 +100,6 @@ func (textstringer) String() string {
+ }
+ 
+ func TestJSONLoggerStringValue(t *testing.T) {
+-	t.Parallel()
+ 	tests := []struct {
+ 		v        interface{}
+ 		expected string
+@@ -153,6 +152,5 @@ func BenchmarkJSONLoggerContextual(b *testing.B) {
+ }
+ 
+ func TestJSONLoggerConcurrency(t *testing.T) {
+-	t.Parallel()
+-	testConcurrency(t, log.NewJSONLogger(ioutil.Discard), 10000)
++	testConcurrency(t, log.NewJSONLogger(ioutil.Discard))
+ }
+diff --git a/log/log.go b/log/log.go
+index 97990fe..25e76cb 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -1,6 +1,13 @@
++// Package log provides basic interfaces for structured logging.
++//
++// The fundamental interface is Logger. Loggers create log events from
++// key/value data.
+ package log
+ 
+-import "errors"
++import (
++	"errors"
++	"sync/atomic"
++)
+ 
+ // Logger is the fundamental interface for all log operations. Log creates a
+ // log event from keyvals, a variadic sequence of alternating keys and values.
+@@ -142,3 +149,33 @@ type LoggerFunc func(...interface{}) error
+ func (f LoggerFunc) Log(keyvals ...interface{}) error {
+ 	return f(keyvals...)
+ }
++
++// SwapLogger wraps another logger that may be safely replaced while other
++// goroutines use the SwapLogger concurrently. The zero value for a SwapLogger
++// will discard all log events without error.
++//
++// SwapLogger serves well as a package global logger that can be changed by
++// importers.
++type SwapLogger struct {
++	logger atomic.Value
++}
++
++type loggerStruct struct {
++	Logger
++}
++
++// Log implements the Logger interface by forwarding keyvals to the currently
++// wrapped logger. It does not log anything if the wrapped logger is nil.
++func (l *SwapLogger) Log(keyvals ...interface{}) error {
++	s, ok := l.logger.Load().(loggerStruct)
++	if !ok || s.Logger == nil {
++		return nil
++	}
++	return s.Log(keyvals...)
++}
++
++// Swap replaces the currently wrapped logger with logger. Swap may be called
++// concurrently with calls to Log from other goroutines.
++func (l *SwapLogger) Swap(logger Logger) {
++	l.logger.Store(loggerStruct{logger})
++}
+diff --git a/log/log_test.go b/log/log_test.go
+index 7c44095..7cd0844 100644
+--- a/log/log_test.go
++++ b/log/log_test.go
+@@ -71,7 +71,6 @@ func TestContextMissingValue(t *testing.T) {
+ // whether Context.Log is called via an interface typed variable or a concrete
+ // typed variable.
+ func TestContextStackDepth(t *testing.T) {
+-	t.Parallel()
+ 	fn := fmt.Sprintf("%n", stack.Caller(0))
+ 
+ 	var output []interface{}
+@@ -208,3 +207,49 @@ func BenchmarkTenWith(b *testing.B) {
+ 		lc.Log("k", "v")
+ 	}
+ }
++
++func TestSwapLogger(t *testing.T) {
++	var logger log.SwapLogger
++
++	// Zero value does not panic or error.
++	err := logger.Log("k", "v")
++	if got, want := err, error(nil); got != want {
++		t.Errorf("got %v, want %v", got, want)
++	}
++
++	buf := &bytes.Buffer{}
++	json := log.NewJSONLogger(buf)
++	logger.Swap(json)
++
++	if err := logger.Log("k", "v"); err != nil {
++		t.Error(err)
++	}
++	if got, want := buf.String(), `{"k":"v"}`+"\n"; got != want {
++		t.Errorf("got %v, want %v", got, want)
++	}
++
++	buf.Reset()
++	prefix := log.NewLogfmtLogger(buf)
++	logger.Swap(prefix)
++
++	if err := logger.Log("k", "v"); err != nil {
++		t.Error(err)
++	}
++	if got, want := buf.String(), "k=v\n"; got != want {
++		t.Errorf("got %v, want %v", got, want)
++	}
++
++	buf.Reset()
++	logger.Swap(nil)
++
++	if err := logger.Log("k", "v"); err != nil {
++		t.Error(err)
++	}
++	if got, want := buf.String(), ""; got != want {
++		t.Errorf("got %v, want %v", got, want)
++	}
++}
++
++func TestSwapLoggerConcurrency(t *testing.T) {
++	testConcurrency(t, &log.SwapLogger{})
++}
+diff --git a/log/logfmt_logger.go b/log/logfmt_logger.go
+index a003052..4ff5555 100644
+--- a/log/logfmt_logger.go
++++ b/log/logfmt_logger.go
+@@ -31,9 +31,8 @@ type logfmtLogger struct {
+ }
+ 
+ // NewLogfmtLogger returns a logger that encodes keyvals to the Writer in
+-// logfmt format. Each log event produces no more than one call to w.Write.
+-// The passed Writer must be safe for concurrent use by multiple goroutines if
+-// the returned Logger will be used concurrently.
++// logfmt format. The passed Writer must be safe for concurrent use by
++// multiple goroutines if the returned Logger will be used concurrently.
+ func NewLogfmtLogger(w io.Writer) Logger {
+ 	return &logfmtLogger{w}
+ }
+diff --git a/log/logfmt_logger_test.go b/log/logfmt_logger_test.go
+index 91bbca1..185e948 100644
+--- a/log/logfmt_logger_test.go
++++ b/log/logfmt_logger_test.go
+@@ -11,7 +11,6 @@ import (
+ )
+ 
+ func TestLogfmtLogger(t *testing.T) {
+-	t.Parallel()
+ 	buf := &bytes.Buffer{}
+ 	logger := log.NewLogfmtLogger(buf)
+ 
+@@ -48,8 +47,7 @@ func BenchmarkLogfmtLoggerContextual(b *testing.B) {
+ }
+ 
+ func TestLogfmtLoggerConcurrency(t *testing.T) {
+-	t.Parallel()
+-	testConcurrency(t, log.NewLogfmtLogger(ioutil.Discard), 10000)
++	testConcurrency(t, log.NewLogfmtLogger(ioutil.Discard))
+ }
+ 
+ type mymap map[int]int
+diff --git a/log/nop_logger_test.go b/log/nop_logger_test.go
+index 25af183..043553e 100644
+--- a/log/nop_logger_test.go
++++ b/log/nop_logger_test.go
+@@ -7,7 +7,6 @@ import (
+ )
+ 
+ func TestNopLogger(t *testing.T) {
+-	t.Parallel()
+ 	logger := log.NewNopLogger()
+ 	if err := logger.Log("abc", 123); err != nil {
+ 		t.Error(err)
+diff --git a/log/sync.go b/log/sync.go
+deleted file mode 100644
+index 8ce0db8..0000000
+--- a/log/sync.go
++++ /dev/null
+@@ -1,81 +0,0 @@
+-package log
+-
+-import (
+-	"io"
+-	"sync"
+-	"sync/atomic"
+-)
+-
+-// SwapLogger wraps another logger that may be safely replaced while other
+-// goroutines use the SwapLogger concurrently. The zero value for a SwapLogger
+-// will discard all log events without error.
+-//
+-// SwapLogger serves well as a package global logger that can be changed by
+-// importers.
+-type SwapLogger struct {
+-	logger atomic.Value
+-}
+-
+-type loggerStruct struct {
+-	Logger
+-}
+-
+-// Log implements the Logger interface by forwarding keyvals to the currently
+-// wrapped logger. It does not log anything if the wrapped logger is nil.
+-func (l *SwapLogger) Log(keyvals ...interface{}) error {
+-	s, ok := l.logger.Load().(loggerStruct)
+-	if !ok || s.Logger == nil {
+-		return nil
+-	}
+-	return s.Log(keyvals...)
+-}
+-
+-// Swap replaces the currently wrapped logger with logger. Swap may be called
+-// concurrently with calls to Log from other goroutines.
+-func (l *SwapLogger) Swap(logger Logger) {
+-	l.logger.Store(loggerStruct{logger})
+-}
+-
+-// SyncWriter synchronizes concurrent writes to an io.Writer.
+-type SyncWriter struct {
+-	mu sync.Mutex
+-	w  io.Writer
+-}
+-
+-// NewSyncWriter returns a new SyncWriter. The returned writer is safe for
+-// concurrent use by multiple goroutines.
+-func NewSyncWriter(w io.Writer) *SyncWriter {
+-	return &SyncWriter{w: w}
+-}
+-
+-// Write writes p to the underlying io.Writer. If another write is already in
+-// progress, the calling goroutine blocks until the SyncWriter is available.
+-func (w *SyncWriter) Write(p []byte) (n int, err error) {
+-	w.mu.Lock()
+-	n, err = w.w.Write(p)
+-	w.mu.Unlock()
+-	return n, err
+-}
+-
+-// syncLogger provides concurrent safe logging for another Logger.
+-type syncLogger struct {
+-	mu     sync.Mutex
+-	logger Logger
+-}
+-
+-// NewSyncLogger returns a logger that synchronizes concurrent use of the
+-// wrapped logger. When multiple goroutines use the SyncLogger concurrently
+-// only one goroutine will be allowed to log to the wrapped logger at a time.
+-// The other goroutines will block until the logger is available.
+-func NewSyncLogger(logger Logger) Logger {
+-	return &syncLogger{logger: logger}
+-}
+-
+-// Log logs keyvals to the underlying Logger. If another log is already in
+-// progress, the calling goroutine blocks until the syncLogger is available.
+-func (l *syncLogger) Log(keyvals ...interface{}) error {
+-	l.mu.Lock()
+-	err := l.logger.Log(keyvals...)
+-	l.mu.Unlock()
+-	return err
+-}
+diff --git a/log/sync_test.go b/log/sync_test.go
+deleted file mode 100644
+index 3d915ec..0000000
+--- a/log/sync_test.go
++++ /dev/null
+@@ -1,72 +0,0 @@
+-package log_test
+-
+-import (
+-	"bytes"
+-	"io"
+-	"testing"
+-
+-	"github.com/go-kit/kit/log"
+-)
+-
+-func TestSwapLogger(t *testing.T) {
+-	t.Parallel()
+-	var logger log.SwapLogger
+-
+-	// Zero value does not panic or error.
+-	err := logger.Log("k", "v")
+-	if got, want := err, error(nil); got != want {
+-		t.Errorf("got %v, want %v", got, want)
+-	}
+-
+-	buf := &bytes.Buffer{}
+-	json := log.NewJSONLogger(buf)
+-	logger.Swap(json)
+-
+-	if err := logger.Log("k", "v"); err != nil {
+-		t.Error(err)
+-	}
+-	if got, want := buf.String(), `{"k":"v"}`+"\n"; got != want {
+-		t.Errorf("got %v, want %v", got, want)
+-	}
+-
+-	buf.Reset()
+-	prefix := log.NewLogfmtLogger(buf)
+-	logger.Swap(prefix)
+-
+-	if err := logger.Log("k", "v"); err != nil {
+-		t.Error(err)
+-	}
+-	if got, want := buf.String(), "k=v\n"; got != want {
+-		t.Errorf("got %v, want %v", got, want)
+-	}
+-
+-	buf.Reset()
+-	logger.Swap(nil)
+-
+-	if err := logger.Log("k", "v"); err != nil {
+-		t.Error(err)
+-	}
+-	if got, want := buf.String(), ""; got != want {
+-		t.Errorf("got %v, want %v", got, want)
+-	}
+-}
+-
+-func TestSwapLoggerConcurrency(t *testing.T) {
+-	t.Parallel()
+-	testConcurrency(t, &log.SwapLogger{}, 10000)
+-}
+-
+-func TestSyncLoggerConcurrency(t *testing.T) {
+-	var w io.Writer
+-	w = &bytes.Buffer{}
+-	logger := log.NewLogfmtLogger(w)
+-	logger = log.NewSyncLogger(logger)
+-	testConcurrency(t, logger, 10000)
+-}
+-
+-func TestSyncWriterConcurrency(t *testing.T) {
+-	var w io.Writer
+-	w = &bytes.Buffer{}
+-	w = log.NewSyncWriter(w)
+-	testConcurrency(t, log.NewLogfmtLogger(w), 10000)
+-}
+diff --git a/log/value_test.go b/log/value_test.go
+index 44e6478..5277361 100644
+--- a/log/value_test.go
++++ b/log/value_test.go
+@@ -9,7 +9,6 @@ import (
+ )
+ 
+ func TestValueBinding(t *testing.T) {
+-	t.Parallel()
+ 	var output []interface{}
+ 
+ 	logger := log.Logger(log.LoggerFunc(func(keyvals ...interface{}) error {
+@@ -34,7 +33,7 @@ func TestValueBinding(t *testing.T) {
+ 	if want, have := start.Add(time.Second), timestamp; want != have {
+ 		t.Errorf("output[1]: want %v, have %v", want, have)
+ 	}
+-	if want, have := "value_test.go:29", fmt.Sprint(output[3]); want != have {
++	if want, have := "value_test.go:28", fmt.Sprint(output[3]); want != have {
+ 		t.Errorf("output[3]: want %s, have %s", want, have)
+ 	}
+ 
+@@ -47,13 +46,12 @@ func TestValueBinding(t *testing.T) {
+ 	if want, have := start.Add(2*time.Second), timestamp; want != have {
+ 		t.Errorf("output[1]: want %v, have %v", want, have)
+ 	}
+-	if want, have := "value_test.go:42", fmt.Sprint(output[3]); want != have {
++	if want, have := "value_test.go:41", fmt.Sprint(output[3]); want != have {
+ 		t.Errorf("output[3]: want %s, have %s", want, have)
+ 	}
+ }
+ 
+ func TestValueBinding_loggingZeroKeyvals(t *testing.T) {
+-	t.Parallel()
+ 	var output []interface{}
+ 
+ 	logger := log.Logger(log.LoggerFunc(func(keyvals ...interface{}) error {

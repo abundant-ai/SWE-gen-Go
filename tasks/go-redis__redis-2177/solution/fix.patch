@@ -1,0 +1,231 @@
+diff --git a/cluster.go b/cluster.go
+index 05b234aa..ea312284 100644
+--- a/cluster.go
++++ b/cluster.go
+@@ -1528,6 +1528,16 @@ func (c *ClusterClient) PSubscribe(ctx context.Context, channels ...string) *Pub
+ 	return pubsub
+ }
+ 
++// SSubscribe Subscribes the client to the specified shard channels.
++func (c *ClusterClient) SSubscribe(ctx context.Context, channels ...string) *PubSub {
++	pubsub := c.pubSub()
++	if len(channels) > 0 {
++		_ = pubsub.SSubscribe(ctx, channels...)
++	}
++	return pubsub
++}
++
++
+ func (c *ClusterClient) retryBackoff(attempt int) time.Duration {
+ 	return internal.RetryBackoff(attempt, c.opt.MinRetryBackoff, c.opt.MaxRetryBackoff)
+ }
+diff --git a/commands.go b/commands.go
+index beb3af2d..8db115d3 100644
+--- a/commands.go
++++ b/commands.go
+@@ -345,9 +345,12 @@ type Cmdable interface {
+ 	ScriptLoad(ctx context.Context, script string) *StringCmd
+ 
+ 	Publish(ctx context.Context, channel string, message interface{}) *IntCmd
++	SPublish(ctx context.Context, channel string, message interface{}) *IntCmd
+ 	PubSubChannels(ctx context.Context, pattern string) *StringSliceCmd
+ 	PubSubNumSub(ctx context.Context, channels ...string) *StringIntMapCmd
+ 	PubSubNumPat(ctx context.Context) *IntCmd
++	PubSubShardChannels(ctx context.Context, pattern string) *StringSliceCmd
++	PubSubShardNumSub(ctx context.Context, channels ...string) *StringIntMapCmd
+ 
+ 	ClusterSlots(ctx context.Context) *ClusterSlotsCmd
+ 	ClusterNodes(ctx context.Context) *StringCmd
+@@ -3078,6 +3081,12 @@ func (c cmdable) Publish(ctx context.Context, channel string, message interface{
+ 	return cmd
+ }
+ 
++func (c cmdable) SPublish(ctx context.Context, channel string, message interface{}) *IntCmd {
++	cmd := NewIntCmd(ctx, "spublish", channel, message)
++	_ = c(ctx, cmd)
++	return cmd
++}
++
+ func (c cmdable) PubSubChannels(ctx context.Context, pattern string) *StringSliceCmd {
+ 	args := []interface{}{"pubsub", "channels"}
+ 	if pattern != "*" {
+@@ -3100,6 +3109,28 @@ func (c cmdable) PubSubNumSub(ctx context.Context, channels ...string) *StringIn
+ 	return cmd
+ }
+ 
++func (c cmdable) PubSubShardChannels(ctx context.Context, pattern string) *StringSliceCmd {
++	args := []interface{}{"pubsub", "shardchannels"}
++	if pattern != "*" {
++		args = append(args, pattern)
++	}
++	cmd := NewStringSliceCmd(ctx, args...)
++	_ = c(ctx, cmd)
++	return cmd
++}
++
++func (c cmdable) PubSubShardNumSub(ctx context.Context, channels ...string) *StringIntMapCmd {
++	args := make([]interface{}, 2+len(channels))
++	args[0] = "pubsub"
++	args[1] = "shardnumsub"
++	for i, channel := range channels {
++		args[2+i] = channel
++	}
++	cmd := NewStringIntMapCmd(ctx, args...)
++	_ = c(ctx, cmd)
++	return cmd
++}
++
+ func (c cmdable) PubSubNumPat(ctx context.Context) *IntCmd {
+ 	cmd := NewIntCmd(ctx, "pubsub", "numpat")
+ 	_ = c(ctx, cmd)
+diff --git a/pubsub.go b/pubsub.go
+index 75e5097b..6eede918 100644
+--- a/pubsub.go
++++ b/pubsub.go
+@@ -28,6 +28,7 @@ type PubSub struct {
+ 	cn       *pool.Conn
+ 	channels map[string]struct{}
+ 	patterns map[string]struct{}
++	schannels map[string]struct{}
+ 
+ 	closed bool
+ 	exit   chan struct{}
+@@ -46,6 +47,7 @@ func (c *PubSub) init() {
+ func (c *PubSub) String() string {
+ 	channels := mapKeys(c.channels)
+ 	channels = append(channels, mapKeys(c.patterns)...)
++	channels = append(channels, mapKeys(c.schannels)...)
+ 	return fmt.Sprintf("PubSub(%s)", strings.Join(channels, ", "))
+ }
+ 
+@@ -101,6 +103,13 @@ func (c *PubSub) resubscribe(ctx context.Context, cn *pool.Conn) error {
+ 		}
+ 	}
+ 
++	if len(c.schannels) > 0 {
++		err := c._subscribe(ctx, cn, "ssubscribe", mapKeys(c.schannels))
++		if err != nil && firstErr == nil {
++			firstErr = err
++		}
++	}
++
+ 	return firstErr
+ }
+ 
+@@ -208,6 +217,21 @@ func (c *PubSub) PSubscribe(ctx context.Context, patterns ...string) error {
+ 	return err
+ }
+ 
++// SSubscribe Subscribes the client to the specified shard channels.
++func (c *PubSub) SSubscribe(ctx context.Context, channels ...string) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	err := c.subscribe(ctx, "ssubscribe", channels...)
++	if c.schannels == nil {
++		c.schannels = make(map[string]struct{})
++	}
++	for _, s := range channels {
++		c.schannels[s] = struct{}{}
++	}
++	return err
++}
++
+ // Unsubscribe the client from the given channels, or from all of
+ // them if none is given.
+ func (c *PubSub) Unsubscribe(ctx context.Context, channels ...string) error {
+@@ -234,6 +258,19 @@ func (c *PubSub) PUnsubscribe(ctx context.Context, patterns ...string) error {
+ 	return err
+ }
+ 
++// SUnsubscribe unsubscribes the client from the given shard channels,
++// or from all of them if none is given.
++func (c *PubSub) SUnsubscribe(ctx context.Context, channels ...string) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	for _, channel := range channels {
++		delete(c.schannels, channel)
++	}
++	err := c.subscribe(ctx, "sunsubscribe", channels...)
++	return err
++}
++
+ func (c *PubSub) subscribe(ctx context.Context, redisCmd string, channels ...string) error {
+ 	cn, err := c.conn(ctx, channels)
+ 	if err != nil {
+@@ -311,7 +348,7 @@ func (c *PubSub) newMessage(reply interface{}) (interface{}, error) {
+ 		}, nil
+ 	case []interface{}:
+ 		switch kind := reply[0].(string); kind {
+-		case "subscribe", "unsubscribe", "psubscribe", "punsubscribe":
++		case "subscribe", "unsubscribe", "psubscribe", "punsubscribe", "ssubscribe", "sunsubscribe":
+ 			// Can be nil in case of "unsubscribe".
+ 			channel, _ := reply[1].(string)
+ 			return &Subscription{
+@@ -319,7 +356,7 @@ func (c *PubSub) newMessage(reply interface{}) (interface{}, error) {
+ 				Channel: channel,
+ 				Count:   int(reply[2].(int64)),
+ 			}, nil
+-		case "message":
++		case "message", "smessage":
+ 			switch payload := reply[2].(type) {
+ 			case string:
+ 				return &Message{
+diff --git a/redis.go b/redis.go
+index f5581812..324a1ca8 100644
+--- a/redis.go
++++ b/redis.go
+@@ -691,6 +691,16 @@ func (c *Client) PSubscribe(ctx context.Context, channels ...string) *PubSub {
+ 	return pubsub
+ }
+ 
++// SSubscribe Subscribes the client to the specified shard channels.
++// Channels can be omitted to create empty subscription.
++func (c *Client) SSubscribe(ctx context.Context, channels ...string) *PubSub {
++	pubsub := c.pubSub()
++	if len(channels) > 0 {
++		_ = pubsub.SSubscribe(ctx, channels...)
++	}
++	return pubsub
++}
++
+ //------------------------------------------------------------------------------
+ 
+ type conn struct {
+diff --git a/ring.go b/ring.go
+index dede1e49..9386dfe4 100644
+--- a/ring.go
++++ b/ring.go
+@@ -504,6 +504,19 @@ func (c *Ring) PSubscribe(ctx context.Context, channels ...string) *PubSub {
+ 	return shard.Client.PSubscribe(ctx, channels...)
+ }
+ 
++// SSubscribe Subscribes the client to the specified shard channels.
++func (c *Ring) SSubscribe(ctx context.Context, channels ...string) *PubSub {
++	if len(channels) == 0 {
++		panic("at least one channel is required")
++	}
++	shard, err := c.shards.GetByKey(channels[0])
++	if err != nil {
++		// TODO: return PubSub with sticky error
++		panic(err)
++	}
++	return shard.Client.SSubscribe(ctx, channels...)
++}
++
+ // ForEachShard concurrently calls the fn on each live shard in the ring.
+ // It returns the first error if any.
+ func (c *Ring) ForEachShard(
+diff --git a/universal.go b/universal.go
+index a3c5b9d0..f800935c 100644
+--- a/universal.go
++++ b/universal.go
+@@ -190,6 +190,7 @@ type UniversalClient interface {
+ 	Process(ctx context.Context, cmd Cmder) error
+ 	Subscribe(ctx context.Context, channels ...string) *PubSub
+ 	PSubscribe(ctx context.Context, channels ...string) *PubSub
++	SSubscribe(ctx context.Context, channels ...string) *PubSub
+ 	Close() error
+ 	PoolStats() *PoolStats
+ }

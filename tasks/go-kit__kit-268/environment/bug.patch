@@ -1,0 +1,1688 @@
+diff --git a/metrics/dogstatsd/dogstatsd_test.go b/metrics/dogstatsd/dogstatsd_test.go
+index 383dbd7..c11e5b4 100644
+--- a/metrics/dogstatsd/dogstatsd_test.go
++++ b/metrics/dogstatsd/dogstatsd_test.go
+@@ -3,74 +3,13 @@ package dogstatsd
+ import (
+ 	"bytes"
+ 	"fmt"
+-	"net"
++	"github.com/go-kit/kit/metrics"
+ 	"strings"
+ 	"sync"
+ 	"testing"
+ 	"time"
+-
+-	"github.com/go-kit/kit/log"
+-	"github.com/go-kit/kit/metrics"
+-	"github.com/go-kit/kit/util/conn"
+ )
+ 
+-func TestEmitterCounter(t *testing.T) {
+-	e, buf := testEmitter()
+-
+-	c := e.NewCounter("test_statsd_counter")
+-	c.Add(1)
+-	c.Add(2)
+-
+-	// give time for things to emit
+-	time.Sleep(time.Millisecond * 250)
+-	// force a flush and stop
+-	e.Stop()
+-
+-	want := "prefix.test_statsd_counter:1|c\nprefix.test_statsd_counter:2|c\n"
+-	have := buf.String()
+-	if want != have {
+-		t.Errorf("want %q, have %q", want, have)
+-	}
+-}
+-
+-func TestEmitterGauge(t *testing.T) {
+-	e, buf := testEmitter()
+-
+-	g := e.NewGauge("test_statsd_gauge")
+-
+-	delta := 1.0
+-	g.Add(delta)
+-
+-	// give time for things to emit
+-	time.Sleep(time.Millisecond * 250)
+-	// force a flush and stop
+-	e.Stop()
+-
+-	want := fmt.Sprintf("prefix.test_statsd_gauge:+%f|g\n", delta)
+-	have := buf.String()
+-	if want != have {
+-		t.Errorf("want %q, have %q", want, have)
+-	}
+-}
+-
+-func TestEmitterHistogram(t *testing.T) {
+-	e, buf := testEmitter()
+-	h := e.NewHistogram("test_statsd_histogram")
+-
+-	h.Observe(123)
+-
+-	// give time for things to emit
+-	time.Sleep(time.Millisecond * 250)
+-	// force a flush and stop
+-	e.Stop()
+-
+-	want := "prefix.test_statsd_histogram:123|ms\n"
+-	have := buf.String()
+-	if want != have {
+-		t.Errorf("want %q, have %q", want, have)
+-	}
+-}
+-
+ func TestCounter(t *testing.T) {
+ 	buf := &syncbuf{buf: &bytes.Buffer{}}
+ 	reportc := make(chan time.Time)
+@@ -209,58 +148,3 @@ func (s *syncbuf) Reset() {
+ 	defer s.mtx.Unlock()
+ 	s.buf.Reset()
+ }
+-
+-func testEmitter() (*Emitter, *syncbuf) {
+-	buf := &syncbuf{buf: &bytes.Buffer{}}
+-	e := &Emitter{
+-		prefix:  "prefix.",
+-		mgr:     conn.NewManager(mockDialer(buf), "", "", time.After, log.NewNopLogger()),
+-		logger:  log.NewNopLogger(),
+-		keyVals: make(chan keyVal),
+-		quitc:   make(chan chan struct{}),
+-	}
+-	go e.loop(time.Millisecond * 20)
+-	return e, buf
+-}
+-
+-func mockDialer(buf *syncbuf) conn.Dialer {
+-	return func(net, addr string) (net.Conn, error) {
+-		return &mockConn{buf}, nil
+-	}
+-}
+-
+-type mockConn struct {
+-	buf *syncbuf
+-}
+-
+-func (c *mockConn) Read(b []byte) (n int, err error) {
+-	panic("not implemented")
+-}
+-
+-func (c *mockConn) Write(b []byte) (n int, err error) {
+-	return c.buf.Write(b)
+-}
+-
+-func (c *mockConn) Close() error {
+-	panic("not implemented")
+-}
+-
+-func (c *mockConn) LocalAddr() net.Addr {
+-	panic("not implemented")
+-}
+-
+-func (c *mockConn) RemoteAddr() net.Addr {
+-	panic("not implemented")
+-}
+-
+-func (c *mockConn) SetDeadline(t time.Time) error {
+-	panic("not implemented")
+-}
+-
+-func (c *mockConn) SetReadDeadline(t time.Time) error {
+-	panic("not implemented")
+-}
+-
+-func (c *mockConn) SetWriteDeadline(t time.Time) error {
+-	panic("not implemented")
+-}
+diff --git a/metrics/dogstatsd/emitter.go b/metrics/dogstatsd/emitter.go
+deleted file mode 100644
+index 9d8cdf3..0000000
+--- a/metrics/dogstatsd/emitter.go
++++ /dev/null
+@@ -1,159 +0,0 @@
+-package dogstatsd
+-
+-import (
+-	"bytes"
+-	"fmt"
+-	"net"
+-	"time"
+-
+-	"github.com/go-kit/kit/log"
+-	"github.com/go-kit/kit/metrics"
+-	"github.com/go-kit/kit/util/conn"
+-)
+-
+-// Emitter is a struct to manage connections and orchestrate the emission of
+-// metrics to a DogStatsd process.
+-type Emitter struct {
+-	prefix  string
+-	keyVals chan keyVal
+-	mgr     *conn.Manager
+-	logger  log.Logger
+-	quitc   chan chan struct{}
+-}
+-
+-type keyVal struct {
+-	key string
+-	val string
+-}
+-
+-func stringToKeyVal(key string, keyVals chan keyVal) chan string {
+-	vals := make(chan string)
+-	go func() {
+-		for val := range vals {
+-			keyVals <- keyVal{key: key, val: val}
+-		}
+-	}()
+-	return vals
+-}
+-
+-// NewEmitter will return an Emitter that will prefix all metrics names with the
+-// given prefix. Once started, it will attempt to create a connection with the
+-// given network and address via `net.Dial` and periodically post metrics to the
+-// connection in the DogStatsD protocol.
+-func NewEmitter(network, address string, metricsPrefix string, flushInterval time.Duration, logger log.Logger) *Emitter {
+-	return NewEmitterDial(net.Dial, network, address, metricsPrefix, flushInterval, logger)
+-}
+-
+-// NewEmitterDial is the same as NewEmitter, but allows you to specify your own
+-// Dialer function. This is primarily useful for tests.
+-func NewEmitterDial(dialer conn.Dialer, network, address string, metricsPrefix string, flushInterval time.Duration, logger log.Logger) *Emitter {
+-	e := &Emitter{
+-		prefix:  metricsPrefix,
+-		mgr:     conn.NewManager(dialer, network, address, time.After, logger),
+-		logger:  logger,
+-		keyVals: make(chan keyVal),
+-		quitc:   make(chan chan struct{}),
+-	}
+-	go e.loop(flushInterval)
+-	return e
+-}
+-
+-// NewCounter returns a Counter that emits observations in the DogStatsD protocol
+-// via the Emitter's connection manager. Observations are buffered for the
+-// report interval or until the buffer exceeds a max packet size, whichever
+-// comes first. Fields are ignored.
+-func (e *Emitter) NewCounter(key string) metrics.Counter {
+-	key = e.prefix + key
+-	return &counter{
+-		key: key,
+-		c:   stringToKeyVal(key, e.keyVals),
+-	}
+-}
+-
+-// NewHistogram returns a Histogram that emits observations in the DogStatsD
+-// protocol via the Emitter's conection manager. Observations are buffered for
+-// the reporting interval or until the buffer exceeds a max packet size,
+-// whichever comes first. Fields are ignored.
+-//
+-// NewHistogram is mapped to a statsd Timing, so observations should represent
+-// milliseconds. If you observe in units of nanoseconds, you can make the
+-// translation with a ScaledHistogram:
+-//
+-//    NewScaledHistogram(histogram, time.Millisecond)
+-//
+-// You can also enforce the constraint in a typesafe way with a millisecond
+-// TimeHistogram:
+-//
+-//    NewTimeHistogram(histogram, time.Millisecond)
+-//
+-// TODO: support for sampling.
+-func (e *Emitter) NewHistogram(key string) metrics.Histogram {
+-	key = e.prefix + key
+-	return &histogram{
+-		key: key,
+-		h:   stringToKeyVal(key, e.keyVals),
+-	}
+-}
+-
+-// NewGauge returns a Gauge that emits values in the DogStatsD protocol via the
+-// the Emitter's connection manager. Values are buffered for the report
+-// interval or until the buffer exceeds a max packet size, whichever comes
+-// first. Fields are ignored.
+-//
+-// TODO: support for sampling
+-func (e *Emitter) NewGauge(key string) metrics.Gauge {
+-	key = e.prefix + key
+-	return &gauge{
+-		key: key,
+-		g:   stringToKeyVal(key, e.keyVals),
+-	}
+-}
+-
+-func (e *Emitter) loop(d time.Duration) {
+-	ticker := time.NewTicker(d)
+-	defer ticker.Stop()
+-	buf := &bytes.Buffer{}
+-	for {
+-		select {
+-		case kv := <-e.keyVals:
+-			fmt.Fprintf(buf, "%s:%s\n", kv.key, kv.val)
+-			if buf.Len() > maxBufferSize {
+-				e.Flush(buf)
+-			}
+-
+-		case <-ticker.C:
+-			e.Flush(buf)
+-
+-		case q := <-e.quitc:
+-			e.Flush(buf)
+-			close(q)
+-			return
+-		}
+-	}
+-}
+-
+-// Stop will flush the current metrics and close the active connection. Calling
+-// stop more than once is a programmer error.
+-func (e *Emitter) Stop() {
+-	q := make(chan struct{})
+-	e.quitc <- q
+-	<-q
+-}
+-
+-// Flush will write the given buffer to a connection provided by the Emitter's
+-// connection manager.
+-func (e *Emitter) Flush(buf *bytes.Buffer) {
+-	conn := e.mgr.Take()
+-	if conn == nil {
+-		e.logger.Log("during", "flush", "err", "connection unavailable")
+-		return
+-	}
+-
+-	_, err := conn.Write(buf.Bytes())
+-	if err != nil {
+-		e.logger.Log("during", "flush", "err", err)
+-	}
+-	buf.Reset()
+-
+-	e.mgr.Put(err)
+-}
+diff --git a/metrics/graphite/emitter.go b/metrics/graphite/emitter.go
+deleted file mode 100644
+index 87e633c..0000000
+--- a/metrics/graphite/emitter.go
++++ /dev/null
+@@ -1,159 +0,0 @@
+-package graphite
+-
+-import (
+-	"bufio"
+-	"fmt"
+-	"io"
+-	"net"
+-	"sync"
+-	"time"
+-
+-	"github.com/go-kit/kit/log"
+-	"github.com/go-kit/kit/metrics"
+-	"github.com/go-kit/kit/util/conn"
+-)
+-
+-// Emitter is a struct to manage connections and orchestrate the emission of
+-// metrics to a Graphite system.
+-type Emitter struct {
+-	mtx        sync.Mutex
+-	prefix     string
+-	mgr        *conn.Manager
+-	counters   []*counter
+-	histograms []*windowedHistogram
+-	gauges     []*gauge
+-	logger     log.Logger
+-	quitc      chan chan struct{}
+-}
+-
+-// NewEmitter will return an Emitter that will prefix all metrics names with the
+-// given prefix. Once started, it will attempt to create a connection with the
+-// given network and address via `net.Dial` and periodically post metrics to the
+-// connection in the Graphite plaintext protocol.
+-func NewEmitter(network, address string, metricsPrefix string, flushInterval time.Duration, logger log.Logger) *Emitter {
+-	return NewEmitterDial(net.Dial, network, address, metricsPrefix, flushInterval, logger)
+-}
+-
+-// NewEmitterDial is the same as NewEmitter, but allows you to specify your own
+-// Dialer function. This is primarily useful for tests.
+-func NewEmitterDial(dialer conn.Dialer, network, address string, metricsPrefix string, flushInterval time.Duration, logger log.Logger) *Emitter {
+-	e := &Emitter{
+-		prefix: metricsPrefix,
+-		mgr:    conn.NewManager(dialer, network, address, time.After, logger),
+-		logger: logger,
+-		quitc:  make(chan chan struct{}),
+-	}
+-	go e.loop(flushInterval)
+-	return e
+-}
+-
+-// NewCounter returns a Counter whose value will be periodically emitted in
+-// a Graphite-compatible format once the Emitter is started. Fields are ignored.
+-func (e *Emitter) NewCounter(name string) metrics.Counter {
+-	e.mtx.Lock()
+-	defer e.mtx.Unlock()
+-	c := newCounter(name)
+-	e.counters = append(e.counters, c)
+-	return c
+-}
+-
+-// NewHistogram is taken from http://github.com/codahale/metrics. It returns a
+-// windowed HDR histogram which drops data older than five minutes.
+-//
+-// The histogram exposes metrics for each passed quantile as gauges. Quantiles
+-// should be integers in the range 1..99. The gauge names are assigned by using
+-// the passed name as a prefix and appending "_pNN" e.g. "_p50".
+-//
+-// The values of this histogram will be periodically emitted in a
+-// Graphite-compatible format once the Emitter is started. Fields are ignored.
+-func (e *Emitter) NewHistogram(name string, minValue, maxValue int64, sigfigs int, quantiles ...int) (metrics.Histogram, error) {
+-	gauges := map[int]metrics.Gauge{}
+-	for _, quantile := range quantiles {
+-		if quantile <= 0 || quantile >= 100 {
+-			return nil, fmt.Errorf("invalid quantile %d", quantile)
+-		}
+-		gauges[quantile] = e.gauge(fmt.Sprintf("%s_p%02d", name, quantile))
+-	}
+-	h := newWindowedHistogram(name, minValue, maxValue, sigfigs, gauges, e.logger)
+-
+-	e.mtx.Lock()
+-	defer e.mtx.Unlock()
+-	e.histograms = append(e.histograms, h)
+-	return h, nil
+-}
+-
+-// NewGauge returns a Gauge whose value will be periodically emitted in a
+-// Graphite-compatible format once the Emitter is started. Fields are ignored.
+-func (e *Emitter) NewGauge(name string) metrics.Gauge {
+-	e.mtx.Lock()
+-	defer e.mtx.Unlock()
+-	return e.gauge(name)
+-}
+-
+-func (e *Emitter) gauge(name string) metrics.Gauge {
+-	g := &gauge{name, 0}
+-	e.gauges = append(e.gauges, g)
+-	return g
+-}
+-
+-func (e *Emitter) loop(d time.Duration) {
+-	ticker := time.NewTicker(d)
+-	defer ticker.Stop()
+-
+-	for {
+-		select {
+-		case <-ticker.C:
+-			e.Flush()
+-
+-		case q := <-e.quitc:
+-			e.Flush()
+-			close(q)
+-			return
+-		}
+-	}
+-}
+-
+-// Stop will flush the current metrics and close the active connection. Calling
+-// stop more than once is a programmer error.
+-func (e *Emitter) Stop() {
+-	q := make(chan struct{})
+-	e.quitc <- q
+-	<-q
+-}
+-
+-// Flush will write the current metrics to the Emitter's connection in the
+-// Graphite plaintext protocol.
+-func (e *Emitter) Flush() {
+-	e.mtx.Lock() // one flush at a time
+-	defer e.mtx.Unlock()
+-
+-	conn := e.mgr.Take()
+-	if conn == nil {
+-		e.logger.Log("during", "flush", "err", "connection unavailable")
+-		return
+-	}
+-
+-	err := e.flush(conn)
+-	if err != nil {
+-		e.logger.Log("during", "flush", "err", err)
+-	}
+-	e.mgr.Put(err)
+-}
+-
+-func (e *Emitter) flush(w io.Writer) error {
+-	bw := bufio.NewWriter(w)
+-
+-	for _, c := range e.counters {
+-		c.flush(bw, e.prefix)
+-	}
+-
+-	for _, h := range e.histograms {
+-		h.flush(bw, e.prefix)
+-	}
+-
+-	for _, g := range e.gauges {
+-		g.flush(bw, e.prefix)
+-	}
+-
+-	return bw.Flush()
+-}
+diff --git a/metrics/graphite/graphite.go b/metrics/graphite/graphite.go
+deleted file mode 100644
+index 6736cc2..0000000
+--- a/metrics/graphite/graphite.go
++++ /dev/null
+@@ -1,186 +0,0 @@
+-// Package graphite implements a Graphite backend for package metrics. Metrics
+-// will be emitted to a Graphite server in the plaintext protocol which looks
+-// like:
+-//
+-//   "<metric path> <metric value> <metric timestamp>"
+-//
+-// See http://graphite.readthedocs.io/en/latest/feeding-carbon.html#the-plaintext-protocol.
+-// The current implementation ignores fields.
+-package graphite
+-
+-import (
+-	"fmt"
+-	"io"
+-	"math"
+-	"sort"
+-	"sync"
+-	"sync/atomic"
+-	"time"
+-
+-	"github.com/codahale/hdrhistogram"
+-
+-	"github.com/go-kit/kit/log"
+-	"github.com/go-kit/kit/metrics"
+-)
+-
+-func newCounter(name string) *counter {
+-	return &counter{name, 0}
+-}
+-
+-func newGauge(name string) *gauge {
+-	return &gauge{name, 0}
+-}
+-
+-// counter implements the metrics.counter interface but also provides a
+-// Flush method to emit the current counter values in the Graphite plaintext
+-// protocol.
+-type counter struct {
+-	key   string
+-	count uint64
+-}
+-
+-func (c *counter) Name() string { return c.key }
+-
+-// With currently ignores fields.
+-func (c *counter) With(metrics.Field) metrics.Counter { return c }
+-
+-func (c *counter) Add(delta uint64) { atomic.AddUint64(&c.count, delta) }
+-
+-func (c *counter) get() uint64 { return atomic.LoadUint64(&c.count) }
+-
+-// flush will emit the current counter value in the Graphite plaintext
+-// protocol to the given io.Writer.
+-func (c *counter) flush(w io.Writer, prefix string) {
+-	fmt.Fprintf(w, "%s.count %d %d\n", prefix+c.Name(), c.get(), time.Now().Unix())
+-}
+-
+-// gauge implements the metrics.gauge interface but also provides a
+-// Flush method to emit the current counter values in the Graphite plaintext
+-// protocol.
+-type gauge struct {
+-	key   string
+-	value uint64 // math.Float64bits
+-}
+-
+-func (g *gauge) Name() string { return g.key }
+-
+-// With currently ignores fields.
+-func (g *gauge) With(metrics.Field) metrics.Gauge { return g }
+-
+-func (g *gauge) Add(delta float64) {
+-	for {
+-		old := atomic.LoadUint64(&g.value)
+-		new := math.Float64bits(math.Float64frombits(old) + delta)
+-		if atomic.CompareAndSwapUint64(&g.value, old, new) {
+-			return
+-		}
+-	}
+-}
+-
+-func (g *gauge) Set(value float64) {
+-	atomic.StoreUint64(&g.value, math.Float64bits(value))
+-}
+-
+-func (g *gauge) Get() float64 {
+-	return math.Float64frombits(atomic.LoadUint64(&g.value))
+-}
+-
+-// Flush will emit the current gauge value in the Graphite plaintext
+-// protocol to the given io.Writer.
+-func (g *gauge) flush(w io.Writer, prefix string) {
+-	fmt.Fprintf(w, "%s %.2f %d\n", prefix+g.Name(), g.Get(), time.Now().Unix())
+-}
+-
+-// windowedHistogram is taken from http://github.com/codahale/metrics. It
+-// is a windowed HDR histogram which drops data older than five minutes.
+-//
+-// The histogram exposes metrics for each passed quantile as gauges. Quantiles
+-// should be integers in the range 1..99. The gauge names are assigned by using
+-// the passed name as a prefix and appending "_pNN" e.g. "_p50".
+-//
+-// The values of this histogram will be periodically emitted in a
+-// Graphite-compatible format once the GraphiteProvider is started. Fields are ignored.
+-type windowedHistogram struct {
+-	mtx  sync.Mutex
+-	hist *hdrhistogram.WindowedHistogram
+-
+-	name   string
+-	gauges map[int]metrics.Gauge
+-	logger log.Logger
+-}
+-
+-func newWindowedHistogram(name string, minValue, maxValue int64, sigfigs int, quantiles map[int]metrics.Gauge, logger log.Logger) *windowedHistogram {
+-	h := &windowedHistogram{
+-		hist:   hdrhistogram.NewWindowed(5, minValue, maxValue, sigfigs),
+-		name:   name,
+-		gauges: quantiles,
+-		logger: logger,
+-	}
+-	go h.rotateLoop(1 * time.Minute)
+-	return h
+-}
+-
+-func (h *windowedHistogram) Name() string { return h.name }
+-
+-func (h *windowedHistogram) With(metrics.Field) metrics.Histogram { return h }
+-
+-func (h *windowedHistogram) Observe(value int64) {
+-	h.mtx.Lock()
+-	err := h.hist.Current.RecordValue(value)
+-	h.mtx.Unlock()
+-
+-	if err != nil {
+-		h.logger.Log("err", err, "msg", "unable to record histogram value")
+-		return
+-	}
+-
+-	for q, gauge := range h.gauges {
+-		gauge.Set(float64(h.hist.Current.ValueAtQuantile(float64(q))))
+-	}
+-}
+-
+-func (h *windowedHistogram) Distribution() ([]metrics.Bucket, []metrics.Quantile) {
+-	bars := h.hist.Merge().Distribution()
+-	buckets := make([]metrics.Bucket, len(bars))
+-	for i, bar := range bars {
+-		buckets[i] = metrics.Bucket{
+-			From:  bar.From,
+-			To:    bar.To,
+-			Count: bar.Count,
+-		}
+-	}
+-	quantiles := make([]metrics.Quantile, 0, len(h.gauges))
+-	for quantile, gauge := range h.gauges {
+-		quantiles = append(quantiles, metrics.Quantile{
+-			Quantile: quantile,
+-			Value:    int64(gauge.Get()),
+-		})
+-	}
+-	sort.Sort(quantileSlice(quantiles))
+-	return buckets, quantiles
+-}
+-
+-func (h *windowedHistogram) flush(w io.Writer, prefix string) {
+-	name := prefix + h.Name()
+-	hist := h.hist.Merge()
+-	now := time.Now().Unix()
+-	fmt.Fprintf(w, "%s.count %d %d\n", name, hist.TotalCount(), now)
+-	fmt.Fprintf(w, "%s.min %d %d\n", name, hist.Min(), now)
+-	fmt.Fprintf(w, "%s.max %d %d\n", name, hist.Max(), now)
+-	fmt.Fprintf(w, "%s.mean %.2f %d\n", name, hist.Mean(), now)
+-	fmt.Fprintf(w, "%s.std-dev %.2f %d\n", name, hist.StdDev(), now)
+-}
+-
+-func (h *windowedHistogram) rotateLoop(d time.Duration) {
+-	for range time.Tick(d) {
+-		h.mtx.Lock()
+-		h.hist.Rotate()
+-		h.mtx.Unlock()
+-	}
+-}
+-
+-type quantileSlice []metrics.Quantile
+-
+-func (a quantileSlice) Len() int           { return len(a) }
+-func (a quantileSlice) Less(i, j int) bool { return a[i].Quantile < a[j].Quantile }
+-func (a quantileSlice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+diff --git a/metrics/graphite/graphite_test.go b/metrics/graphite/graphite_test.go
+deleted file mode 100644
+index 627efea..0000000
+--- a/metrics/graphite/graphite_test.go
++++ /dev/null
+@@ -1,80 +0,0 @@
+-package graphite
+-
+-import (
+-	"bytes"
+-	"fmt"
+-	"strings"
+-	"testing"
+-	"time"
+-
+-	"github.com/go-kit/kit/log"
+-	"github.com/go-kit/kit/metrics"
+-	"github.com/go-kit/kit/metrics/teststat"
+-)
+-
+-func TestHistogramQuantiles(t *testing.T) {
+-	prefix := "prefix."
+-	e := NewEmitter("", "", prefix, time.Second, log.NewNopLogger())
+-	var (
+-		name      = "test_histogram_quantiles"
+-		quantiles = []int{50, 90, 95, 99}
+-	)
+-	h, err := e.NewHistogram(name, 0, 100, 3, quantiles...)
+-	if err != nil {
+-		t.Fatalf("unable to create test histogram: %v", err)
+-	}
+-	h = h.With(metrics.Field{Key: "ignored", Value: "field"})
+-	const seed, mean, stdev int64 = 424242, 50, 10
+-	teststat.PopulateNormalHistogram(t, h, seed, mean, stdev)
+-
+-	// flush the current metrics into a buffer to examine
+-	var b bytes.Buffer
+-	e.flush(&b)
+-	teststat.AssertGraphiteNormalHistogram(t, prefix, name, mean, stdev, quantiles, b.String())
+-}
+-
+-func TestCounter(t *testing.T) {
+-	var (
+-		prefix = "prefix."
+-		name   = "m"
+-		value  = 123
+-		e      = NewEmitter("", "", prefix, time.Second, log.NewNopLogger())
+-		b      bytes.Buffer
+-	)
+-	e.NewCounter(name).With(metrics.Field{Key: "ignored", Value: "field"}).Add(uint64(value))
+-	e.flush(&b)
+-	want := fmt.Sprintf("%s%s.count %d", prefix, name, value)
+-	payload := b.String()
+-	if !strings.HasPrefix(payload, want) {
+-		t.Errorf("counter %s want\n%s, have\n%s", name, want, payload)
+-	}
+-}
+-
+-func TestGauge(t *testing.T) {
+-	var (
+-		prefix = "prefix."
+-		name   = "xyz"
+-		value  = 54321
+-		delta  = 12345
+-		e      = NewEmitter("", "", prefix, time.Second, log.NewNopLogger())
+-		b      bytes.Buffer
+-		g      = e.NewGauge(name).With(metrics.Field{Key: "ignored", Value: "field"})
+-	)
+-
+-	g.Set(float64(value))
+-	g.Add(float64(delta))
+-
+-	e.flush(&b)
+-	payload := b.String()
+-
+-	want := fmt.Sprintf("%s%s %d", prefix, name, value+delta)
+-	if !strings.HasPrefix(payload, want) {
+-		t.Errorf("gauge %s want\n%s, have\n%s", name, want, payload)
+-	}
+-}
+-
+-func TestEmitterStops(t *testing.T) {
+-	e := NewEmitter("foo", "bar", "baz", time.Second, log.NewNopLogger())
+-	time.Sleep(100 * time.Millisecond)
+-	e.Stop()
+-}
+diff --git a/metrics/provider/providers.go b/metrics/provider/providers.go
+deleted file mode 100644
+index 34cdf33..0000000
+--- a/metrics/provider/providers.go
++++ /dev/null
+@@ -1,259 +0,0 @@
+-package provider
+-
+-import (
+-	"errors"
+-	"time"
+-
+-	"github.com/prometheus/client_golang/prometheus"
+-
+-	"github.com/go-kit/kit/log"
+-	"github.com/go-kit/kit/metrics"
+-	"github.com/go-kit/kit/metrics/discard"
+-	"github.com/go-kit/kit/metrics/dogstatsd"
+-	kitexp "github.com/go-kit/kit/metrics/expvar"
+-	"github.com/go-kit/kit/metrics/graphite"
+-	kitprom "github.com/go-kit/kit/metrics/prometheus"
+-	"github.com/go-kit/kit/metrics/statsd"
+-)
+-
+-// Provider represents a union set of constructors and lifecycle management
+-// functions for each supported metrics backend. It should be used by those who
+-// need to easily swap out implementations, e.g. dynamically, or at a single
+-// point in an intermediating framework.
+-type Provider interface {
+-	NewCounter(name, help string) metrics.Counter
+-	NewHistogram(name, help string, min, max int64, sigfigs int, quantiles ...int) (metrics.Histogram, error)
+-	NewGauge(name, help string) metrics.Gauge
+-	Stop()
+-}
+-
+-// NewGraphiteProvider will return a Provider implementation that is a simple
+-// wrapper around a graphite.Emitter. All metric names will be prefixed with the
+-// given value and data will be emitted once every interval. If no network value
+-// is given, it will default to "udp".
+-func NewGraphiteProvider(network, address, prefix string, interval time.Duration, logger log.Logger) (Provider, error) {
+-	if network == "" {
+-		network = "udp"
+-	}
+-	if address == "" {
+-		return nil, errors.New("address is required")
+-	}
+-	return graphiteProvider{
+-		e: graphite.NewEmitter(network, address, prefix, interval, logger),
+-	}, nil
+-}
+-
+-type graphiteProvider struct {
+-	e *graphite.Emitter
+-}
+-
+-var _ Provider = graphiteProvider{}
+-
+-// NewCounter implements Provider. Help is ignored.
+-func (p graphiteProvider) NewCounter(name, _ string) metrics.Counter {
+-	return p.e.NewCounter(name)
+-}
+-
+-// NewHistogram implements Provider. Help is ignored.
+-func (p graphiteProvider) NewHistogram(name, _ string, min, max int64, sigfigs int, quantiles ...int) (metrics.Histogram, error) {
+-	return p.e.NewHistogram(name, min, max, sigfigs, quantiles...)
+-}
+-
+-// NewGauge implements Provider. Help is ignored.
+-func (p graphiteProvider) NewGauge(name, _ string) metrics.Gauge {
+-	return p.e.NewGauge(name)
+-}
+-
+-// Stop implements Provider.
+-func (p graphiteProvider) Stop() {
+-	p.e.Stop()
+-}
+-
+-// NewStatsdProvider will return a Provider implementation that is a simple
+-// wrapper around a statsd.Emitter. All metric names will be prefixed with the
+-// given value and data will be emitted once every interval or when the buffer
+-// has reached its max size. If no network value is given, it will default to
+-// "udp".
+-func NewStatsdProvider(network, address, prefix string, interval time.Duration, logger log.Logger) (Provider, error) {
+-	if network == "" {
+-		network = "udp"
+-	}
+-	if address == "" {
+-		return nil, errors.New("address is required")
+-	}
+-	return statsdProvider{
+-		e: statsd.NewEmitter(network, address, prefix, interval, logger),
+-	}, nil
+-}
+-
+-type statsdProvider struct {
+-	e *statsd.Emitter
+-}
+-
+-var _ Provider = statsdProvider{}
+-
+-// NewCounter implements Provider. Help is ignored.
+-func (p statsdProvider) NewCounter(name, _ string) metrics.Counter {
+-	return p.e.NewCounter(name)
+-}
+-
+-// NewHistogram implements Provider. Help is ignored.
+-func (p statsdProvider) NewHistogram(name, _ string, min, max int64, sigfigs int, quantiles ...int) (metrics.Histogram, error) {
+-	return p.e.NewHistogram(name), nil
+-}
+-
+-// NewGauge implements Provider. Help is ignored.
+-func (p statsdProvider) NewGauge(name, _ string) metrics.Gauge {
+-	return p.e.NewGauge(name)
+-}
+-
+-// Stop will call the underlying statsd.Emitter's Stop method.
+-func (p statsdProvider) Stop() {
+-	p.e.Stop()
+-}
+-
+-// NewDogStatsdProvider will return a Provider implementation that is a simple
+-// wrapper around a dogstatsd.Emitter. All metric names will be prefixed with
+-// the given value and data will be emitted once every interval or when the
+-// buffer has reached its max size. If no network value is given, it will
+-// default to "udp".
+-func NewDogStatsdProvider(network, address, prefix string, interval time.Duration, logger log.Logger) (Provider, error) {
+-	if network == "" {
+-		network = "udp"
+-	}
+-	if address == "" {
+-		return nil, errors.New("address is required")
+-	}
+-	return dogstatsdProvider{
+-		e: dogstatsd.NewEmitter(network, address, prefix, interval, logger),
+-	}, nil
+-}
+-
+-type dogstatsdProvider struct {
+-	e *dogstatsd.Emitter
+-}
+-
+-var _ Provider = dogstatsdProvider{}
+-
+-// NewCounter implements Provider. Help is ignored.
+-func (p dogstatsdProvider) NewCounter(name, _ string) metrics.Counter {
+-	return p.e.NewCounter(name)
+-}
+-
+-// NewHistogram implements Provider. Help is ignored.
+-func (p dogstatsdProvider) NewHistogram(name, _ string, min, max int64, sigfigs int, quantiles ...int) (metrics.Histogram, error) {
+-	return p.e.NewHistogram(name), nil
+-}
+-
+-// NewGauge implements Provider. Help is ignored.
+-func (p dogstatsdProvider) NewGauge(name, _ string) metrics.Gauge {
+-	return p.e.NewGauge(name)
+-}
+-
+-// Stop will call the underlying statsd.Emitter's Stop method.
+-func (p dogstatsdProvider) Stop() {
+-	p.e.Stop()
+-}
+-
+-// NewExpvarProvider is a very thin wrapper over the expvar package.
+-// If a prefix is provided, it will prefix all metric names.
+-func NewExpvarProvider(prefix string) Provider {
+-	return expvarProvider{prefix: prefix}
+-}
+-
+-type expvarProvider struct {
+-	prefix string
+-}
+-
+-var _ Provider = expvarProvider{}
+-
+-// NewCounter implements Provider. Help is ignored.
+-func (p expvarProvider) NewCounter(name, _ string) metrics.Counter {
+-	return kitexp.NewCounter(p.prefix + name)
+-}
+-
+-// NewHistogram implements Provider. Help is ignored.
+-func (p expvarProvider) NewHistogram(name, _ string, min, max int64, sigfigs int, quantiles ...int) (metrics.Histogram, error) {
+-	return kitexp.NewHistogram(p.prefix+name, min, max, sigfigs, quantiles...), nil
+-}
+-
+-// NewGauge implements Provider. Help is ignored.
+-func (p expvarProvider) NewGauge(name, _ string) metrics.Gauge {
+-	return kitexp.NewGauge(p.prefix + name)
+-}
+-
+-// Stop is a no-op.
+-func (expvarProvider) Stop() {}
+-
+-type prometheusProvider struct {
+-	namespace string
+-	subsystem string
+-}
+-
+-var _ Provider = prometheusProvider{}
+-
+-// NewPrometheusProvider returns a Prometheus provider that uses the provided
+-// namespace and subsystem for all metrics.
+-func NewPrometheusProvider(namespace, subsystem string) Provider {
+-	return prometheusProvider{
+-		namespace: namespace,
+-		subsystem: subsystem,
+-	}
+-}
+-
+-// NewCounter implements Provider.
+-func (p prometheusProvider) NewCounter(name, help string) metrics.Counter {
+-	return kitprom.NewCounter(prometheus.CounterOpts{
+-		Namespace: p.namespace,
+-		Subsystem: p.subsystem,
+-		Name:      name,
+-		Help:      help,
+-	}, nil)
+-}
+-
+-// NewHistogram ignores all parameters except name and help.
+-func (p prometheusProvider) NewHistogram(name, help string, _, _ int64, _ int, _ ...int) (metrics.Histogram, error) {
+-	return kitprom.NewHistogram(prometheus.HistogramOpts{
+-		Namespace: p.namespace,
+-		Subsystem: p.subsystem,
+-		Name:      name,
+-		Help:      help,
+-	}, nil), nil
+-}
+-
+-// NewGauge implements Provider.
+-func (p prometheusProvider) NewGauge(name, help string) metrics.Gauge {
+-	return kitprom.NewGauge(prometheus.GaugeOpts{
+-		Namespace: p.namespace,
+-		Subsystem: p.subsystem,
+-		Name:      name,
+-		Help:      help,
+-	}, nil)
+-}
+-
+-// Stop is a no-op.
+-func (prometheusProvider) Stop() {}
+-
+-var _ Provider = discardProvider{}
+-
+-// NewDiscardProvider returns a provider that will discard all metrics.
+-func NewDiscardProvider() Provider {
+-	return discardProvider{}
+-}
+-
+-type discardProvider struct{}
+-
+-func (p discardProvider) NewCounter(name string, _ string) metrics.Counter {
+-	return discard.NewCounter(name)
+-}
+-
+-func (p discardProvider) NewHistogram(name string, _ string, _ int64, _ int64, _ int, _ ...int) (metrics.Histogram, error) {
+-	return discard.NewHistogram(name), nil
+-}
+-
+-func (p discardProvider) NewGauge(name string, _ string) metrics.Gauge {
+-	return discard.NewGauge(name)
+-}
+-
+-// Stop is a no-op.
+-func (p discardProvider) Stop() {}
+diff --git a/metrics/provider/providers_test.go b/metrics/provider/providers_test.go
+deleted file mode 100644
+index 15d3e4d..0000000
+--- a/metrics/provider/providers_test.go
++++ /dev/null
+@@ -1,56 +0,0 @@
+-package provider
+-
+-import (
+-	"testing"
+-	"time"
+-
+-	"github.com/go-kit/kit/log"
+-)
+-
+-func TestGraphite(t *testing.T) {
+-	p, err := NewGraphiteProvider("network", "address", "prefix", time.Second, log.NewNopLogger())
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	testProvider(t, "Graphite", p)
+-}
+-
+-func TestStatsd(t *testing.T) {
+-	p, err := NewStatsdProvider("network", "address", "prefix", time.Second, log.NewNopLogger())
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	testProvider(t, "Statsd", p)
+-}
+-
+-func TestDogStatsd(t *testing.T) {
+-	p, err := NewDogStatsdProvider("network", "address", "prefix", time.Second, log.NewNopLogger())
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	testProvider(t, "DogStatsd", p)
+-}
+-
+-func TestExpvar(t *testing.T) {
+-	testProvider(t, "Expvar", NewExpvarProvider("prefix"))
+-}
+-
+-func TestPrometheus(t *testing.T) {
+-	testProvider(t, "Prometheus", NewPrometheusProvider("namespace", "subsystem"))
+-}
+-
+-func testProvider(t *testing.T, what string, p Provider) {
+-	c := p.NewCounter("counter", "Counter help.")
+-	c.Add(1)
+-
+-	h, err := p.NewHistogram("histogram", "Histogram help.", 1, 100, 3, 50, 95, 99)
+-	if err != nil {
+-		t.Errorf("%s: NewHistogram: %v", what, err)
+-	}
+-	h.Observe(99)
+-
+-	g := p.NewGauge("gauge", "Gauge help.")
+-	g.Set(123)
+-
+-	p.Stop()
+-}
+diff --git a/metrics/statsd/emitter.go b/metrics/statsd/emitter.go
+deleted file mode 100644
+index f47aada..0000000
+--- a/metrics/statsd/emitter.go
++++ /dev/null
+@@ -1,159 +0,0 @@
+-package statsd
+-
+-import (
+-	"bytes"
+-	"fmt"
+-	"net"
+-	"time"
+-
+-	"github.com/go-kit/kit/log"
+-	"github.com/go-kit/kit/metrics"
+-	"github.com/go-kit/kit/util/conn"
+-)
+-
+-// Emitter is a struct to manage connections and orchestrate the emission of
+-// metrics to a Statsd process.
+-type Emitter struct {
+-	prefix  string
+-	keyVals chan keyVal
+-	mgr     *conn.Manager
+-	logger  log.Logger
+-	quitc   chan chan struct{}
+-}
+-
+-type keyVal struct {
+-	key string
+-	val string
+-}
+-
+-func stringToKeyVal(key string, keyVals chan keyVal) chan string {
+-	vals := make(chan string)
+-	go func() {
+-		for val := range vals {
+-			keyVals <- keyVal{key: key, val: val}
+-		}
+-	}()
+-	return vals
+-}
+-
+-// NewEmitter will return an Emitter that will prefix all metrics names with the
+-// given prefix. Once started, it will attempt to create a connection with the
+-// given network and address via `net.Dial` and periodically post metrics to the
+-// connection in the statsd protocol.
+-func NewEmitter(network, address string, metricsPrefix string, flushInterval time.Duration, logger log.Logger) *Emitter {
+-	return NewEmitterDial(net.Dial, network, address, metricsPrefix, flushInterval, logger)
+-}
+-
+-// NewEmitterDial is the same as NewEmitter, but allows you to specify your own
+-// Dialer function. This is primarily useful for tests.
+-func NewEmitterDial(dialer conn.Dialer, network, address string, metricsPrefix string, flushInterval time.Duration, logger log.Logger) *Emitter {
+-	e := &Emitter{
+-		prefix:  metricsPrefix,
+-		mgr:     conn.NewManager(dialer, network, address, time.After, logger),
+-		logger:  logger,
+-		keyVals: make(chan keyVal),
+-		quitc:   make(chan chan struct{}),
+-	}
+-	go e.loop(flushInterval)
+-	return e
+-}
+-
+-// NewCounter returns a Counter that emits observations in the statsd protocol
+-// via the Emitter's connection manager. Observations are buffered for the
+-// report interval or until the buffer exceeds a max packet size, whichever
+-// comes first. Fields are ignored.
+-func (e *Emitter) NewCounter(key string) metrics.Counter {
+-	key = e.prefix + key
+-	return &counter{
+-		key: key,
+-		c:   stringToKeyVal(key, e.keyVals),
+-	}
+-}
+-
+-// NewHistogram returns a Histogram that emits observations in the statsd
+-// protocol via the Emitter's conection manager. Observations are buffered for
+-// the reporting interval or until the buffer exceeds a max packet size,
+-// whichever comes first. Fields are ignored.
+-//
+-// NewHistogram is mapped to a statsd Timing, so observations should represent
+-// milliseconds. If you observe in units of nanoseconds, you can make the
+-// translation with a ScaledHistogram:
+-//
+-//    NewScaledHistogram(histogram, time.Millisecond)
+-//
+-// You can also enforce the constraint in a typesafe way with a millisecond
+-// TimeHistogram:
+-//
+-//    NewTimeHistogram(histogram, time.Millisecond)
+-//
+-// TODO: support for sampling.
+-func (e *Emitter) NewHistogram(key string) metrics.Histogram {
+-	key = e.prefix + key
+-	return &histogram{
+-		key: key,
+-		h:   stringToKeyVal(key, e.keyVals),
+-	}
+-}
+-
+-// NewGauge returns a Gauge that emits values in the statsd protocol via the
+-// the Emitter's connection manager. Values are buffered for the report
+-// interval or until the buffer exceeds a max packet size, whichever comes
+-// first. Fields are ignored.
+-//
+-// TODO: support for sampling
+-func (e *Emitter) NewGauge(key string) metrics.Gauge {
+-	key = e.prefix + key
+-	return &gauge{
+-		key: key,
+-		g:   stringToKeyVal(key, e.keyVals),
+-	}
+-}
+-
+-func (e *Emitter) loop(d time.Duration) {
+-	ticker := time.NewTicker(d)
+-	defer ticker.Stop()
+-	buf := &bytes.Buffer{}
+-	for {
+-		select {
+-		case kv := <-e.keyVals:
+-			fmt.Fprintf(buf, "%s:%s\n", kv.key, kv.val)
+-			if buf.Len() > maxBufferSize {
+-				e.Flush(buf)
+-			}
+-
+-		case <-ticker.C:
+-			e.Flush(buf)
+-
+-		case q := <-e.quitc:
+-			e.Flush(buf)
+-			close(q)
+-			return
+-		}
+-	}
+-}
+-
+-// Stop will flush the current metrics and close the active connection. Calling
+-// stop more than once is a programmer error.
+-func (e *Emitter) Stop() {
+-	q := make(chan struct{})
+-	e.quitc <- q
+-	<-q
+-}
+-
+-// Flush will write the given buffer to a connection provided by the Emitter's
+-// connection manager.
+-func (e *Emitter) Flush(buf *bytes.Buffer) {
+-	conn := e.mgr.Take()
+-	if conn == nil {
+-		e.logger.Log("during", "flush", "err", "connection unavailable")
+-		return
+-	}
+-
+-	_, err := conn.Write(buf.Bytes())
+-	if err != nil {
+-		e.logger.Log("during", "flush", "err", err)
+-	}
+-	buf.Reset()
+-
+-	e.mgr.Put(err)
+-}
+diff --git a/metrics/statsd/statsd_test.go b/metrics/statsd/statsd_test.go
+index 516520d..dc7b286 100644
+--- a/metrics/statsd/statsd_test.go
++++ b/metrics/statsd/statsd_test.go
+@@ -3,73 +3,12 @@ package statsd
+ import (
+ 	"bytes"
+ 	"fmt"
+-	"net"
+ 	"strings"
+ 	"sync"
+ 	"testing"
+ 	"time"
+-
+-	"github.com/go-kit/kit/log"
+-	"github.com/go-kit/kit/util/conn"
+ )
+ 
+-func TestEmitterCounter(t *testing.T) {
+-	e, buf := testEmitter()
+-
+-	c := e.NewCounter("test_statsd_counter")
+-	c.Add(1)
+-	c.Add(2)
+-
+-	// give time for things to emit
+-	time.Sleep(time.Millisecond * 250)
+-	// force a flush and stop
+-	e.Stop()
+-
+-	want := "prefix.test_statsd_counter:1|c\nprefix.test_statsd_counter:2|c\n"
+-	have := buf.String()
+-	if want != have {
+-		t.Errorf("want %q, have %q", want, have)
+-	}
+-}
+-
+-func TestEmitterGauge(t *testing.T) {
+-	e, buf := testEmitter()
+-
+-	g := e.NewGauge("test_statsd_gauge")
+-
+-	delta := 1.0
+-	g.Add(delta)
+-
+-	// give time for things to emit
+-	time.Sleep(time.Millisecond * 250)
+-	// force a flush and stop
+-	e.Stop()
+-
+-	want := fmt.Sprintf("prefix.test_statsd_gauge:+%f|g\n", delta)
+-	have := buf.String()
+-	if want != have {
+-		t.Errorf("want %q, have %q", want, have)
+-	}
+-}
+-
+-func TestEmitterHistogram(t *testing.T) {
+-	e, buf := testEmitter()
+-	h := e.NewHistogram("test_statsd_histogram")
+-
+-	h.Observe(123)
+-
+-	// give time for things to emit
+-	time.Sleep(time.Millisecond * 250)
+-	// force a flush and stop
+-	e.Stop()
+-
+-	want := "prefix.test_statsd_histogram:123|ms\n"
+-	have := buf.String()
+-	if want != have {
+-		t.Errorf("want %q, have %q", want, have)
+-	}
+-}
+-
+ func TestCounter(t *testing.T) {
+ 	buf := &syncbuf{buf: &bytes.Buffer{}}
+ 	reportc := make(chan time.Time)
+@@ -202,58 +141,3 @@ func (s *syncbuf) Reset() {
+ 	defer s.mtx.Unlock()
+ 	s.buf.Reset()
+ }
+-
+-func testEmitter() (*Emitter, *syncbuf) {
+-	buf := &syncbuf{buf: &bytes.Buffer{}}
+-	e := &Emitter{
+-		prefix:  "prefix.",
+-		mgr:     conn.NewManager(mockDialer(buf), "", "", time.After, log.NewNopLogger()),
+-		logger:  log.NewNopLogger(),
+-		keyVals: make(chan keyVal),
+-		quitc:   make(chan chan struct{}),
+-	}
+-	go e.loop(time.Millisecond * 20)
+-	return e, buf
+-}
+-
+-func mockDialer(buf *syncbuf) conn.Dialer {
+-	return func(net, addr string) (net.Conn, error) {
+-		return &mockConn{buf}, nil
+-	}
+-}
+-
+-type mockConn struct {
+-	buf *syncbuf
+-}
+-
+-func (c *mockConn) Read(b []byte) (n int, err error) {
+-	panic("not implemented")
+-}
+-
+-func (c *mockConn) Write(b []byte) (n int, err error) {
+-	return c.buf.Write(b)
+-}
+-
+-func (c *mockConn) Close() error {
+-	panic("not implemented")
+-}
+-
+-func (c *mockConn) LocalAddr() net.Addr {
+-	panic("not implemented")
+-}
+-
+-func (c *mockConn) RemoteAddr() net.Addr {
+-	panic("not implemented")
+-}
+-
+-func (c *mockConn) SetDeadline(t time.Time) error {
+-	panic("not implemented")
+-}
+-
+-func (c *mockConn) SetReadDeadline(t time.Time) error {
+-	panic("not implemented")
+-}
+-
+-func (c *mockConn) SetWriteDeadline(t time.Time) error {
+-	panic("not implemented")
+-}
+diff --git a/metrics/teststat/graphite.go b/metrics/teststat/graphite.go
+deleted file mode 100644
+index 6b52e71..0000000
+--- a/metrics/teststat/graphite.go
++++ /dev/null
+@@ -1,63 +0,0 @@
+-package teststat
+-
+-import (
+-	"fmt"
+-	"math"
+-	"regexp"
+-	"strconv"
+-	"testing"
+-)
+-
+-// AssertGraphiteNormalHistogram ensures the expvar Histogram referenced by
+-// metricName abides a normal distribution.
+-func AssertGraphiteNormalHistogram(t *testing.T, prefix, metricName string, mean, stdev int64, quantiles []int, gPayload string) {
+-	// check for hdr histo data
+-	wants := map[string]int64{"count": 1234, "min": 15, "max": 83}
+-	for key, want := range wants {
+-		re := regexp.MustCompile(fmt.Sprintf("%s%s.%s (\\d*)", prefix, metricName, key))
+-		res := re.FindAllStringSubmatch(gPayload, 1)
+-		if res == nil {
+-			t.Error("did not find metrics log for", key, "in \n", gPayload)
+-			continue
+-		}
+-
+-		if len(res[0]) == 1 {
+-			t.Fatalf("%q: bad regex, please check the test scenario", key)
+-		}
+-
+-		have, err := strconv.ParseInt(res[0][1], 10, 64)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-
+-		if want != have {
+-			t.Errorf("key %s: want %d, have %d", key, want, have)
+-		}
+-	}
+-
+-	const tolerance int = 2
+-	wants = map[string]int64{".std-dev": stdev, ".mean": mean}
+-	for _, quantile := range quantiles {
+-		wants[fmt.Sprintf("_p%02d", quantile)] = normalValueAtQuantile(mean, stdev, quantile)
+-	}
+-	// check for quantile gauges
+-	for key, want := range wants {
+-		re := regexp.MustCompile(fmt.Sprintf("%s%s%s (\\d*\\.\\d*)", prefix, metricName, key))
+-		res := re.FindAllStringSubmatch(gPayload, 1)
+-		if res == nil {
+-			t.Errorf("did not find metrics log for %s", key)
+-			continue
+-		}
+-
+-		if len(res[0]) == 1 {
+-			t.Fatalf("%q: bad regex found, please check the test scenario", key)
+-		}
+-		have, err := strconv.ParseFloat(res[0][1], 64)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		if int(math.Abs(float64(want)-have)) > tolerance {
+-			t.Errorf("key %s: want %.2f, have %.2f", key, want, have)
+-		}
+-	}
+-}
+diff --git a/util/conn/manager.go b/util/conn/manager.go
+deleted file mode 100644
+index d260362..0000000
+--- a/util/conn/manager.go
++++ /dev/null
+@@ -1,105 +0,0 @@
+-package conn
+-
+-import (
+-	"net"
+-	"time"
+-
+-	"github.com/go-kit/kit/log"
+-)
+-
+-// Dialer dials a network and address. net.Dial is a good default Dialer.
+-type Dialer func(network, address string) (net.Conn, error)
+-
+-// AfterFunc imitates time.After.
+-type AfterFunc func(time.Duration) <-chan time.Time
+-
+-// Manager manages a net.Conn. Clients should take the conn when they want to
+-// use it, and put back whatever error they receive from an e.g. Write. When a
+-// non-nil error is put, the conn is invalidated and a new conn is established.
+-// Connection failures are retried after an exponential backoff.
+-type Manager struct {
+-	dial    Dialer
+-	network string
+-	address string
+-	after   AfterFunc
+-	logger  log.Logger
+-
+-	takec chan net.Conn
+-	putc  chan error
+-}
+-
+-func NewManager(d Dialer, network, address string, after AfterFunc, logger log.Logger) *Manager {
+-	m := &Manager{
+-		dial:    d,
+-		network: network,
+-		address: address,
+-		after:   after,
+-		logger:  logger,
+-
+-		takec: make(chan net.Conn),
+-		putc:  make(chan error),
+-	}
+-	go m.loop()
+-	return m
+-}
+-
+-func (m *Manager) Take() net.Conn {
+-	return <-m.takec
+-}
+-
+-func (m *Manager) Put(err error) {
+-	m.putc <- err
+-}
+-
+-func (m *Manager) loop() {
+-	var (
+-		conn       = dial(m.dial, m.network, m.address, m.logger) // may block slightly
+-		connc      = make(chan net.Conn)
+-		reconnectc <-chan time.Time // initially nil
+-		backoff    = time.Second
+-	)
+-
+-	for {
+-		select {
+-		case <-reconnectc:
+-			reconnectc = nil
+-			go func() { connc <- dial(m.dial, m.network, m.address, m.logger) }()
+-
+-		case conn = <-connc:
+-			if conn == nil {
+-				backoff = exponential(backoff)
+-				reconnectc = m.after(backoff)
+-			} else {
+-				backoff = time.Second
+-				reconnectc = nil
+-			}
+-
+-		case m.takec <- conn:
+-			// might be nil
+-
+-		case err := <-m.putc:
+-			if err != nil && conn != nil {
+-				m.logger.Log("err", err)
+-				conn = nil                            // connection is bad
+-				reconnectc = m.after(time.Nanosecond) // trigger immediately
+-			}
+-		}
+-	}
+-}
+-
+-func dial(d Dialer, network, address string, logger log.Logger) net.Conn {
+-	conn, err := d(network, address)
+-	if err != nil {
+-		logger.Log("err", err)
+-		conn = nil
+-	}
+-	return conn
+-}
+-
+-func exponential(d time.Duration) time.Duration {
+-	d *= 2
+-	if d > time.Minute {
+-		d = time.Minute
+-	}
+-	return d
+-}
+diff --git a/util/conn/manager_test.go b/util/conn/manager_test.go
+deleted file mode 100644
+index 73e9551..0000000
+--- a/util/conn/manager_test.go
++++ /dev/null
+@@ -1,126 +0,0 @@
+-package conn
+-
+-import (
+-	"errors"
+-	"net"
+-	"sync/atomic"
+-	"testing"
+-	"time"
+-
+-	"github.com/go-kit/kit/log"
+-)
+-
+-func TestManager(t *testing.T) {
+-	var (
+-		tickc    = make(chan time.Time)
+-		after    = func(time.Duration) <-chan time.Time { return tickc }
+-		dialconn = &mockConn{}
+-		dialerr  = error(nil)
+-		dialer   = func(string, string) (net.Conn, error) { return dialconn, dialerr }
+-		mgr      = NewManager(dialer, "netw", "addr", after, log.NewNopLogger())
+-	)
+-
+-	// First conn should be fine.
+-	conn := mgr.Take()
+-	if conn == nil {
+-		t.Fatal("nil conn")
+-	}
+-
+-	// Write and check it went thru.
+-	if _, err := conn.Write([]byte{1, 2, 3}); err != nil {
+-		t.Fatal(err)
+-	}
+-	if want, have := uint64(3), atomic.LoadUint64(&dialconn.wr); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-
+-	// Put an error to kill the conn.
+-	mgr.Put(errors.New("should kill the connection"))
+-
+-	// First takes should fail.
+-	for i := 0; i < 10; i++ {
+-		if conn = mgr.Take(); conn != nil {
+-			t.Fatalf("want nil conn, got real conn")
+-		}
+-	}
+-
+-	// Trigger the reconnect.
+-	tickc <- time.Now()
+-
+-	// The dial should eventually succeed and yield a good conn.
+-	if !within(100*time.Millisecond, func() bool {
+-		conn = mgr.Take()
+-		return conn != nil
+-	}) {
+-		t.Fatal("conn remained nil")
+-	}
+-
+-	// Write and check it went thru.
+-	if _, err := conn.Write([]byte{4, 5}); err != nil {
+-		t.Fatal(err)
+-	}
+-	if want, have := uint64(5), atomic.LoadUint64(&dialconn.wr); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-
+-	// Dial starts failing.
+-	dialconn, dialerr = nil, errors.New("oh noes")
+-	mgr.Put(errors.New("trigger that reconnect y'all"))
+-	if conn = mgr.Take(); conn != nil {
+-		t.Fatalf("want nil conn, got real conn")
+-	}
+-
+-	// As many reconnects as they want.
+-	go func() {
+-		done := time.After(100 * time.Millisecond)
+-		for {
+-			select {
+-			case tickc <- time.Now():
+-			case <-done:
+-				return
+-			}
+-		}
+-	}()
+-
+-	// The dial should never succeed.
+-	if within(100*time.Millisecond, func() bool {
+-		conn = mgr.Take()
+-		return conn != nil
+-	}) {
+-		t.Fatal("eventually got a good conn, despite failing dialer")
+-	}
+-}
+-
+-type mockConn struct {
+-	rd, wr uint64
+-}
+-
+-func (c *mockConn) Read(b []byte) (n int, err error) {
+-	atomic.AddUint64(&c.rd, uint64(len(b)))
+-	return len(b), nil
+-}
+-
+-func (c *mockConn) Write(b []byte) (n int, err error) {
+-	atomic.AddUint64(&c.wr, uint64(len(b)))
+-	return len(b), nil
+-}
+-
+-func (c *mockConn) Close() error                       { return nil }
+-func (c *mockConn) LocalAddr() net.Addr                { return nil }
+-func (c *mockConn) RemoteAddr() net.Addr               { return nil }
+-func (c *mockConn) SetDeadline(t time.Time) error      { return nil }
+-func (c *mockConn) SetReadDeadline(t time.Time) error  { return nil }
+-func (c *mockConn) SetWriteDeadline(t time.Time) error { return nil }
+-
+-func within(d time.Duration, f func() bool) bool {
+-	deadline := time.Now().Add(d)
+-	for {
+-		if time.Now().After(deadline) {
+-			return false
+-		}
+-		if f() {
+-			return true
+-		}
+-		time.Sleep(d / 10)
+-	}
+-}

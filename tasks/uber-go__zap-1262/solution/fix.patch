@@ -1,0 +1,322 @@
+diff --git a/buffer/pool.go b/buffer/pool.go
+index 8fb3e20..8463233 100644
+--- a/buffer/pool.go
++++ b/buffer/pool.go
+@@ -20,25 +20,29 @@
+ 
+ package buffer
+ 
+-import "sync"
++import (
++	"go.uber.org/zap/internal/pool"
++)
+ 
+ // A Pool is a type-safe wrapper around a sync.Pool.
+ type Pool struct {
+-	p *sync.Pool
++	p *pool.Pool[*Buffer]
+ }
+ 
+ // NewPool constructs a new Pool.
+ func NewPool() Pool {
+-	return Pool{p: &sync.Pool{
+-		New: func() interface{} {
+-			return &Buffer{bs: make([]byte, 0, _size)}
+-		},
+-	}}
++	return Pool{
++		p: pool.New(func() *Buffer {
++			return &Buffer{
++				bs: make([]byte, 0, _size),
++			}
++		}),
++	}
+ }
+ 
+ // Get retrieves a Buffer from the pool, creating one if necessary.
+ func (p Pool) Get() *Buffer {
+-	buf := p.p.Get().(*Buffer)
++	buf := p.p.Get()
+ 	buf.Reset()
+ 	buf.pool = p
+ 	return buf
+diff --git a/error.go b/error.go
+index 65982a5..38cb768 100644
+--- a/error.go
++++ b/error.go
+@@ -21,14 +21,13 @@
+ package zap
+ 
+ import (
+-	"sync"
+-
++	"go.uber.org/zap/internal/pool"
+ 	"go.uber.org/zap/zapcore"
+ )
+ 
+-var _errArrayElemPool = sync.Pool{New: func() interface{} {
++var _errArrayElemPool = pool.New(func() *errArrayElem {
+ 	return &errArrayElem{}
+-}}
++})
+ 
+ // Error is shorthand for the common idiom NamedError("error", err).
+ func Error(err error) Field {
+@@ -60,7 +59,7 @@ func (errs errArray) MarshalLogArray(arr zapcore.ArrayEncoder) error {
+ 		// potentially an "errorVerbose" attribute, we need to wrap it in a
+ 		// type that implements LogObjectMarshaler. To prevent this from
+ 		// allocating, pool the wrapper type.
+-		elem := _errArrayElemPool.Get().(*errArrayElem)
++		elem := _errArrayElemPool.Get()
+ 		elem.error = errs[i]
+ 		arr.AppendObject(elem)
+ 		elem.error = nil
+diff --git a/internal/pool/pool.go b/internal/pool/pool.go
+new file mode 100644
+index 0000000..60e9d2c
+--- /dev/null
++++ b/internal/pool/pool.go
+@@ -0,0 +1,58 @@
++// Copyright (c) 2023 Uber Technologies, Inc.
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to deal
++// in the Software without restriction, including without limitation the rights
++// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++// copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++// THE SOFTWARE.
++
++// Package pool provides internal pool utilities.
++package pool
++
++import (
++	"sync"
++)
++
++// A Pool is a generic wrapper around [sync.Pool] to provide strongly-typed
++// object pooling.
++//
++// Note that SA6002 (ref: https://staticcheck.io/docs/checks/#SA6002) will
++// not be detected, so all internal pool use must take care to only store
++// pointer types.
++type Pool[T any] struct {
++	pool sync.Pool
++}
++
++// New returns a new [Pool] for T, and will use fn to construct new Ts when
++// the pool is empty.
++func New[T any](fn func() T) *Pool[T] {
++	return &Pool[T]{
++		pool: sync.Pool{
++			New: func() any {
++				return fn()
++			},
++		},
++	}
++}
++
++// Get gets a T from the pool, or creates a new one if the pool is empty.
++func (p *Pool[T]) Get() T {
++	return p.pool.Get().(T)
++}
++
++// Put returns x into the pool.
++func (p *Pool[T]) Put(x T) {
++	p.pool.Put(x)
++}
+diff --git a/stacktrace.go b/stacktrace.go
+index 817a3bd..1f152eb 100644
+--- a/stacktrace.go
++++ b/stacktrace.go
+@@ -22,19 +22,17 @@ package zap
+ 
+ import (
+ 	"runtime"
+-	"sync"
+ 
+ 	"go.uber.org/zap/buffer"
+ 	"go.uber.org/zap/internal/bufferpool"
++	"go.uber.org/zap/internal/pool"
+ )
+ 
+-var _stacktracePool = sync.Pool{
+-	New: func() interface{} {
+-		return &stacktrace{
+-			storage: make([]uintptr, 64),
+-		}
+-	},
+-}
++var _stacktracePool = pool.New(func() *stacktrace {
++	return &stacktrace{
++		storage: make([]uintptr, 64),
++	}
++})
+ 
+ type stacktrace struct {
+ 	pcs    []uintptr // program counters; always a subslice of storage
+@@ -68,7 +66,7 @@ const (
+ //
+ // The caller must call Free on the returned stacktrace after using it.
+ func captureStacktrace(skip int, depth stacktraceDepth) *stacktrace {
+-	stack := _stacktracePool.Get().(*stacktrace)
++	stack := _stacktracePool.Get()
+ 
+ 	switch depth {
+ 	case stacktraceFirst:
+diff --git a/zapcore/console_encoder.go b/zapcore/console_encoder.go
+index 1aa5dc3..8ca0bfa 100644
+--- a/zapcore/console_encoder.go
++++ b/zapcore/console_encoder.go
+@@ -22,20 +22,20 @@ package zapcore
+ 
+ import (
+ 	"fmt"
+-	"sync"
+ 
+ 	"go.uber.org/zap/buffer"
+ 	"go.uber.org/zap/internal/bufferpool"
++	"go.uber.org/zap/internal/pool"
+ )
+ 
+-var _sliceEncoderPool = sync.Pool{
+-	New: func() interface{} {
+-		return &sliceArrayEncoder{elems: make([]interface{}, 0, 2)}
+-	},
+-}
++var _sliceEncoderPool = pool.New(func() *sliceArrayEncoder {
++	return &sliceArrayEncoder{
++		elems: make([]interface{}, 0, 2),
++	}
++})
+ 
+ func getSliceEncoder() *sliceArrayEncoder {
+-	return _sliceEncoderPool.Get().(*sliceArrayEncoder)
++	return _sliceEncoderPool.Get()
+ }
+ 
+ func putSliceEncoder(e *sliceArrayEncoder) {
+diff --git a/zapcore/entry.go b/zapcore/entry.go
+index 9d326e9..059844f 100644
+--- a/zapcore/entry.go
++++ b/zapcore/entry.go
+@@ -24,25 +24,23 @@ import (
+ 	"fmt"
+ 	"runtime"
+ 	"strings"
+-	"sync"
+ 	"time"
+ 
+ 	"go.uber.org/multierr"
+ 	"go.uber.org/zap/internal/bufferpool"
+ 	"go.uber.org/zap/internal/exit"
++	"go.uber.org/zap/internal/pool"
+ )
+ 
+-var (
+-	_cePool = sync.Pool{New: func() interface{} {
+-		// Pre-allocate some space for cores.
+-		return &CheckedEntry{
+-			cores: make([]Core, 4),
+-		}
+-	}}
+-)
++var _cePool = pool.New(func() *CheckedEntry {
++	// Pre-allocate some space for cores.
++	return &CheckedEntry{
++		cores: make([]Core, 4),
++	}
++})
+ 
+ func getCheckedEntry() *CheckedEntry {
+-	ce := _cePool.Get().(*CheckedEntry)
++	ce := _cePool.Get()
+ 	ce.reset()
+ 	return ce
+ }
+diff --git a/zapcore/error.go b/zapcore/error.go
+index 0635990..c67dd71 100644
+--- a/zapcore/error.go
++++ b/zapcore/error.go
+@@ -23,7 +23,8 @@ package zapcore
+ import (
+ 	"fmt"
+ 	"reflect"
+-	"sync"
++
++	"go.uber.org/zap/internal/pool"
+ )
+ 
+ // Encodes the given error into fields of an object. A field with the given
+@@ -103,9 +104,9 @@ func (errs errArray) MarshalLogArray(arr ArrayEncoder) error {
+ 	return nil
+ }
+ 
+-var _errArrayElemPool = sync.Pool{New: func() interface{} {
++var _errArrayElemPool = pool.New(func() *errArrayElem {
+ 	return &errArrayElem{}
+-}}
++})
+ 
+ // Encodes any error into a {"error": ...} re-using the same errors logic.
+ //
+@@ -113,7 +114,7 @@ var _errArrayElemPool = sync.Pool{New: func() interface{} {
+ type errArrayElem struct{ err error }
+ 
+ func newErrArrayElem(err error) *errArrayElem {
+-	e := _errArrayElemPool.Get().(*errArrayElem)
++	e := _errArrayElemPool.Get()
+ 	e.err = err
+ 	return e
+ }
+diff --git a/zapcore/json_encoder.go b/zapcore/json_encoder.go
+index de9e2c1..ce6838d 100644
+--- a/zapcore/json_encoder.go
++++ b/zapcore/json_encoder.go
+@@ -23,24 +23,20 @@ package zapcore
+ import (
+ 	"encoding/base64"
+ 	"math"
+-	"sync"
+ 	"time"
+ 	"unicode/utf8"
+ 
+ 	"go.uber.org/zap/buffer"
+ 	"go.uber.org/zap/internal/bufferpool"
++	"go.uber.org/zap/internal/pool"
+ )
+ 
+ // For JSON-escaping; see jsonEncoder.safeAddString below.
+ const _hex = "0123456789abcdef"
+ 
+-var _jsonPool = sync.Pool{New: func() interface{} {
++var _jsonPool = pool.New(func() *jsonEncoder {
+ 	return &jsonEncoder{}
+-}}
+-
+-func getJSONEncoder() *jsonEncoder {
+-	return _jsonPool.Get().(*jsonEncoder)
+-}
++})
+ 
+ func putJSONEncoder(enc *jsonEncoder) {
+ 	if enc.reflectBuf != nil {
+@@ -354,7 +350,7 @@ func (enc *jsonEncoder) Clone() Encoder {
+ }
+ 
+ func (enc *jsonEncoder) clone() *jsonEncoder {
+-	clone := getJSONEncoder()
++	clone := _jsonPool.Get()
+ 	clone.EncoderConfig = enc.EncoderConfig
+ 	clone.spaced = enc.spaced
+ 	clone.openNamespaces = enc.openNamespaces

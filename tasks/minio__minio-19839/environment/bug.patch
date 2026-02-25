@@ -1,0 +1,201 @@
+diff --git a/cmd/common-main.go b/cmd/common-main.go
+index 263e4fb3a..151eff397 100644
+--- a/cmd/common-main.go
++++ b/cmd/common-main.go
+@@ -402,29 +402,6 @@ func buildServerCtxt(ctx *cli.Context, ctxt *serverCtxt) (err error) {
+ 		ctxt.certsDirSet = true
+ 	}
+ 
+-	memAvailable := availableMemory()
+-	if ctx.IsSet("memlimit") || ctx.GlobalIsSet("memlimit") {
+-		memlimit := ctx.String("memlimit")
+-		if memlimit == "" {
+-			memlimit = ctx.GlobalString("memlimit")
+-		}
+-		mlimit, err := humanize.ParseBytes(memlimit)
+-		if err != nil {
+-			return err
+-		}
+-		if mlimit > memAvailable {
+-			logger.Info("WARNING: maximum memory available (%s) smaller than specified --memlimit=%s, ignoring --memlimit value",
+-				humanize.IBytes(memAvailable), memlimit)
+-		}
+-		ctxt.MemLimit = mlimit
+-	} else {
+-		ctxt.MemLimit = memAvailable
+-	}
+-
+-	if memAvailable < ctxt.MemLimit {
+-		ctxt.MemLimit = memAvailable
+-	}
+-
+ 	ctxt.FTP = ctx.StringSlice("ftp")
+ 	ctxt.SFTP = ctx.StringSlice("sftp")
+ 	ctxt.Interface = ctx.String("interface")
+diff --git a/cmd/erasure-server-pool.go b/cmd/erasure-server-pool.go
+index 386d03256..dfd4799cc 100644
+--- a/cmd/erasure-server-pool.go
++++ b/cmd/erasure-server-pool.go
+@@ -104,11 +104,7 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
+ 	// Initialize byte pool once for all sets, bpool size is set to
+ 	// setCount * setDriveCount with each memory upto blockSizeV2.
+ 	buffers := bpool.NewBytePoolCap(n, blockSizeV2, blockSizeV2*2)
+-	if n >= 16384 {
+-		// pre-populate buffers only n >= 16384 which is (32Gi/2Mi)
+-		// for all setups smaller than this avoid pre-alloc.
+-		buffers.Populate()
+-	}
++	buffers.Populate()
+ 	globalBytePoolCap.Store(buffers)
+ 
+ 	var localDrives []StorageAPI
+diff --git a/cmd/globals.go b/cmd/globals.go
+index 4569c3083..a5a6e7ece 100644
+--- a/cmd/globals.go
++++ b/cmd/globals.go
+@@ -160,8 +160,6 @@ type serverCtxt struct {
+ 	FTP  []string
+ 	SFTP []string
+ 
+-	MemLimit uint64
+-
+ 	UserTimeout         time.Duration
+ 	ShutdownTimeout     time.Duration
+ 	IdleTimeout         time.Duration
+diff --git a/cmd/handler-api.go b/cmd/handler-api.go
+index 7b5942a25..7485a25aa 100644
+--- a/cmd/handler-api.go
++++ b/cmd/handler-api.go
+@@ -91,11 +91,11 @@ func availableMemory() (available uint64) {
+ 	available = 2048 * blockSizeV2 * 2 // Default to 4 GiB when we can't find the limits.
+ 
+ 	if runtime.GOOS == "linux" {
+-		// Honor cgroup limits if set.
++		// Useful in container mode
+ 		limit := cgroupMemLimit()
+ 		if limit > 0 {
+-			// A valid value is found, return its 90%
+-			available = (limit * 9) / 10
++			// A valid value is found, return its 75%
++			available = (limit * 3) / 4
+ 			return
+ 		}
+ 	} // for all other platforms limits are based on virtual memory.
+@@ -104,9 +104,8 @@ func availableMemory() (available uint64) {
+ 	if err != nil {
+ 		return
+ 	}
+-
+-	// A valid value is available return its 90%
+-	available = (memStats.Available * 9) / 10
++	// A valid value is available return its 75%
++	available = (memStats.Available * 3) / 4
+ 	return
+ }
+ 
+@@ -130,7 +129,7 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int, legacy bool) {
+ 		maxSetDrives := slices.Max(setDriveCounts)
+ 
+ 		// Returns 75% of max memory allowed
+-		maxMem := globalServerCtxt.MemLimit
++		maxMem := availableMemory()
+ 
+ 		// max requests per node is calculated as
+ 		// total_ram / ram_per_request
+diff --git a/cmd/server-main.go b/cmd/server-main.go
+index d477466d3..527976abb 100644
+--- a/cmd/server-main.go
++++ b/cmd/server-main.go
+@@ -834,7 +834,7 @@ func serverMain(ctx *cli.Context) {
+ 
+ 	// Set system resources to maximum.
+ 	bootstrapTrace("setMaxResources", func() {
+-		_ = setMaxResources(globalServerCtxt)
++		_ = setMaxResources(ctx)
+ 	})
+ 
+ 	// Verify kernel release and version.
+diff --git a/cmd/server-rlimit.go b/cmd/server-rlimit.go
+index 23946e0a0..69e0a7651 100644
+--- a/cmd/server-rlimit.go
++++ b/cmd/server-rlimit.go
+@@ -22,6 +22,7 @@ import (
+ 	"runtime/debug"
+ 
+ 	"github.com/dustin/go-humanize"
++	"github.com/minio/cli"
+ 	"github.com/minio/madmin-go/v3/kernel"
+ 	"github.com/minio/minio/internal/logger"
+ 	"github.com/minio/pkg/v3/sys"
+@@ -44,7 +45,7 @@ func oldLinux() bool {
+ 	return currentKernel < kernel.Version(4, 0, 0)
+ }
+ 
+-func setMaxResources(ctx serverCtxt) (err error) {
++func setMaxResources(ctx *cli.Context) (err error) {
+ 	// Set the Go runtime max threads threshold to 90% of kernel setting.
+ 	sysMaxThreads, err := sys.GetMaxThreads()
+ 	if err == nil {
+@@ -71,28 +72,32 @@ func setMaxResources(ctx serverCtxt) (err error) {
+ 		return err
+ 	}
+ 
+-	_, vssLimit, err := sys.GetMaxMemoryLimit()
+-	if err != nil {
++	// Set max memory limit as current memory limit.
++	if _, maxLimit, err = sys.GetMaxMemoryLimit(); err != nil {
+ 		return err
+ 	}
+ 
+-	if vssLimit > 0 && vssLimit < humanize.GiByte {
+-		logger.Info("WARNING: maximum virtual memory limit (%s) is too small for 'go runtime', please consider setting `ulimit -v` to unlimited",
+-			humanize.IBytes(vssLimit))
+-	}
++	// set debug memory limit instead of GOMEMLIMIT env
++	_ = setDebugMemoryLimit(ctx)
+ 
+-	if ctx.MemLimit > 0 {
+-		maxLimit = ctx.MemLimit
+-	}
++	err = sys.SetMaxMemoryLimit(maxLimit, maxLimit)
++	return err
++}
+ 
+-	if maxLimit > 0 {
+-		debug.SetMemoryLimit(int64(maxLimit))
++func setDebugMemoryLimit(ctx *cli.Context) error {
++	if ctx == nil {
++		return nil
++	}
++	if ctx.IsSet("memlimit") {
++		memlimit := ctx.String("memlimit")
++		if memlimit == "" {
++			memlimit = ctx.GlobalString("memlimit")
++		}
++		mlimit, err := humanize.ParseBytes(memlimit)
++		if err != nil {
++			return err
++		}
++		debug.SetMemoryLimit(int64(mlimit))
+ 	}
+-
+-	// Do not use RLIMIT_AS as that is not useful and at times on systems < 4Gi
+-	// this can crash the Go runtime if the value is smaller refer
+-	// - https://github.com/golang/go/issues/38010
+-	// - https://github.com/golang/go/issues/43699
+-	// So do not add `sys.SetMaxMemoryLimit()` this is not useful for any practical purposes.
+ 	return nil
+ }
+diff --git a/cmd/test-utils_test.go b/cmd/test-utils_test.go
+index 6d62b9c05..a63eaf942 100644
+--- a/cmd/test-utils_test.go
++++ b/cmd/test-utils_test.go
+@@ -106,7 +106,7 @@ func TestMain(m *testing.M) {
+ 	// logger.AddTarget(console.New())
+ 
+ 	// Set system resources to maximum.
+-	setMaxResources(serverCtxt{})
++	setMaxResources(nil)
+ 
+ 	// Initialize globalConsoleSys system
+ 	globalConsoleSys = NewConsoleLogger(context.Background(), io.Discard)

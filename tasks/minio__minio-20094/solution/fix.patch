@@ -1,0 +1,162 @@
+diff --git a/cmd/metrics-router.go b/cmd/metrics-router.go
+index e3078a7fc..f8b85c254 100644
+--- a/cmd/metrics-router.go
++++ b/cmd/metrics-router.go
+@@ -38,7 +38,8 @@ const (
+ 
+ // Standard env prometheus auth type
+ const (
+-	EnvPrometheusAuthType = "MINIO_PROMETHEUS_AUTH_TYPE"
++	EnvPrometheusAuthType    = "MINIO_PROMETHEUS_AUTH_TYPE"
++	EnvPrometheusOpenMetrics = "MINIO_PROMETHEUS_OPEN_METRICS"
+ )
+ 
+ type prometheusAuthType string
+@@ -58,14 +59,15 @@ func registerMetricsRouter(router *mux.Router) {
+ 	if authType == prometheusPublic {
+ 		auth = NoAuthMiddleware
+ 	}
++
+ 	metricsRouter.Handle(prometheusMetricsPathLegacy, auth(metricsHandler()))
+ 	metricsRouter.Handle(prometheusMetricsV2ClusterPath, auth(metricsServerHandler()))
+ 	metricsRouter.Handle(prometheusMetricsV2BucketPath, auth(metricsBucketHandler()))
+ 	metricsRouter.Handle(prometheusMetricsV2NodePath, auth(metricsNodeHandler()))
+ 	metricsRouter.Handle(prometheusMetricsV2ResourcePath, auth(metricsResourceHandler()))
+ 
+-	// Metrics v3!
+-	metricsV3Server := newMetricsV3Server(authType)
++	// Metrics v3
++	metricsV3Server := newMetricsV3Server(auth)
+ 
+ 	// Register metrics v3 handler. It also accepts an optional query
+ 	// parameter `?list` - see handler for details.
+diff --git a/cmd/metrics-v3-handler.go b/cmd/metrics-v3-handler.go
+index 68a3160d5..0c9a775a6 100644
+--- a/cmd/metrics-v3-handler.go
++++ b/cmd/metrics-v3-handler.go
+@@ -23,9 +23,12 @@ import (
+ 	"net/http"
+ 	"slices"
+ 	"strings"
++	"sync"
+ 
++	"github.com/minio/minio/internal/config"
+ 	"github.com/minio/minio/internal/mcontext"
+ 	"github.com/minio/mux"
++	"github.com/minio/pkg/v3/env"
+ 	"github.com/prometheus/client_golang/prometheus"
+ 	"github.com/prometheus/client_golang/prometheus/promhttp"
+ )
+@@ -33,41 +36,39 @@ import (
+ type promLogger struct{}
+ 
+ func (p promLogger) Println(v ...interface{}) {
+-	s := make([]string, 0, len(v))
+-	for _, val := range v {
+-		s = append(s, fmt.Sprintf("%v", val))
+-	}
+-	err := fmt.Errorf("metrics handler error: %v", strings.Join(s, " "))
+-	metricsLogIf(GlobalContext, err)
++	metricsLogIf(GlobalContext, fmt.Errorf("metrics handler error: %v", v))
+ }
+ 
+ type metricsV3Server struct {
+ 	registry *prometheus.Registry
+ 	opts     promhttp.HandlerOpts
+-	authFn   func(http.Handler) http.Handler
++	auth     func(http.Handler) http.Handler
+ 
+ 	metricsData *metricsV3Collection
+ }
+ 
+-func newMetricsV3Server(authType prometheusAuthType) *metricsV3Server {
+-	registry := prometheus.NewRegistry()
+-	authFn := AuthMiddleware
+-	if authType == prometheusPublic {
+-		authFn = NoAuthMiddleware
+-	}
++var (
++	globalMetricsV3CollectorPaths []collectorPath
++	globalMetricsV3Once           sync.Once
++)
+ 
++func newMetricsV3Server(auth func(h http.Handler) http.Handler) *metricsV3Server {
++	registry := prometheus.NewRegistry()
+ 	metricGroups := newMetricGroups(registry)
+-
++	globalMetricsV3Once.Do(func() {
++		globalMetricsV3CollectorPaths = metricGroups.collectorPaths
++	})
+ 	return &metricsV3Server{
+ 		registry: registry,
+ 		opts: promhttp.HandlerOpts{
+ 			ErrorLog:            promLogger{},
+-			ErrorHandling:       promhttp.HTTPErrorOnError,
++			ErrorHandling:       promhttp.ContinueOnError,
+ 			Registry:            registry,
+ 			MaxRequestsInFlight: 2,
++			EnableOpenMetrics:   env.Get(EnvPrometheusOpenMetrics, config.EnableOff) == config.EnableOn,
++			ProcessStartTime:    globalBootTime,
+ 		},
+-		authFn: authFn,
+-
++		auth:        auth,
+ 		metricsData: metricGroups,
+ 	}
+ }
+@@ -221,7 +222,7 @@ func (h *metricsV3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	pathComponents := mux.Vars(r)["pathComps"]
+ 	isListingRequest := r.Form.Has("list")
+ 
+-	buckets := []string{}
++	var buckets []string
+ 	if strings.HasPrefix(pathComponents, "/bucket/") {
+ 		// bucket specific metrics, extract the bucket name from the path.
+ 		// it's the last part of the path. e.g. /bucket/api/<bucket-name>
+@@ -246,5 +247,5 @@ func (h *metricsV3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	})
+ 
+ 	// Add authentication
+-	h.authFn(tracedHandler).ServeHTTP(w, r)
++	h.auth(tracedHandler).ServeHTTP(w, r)
+ }
+diff --git a/cmd/metrics-v3-types.go b/cmd/metrics-v3-types.go
+index 07bc1d616..f891cf947 100644
+--- a/cmd/metrics-v3-types.go
++++ b/cmd/metrics-v3-types.go
+@@ -35,8 +35,8 @@ type collectorPath string
+ // converted to snake-case (by replaced '/' and '-' with '_') and prefixed with
+ // `minio_`.
+ func (cp collectorPath) metricPrefix() string {
+-	s := strings.TrimPrefix(string(cp), "/")
+-	s = strings.ReplaceAll(s, "/", "_")
++	s := strings.TrimPrefix(string(cp), SlashSeparator)
++	s = strings.ReplaceAll(s, SlashSeparator, "_")
+ 	s = strings.ReplaceAll(s, "-", "_")
+ 	return "minio_" + s
+ }
+@@ -56,8 +56,8 @@ func (cp collectorPath) isDescendantOf(arg string) bool {
+ 	if len(arg) >= len(descendant) {
+ 		return false
+ 	}
+-	if !strings.HasSuffix(arg, "/") {
+-		arg += "/"
++	if !strings.HasSuffix(arg, SlashSeparator) {
++		arg += SlashSeparator
+ 	}
+ 	return strings.HasPrefix(descendant, arg)
+ }
+@@ -72,10 +72,11 @@ const (
+ 	GaugeMT
+ 	// HistogramMT - represents a histogram metric.
+ 	HistogramMT
+-	// rangeL - represents a range label.
+-	rangeL = "range"
+ )
+ 
++// rangeL - represents a range label.
++const rangeL = "range"
++
+ func (mt MetricType) String() string {
+ 	switch mt {
+ 	case CounterMT:

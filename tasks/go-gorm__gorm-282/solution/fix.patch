@@ -1,0 +1,149 @@
+diff --git a/README.md b/README.md
+index dba65d5..c5e06ed 100644
+--- a/README.md
++++ b/README.md
+@@ -609,6 +609,12 @@ db.Where(User{Name: "jinzhu"}).Assign(User{Age: 30}).FirstOrCreate(&user)
+ ```go
+ db.Select("name, age").Find(&users)
+ //// SELECT name, age FROM users;
++
++db.Select([]string{"name", "age"}).Find(&users)
++//// SELECT name, age FROM users;
++
++db.Table("users").Select("COALESCE(age,?)", 42).Rows()
++//// SELECT COALESCE(age,'42') FROM users;
+ ```
+ 
+ ## Order
+diff --git a/main.go b/main.go
+index 14a76b1..ec974ca 100644
+--- a/main.go
++++ b/main.go
+@@ -125,8 +125,8 @@ func (s *DB) Order(value string, reorder ...bool) *DB {
+ 	return s.clone().search.order(value, reorder...).db
+ }
+ 
+-func (s *DB) Select(value interface{}) *DB {
+-	return s.clone().search.selects(value).db
++func (s *DB) Select(query interface{}, args ...interface{}) *DB {
++	return s.clone().search.selects(query, args...).db
+ }
+ 
+ func (s *DB) Group(query string) *DB {
+diff --git a/scope_private.go b/scope_private.go
+index debea2b..0e2308e 100644
+--- a/scope_private.go
++++ b/scope_private.go
+@@ -129,6 +129,34 @@ func (scope *Scope) buildNotCondition(clause map[string]interface{}) (str string
+ 	return
+ }
+ 
++func (scope *Scope) buildSelectQuery(clause map[string]interface{}) (str string) {
++	switch value := clause["query"].(type) {
++	case string:
++		str = value
++	case []string:
++		str = strings.Join(value, ", ")
++	}
++
++	args := clause["args"].([]interface{})
++	for _, arg := range args {
++		switch reflect.TypeOf(arg).Kind() {
++		case reflect.Slice:
++			values := reflect.ValueOf(arg)
++			var tempMarks []string
++			for i := 0; i < values.Len(); i++ {
++				tempMarks = append(tempMarks, scope.AddToVars(values.Index(i).Interface()))
++			}
++			str = strings.Replace(str, "?", strings.Join(tempMarks, ","), 1)
++		default:
++			if valuer, ok := interface{}(arg).(driver.Valuer); ok {
++				arg, _ = valuer.Value()
++			}
++			str = strings.Replace(str, "?", scope.AddToVars(arg), 1)
++		}
++	}
++	return
++}
++
+ func (scope *Scope) where(where ...interface{}) {
+ 	if len(where) > 0 {
+ 		scope.Search = scope.Search.clone().where(where[0], where[1:]...)
+@@ -180,11 +208,18 @@ func (scope *Scope) whereSql() (sql string) {
+ }
+ 
+ func (s *Scope) selectSql() string {
+-	if len(s.Search.Select) == 0 {
++	if len(s.Search.Selects) == 0 {
+ 		return "*"
+-	} else {
+-		return s.Search.Select
+ 	}
++
++	var selectQueries []string
++
++	for _, clause := range s.Search.Selects {
++		selectQueries = append(selectQueries, s.buildSelectQuery(clause))
++	}
++
++	return strings.Join(selectQueries, ", ")
++
+ }
+ 
+ func (s *Scope) orderSql() string {
+@@ -512,12 +547,17 @@ func (scope *Scope) createJoinTable(field *Field) {
+ 
+ func (scope *Scope) createTable() *Scope {
+ 	var sqls []string
+-	for _, field := range scope.Fields() {
+-		if field.IsNormal {
+-			sqlTag := scope.sqlTagForField(field)
+-			sqls = append(sqls, scope.Quote(field.DBName)+" "+sqlTag)
++	fields := scope.Fields()
++	scopeType := scope.IndirectValue().Type()
++	for i := 0; i < scopeType.NumField(); i++ {
++		for _, field := range scope.fieldFromStruct(scopeType.Field(i), false) {
++			field = fields[field.DBName]
++			if field.IsNormal {
++				sqlTag := scope.sqlTagForField(field)
++				sqls = append(sqls, scope.Quote(field.DBName)+" "+sqlTag)
++			}
++			scope.createJoinTable(field)
+ 		}
+-		scope.createJoinTable(field)
+ 	}
+ 	scope.Raw(fmt.Sprintf("CREATE TABLE %v (%v)", scope.QuotedTableName(), strings.Join(sqls, ","))).Exec()
+ 	return scope
+diff --git a/search.go b/search.go
+index 8591d65..78ed530 100644
+--- a/search.go
++++ b/search.go
+@@ -12,7 +12,7 @@ type search struct {
+ 	HavingCondition map[string]interface{}
+ 	Orders          []string
+ 	Joins           string
+-	Select          string
++	Selects         []map[string]interface{}
+ 	Offset          string
+ 	Limit           string
+ 	Group           string
+@@ -30,7 +30,7 @@ func (s *search) clone() *search {
+ 		AssignAttrs:     s.AssignAttrs,
+ 		HavingCondition: s.HavingCondition,
+ 		Orders:          s.Orders,
+-		Select:          s.Select,
++		Selects:         s.Selects,
+ 		Offset:          s.Offset,
+ 		Limit:           s.Limit,
+ 		Unscope:         s.Unscope,
+@@ -75,8 +75,8 @@ func (s *search) order(value string, reorder ...bool) *search {
+ 	return s
+ }
+ 
+-func (s *search) selects(value interface{}) *search {
+-	s.Select = s.getInterfaceAsSql(value)
++func (s *search) selects(query interface{}, args ...interface{}) *search {
++	s.Selects = append(s.Selects, map[string]interface{}{"query": query, "args": args})
+ 	return s
+ }
+ 

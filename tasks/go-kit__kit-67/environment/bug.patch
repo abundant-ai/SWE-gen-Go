@@ -1,0 +1,705 @@
+diff --git a/loadbalancer/cache.go b/loadbalancer/cache.go
+deleted file mode 100644
+index 7d01ff6..0000000
+--- a/loadbalancer/cache.go
++++ /dev/null
+@@ -1,40 +0,0 @@
+-package loadbalancer
+-
+-import "github.com/go-kit/kit/endpoint"
+-
+-type cache struct {
+-	req  chan []endpoint.Endpoint
+-	quit chan struct{}
+-}
+-
+-func newCache(p Publisher) *cache {
+-	c := &cache{
+-		req:  make(chan []endpoint.Endpoint),
+-		quit: make(chan struct{}),
+-	}
+-	go c.loop(p)
+-	return c
+-}
+-
+-func (c *cache) loop(p Publisher) {
+-	e := make(chan []endpoint.Endpoint, 1)
+-	p.Subscribe(e)
+-	defer p.Unsubscribe(e)
+-	endpoints := <-e
+-	for {
+-		select {
+-		case endpoints = <-e:
+-		case c.req <- endpoints:
+-		case <-c.quit:
+-			return
+-		}
+-	}
+-}
+-
+-func (c *cache) get() []endpoint.Endpoint {
+-	return <-c.req
+-}
+-
+-func (c *cache) stop() {
+-	close(c.quit)
+-}
+diff --git a/loadbalancer/cache_internal_test.go b/loadbalancer/cache_internal_test.go
+deleted file mode 100644
+index 0cad6f7..0000000
+--- a/loadbalancer/cache_internal_test.go
++++ /dev/null
+@@ -1,33 +0,0 @@
+-package loadbalancer
+-
+-import (
+-	"runtime"
+-	"testing"
+-
+-	"golang.org/x/net/context"
+-
+-	"github.com/go-kit/kit/endpoint"
+-)
+-
+-func TestCache(t *testing.T) {
+-	e := func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil }
+-	endpoints := []endpoint.Endpoint{e}
+-
+-	p := NewStaticPublisher(endpoints)
+-	defer p.Stop()
+-
+-	c := newCache(p)
+-	defer c.stop()
+-
+-	for _, n := range []int{2, 10, 0} {
+-		endpoints = make([]endpoint.Endpoint, n)
+-		for i := 0; i < n; i++ {
+-			endpoints[i] = e
+-		}
+-		p.Replace(endpoints)
+-		runtime.Gosched()
+-		if want, have := len(endpoints), len(c.get()); want != have {
+-			t.Errorf("want %d, have %d", want, have)
+-		}
+-	}
+-}
+diff --git a/loadbalancer/dns_srv_publisher.go b/loadbalancer/dns_srv_publisher.go
+deleted file mode 100644
+index 154e854..0000000
+--- a/loadbalancer/dns_srv_publisher.go
++++ /dev/null
+@@ -1,105 +0,0 @@
+-package loadbalancer
+-
+-import (
+-	"crypto/md5"
+-	"fmt"
+-	"net"
+-	"sort"
+-	"time"
+-
+-	"github.com/go-kit/kit/endpoint"
+-)
+-
+-type dnssrvPublisher struct {
+-	subscribe   chan chan<- []endpoint.Endpoint
+-	unsubscribe chan chan<- []endpoint.Endpoint
+-	quit        chan struct{}
+-}
+-
+-// NewDNSSRVPublisher returns a publisher that resolves the SRV name every ttl, and
+-func NewDNSSRVPublisher(name string, ttl time.Duration, makeEndpoint func(hostport string) endpoint.Endpoint) Publisher {
+-	p := &dnssrvPublisher{
+-		subscribe:   make(chan chan<- []endpoint.Endpoint),
+-		unsubscribe: make(chan chan<- []endpoint.Endpoint),
+-		quit:        make(chan struct{}),
+-	}
+-	go p.loop(name, ttl, makeEndpoint)
+-	return p
+-}
+-
+-func (p *dnssrvPublisher) Subscribe(c chan<- []endpoint.Endpoint) {
+-	p.subscribe <- c
+-}
+-
+-func (p *dnssrvPublisher) Unsubscribe(c chan<- []endpoint.Endpoint) {
+-	p.unsubscribe <- c
+-}
+-
+-func (p *dnssrvPublisher) Stop() {
+-	close(p.quit)
+-}
+-
+-var newTicker = time.NewTicker
+-
+-func (p *dnssrvPublisher) loop(name string, ttl time.Duration, makeEndpoint func(hostport string) endpoint.Endpoint) {
+-	var (
+-		subscriptions = map[chan<- []endpoint.Endpoint]struct{}{}
+-		addrs, md5, _ = resolve(name)
+-		endpoints     = convert(addrs, makeEndpoint)
+-		ticker        = newTicker(ttl)
+-	)
+-	defer ticker.Stop()
+-	for {
+-		select {
+-		case <-ticker.C:
+-			addrs, newmd5, err := resolve(name)
+-			if err == nil && newmd5 != md5 {
+-				endpoints = convert(addrs, makeEndpoint)
+-				for c := range subscriptions {
+-					c <- endpoints
+-				}
+-				md5 = newmd5
+-			}
+-
+-		case c := <-p.subscribe:
+-			subscriptions[c] = struct{}{}
+-			c <- endpoints
+-
+-		case c := <-p.unsubscribe:
+-			delete(subscriptions, c)
+-
+-		case <-p.quit:
+-			return
+-		}
+-	}
+-}
+-
+-// Allow mocking in tests.
+-var resolve = func(name string) (addrs []*net.SRV, md5sum string, err error) {
+-	_, addrs, err = net.LookupSRV("", "", name)
+-	if err != nil {
+-		return addrs, "", err
+-	}
+-	hostports := make([]string, len(addrs))
+-	for i, addr := range addrs {
+-		hostports[i] = fmt.Sprintf("%s:%d", addr.Target, addr.Port)
+-	}
+-	sort.Sort(sort.StringSlice(hostports))
+-	h := md5.New()
+-	for _, hostport := range hostports {
+-		fmt.Fprintf(h, hostport)
+-	}
+-	return addrs, fmt.Sprintf("%x", h.Sum(nil)), nil
+-}
+-
+-func convert(addrs []*net.SRV, makeEndpoint func(hostport string) endpoint.Endpoint) []endpoint.Endpoint {
+-	endpoints := make([]endpoint.Endpoint, len(addrs))
+-	for i, addr := range addrs {
+-		endpoints[i] = makeEndpoint(addr2hostport(addr))
+-	}
+-	return endpoints
+-}
+-
+-func addr2hostport(addr *net.SRV) string {
+-	return net.JoinHostPort(addr.Target, fmt.Sprintf("%d", addr.Port))
+-}
+diff --git a/loadbalancer/dns_srv_publisher_internal_test.go b/loadbalancer/dns_srv_publisher_internal_test.go
+deleted file mode 100644
+index 2f8c978..0000000
+--- a/loadbalancer/dns_srv_publisher_internal_test.go
++++ /dev/null
+@@ -1,77 +0,0 @@
+-package loadbalancer
+-
+-import (
+-	"fmt"
+-	"net"
+-	"testing"
+-	"time"
+-
+-	"golang.org/x/net/context"
+-
+-	"github.com/go-kit/kit/endpoint"
+-)
+-
+-func TestDNSSRVPublisher(t *testing.T) {
+-	// Reset the vars when we're done
+-	oldResolve := resolve
+-	defer func() { resolve = oldResolve }()
+-	oldNewTicker := newTicker
+-	defer func() { newTicker = oldNewTicker }()
+-
+-	// Set up a fixture and swap the vars
+-	a := []*net.SRV{
+-		{Target: "foo", Port: 123},
+-		{Target: "bar", Port: 456},
+-		{Target: "baz", Port: 789},
+-	}
+-	ticker := make(chan time.Time)
+-	resolve = func(string) ([]*net.SRV, string, error) { return a, fmt.Sprint(len(a)), nil }
+-	newTicker = func(time.Duration) *time.Ticker { return &time.Ticker{C: ticker} }
+-
+-	// Construct endpoint
+-	m := map[string]int{}
+-	e := func(hostport string) endpoint.Endpoint {
+-		return func(context.Context, interface{}) (interface{}, error) {
+-			m[hostport]++
+-			return struct{}{}, nil
+-		}
+-	}
+-
+-	// Build the publisher
+-	var (
+-		name         = "irrelevant"
+-		ttl          = time.Second
+-		makeEndpoint = func(hostport string) endpoint.Endpoint { return e(hostport) }
+-	)
+-	p := NewDNSSRVPublisher(name, ttl, makeEndpoint)
+-	defer p.Stop()
+-
+-	// Subscribe
+-	c := make(chan []endpoint.Endpoint, 1)
+-	p.Subscribe(c)
+-	defer p.Unsubscribe(c)
+-
+-	// Invoke all of the endpoints
+-	for _, e := range <-c {
+-		e(context.Background(), struct{}{})
+-	}
+-
+-	// Make sure we invoked what we expected to
+-	for _, addr := range a {
+-		hostport := addr2hostport(addr)
+-		if want, have := 1, m[hostport]; want != have {
+-			t.Errorf("%q: want %d, have %d", name, want, have)
+-		}
+-		delete(m, hostport)
+-	}
+-	if want, have := 0, len(m); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-
+-	// Reset the fixture, trigger the timer, count the endpoints
+-	a = []*net.SRV{}
+-	ticker <- time.Now()
+-	if want, have := len(a), len(<-c); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-}
+diff --git a/loadbalancer/load_balancer.go b/loadbalancer/load_balancer.go
+deleted file mode 100644
+index d6df040..0000000
+--- a/loadbalancer/load_balancer.go
++++ /dev/null
+@@ -1,16 +0,0 @@
+-package loadbalancer
+-
+-import (
+-	"errors"
+-
+-	"github.com/go-kit/kit/endpoint"
+-)
+-
+-// LoadBalancer yields endpoints one-by-one.
+-type LoadBalancer interface {
+-	Get() (endpoint.Endpoint, error)
+-}
+-
+-// ErrNoEndpointsAvailable is given by a load balancer when no endpoints are
+-// available to be returned.
+-var ErrNoEndpointsAvailable = errors.New("no endpoints available")
+diff --git a/loadbalancer/publisher.go b/loadbalancer/publisher.go
+deleted file mode 100644
+index f697e10..0000000
+--- a/loadbalancer/publisher.go
++++ /dev/null
+@@ -1,10 +0,0 @@
+-package loadbalancer
+-
+-import "github.com/go-kit/kit/endpoint"
+-
+-// Publisher produces endpoints.
+-type Publisher interface {
+-	Subscribe(chan<- []endpoint.Endpoint)
+-	Unsubscribe(chan<- []endpoint.Endpoint)
+-	Stop()
+-}
+diff --git a/loadbalancer/random.go b/loadbalancer/random.go
+deleted file mode 100644
+index 6f8bc93..0000000
+--- a/loadbalancer/random.go
++++ /dev/null
+@@ -1,22 +0,0 @@
+-package loadbalancer
+-
+-import (
+-	"math/rand"
+-
+-	"github.com/go-kit/kit/endpoint"
+-)
+-
+-// Random returns a load balancer that yields random endpoints.
+-func Random(p Publisher) LoadBalancer {
+-	return random{newCache(p)}
+-}
+-
+-type random struct{ *cache }
+-
+-func (r random) Get() (endpoint.Endpoint, error) {
+-	endpoints := r.cache.get()
+-	if len(endpoints) <= 0 {
+-		return nil, ErrNoEndpointsAvailable
+-	}
+-	return endpoints[rand.Intn(len(endpoints))], nil
+-}
+diff --git a/loadbalancer/random_test.go b/loadbalancer/random_test.go
+deleted file mode 100644
+index 818957d..0000000
+--- a/loadbalancer/random_test.go
++++ /dev/null
+@@ -1,43 +0,0 @@
+-package loadbalancer_test
+-
+-import (
+-	"math"
+-	"runtime"
+-	"testing"
+-
+-	"github.com/go-kit/kit/endpoint"
+-	"github.com/go-kit/kit/loadbalancer"
+-	"golang.org/x/net/context"
+-)
+-
+-func TestRandom(t *testing.T) {
+-	p := loadbalancer.NewStaticPublisher([]endpoint.Endpoint{})
+-	defer p.Stop()
+-
+-	lb := loadbalancer.Random(p)
+-	if _, err := lb.Get(); err == nil {
+-		t.Error("want error, got none")
+-	}
+-
+-	counts := []int{0, 0, 0}
+-	p.Replace([]endpoint.Endpoint{
+-		func(context.Context, interface{}) (interface{}, error) { counts[0]++; return struct{}{}, nil },
+-		func(context.Context, interface{}) (interface{}, error) { counts[1]++; return struct{}{}, nil },
+-		func(context.Context, interface{}) (interface{}, error) { counts[2]++; return struct{}{}, nil },
+-	})
+-	runtime.Gosched()
+-
+-	n := 10000
+-	for i := 0; i < n; i++ {
+-		e, _ := lb.Get()
+-		e(context.Background(), struct{}{})
+-	}
+-
+-	want := float64(n) / float64(len(counts))
+-	tolerance := want / 100.0 // 1%
+-	for _, have := range counts {
+-		if math.Abs(want-float64(have)) > tolerance {
+-			t.Errorf("want %.0f, have %d", want, have)
+-		}
+-	}
+-}
+diff --git a/loadbalancer/retry.go b/loadbalancer/retry.go
+deleted file mode 100644
+index 380d30c..0000000
+--- a/loadbalancer/retry.go
++++ /dev/null
+@@ -1,52 +0,0 @@
+-package loadbalancer
+-
+-import (
+-	"fmt"
+-	"strings"
+-	"time"
+-
+-	"golang.org/x/net/context"
+-
+-	"github.com/go-kit/kit/endpoint"
+-)
+-
+-// Retry yields an endpoint that takes endpoints from the load balancer.
+-// Invocations that return errors will be retried until they succeed, up to
+-// max times, or until the timeout is elapsed, whichever comes first.
+-func Retry(max int, timeout time.Duration, lb LoadBalancer) endpoint.Endpoint {
+-	return func(ctx context.Context, request interface{}) (interface{}, error) {
+-		var (
+-			newctx, cancel = context.WithTimeout(ctx, timeout)
+-			responses      = make(chan interface{}, 1)
+-			errs           = make(chan error, 1)
+-			a              = []string{}
+-		)
+-		defer cancel()
+-		for i := 1; i <= max; i++ {
+-			go func() {
+-				e, err := lb.Get()
+-				if err != nil {
+-					errs <- err
+-					return
+-				}
+-				response, err := e(newctx, request)
+-				if err != nil {
+-					errs <- err
+-					return
+-				}
+-				responses <- response
+-			}()
+-
+-			select {
+-			case <-newctx.Done():
+-				return nil, newctx.Err()
+-			case response := <-responses:
+-				return response, nil
+-			case err := <-errs:
+-				a = append(a, err.Error())
+-				continue
+-			}
+-		}
+-		return nil, fmt.Errorf("retry attempts exceeded (%s)", strings.Join(a, "; "))
+-	}
+-}
+diff --git a/loadbalancer/retry_test.go b/loadbalancer/retry_test.go
+deleted file mode 100644
+index 270f5d8..0000000
+--- a/loadbalancer/retry_test.go
++++ /dev/null
+@@ -1,65 +0,0 @@
+-package loadbalancer_test
+-
+-import (
+-	"errors"
+-	"runtime"
+-	"time"
+-
+-	"github.com/go-kit/kit/endpoint"
+-	"github.com/go-kit/kit/loadbalancer"
+-	"golang.org/x/net/context"
+-
+-	"testing"
+-)
+-
+-func TestRetryMax(t *testing.T) {
+-	var (
+-		endpoints = []endpoint.Endpoint{}
+-		p         = loadbalancer.NewStaticPublisher(endpoints)
+-		lb        = loadbalancer.RoundRobin(p)
+-	)
+-
+-	if _, err := loadbalancer.Retry(999, time.Second, lb)(context.Background(), struct{}{}); err == nil {
+-		t.Errorf("expected error, got none")
+-	}
+-
+-	endpoints = []endpoint.Endpoint{
+-		func(context.Context, interface{}) (interface{}, error) { return nil, errors.New("error one") },
+-		func(context.Context, interface{}) (interface{}, error) { return nil, errors.New("error two") },
+-		func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil /* OK */ },
+-	}
+-	p.Replace(endpoints)
+-	runtime.Gosched()
+-
+-	if _, err := loadbalancer.Retry(len(endpoints)-1, time.Second, lb)(context.Background(), struct{}{}); err == nil {
+-		t.Errorf("expected error, got none")
+-	}
+-
+-	if _, err := loadbalancer.Retry(len(endpoints), time.Second, lb)(context.Background(), struct{}{}); err != nil {
+-		t.Error(err)
+-	}
+-}
+-
+-func TestRetryTimeout(t *testing.T) {
+-	var (
+-		step    = make(chan struct{})
+-		e       = func(context.Context, interface{}) (interface{}, error) { <-step; return struct{}{}, nil }
+-		timeout = time.Millisecond
+-		retry   = loadbalancer.Retry(999, timeout, loadbalancer.RoundRobin(loadbalancer.NewStaticPublisher([]endpoint.Endpoint{e})))
+-		errs    = make(chan error)
+-		invoke  = func() { _, err := retry(context.Background(), struct{}{}); errs <- err }
+-	)
+-
+-	go invoke()                    // invoke the endpoint
+-	step <- struct{}{}             // tell the endpoint to return
+-	if err := <-errs; err != nil { // that should succeed
+-		t.Error(err)
+-	}
+-
+-	go invoke()                                         // invoke the endpoint
+-	time.Sleep(2 * timeout)                             // wait
+-	step <- struct{}{}                                  // tell the endpoint to return
+-	if err := <-errs; err != context.DeadlineExceeded { // that should not succeed
+-		t.Errorf("wanted error, got none")
+-	}
+-}
+diff --git a/loadbalancer/round_robin.go b/loadbalancer/round_robin.go
+deleted file mode 100644
+index d329550..0000000
+--- a/loadbalancer/round_robin.go
++++ /dev/null
+@@ -1,32 +0,0 @@
+-package loadbalancer
+-
+-import (
+-	"sync/atomic"
+-
+-	"github.com/go-kit/kit/endpoint"
+-)
+-
+-// RoundRobin returns a load balancer that yields endpoints in sequence.
+-func RoundRobin(p Publisher) LoadBalancer {
+-	return &roundRobin{newCache(p), 0}
+-}
+-
+-type roundRobin struct {
+-	*cache
+-	uint64
+-}
+-
+-func (r *roundRobin) Get() (endpoint.Endpoint, error) {
+-	endpoints := r.cache.get()
+-	if len(endpoints) <= 0 {
+-		return nil, ErrNoEndpointsAvailable
+-	}
+-	var old uint64
+-	for {
+-		old = atomic.LoadUint64(&r.uint64)
+-		if atomic.CompareAndSwapUint64(&r.uint64, old, old+1) {
+-			break
+-		}
+-	}
+-	return endpoints[old%uint64(len(endpoints))], nil
+-}
+diff --git a/loadbalancer/round_robin_test.go b/loadbalancer/round_robin_test.go
+deleted file mode 100644
+index 17e8955..0000000
+--- a/loadbalancer/round_robin_test.go
++++ /dev/null
+@@ -1,45 +0,0 @@
+-package loadbalancer_test
+-
+-import (
+-	"reflect"
+-	"runtime"
+-	"testing"
+-
+-	"github.com/go-kit/kit/endpoint"
+-	"github.com/go-kit/kit/loadbalancer"
+-	"golang.org/x/net/context"
+-)
+-
+-func TestRoundRobin(t *testing.T) {
+-	p := loadbalancer.NewStaticPublisher([]endpoint.Endpoint{})
+-	defer p.Stop()
+-
+-	lb := loadbalancer.RoundRobin(p)
+-	if _, err := lb.Get(); err == nil {
+-		t.Error("want error, got none")
+-	}
+-
+-	counts := []int{0, 0, 0}
+-	p.Replace([]endpoint.Endpoint{
+-		func(context.Context, interface{}) (interface{}, error) { counts[0]++; return struct{}{}, nil },
+-		func(context.Context, interface{}) (interface{}, error) { counts[1]++; return struct{}{}, nil },
+-		func(context.Context, interface{}) (interface{}, error) { counts[2]++; return struct{}{}, nil },
+-	})
+-	runtime.Gosched()
+-
+-	for i, want := range [][]int{
+-		{1, 0, 0},
+-		{1, 1, 0},
+-		{1, 1, 1},
+-		{2, 1, 1},
+-		{2, 2, 1},
+-		{2, 2, 2},
+-		{3, 2, 2},
+-	} {
+-		e, _ := lb.Get()
+-		e(context.Background(), struct{}{})
+-		if have := counts; !reflect.DeepEqual(want, have) {
+-			t.Errorf("%d: want %v, have %v", i+1, want, have)
+-		}
+-	}
+-}
+diff --git a/loadbalancer/static_publisher.go b/loadbalancer/static_publisher.go
+deleted file mode 100644
+index 55d5d31..0000000
+--- a/loadbalancer/static_publisher.go
++++ /dev/null
+@@ -1,51 +0,0 @@
+-package loadbalancer
+-
+-import (
+-	"sync"
+-
+-	"github.com/go-kit/kit/endpoint"
+-)
+-
+-// NewStaticPublisher returns a publisher that yields a static set of
+-// endpoints, which can be completely replaced.
+-func NewStaticPublisher(endpoints []endpoint.Endpoint) *StaticPublisher {
+-	return &StaticPublisher{
+-		current:     endpoints,
+-		subscribers: map[chan<- []endpoint.Endpoint]struct{}{},
+-	}
+-}
+-
+-// StaticPublisher holds a static set of endpoints.
+-type StaticPublisher struct {
+-	sync.Mutex
+-	current     []endpoint.Endpoint
+-	subscribers map[chan<- []endpoint.Endpoint]struct{}
+-}
+-
+-// Subscribe implements Publisher.
+-func (p *StaticPublisher) Subscribe(c chan<- []endpoint.Endpoint) {
+-	p.Lock()
+-	defer p.Unlock()
+-	p.subscribers[c] = struct{}{}
+-	c <- p.current
+-}
+-
+-// Unsubscribe implements Publisher.
+-func (p *StaticPublisher) Unsubscribe(c chan<- []endpoint.Endpoint) {
+-	p.Lock()
+-	defer p.Unlock()
+-	delete(p.subscribers, c)
+-}
+-
+-// Stop implements Publisher, but is a no-op.
+-func (p *StaticPublisher) Stop() {}
+-
+-// Replace replaces the endpoints and notifies all subscribers.
+-func (p *StaticPublisher) Replace(endpoints []endpoint.Endpoint) {
+-	p.Lock()
+-	defer p.Unlock()
+-	p.current = endpoints
+-	for c := range p.subscribers {
+-		c <- p.current
+-	}
+-}
+diff --git a/loadbalancer/static_publisher_test.go b/loadbalancer/static_publisher_test.go
+deleted file mode 100644
+index 1fc4579..0000000
+--- a/loadbalancer/static_publisher_test.go
++++ /dev/null
+@@ -1,30 +0,0 @@
+-package loadbalancer_test
+-
+-import (
+-	"testing"
+-
+-	"golang.org/x/net/context"
+-
+-	"github.com/go-kit/kit/endpoint"
+-	"github.com/go-kit/kit/loadbalancer"
+-)
+-
+-func TestStaticPublisher(t *testing.T) {
+-	endpoints := []endpoint.Endpoint{
+-		func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil },
+-	}
+-	p := loadbalancer.NewStaticPublisher(endpoints)
+-	defer p.Stop()
+-
+-	c := make(chan []endpoint.Endpoint, 1)
+-	p.Subscribe(c)
+-	if want, have := len(endpoints), len(<-c); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-
+-	endpoints = []endpoint.Endpoint{}
+-	p.Replace(endpoints)
+-	if want, have := len(endpoints), len(<-c); want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-}

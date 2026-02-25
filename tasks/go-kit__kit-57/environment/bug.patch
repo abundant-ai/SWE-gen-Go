@@ -1,0 +1,217 @@
+diff --git a/ratelimit/token_bucket.go b/ratelimit/token_bucket.go
+deleted file mode 100644
+index d829cca..0000000
+--- a/ratelimit/token_bucket.go
++++ /dev/null
+@@ -1,126 +0,0 @@
+-package ratelimit
+-
+-import (
+-	"errors"
+-	"time"
+-
+-	juju "github.com/juju/ratelimit"
+-	"golang.org/x/net/context"
+-
+-	"github.com/go-kit/kit/endpoint"
+-)
+-
+-// ErrLimited is returned in the request path when the rate limiter is
+-// triggered and the request is rejected.
+-var ErrLimited = errors.New("rate limit exceeded")
+-
+-// NewTokenBucketLimiter returns an endpoint.Middleware that acts as a rate
+-// limiter based on a token-bucket algorithm. Requests that would exceed the
+-// maximum request rate are simply rejected with an error.
+-func NewTokenBucketLimiter(options ...TokenBucketLimiterOption) endpoint.Middleware {
+-	limiter := tokenBucketLimiter{
+-		rate:     100,
+-		capacity: 100,
+-		take:     1,
+-	}
+-	for _, option := range options {
+-		option(&limiter)
+-	}
+-	tb := juju.NewBucketWithRate(limiter.rate, limiter.capacity)
+-	return func(next endpoint.Endpoint) endpoint.Endpoint {
+-		return func(ctx context.Context, request interface{}) (interface{}, error) {
+-			if tb.TakeAvailable(limiter.take) == 0 {
+-				return nil, ErrLimited
+-			}
+-			return next(ctx, request)
+-		}
+-	}
+-}
+-
+-type tokenBucketLimiter struct {
+-	rate     float64
+-	capacity int64
+-	take     int64
+-}
+-
+-// TokenBucketLimiterOption sets a parameter on the TokenBucketLimiter.
+-type TokenBucketLimiterOption func(*tokenBucketLimiter)
+-
+-// TokenBucketLimiterRate sets the rate (per second) at which tokens are
+-// replenished into the bucket. For most use cases, this should be the same as
+-// the capacity. By default, the rate is 100.
+-func TokenBucketLimiterRate(rate float64) TokenBucketLimiterOption {
+-	return func(tb *tokenBucketLimiter) { tb.rate = rate }
+-}
+-
+-// TokenBucketLimiterCapacity sets the maximum number of tokens that the
+-// bucket will hold. For most use cases, this should be the same as the rate.
+-// By default, the capacity is 100.
+-func TokenBucketLimiterCapacity(capacity int64) TokenBucketLimiterOption {
+-	return func(tb *tokenBucketLimiter) { tb.capacity = capacity }
+-}
+-
+-// TokenBucketLimiterTake sets the number of tokens that will be taken from
+-// the bucket with each request. By default, this is 1.
+-func TokenBucketLimiterTake(take int64) TokenBucketLimiterOption {
+-	return func(tb *tokenBucketLimiter) { tb.take = take }
+-}
+-
+-// NewTokenBucketThrottler returns an endpoint.Middleware that acts as a
+-// request throttler based on a token-bucket algorithm. Requests that would
+-// exceed the maximum request rate are delayed via a parameterized sleep
+-// function.
+-func NewTokenBucketThrottler(options ...TokenBucketThrottlerOption) endpoint.Middleware {
+-	throttler := tokenBucketThrottler{
+-		tokenBucketLimiter: tokenBucketLimiter{
+-			rate:     100,
+-			capacity: 100,
+-			take:     1,
+-		},
+-		sleep: time.Sleep,
+-	}
+-	for _, option := range options {
+-		option(&throttler)
+-	}
+-	tb := juju.NewBucketWithRate(throttler.rate, throttler.capacity)
+-	return func(next endpoint.Endpoint) endpoint.Endpoint {
+-		return func(ctx context.Context, request interface{}) (interface{}, error) {
+-			throttler.sleep(tb.Take(throttler.take))
+-			return next(ctx, request)
+-		}
+-	}
+-}
+-
+-type tokenBucketThrottler struct {
+-	tokenBucketLimiter
+-	sleep func(time.Duration)
+-}
+-
+-// TokenBucketThrottlerOption sets a parameter on the TokenBucketThrottler.
+-type TokenBucketThrottlerOption func(*tokenBucketThrottler)
+-
+-// TokenBucketThrottlerRate sets the rate (per second) at which tokens are
+-// replenished into the bucket. For most use cases, this should be the same as
+-// the capacity. By default, the rate is 100.
+-func TokenBucketThrottlerRate(rate float64) TokenBucketThrottlerOption {
+-	return func(tb *tokenBucketThrottler) { tb.rate = rate }
+-}
+-
+-// TokenBucketThrottlerCapacity sets the maximum number of tokens that the
+-// bucket will hold. For most use cases, this should be the same as the rate.
+-// By default, the capacity is 100.
+-func TokenBucketThrottlerCapacity(capacity int64) TokenBucketThrottlerOption {
+-	return func(tb *tokenBucketThrottler) { tb.capacity = capacity }
+-}
+-
+-// TokenBucketThrottlerTake sets the number of tokens that will be taken from
+-// the bucket with each request. By default, this is 1.
+-func TokenBucketThrottlerTake(take int64) TokenBucketThrottlerOption {
+-	return func(tb *tokenBucketThrottler) { tb.take = take }
+-}
+-
+-// TokenBucketThrottlerSleep sets the sleep function that's invoked to
+-// throttle requests. By default, it's time.Sleep.
+-func TokenBucketThrottlerSleep(sleep func(time.Duration)) TokenBucketThrottlerOption {
+-	return func(tb *tokenBucketThrottler) { tb.sleep = sleep }
+-}
+diff --git a/ratelimit/token_bucket_test.go b/ratelimit/token_bucket_test.go
+deleted file mode 100644
+index 96f2231..0000000
+--- a/ratelimit/token_bucket_test.go
++++ /dev/null
+@@ -1,60 +0,0 @@
+-package ratelimit_test
+-
+-import (
+-	"math"
+-	"testing"
+-	"time"
+-
+-	"golang.org/x/net/context"
+-
+-	"github.com/go-kit/kit/endpoint"
+-	"github.com/go-kit/kit/ratelimit"
+-)
+-
+-func TestTokenBucketLimiter(t *testing.T) {
+-	e := func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil }
+-	for _, n := range []int{1, 2, 100} {
+-		testLimiter(t, ratelimit.NewTokenBucketLimiter(
+-			ratelimit.TokenBucketLimiterRate(float64(n)),
+-			ratelimit.TokenBucketLimiterCapacity(int64(n)),
+-		)(e), int(n))
+-	}
+-}
+-
+-func TestTokenBucketThrottler(t *testing.T) {
+-	d := time.Duration(0)
+-	s := func(d0 time.Duration) { d = d0 }
+-
+-	e := func(context.Context, interface{}) (interface{}, error) { return struct{}{}, nil }
+-	e = ratelimit.NewTokenBucketThrottler(
+-		ratelimit.TokenBucketThrottlerRate(1),
+-		ratelimit.TokenBucketThrottlerCapacity(1),
+-		ratelimit.TokenBucketThrottlerSleep(s),
+-	)(e)
+-
+-	// First request should go through with no delay.
+-	e(context.Background(), struct{}{})
+-	if want, have := time.Duration(0), d; want != have {
+-		t.Errorf("want %s, have %s", want, have)
+-	}
+-
+-	// Next request should request a ~1s sleep.
+-	e(context.Background(), struct{}{})
+-	if want, have, tol := time.Second, d, time.Millisecond; math.Abs(float64(want-have)) > float64(tol) {
+-		t.Errorf("want %s, have %s", want, have)
+-	}
+-}
+-
+-func testLimiter(t *testing.T, e endpoint.Endpoint, rate int) {
+-	// First <rate> requests should succeed.
+-	for i := 0; i < rate; i++ {
+-		if _, err := e(context.Background(), struct{}{}); err != nil {
+-			t.Fatalf("rate=%d: request %d/%d failed: %v", rate, i+1, rate, err)
+-		}
+-	}
+-
+-	// Next request should fail.
+-	if _, err := e(context.Background(), struct{}{}); err != ratelimit.ErrLimited {
+-		t.Errorf("rate=%d: want %v, have %v", rate, ratelimit.ErrLimited, err)
+-	}
+-}
+diff --git a/server/README.md b/server/README.md
+new file mode 100644
+index 0000000..cdbdb69
+--- /dev/null
++++ b/server/README.md
+@@ -0,0 +1,13 @@
++# package server
++
++`package server` is a very small package that collects interfaces used by services.
++Most server-side functionality is actually implemented by surrounding packages.
++
++# Rationale
++
++TODO
++
++# Usage
++
++As currently defined, you shouldn't need to use `package server` directly.
++Other gokit components integrate on `package server` interfaces.

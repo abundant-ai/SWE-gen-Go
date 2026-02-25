@@ -1,0 +1,1176 @@
+diff --git a/cmd/admin-handlers.go b/cmd/admin-handlers.go
+index 8b031e732..9715db0aa 100644
+--- a/cmd/admin-handlers.go
++++ b/cmd/admin-handlers.go
+@@ -2186,7 +2186,7 @@ func (a adminAPIHandlers) KMSCreateKeyHandler(w http.ResponseWriter, r *http.Req
+ 	writeSuccessResponseHeadersOnly(w)
+ }
+ 
+-// KMSStatusHandler - GET /minio/admin/v3/kms/status
++// KMSKeyStatusHandler - GET /minio/admin/v3/kms/status
+ func (a adminAPIHandlers) KMSStatusHandler(w http.ResponseWriter, r *http.Request) {
+ 	ctx := r.Context()
+ 
+diff --git a/cmd/kms-handlers.go b/cmd/kms-handlers.go
+index 39fe31fdd..e77a3ea68 100644
+--- a/cmd/kms-handlers.go
++++ b/cmd/kms-handlers.go
+@@ -24,7 +24,6 @@ import (
+ 
+ 	"github.com/minio/kms-go/kes"
+ 	"github.com/minio/madmin-go/v3"
+-	"github.com/minio/minio/internal/auth"
+ 	"github.com/minio/minio/internal/kms"
+ 	"github.com/minio/minio/internal/logger"
+ 	"github.com/minio/pkg/v3/policy"
+@@ -57,7 +56,7 @@ func (a kmsAPIHandlers) KMSStatusHandler(w http.ResponseWriter, r *http.Request)
+ 	writeSuccessResponseJSON(w, resp)
+ }
+ 
+-// KMSMetricsHandler - GET /minio/kms/v1/metrics
++// KMSMetricsHandler - POST /minio/kms/v1/metrics
+ func (a kmsAPIHandlers) KMSMetricsHandler(w http.ResponseWriter, r *http.Request) {
+ 	ctx := newContext(r, w, "KMSMetrics")
+ 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+@@ -84,7 +83,7 @@ func (a kmsAPIHandlers) KMSMetricsHandler(w http.ResponseWriter, r *http.Request
+ 	}
+ }
+ 
+-// KMSAPIsHandler - GET /minio/kms/v1/apis
++// KMSAPIsHandler - POST /minio/kms/v1/apis
+ func (a kmsAPIHandlers) KMSAPIsHandler(w http.ResponseWriter, r *http.Request) {
+ 	ctx := newContext(r, w, "KMSAPIs")
+ 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+@@ -115,7 +114,7 @@ type versionResponse struct {
+ 	Version string `json:"version"`
+ }
+ 
+-// KMSVersionHandler - GET /minio/kms/v1/version
++// KMSVersionHandler - POST /minio/kms/v1/version
+ func (a kmsAPIHandlers) KMSVersionHandler(w http.ResponseWriter, r *http.Request) {
+ 	ctx := newContext(r, w, "KMSVersion")
+ 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+@@ -160,20 +159,7 @@ func (a kmsAPIHandlers) KMSCreateKeyHandler(w http.ResponseWriter, r *http.Reque
+ 		return
+ 	}
+ 
+-	keyID := r.Form.Get("key-id")
+-
+-	// Ensure policy allows the user to create this key name
+-	cred, owner, s3Err := validateAdminSignature(ctx, r, "")
+-	if s3Err != ErrNone {
+-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+-		return
+-	}
+-	if !checkKMSActionAllowed(r, owner, cred, policy.KMSCreateKeyAction, keyID) {
+-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+-		return
+-	}
+-
+-	if err := GlobalKMS.CreateKey(ctx, &kms.CreateKeyRequest{Name: keyID}); err != nil {
++	if err := GlobalKMS.CreateKey(ctx, &kms.CreateKeyRequest{Name: r.Form.Get("key-id")}); err != nil {
+ 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+ 		return
+ 	}
+@@ -185,9 +171,6 @@ func (a kmsAPIHandlers) KMSListKeysHandler(w http.ResponseWriter, r *http.Reques
+ 	ctx := newContext(r, w, "KMSListKeys")
+ 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+ 
+-	// This only checks if the action (kms:ListKeys) is allowed, it does not check
+-	// each key name against the policy's Resources. We check that below, once
+-	// we have the list of key names from the KMS.
+ 	objectAPI, _ := validateAdminReq(ctx, w, r, policy.KMSListKeysAction)
+ 	if objectAPI == nil {
+ 		return
+@@ -197,7 +180,7 @@ func (a kmsAPIHandlers) KMSListKeysHandler(w http.ResponseWriter, r *http.Reques
+ 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrKMSNotConfigured), r.URL)
+ 		return
+ 	}
+-	allKeyNames, _, err := GlobalKMS.ListKeyNames(ctx, &kms.ListRequest{
++	names, _, err := GlobalKMS.ListKeyNames(ctx, &kms.ListRequest{
+ 		Prefix: r.Form.Get("pattern"),
+ 	})
+ 	if err != nil {
+@@ -205,24 +188,8 @@ func (a kmsAPIHandlers) KMSListKeysHandler(w http.ResponseWriter, r *http.Reques
+ 		return
+ 	}
+ 
+-	// Get the cred and owner for checking authz below.
+-	cred, owner, s3Err := validateAdminSignature(ctx, r, "")
+-	if s3Err != ErrNone {
+-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+-		return
+-	}
+-
+-	// Now we have all the key names, for each of them, check whether the policy grants permission for
+-	// the user to list it.
+-	keyNames := []string{}
+-	for _, name := range allKeyNames {
+-		if checkKMSActionAllowed(r, owner, cred, policy.KMSListKeysAction, name) {
+-			keyNames = append(keyNames, name)
+-		}
+-	}
+-
+-	values := make([]kes.KeyInfo, 0, len(keyNames))
+-	for _, name := range keyNames {
++	values := make([]kes.KeyInfo, 0, len(names))
++	for _, name := range names {
+ 		values = append(values, kes.KeyInfo{
+ 			Name: name,
+ 		})
+@@ -257,17 +224,6 @@ func (a kmsAPIHandlers) KMSKeyStatusHandler(w http.ResponseWriter, r *http.Reque
+ 		KeyID: keyID,
+ 	}
+ 
+-	// Ensure policy allows the user to get this key's status
+-	cred, owner, s3Err := validateAdminSignature(ctx, r, "")
+-	if s3Err != ErrNone {
+-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+-		return
+-	}
+-	if !checkKMSActionAllowed(r, owner, cred, policy.KMSKeyStatusAction, keyID) {
+-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+-		return
+-	}
+-
+ 	kmsContext := kms.Context{"MinIO admin API": "KMSKeyStatusHandler"} // Context for a test key operation
+ 	// 1. Generate a new key using the KMS.
+ 	key, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{Name: keyID, AssociatedData: kmsContext})
+@@ -318,16 +274,3 @@ func (a kmsAPIHandlers) KMSKeyStatusHandler(w http.ResponseWriter, r *http.Reque
+ 	}
+ 	writeSuccessResponseJSON(w, resp)
+ }
+-
+-// checkKMSActionAllowed checks for authorization for a specific action on a resource.
+-func checkKMSActionAllowed(r *http.Request, owner bool, cred auth.Credentials, action policy.KMSAction, resource string) bool {
+-	return globalIAMSys.IsAllowed(policy.Args{
+-		AccountName:     cred.AccessKey,
+-		Groups:          cred.Groups,
+-		Action:          policy.Action(action),
+-		ConditionValues: getConditionValues(r, "", cred),
+-		IsOwner:         owner,
+-		Claims:          cred.Claims,
+-		BucketName:      resource, // overloading BucketName as that's what the policy engine uses to assemble a Resource.
+-	})
+-}
+diff --git a/cmd/kms-handlers_test.go b/cmd/kms-handlers_test.go
+deleted file mode 100644
+index e01da7da0..000000000
+--- a/cmd/kms-handlers_test.go
++++ /dev/null
+@@ -1,851 +0,0 @@
+-// Copyright (c) 2015-2024 MinIO, Inc.
+-//
+-// This file is part of MinIO Object Storage stack
+-//
+-// This program is free software: you can redistribute it and/or modify
+-// it under the terms of the GNU Affero General Public License as published by
+-// the Free Software Foundation, either version 3 of the License, or
+-// (at your option) any later version.
+-//
+-// This program is distributed in the hope that it will be useful
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-// GNU Affero General Public License for more details.
+-//
+-// You should have received a copy of the GNU Affero General Public License
+-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-
+-package cmd
+-
+-import (
+-	"context"
+-	"encoding/json"
+-	"fmt"
+-	"net/http"
+-	"net/http/httptest"
+-	"net/url"
+-	"strings"
+-	"testing"
+-
+-	"github.com/minio/madmin-go/v3"
+-	"github.com/minio/minio/internal/kms"
+-	"github.com/minio/pkg/v3/policy"
+-)
+-
+-const (
+-	// KMS API paths
+-	// For example: /minio/kms/v1/key/list?pattern=*
+-	kmsURL           = kmsPathPrefix + kmsAPIVersionPrefix
+-	kmsStatusPath    = kmsURL + "/status"
+-	kmsMetricsPath   = kmsURL + "/metrics"
+-	kmsAPIsPath      = kmsURL + "/apis"
+-	kmsVersionPath   = kmsURL + "/version"
+-	kmsKeyCreatePath = kmsURL + "/key/create"
+-	kmsKeyListPath   = kmsURL + "/key/list"
+-	kmsKeyStatusPath = kmsURL + "/key/status"
+-
+-	// Admin API paths
+-	// For example: /minio/admin/v3/kms/status
+-	adminURL              = adminPathPrefix + adminAPIVersionPrefix
+-	kmsAdminStatusPath    = adminURL + "/kms/status"
+-	kmsAdminKeyStatusPath = adminURL + "/kms/key/status"
+-	kmsAdminKeyCreate     = adminURL + "/kms/key/create"
+-)
+-
+-const (
+-	userAccessKey = "miniofakeuseraccesskey"
+-	userSecretKey = "miniofakeusersecret"
+-)
+-
+-type kmsTestCase struct {
+-	name   string
+-	method string
+-	path   string
+-	query  map[string]string
+-
+-	// User credentials and policy for request
+-	policy string
+-	asRoot bool
+-
+-	// Wanted in response.
+-	wantStatusCode int
+-	wantKeyNames   []string
+-	wantResp       []string
+-}
+-
+-func TestKMSHandlersCreateKey(t *testing.T) {
+-	adminTestBed, tearDown := setupKMSTest(t, true)
+-	defer tearDown()
+-
+-	tests := []kmsTestCase{
+-		// Create key test
+-		{
+-			name:   "create key as user with no policy want forbidden",
+-			method: http.MethodPost,
+-			path:   kmsKeyCreatePath,
+-			query:  map[string]string{"key-id": "new-test-key"},
+-			asRoot: false,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-		{
+-			name:   "create key as user with no resources specified want success",
+-			method: http.MethodPost,
+-			path:   kmsKeyCreatePath,
+-			query:  map[string]string{"key-id": "new-test-key"},
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-				"Action": ["kms:CreateKey"] }`,
+-
+-			wantStatusCode: http.StatusOK,
+-		},
+-		{
+-			name:   "create key as user set policy to allow want success",
+-			method: http.MethodPost,
+-			path:   kmsKeyCreatePath,
+-			query:  map[string]string{"key-id": "second-new-test-key"},
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-				"Action": ["kms:CreateKey"],
+-				"Resource": ["arn:minio:kms:::second-new-test-*"] }`,
+-
+-			wantStatusCode: http.StatusOK,
+-		},
+-		{
+-			name:   "create key as user set policy to non matching resource want forbidden",
+-			method: http.MethodPost,
+-			path:   kmsKeyCreatePath,
+-			query:  map[string]string{"key-id": "third-new-test-key"},
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-				"Action": ["kms:CreateKey"],
+-				"Resource": ["arn:minio:kms:::non-matching-key-name"] }`,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-	}
+-	for testNum, test := range tests {
+-		t.Run(fmt.Sprintf("%d %s", testNum+1, test.name), func(t *testing.T) {
+-			execKMSTest(t, test, adminTestBed)
+-		})
+-	}
+-}
+-
+-func TestKMSHandlersKeyStatus(t *testing.T) {
+-	adminTestBed, tearDown := setupKMSTest(t, true)
+-	defer tearDown()
+-
+-	tests := []kmsTestCase{
+-		{
+-			name:   "create a first key root user",
+-			method: http.MethodPost,
+-			path:   kmsKeyCreatePath,
+-			query:  map[string]string{"key-id": "abc-test-key"},
+-			asRoot: true,
+-
+-			wantStatusCode: http.StatusOK,
+-		},
+-		{
+-			name:   "key status as root want success",
+-			method: http.MethodGet,
+-			path:   kmsKeyStatusPath,
+-			query:  map[string]string{"key-id": "abc-test-key"},
+-			asRoot: true,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"abc-test-key"},
+-		},
+-		{
+-			name:   "key status as user no policy want forbidden",
+-			method: http.MethodGet,
+-			path:   kmsKeyStatusPath,
+-			query:  map[string]string{"key-id": "abc-test-key"},
+-			asRoot: false,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-		{
+-			name:   "key status as user legacy no resources specified want success",
+-			method: http.MethodGet,
+-			path:   kmsKeyStatusPath,
+-			query:  map[string]string{"key-id": "abc-test-key"},
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-					"Action": ["kms:KeyStatus"] }`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"abc-test-key"},
+-		},
+-		{
+-			name:   "key status as user set policy to allow only one key",
+-			method: http.MethodGet,
+-			path:   kmsKeyStatusPath,
+-			query:  map[string]string{"key-id": "abc-test-key"},
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-					"Action": ["kms:KeyStatus"],
+-					"Resource": ["arn:minio:kms:::abc-test-*"] }`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"abc-test-key"},
+-		},
+-		{
+-			name:   "key status as user set policy to allow non-matching key",
+-			method: http.MethodGet,
+-			path:   kmsKeyStatusPath,
+-			query:  map[string]string{"key-id": "abc-test-key"},
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-					"Action": ["kms:KeyStatus"],
+-					"Resource": ["arn:minio:kms:::xyz-test-key"] }`,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-	}
+-	for testNum, test := range tests {
+-		t.Run(fmt.Sprintf("%d %s", testNum+1, test.name), func(t *testing.T) {
+-			execKMSTest(t, test, adminTestBed)
+-		})
+-	}
+-}
+-
+-func TestKMSHandlersAPIs(t *testing.T) {
+-	adminTestBed, tearDown := setupKMSTest(t, true)
+-	defer tearDown()
+-
+-	tests := []kmsTestCase{
+-		// Version test
+-		{
+-			name:   "version as root want success",
+-			method: http.MethodGet,
+-			path:   kmsVersionPath,
+-			asRoot: true,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"version"},
+-		},
+-		{
+-			name:   "version as user with no policy want forbidden",
+-			method: http.MethodGet,
+-			path:   kmsVersionPath,
+-			asRoot: false,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-		{
+-			name:   "version as user with policy ignores resource want success",
+-			method: http.MethodGet,
+-			path:   kmsVersionPath,
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-				"Action": ["kms:Version"],
+-				"Resource": ["arn:minio:kms:::does-not-matter-it-is-ignored"] }`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"version"},
+-		},
+-
+-		// APIs test
+-		{
+-			name:   "apis as root want success",
+-			method: http.MethodGet,
+-			path:   kmsAPIsPath,
+-			asRoot: true,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"stub/path"},
+-		},
+-		{
+-			name:   "apis as user with no policy want forbidden",
+-			method: http.MethodGet,
+-			path:   kmsAPIsPath,
+-			asRoot: false,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-		{
+-			name:   "apis as user with policy ignores resource want success",
+-			method: http.MethodGet,
+-			path:   kmsAPIsPath,
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-				"Action": ["kms:API"],
+-				"Resource": ["arn:minio:kms:::does-not-matter-it-is-ignored"] }`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"stub/path"},
+-		},
+-
+-		// Metrics test
+-		{
+-			name:   "metrics as root want success",
+-			method: http.MethodGet,
+-			path:   kmsMetricsPath,
+-			asRoot: true,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"kms"},
+-		},
+-		{
+-			name:   "metrics as user with no policy want forbidden",
+-			method: http.MethodGet,
+-			path:   kmsMetricsPath,
+-			asRoot: false,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-		{
+-			name:   "metrics as user with policy ignores resource want success",
+-			method: http.MethodGet,
+-			path:   kmsMetricsPath,
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-				"Action": ["kms:Metrics"],
+-				"Resource": ["arn:minio:kms:::does-not-matter-it-is-ignored"] }`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"kms"},
+-		},
+-
+-		// Status tests
+-		{
+-			name:   "status as root want success",
+-			method: http.MethodGet,
+-			path:   kmsStatusPath,
+-			asRoot: true,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"MinIO builtin"},
+-		},
+-		{
+-			name:   "status as user with no policy want forbidden",
+-			method: http.MethodGet,
+-			path:   kmsStatusPath,
+-			asRoot: false,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-		{
+-			name:   "status as user with policy ignores resource want success",
+-			method: http.MethodGet,
+-			path:   kmsStatusPath,
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-				"Action": ["kms:Status"],
+-				"Resource": ["arn:minio:kms:::does-not-matter-it-is-ignored"]}`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"MinIO builtin"},
+-		},
+-	}
+-	for testNum, test := range tests {
+-		t.Run(fmt.Sprintf("%d %s", testNum+1, test.name), func(t *testing.T) {
+-			execKMSTest(t, test, adminTestBed)
+-		})
+-	}
+-}
+-
+-func TestKMSHandlersListKeys(t *testing.T) {
+-	adminTestBed, tearDown := setupKMSTest(t, true)
+-	defer tearDown()
+-
+-	tests := []kmsTestCase{
+-		{
+-			name:   "create a first key root user",
+-			method: http.MethodPost,
+-			path:   kmsKeyCreatePath,
+-			query:  map[string]string{"key-id": "abc-test-key"},
+-			asRoot: true,
+-
+-			wantStatusCode: http.StatusOK,
+-		},
+-		{
+-			name:   "create a second key root user",
+-			method: http.MethodPost,
+-			path:   kmsKeyCreatePath,
+-			query:  map[string]string{"key-id": "xyz-test-key"},
+-			asRoot: true,
+-
+-			wantStatusCode: http.StatusOK,
+-		},
+-
+-		// List keys tests
+-		{
+-			name:   "list keys as root want all to be returned",
+-			method: http.MethodGet,
+-			path:   kmsKeyListPath,
+-			query:  map[string]string{"pattern": "*"},
+-			asRoot: true,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantKeyNames:   []string{"default-test-key", "abc-test-key", "xyz-test-key"},
+-		},
+-		{
+-			name:   "list keys as user with no policy want forbidden",
+-			method: http.MethodGet,
+-			path:   kmsKeyListPath,
+-			query:  map[string]string{"pattern": "*"},
+-			asRoot: false,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-		{
+-			name:   "list keys as user with no resources specified want success",
+-			method: http.MethodGet,
+-			path:   kmsKeyListPath,
+-			query:  map[string]string{"pattern": "*"},
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-				"Action": ["kms:ListKeys"]
+-			}`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantKeyNames:   []string{"default-test-key", "abc-test-key", "xyz-test-key"},
+-		},
+-		{
+-			name:   "list keys as user set policy resource to allow only one key",
+-			method: http.MethodGet,
+-			path:   kmsKeyListPath,
+-			query:  map[string]string{"pattern": "*"},
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-					"Action": ["kms:ListKeys"],
+-					"Resource": ["arn:minio:kms:::abc*"]}`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantKeyNames:   []string{"abc-test-key"},
+-		},
+-		{
+-			name:   "list keys as user set policy to allow only one key, use pattern that includes correct key",
+-			method: http.MethodGet,
+-			path:   kmsKeyListPath,
+-			query:  map[string]string{"pattern": "abc*"},
+-
+-			policy: `{"Effect": "Allow",
+-					"Action": ["kms:ListKeys"],
+-					"Resource": ["arn:minio:kms:::abc*"]}`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantKeyNames:   []string{"abc-test-key"},
+-		},
+-		{
+-			name:   "list keys as user set policy to allow only one key, use pattern that excludes correct key",
+-			method: http.MethodGet,
+-			path:   kmsKeyListPath,
+-			query:  map[string]string{"pattern": "xyz*"},
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-					"Action": ["kms:ListKeys"],
+-					"Resource": ["arn:minio:kms:::abc*"]}`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantKeyNames:   []string{},
+-		},
+-		{
+-			name:   "list keys as user set policy that has no matching key resources",
+-			method: http.MethodGet,
+-			path:   kmsKeyListPath,
+-			query:  map[string]string{"pattern": "*"},
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-					"Action": ["kms:ListKeys"],
+-					"Resource": ["arn:minio:kms:::nonematch*"]}`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantKeyNames:   []string{},
+-		},
+-		{
+-			name:   "list keys as user set policy that allows listing but denies specific keys",
+-			method: http.MethodGet,
+-			path:   kmsKeyListPath,
+-			query:  map[string]string{"pattern": "*"},
+-			asRoot: false,
+-
+-			// It looks like this should allow listing any key that isn't "default-test-key", however
+-			// the policy engine matches all Deny statements first, without regard to Resources (for KMS).
+-			// This is for backwards compatibility where historically KMS statements ignored Resources.
+-			policy: `{
+-						"Effect": "Allow",
+-						"Action": ["kms:ListKeys"]
+-					},{
+-						"Effect": "Deny",
+-						"Action": ["kms:ListKeys"],
+-						"Resource": ["arn:minio:kms:::default-test-key"]
+-					}`,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-	}
+-
+-	for testNum, test := range tests {
+-		t.Run(fmt.Sprintf("%d %s", testNum+1, test.name), func(t *testing.T) {
+-			execKMSTest(t, test, adminTestBed)
+-		})
+-	}
+-}
+-
+-func TestKMSHandlerAdminAPI(t *testing.T) {
+-	adminTestBed, tearDown := setupKMSTest(t, true)
+-	defer tearDown()
+-
+-	tests := []kmsTestCase{
+-		// Create key tests
+-		{
+-			name:   "create a key root user",
+-			method: http.MethodPost,
+-			path:   kmsAdminKeyCreate,
+-			query:  map[string]string{"key-id": "abc-test-key"},
+-			asRoot: true,
+-
+-			wantStatusCode: http.StatusOK,
+-		},
+-		{
+-			name:   "create key as user with no policy want forbidden",
+-			method: http.MethodPost,
+-			path:   kmsAdminKeyCreate,
+-			query:  map[string]string{"key-id": "new-test-key"},
+-			asRoot: false,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-		{
+-			name:   "create key as user with no resources specified want success",
+-			method: http.MethodPost,
+-			path:   kmsAdminKeyCreate,
+-			query:  map[string]string{"key-id": "new-test-key"},
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-				"Action": ["admin:KMSCreateKey"] }`,
+-
+-			wantStatusCode: http.StatusOK,
+-		},
+-		{
+-			name:   "create key as user set policy to non matching resource want success",
+-			method: http.MethodPost,
+-			path:   kmsAdminKeyCreate,
+-			query:  map[string]string{"key-id": "third-new-test-key"},
+-			asRoot: false,
+-
+-			// Admin actions ignore Resources
+-			policy: `{"Effect": "Allow",
+-				"Action": ["admin:KMSCreateKey"],
+-				"Resource": ["arn:minio:kms:::this-is-disregarded"] }`,
+-
+-			wantStatusCode: http.StatusOK,
+-		},
+-
+-		// Status tests
+-		{
+-			name:   "status as root want success",
+-			method: http.MethodPost,
+-			path:   kmsAdminStatusPath,
+-			asRoot: true,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"MinIO builtin"},
+-		},
+-		{
+-			name:   "status as user with no policy want forbidden",
+-			method: http.MethodPost,
+-			path:   kmsAdminStatusPath,
+-			asRoot: false,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-		{
+-			name:   "status as user with policy ignores resource want success",
+-			method: http.MethodPost,
+-			path:   kmsAdminStatusPath,
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-				"Action": ["admin:KMSKeyStatus"],
+-				"Resource": ["arn:minio:kms:::does-not-matter-it-is-ignored"] }`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"MinIO builtin"},
+-		},
+-
+-		// Key status tests
+-		{
+-			name:   "key status as root want success",
+-			method: http.MethodGet,
+-			path:   kmsAdminKeyStatusPath,
+-			asRoot: true,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"key-id"},
+-		},
+-		{
+-			name:   "key status as user with no policy want forbidden",
+-			method: http.MethodGet,
+-			path:   kmsAdminKeyStatusPath,
+-			asRoot: false,
+-
+-			wantStatusCode: http.StatusForbidden,
+-			wantResp:       []string{"AccessDenied"},
+-		},
+-		{
+-			name:   "key status as user with policy ignores resource want success",
+-			method: http.MethodGet,
+-			path:   kmsAdminKeyStatusPath,
+-			asRoot: false,
+-
+-			policy: `{"Effect": "Allow",
+-				"Action": ["admin:KMSKeyStatus"],
+-				"Resource": ["arn:minio:kms:::does-not-matter-it-is-ignored"] }`,
+-
+-			wantStatusCode: http.StatusOK,
+-			wantResp:       []string{"key-id"},
+-		},
+-	}
+-
+-	for testNum, test := range tests {
+-		t.Run(fmt.Sprintf("%d %s", testNum+1, test.name), func(t *testing.T) {
+-			execKMSTest(t, test, adminTestBed)
+-		})
+-	}
+-}
+-
+-// execKMSTest runs a single test case for KMS handlers
+-func execKMSTest(t *testing.T, test kmsTestCase, adminTestBed *adminErasureTestBed) {
+-	var accessKey, secretKey string
+-	if test.asRoot {
+-		accessKey, secretKey = globalActiveCred.AccessKey, globalActiveCred.SecretKey
+-	} else {
+-		setupKMSUser(t, userAccessKey, userSecretKey, test.policy)
+-		accessKey = userAccessKey
+-		secretKey = userSecretKey
+-	}
+-
+-	req := buildKMSRequest(t, test.method, test.path, accessKey, secretKey, test.query)
+-	rec := httptest.NewRecorder()
+-	adminTestBed.router.ServeHTTP(rec, req)
+-
+-	t.Logf("HTTP req: %s, resp code: %d, resp body: %s", req.URL.String(), rec.Code, rec.Body.String())
+-
+-	// Check status code
+-	if rec.Code != test.wantStatusCode {
+-		t.Errorf("want status code %d, got %d", test.wantStatusCode, rec.Code)
+-	}
+-
+-	// Check returned key list is correct
+-	if test.wantKeyNames != nil {
+-		gotKeyNames := keyNamesFromListKeysResp(t, rec.Body.Bytes())
+-		if len(test.wantKeyNames) != len(gotKeyNames) {
+-			t.Fatalf("want keys len: %d, got len: %d", len(test.wantKeyNames), len(gotKeyNames))
+-		}
+-		for i, wantKeyName := range test.wantKeyNames {
+-			if gotKeyNames[i] != wantKeyName {
+-				t.Fatalf("want key name %s, in position %d, got %s", wantKeyName, i, gotKeyNames[i])
+-			}
+-		}
+-	}
+-
+-	// Check generic text in the response
+-	if test.wantResp != nil {
+-		for _, want := range test.wantResp {
+-			if !strings.Contains(rec.Body.String(), want) {
+-				t.Fatalf("want response to contain %s, got %s", want, rec.Body.String())
+-			}
+-		}
+-	}
+-}
+-
+-// TestKMSHandlerNotConfiguredOrInvalidCreds tests KMS handlers for situations where KMS is not configured
+-// or invalid credentials are provided.
+-func TestKMSHandlerNotConfiguredOrInvalidCreds(t *testing.T) {
+-	adminTestBed, tearDown := setupKMSTest(t, false)
+-	defer tearDown()
+-
+-	tests := []struct {
+-		name   string
+-		method string
+-		path   string
+-		query  map[string]string
+-	}{
+-		{
+-			name:   "GET status",
+-			method: http.MethodGet,
+-			path:   kmsStatusPath,
+-		},
+-		{
+-			name:   "GET metrics",
+-			method: http.MethodGet,
+-			path:   kmsMetricsPath,
+-		},
+-		{
+-			name:   "GET apis",
+-			method: http.MethodGet,
+-			path:   kmsAPIsPath,
+-		},
+-		{
+-			name:   "GET version",
+-			method: http.MethodGet,
+-			path:   kmsVersionPath,
+-		},
+-		{
+-			name:   "POST key create",
+-			method: http.MethodPost,
+-			path:   kmsKeyCreatePath,
+-			query:  map[string]string{"key-id": "master-key-id"},
+-		},
+-		{
+-			name:   "GET key list",
+-			method: http.MethodGet,
+-			path:   kmsKeyListPath,
+-			query:  map[string]string{"pattern": "*"},
+-		},
+-		{
+-			name:   "GET key status",
+-			method: http.MethodGet,
+-			path:   kmsKeyStatusPath,
+-			query:  map[string]string{"key-id": "master-key-id"},
+-		},
+-	}
+-
+-	// Test when the GlobalKMS is not configured
+-	for _, test := range tests {
+-		t.Run(test.name+" not configured", func(t *testing.T) {
+-			req := buildKMSRequest(t, test.method, test.path, "", "", test.query)
+-			rec := httptest.NewRecorder()
+-			adminTestBed.router.ServeHTTP(rec, req)
+-			if rec.Code != http.StatusNotImplemented {
+-				t.Errorf("want status code %d, got %d", http.StatusNotImplemented, rec.Code)
+-			}
+-		})
+-	}
+-
+-	// Test when the GlobalKMS is configured but the credentials are invalid
+-	GlobalKMS = kms.NewStub("default-test-key")
+-	for _, test := range tests {
+-		t.Run(test.name+" invalid credentials", func(t *testing.T) {
+-			req := buildKMSRequest(t, test.method, test.path, userAccessKey, userSecretKey, test.query)
+-			rec := httptest.NewRecorder()
+-			adminTestBed.router.ServeHTTP(rec, req)
+-			if rec.Code != http.StatusForbidden {
+-				t.Errorf("want status code %d, got %d", http.StatusForbidden, rec.Code)
+-			}
+-		})
+-	}
+-}
+-
+-func setupKMSTest(t *testing.T, enableKMS bool) (*adminErasureTestBed, func()) {
+-	adminTestBed, err := prepareAdminErasureTestBed(context.Background())
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	registerKMSRouter(adminTestBed.router)
+-
+-	if enableKMS {
+-		GlobalKMS = kms.NewStub("default-test-key")
+-	}
+-
+-	tearDown := func() {
+-		adminTestBed.TearDown()
+-		GlobalKMS = nil
+-	}
+-	return adminTestBed, tearDown
+-}
+-
+-func buildKMSRequest(t *testing.T, method, path, accessKey, secretKey string, query map[string]string) *http.Request {
+-	if len(query) > 0 {
+-		queryVal := url.Values{}
+-		for k, v := range query {
+-			queryVal.Add(k, v)
+-		}
+-		path = path + "?" + queryVal.Encode()
+-	}
+-
+-	if accessKey == "" && secretKey == "" {
+-		accessKey = globalActiveCred.AccessKey
+-		secretKey = globalActiveCred.SecretKey
+-	}
+-
+-	req, err := newTestSignedRequestV4(method, path, 0, nil, accessKey, secretKey, nil)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	return req
+-}
+-
+-// setupKMSUser is a test helper that creates a new user with the provided access key and secret key
+-// and applies the given policy to the user.
+-func setupKMSUser(t *testing.T, accessKey, secretKey, p string) {
+-	ctx := context.Background()
+-	createUserParams := madmin.AddOrUpdateUserReq{
+-		SecretKey: secretKey,
+-		Status:    madmin.AccountEnabled,
+-	}
+-	_, err := globalIAMSys.CreateUser(ctx, accessKey, createUserParams)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	testKMSPolicyName := "testKMSPolicy"
+-	if p != "" {
+-		p = `{"Version":"2012-10-17","Statement":[` + p + `]}`
+-		policyData, err := policy.ParseConfig(strings.NewReader(p))
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		_, err = globalIAMSys.SetPolicy(ctx, testKMSPolicyName, *policyData)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		_, err = globalIAMSys.PolicyDBSet(ctx, accessKey, testKMSPolicyName, regUser, false)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-	} else {
+-		err = globalIAMSys.DeletePolicy(ctx, testKMSPolicyName, false)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-		_, err = globalIAMSys.PolicyDBSet(ctx, accessKey, "", regUser, false)
+-		if err != nil {
+-			t.Fatal(err)
+-		}
+-	}
+-}
+-
+-func keyNamesFromListKeysResp(t *testing.T, b []byte) []string {
+-	var keyInfos []madmin.KMSKeyInfo
+-	err := json.Unmarshal(b, &keyInfos)
+-	if err != nil {
+-		t.Fatalf("cannot unmarshal '%s', err: %v", b, err)
+-	}
+-
+-	var gotKeyNames []string
+-	for _, keyInfo := range keyInfos {
+-		gotKeyNames = append(gotKeyNames, keyInfo.Name)
+-	}
+-	return gotKeyNames
+-}
+diff --git a/go.mod b/go.mod
+index 140dd8463..c7c570ae9 100644
+--- a/go.mod
++++ b/go.mod
+@@ -55,7 +55,7 @@ require (
+ 	github.com/minio/madmin-go/v3 v3.0.58
+ 	github.com/minio/minio-go/v7 v7.0.73
+ 	github.com/minio/mux v1.9.0
+-	github.com/minio/pkg/v3 v3.0.8
++	github.com/minio/pkg/v3 v3.0.7
+ 	github.com/minio/selfupdate v0.6.0
+ 	github.com/minio/simdjson-go v0.4.5
+ 	github.com/minio/sio v0.4.0
+diff --git a/go.sum b/go.sum
+index 2bb960122..07936554a 100644
+--- a/go.sum
++++ b/go.sum
+@@ -472,8 +472,8 @@ github.com/minio/mux v1.9.0 h1:dWafQFyEfGhJvK6AwLOt83bIG5bxKxKJnKMCi0XAaoA=
+ github.com/minio/mux v1.9.0/go.mod h1:1pAare17ZRL5GpmNL+9YmqHoWnLmMZF9C/ioUCfy0BQ=
+ github.com/minio/pkg/v2 v2.0.19 h1:r187/k/oVH9H0DDwvLY5WipkJaZ4CLd4KI3KgIUExR0=
+ github.com/minio/pkg/v2 v2.0.19/go.mod h1:luK9LAhQlAPzSuF6F326XSCKjMc1G3Tbh+a9JYwqh8M=
+-github.com/minio/pkg/v3 v3.0.8 h1:trJw6D3LzKQ96Hl5nWLwBpstaO56VNdsOmR5rowmDjc=
+-github.com/minio/pkg/v3 v3.0.8/go.mod h1:njlf539caYrgXqn/CXewqvkqBIMDTQo9oBBEL34LzY0=
++github.com/minio/pkg/v3 v3.0.7 h1:1I2CbFKO+brioB6Pbnw0jLlFxo+YPy6hCTTXTSitgI8=
++github.com/minio/pkg/v3 v3.0.7/go.mod h1:njlf539caYrgXqn/CXewqvkqBIMDTQo9oBBEL34LzY0=
+ github.com/minio/selfupdate v0.6.0 h1:i76PgT0K5xO9+hjzKcacQtO7+MjJ4JKA8Ak8XQ9DDwU=
+ github.com/minio/selfupdate v0.6.0/go.mod h1:bO02GTIPCMQFTEvE5h4DjYB58bCoZ35XLeBf0buTDdM=
+ github.com/minio/sha256-simd v0.1.1/go.mod h1:B5e1o+1/KgNmWrSQK08Y6Z1Vb5pwIktudl0J58iy0KM=
+diff --git a/internal/kms/errors.go b/internal/kms/errors.go
+index 9583651ed..4f7b87d6a 100644
+--- a/internal/kms/errors.go
++++ b/internal/kms/errors.go
+@@ -44,7 +44,7 @@ var (
+ 	ErrKeyNotFound = Error{
+ 		Code:    http.StatusNotFound,
+ 		APICode: "kms:KeyNotFound",
+-		Err:     "key with given key ID does not exist",
++		Err:     "key with given key ID does not exit",
+ 	}
+ 
+ 	// ErrDecrypt is an error returned by the KMS when the decryption
+diff --git a/internal/kms/stub.go b/internal/kms/stub.go
+deleted file mode 100644
+index 545af6c63..000000000
+--- a/internal/kms/stub.go
++++ /dev/null
+@@ -1,117 +0,0 @@
+-// Copyright (c) 2015-2024 MinIO, Inc.
+-//
+-// This file is part of MinIO Object Storage stack
+-//
+-// This program is free software: you can redistribute it and/or modify
+-// it under the terms of the GNU Affero General Public License as published by
+-// the Free Software Foundation, either version 3 of the License, or
+-// (at your option) any later version.
+-//
+-// This program is distributed in the hope that it will be useful
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-// GNU Affero General Public License for more details.
+-//
+-// You should have received a copy of the GNU Affero General Public License
+-// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-
+-package kms
+-
+-import (
+-	"context"
+-	"net/http"
+-	"slices"
+-	"sync/atomic"
+-
+-	"github.com/minio/madmin-go/v3"
+-	"github.com/minio/pkg/v3/wildcard"
+-)
+-
+-// NewStub returns a stub of KMS for testing
+-func NewStub(defaultKeyName string) *KMS {
+-	return &KMS{
+-		Type:           Builtin,
+-		DefaultKey:     defaultKeyName,
+-		latencyBuckets: defaultLatencyBuckets,
+-		latency:        make([]atomic.Uint64, len(defaultLatencyBuckets)),
+-		conn: &StubKMS{
+-			KeyNames: []string{defaultKeyName},
+-		},
+-	}
+-}
+-
+-// StubKMS is a KMS implementation for tests
+-type StubKMS struct {
+-	KeyNames []string
+-}
+-
+-// Version returns the type of the KMS.
+-func (s StubKMS) Version(ctx context.Context) (string, error) {
+-	return "stub", nil
+-}
+-
+-// APIs returns supported APIs
+-func (s StubKMS) APIs(ctx context.Context) ([]madmin.KMSAPI, error) {
+-	return []madmin.KMSAPI{
+-		{Method: http.MethodGet, Path: "stub/path"},
+-	}, nil
+-}
+-
+-// Status returns a set of endpoints and their KMS status.
+-func (s StubKMS) Status(context.Context) (map[string]madmin.ItemState, error) {
+-	return map[string]madmin.ItemState{
+-		"127.0.0.1": madmin.ItemOnline,
+-	}, nil
+-}
+-
+-// ListKeyNames returns a list of key names.
+-func (s StubKMS) ListKeyNames(ctx context.Context, req *ListRequest) ([]string, string, error) {
+-	matches := []string{}
+-	if req.Prefix == "" {
+-		req.Prefix = "*"
+-	}
+-	for _, keyName := range s.KeyNames {
+-		if wildcard.MatchAsPatternPrefix(req.Prefix, keyName) {
+-			matches = append(matches, keyName)
+-		}
+-	}
+-
+-	return matches, "", nil
+-}
+-
+-// CreateKey creates a new key with the given name.
+-func (s *StubKMS) CreateKey(_ context.Context, req *CreateKeyRequest) error {
+-	if s.containsKeyName(req.Name) {
+-		return ErrKeyExists
+-	}
+-	s.KeyNames = append(s.KeyNames, req.Name)
+-	return nil
+-}
+-
+-// GenerateKey is a non-functional stub.
+-func (s StubKMS) GenerateKey(_ context.Context, req *GenerateKeyRequest) (DEK, error) {
+-	if !s.containsKeyName(req.Name) {
+-		return DEK{}, ErrKeyNotFound
+-	}
+-	return DEK{
+-		KeyID:      req.Name,
+-		Version:    0,
+-		Plaintext:  []byte("stubplaincharswhichare32bytelong"),
+-		Ciphertext: []byte("stubplaincharswhichare32bytelong"),
+-	}, nil
+-}
+-
+-// Decrypt is a non-functional stub.
+-func (s StubKMS) Decrypt(_ context.Context, req *DecryptRequest) ([]byte, error) {
+-	return req.Ciphertext, nil
+-}
+-
+-// MAC is a non-functional stub.
+-func (s StubKMS) MAC(_ context.Context, m *MACRequest) ([]byte, error) {
+-	return m.Message, nil
+-}
+-
+-// containsKeyName returns true if the given key name exists in the stub KMS.
+-func (s *StubKMS) containsKeyName(keyName string) bool {
+-	return slices.Contains(s.KeyNames, keyName)
+-}

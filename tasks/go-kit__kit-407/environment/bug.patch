@@ -1,0 +1,329 @@
+diff --git a/examples/addsvc/transport_http.go b/examples/addsvc/transport_http.go
+index 20c8de3..e2d8f6d 100644
+--- a/examples/addsvc/transport_http.go
++++ b/examples/addsvc/transport_http.go
+@@ -47,9 +47,18 @@ func errorEncoder(_ context.Context, err error, w http.ResponseWriter) {
+ 	code := http.StatusInternalServerError
+ 	msg := err.Error()
+ 
+-	switch err {
+-	case ErrTwoZeroes, ErrMaxSizeExceeded, ErrIntOverflow:
+-		code = http.StatusBadRequest
++	if e, ok := err.(httptransport.Error); ok {
++		msg = e.Err.Error()
++		switch e.Domain {
++		case httptransport.DomainDecode:
++			code = http.StatusBadRequest
++
++		case httptransport.DomainDo:
++			switch e.Err {
++			case ErrTwoZeroes, ErrMaxSizeExceeded, ErrIntOverflow:
++				code = http.StatusBadRequest
++			}
++		}
+ 	}
+ 
+ 	w.WriteHeader(code)
+diff --git a/examples/profilesvc/transport.go b/examples/profilesvc/transport.go
+index 5a2284d..aab78ab 100644
+--- a/examples/profilesvc/transport.go
++++ b/examples/profilesvc/transport.go
+@@ -405,6 +405,16 @@ func codeFrom(err error) int {
+ 	case ErrAlreadyExists, ErrInconsistentIDs:
+ 		return http.StatusBadRequest
+ 	default:
++		if e, ok := err.(httptransport.Error); ok {
++			switch e.Domain {
++			case httptransport.DomainDecode:
++				return http.StatusBadRequest
++			case httptransport.DomainDo:
++				return http.StatusServiceUnavailable
++			default:
++				return http.StatusInternalServerError
++			}
++		}
+ 		return http.StatusInternalServerError
+ 	}
+ }
+diff --git a/transport/grpc/client.go b/transport/grpc/client.go
+index ae4672a..2dffb4f 100644
+--- a/transport/grpc/client.go
++++ b/transport/grpc/client.go
+@@ -79,7 +79,7 @@ func (c Client) Endpoint() endpoint.Endpoint {
+ 
+ 		req, err := c.enc(ctx, request)
+ 		if err != nil {
+-			return nil, err
++			return nil, fmt.Errorf("Encode: %v", err)
+ 		}
+ 
+ 		md := &metadata.MD{}
+@@ -90,12 +90,12 @@ func (c Client) Endpoint() endpoint.Endpoint {
+ 
+ 		grpcReply := reflect.New(c.grpcReply).Interface()
+ 		if err = grpc.Invoke(ctx, c.method, req, grpcReply, c.client); err != nil {
+-			return nil, err
++			return nil, fmt.Errorf("Invoke: %v", err)
+ 		}
+ 
+ 		response, err := c.dec(ctx, grpcReply)
+ 		if err != nil {
+-			return nil, err
++			return nil, fmt.Errorf("Decode: %v", err)
+ 		}
+ 		return response, nil
+ 	}
+diff --git a/transport/grpc/server.go b/transport/grpc/server.go
+index 637623b..80b41d8 100644
+--- a/transport/grpc/server.go
++++ b/transport/grpc/server.go
+@@ -92,7 +92,7 @@ func (s Server) ServeGRPC(grpcCtx context.Context, req interface{}) (context.Con
+ 	request, err := s.dec(grpcCtx, req)
+ 	if err != nil {
+ 		s.logger.Log("err", err)
+-		return grpcCtx, nil, err
++		return grpcCtx, nil, BadRequestError{err}
+ 	}
+ 
+ 	response, err := s.e(ctx, request)
+@@ -116,3 +116,13 @@ func (s Server) ServeGRPC(grpcCtx context.Context, req interface{}) (context.Con
+ 
+ 	return grpcCtx, grpcResp, nil
+ }
++
++// BadRequestError is an error in decoding the request.
++type BadRequestError struct {
++	Err error
++}
++
++// Error implements the error interface.
++func (err BadRequestError) Error() string {
++	return err.Err.Error()
++}
+diff --git a/transport/http/client.go b/transport/http/client.go
+index 0d8eb2a..a8aca26 100644
+--- a/transport/http/client.go
++++ b/transport/http/client.go
+@@ -82,11 +82,11 @@ func (c Client) Endpoint() endpoint.Endpoint {
+ 
+ 		req, err := http.NewRequest(c.method, c.tgt.String(), nil)
+ 		if err != nil {
+-			return nil, err
++			return nil, Error{Domain: DomainNewRequest, Err: err}
+ 		}
+ 
+ 		if err = c.enc(ctx, req, request); err != nil {
+-			return nil, err
++			return nil, Error{Domain: DomainEncode, Err: err}
+ 		}
+ 
+ 		for _, f := range c.before {
+@@ -95,7 +95,7 @@ func (c Client) Endpoint() endpoint.Endpoint {
+ 
+ 		resp, err := ctxhttp.Do(ctx, c.client, req)
+ 		if err != nil {
+-			return nil, err
++			return nil, Error{Domain: DomainDo, Err: err}
+ 		}
+ 		if !c.bufferedStream {
+ 			defer resp.Body.Close()
+@@ -107,7 +107,7 @@ func (c Client) Endpoint() endpoint.Endpoint {
+ 
+ 		response, err := c.dec(ctx, resp)
+ 		if err != nil {
+-			return nil, err
++			return nil, Error{Domain: DomainDecode, Err: err}
+ 		}
+ 
+ 		return response, nil
+diff --git a/transport/http/err.go b/transport/http/err.go
+new file mode 100644
+index 0000000..15270c6
+--- /dev/null
++++ b/transport/http/err.go
+@@ -0,0 +1,33 @@
++package http
++
++import (
++	"fmt"
++)
++
++const (
++	// DomainNewRequest is an error during request generation.
++	DomainNewRequest = "NewRequest"
++
++	// DomainEncode is an error during request or response encoding.
++	DomainEncode = "Encode"
++
++	// DomainDo is an error during the execution phase of the request.
++	DomainDo = "Do"
++
++	// DomainDecode is an error during request or response decoding.
++	DomainDecode = "Decode"
++)
++
++// Error is an error that occurred at some phase within the transport.
++type Error struct {
++	// Domain is the phase in which the error was generated.
++	Domain string
++
++	// Err is the concrete error.
++	Err error
++}
++
++// Error implements the error interface.
++func (e Error) Error() string {
++	return fmt.Sprintf("%s: %s", e.Domain, e.Err)
++}
+diff --git a/transport/http/err_test.go b/transport/http/err_test.go
+new file mode 100644
+index 0000000..b0dd6f7
+--- /dev/null
++++ b/transport/http/err_test.go
+@@ -0,0 +1,56 @@
++package http_test
++
++import (
++	"errors"
++	"fmt"
++	"net/http"
++	"net/url"
++	"testing"
++
++	"golang.org/x/net/context"
++
++	httptransport "github.com/go-kit/kit/transport/http"
++)
++
++func TestClientEndpointEncodeError(t *testing.T) {
++	var (
++		sampleErr = errors.New("Oh no, an error")
++		enc       = func(context.Context, *http.Request, interface{}) error { return sampleErr }
++		dec       = func(context.Context, *http.Response) (interface{}, error) { return nil, nil }
++	)
++
++	u := &url.URL{
++		Scheme: "https",
++		Host:   "localhost",
++		Path:   "/does/not/matter",
++	}
++
++	c := httptransport.NewClient(
++		"GET",
++		u,
++		enc,
++		dec,
++	)
++
++	_, err := c.Endpoint()(context.Background(), nil)
++	if err == nil {
++		t.Fatal("err == nil")
++	}
++
++	e, ok := err.(httptransport.Error)
++	if !ok {
++		t.Fatal("err is not of type github.com/go-kit/kit/transport/http.Error")
++	}
++
++	if want, have := sampleErr, e.Err; want != have {
++		t.Fatalf("want %v, have %v", want, have)
++	}
++}
++
++func ExampleErrorOutput() {
++	sampleErr := errors.New("oh no, an error")
++	err := httptransport.Error{Domain: httptransport.DomainDo, Err: sampleErr}
++	fmt.Println(err)
++	// Output:
++	// Do: oh no, an error
++}
+diff --git a/transport/http/server.go b/transport/http/server.go
+index 7d6f21e..db528be 100644
+--- a/transport/http/server.go
++++ b/transport/http/server.go
+@@ -85,14 +85,14 @@ func (s Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	request, err := s.dec(ctx, r)
+ 	if err != nil {
+ 		s.logger.Log("err", err)
+-		s.errorEncoder(ctx, err, w)
++		s.errorEncoder(ctx, Error{Domain: DomainDecode, Err: err}, w)
+ 		return
+ 	}
+ 
+ 	response, err := s.e(ctx, request)
+ 	if err != nil {
+ 		s.logger.Log("err", err)
+-		s.errorEncoder(ctx, err, w)
++		s.errorEncoder(ctx, Error{Domain: DomainDo, Err: err}, w)
+ 		return
+ 	}
+ 
+@@ -102,17 +102,32 @@ func (s Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 
+ 	if err := s.enc(ctx, w, response); err != nil {
+ 		s.logger.Log("err", err)
+-		s.errorEncoder(ctx, err, w)
++		s.errorEncoder(ctx, Error{Domain: DomainEncode, Err: err}, w)
+ 		return
+ 	}
+ }
+ 
+ // ErrorEncoder is responsible for encoding an error to the ResponseWriter.
+-// Users are encouraged to use custom ErrorEncoders to encode HTTP errors to
+-// their clients, and will likely want to pass and check for their own error
+-// types. See the example shipping/handling service.
++//
++// In the server implementation, only kit/transport/http.Error values are ever
++// passed to this function, so you might be tempted to have this function take
++// one of those directly. But, users are encouraged to use custom ErrorEncoders
++// to encode all HTTP errors to their clients, and so may want to pass and check
++// for their own error types. See the example shipping/handling service.
+ type ErrorEncoder func(ctx context.Context, err error, w http.ResponseWriter)
+ 
+ func defaultErrorEncoder(_ context.Context, err error, w http.ResponseWriter) {
+-	http.Error(w, err.Error(), http.StatusInternalServerError)
++	switch e := err.(type) {
++	case Error:
++		switch e.Domain {
++		case DomainDecode:
++			http.Error(w, err.Error(), http.StatusBadRequest)
++		case DomainDo:
++			http.Error(w, err.Error(), http.StatusServiceUnavailable) // too aggressive?
++		default:
++			http.Error(w, err.Error(), http.StatusInternalServerError)
++		}
++	default:
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++	}
+ }
+diff --git a/transport/http/server_test.go b/transport/http/server_test.go
+index 34e1129..752f010 100644
+--- a/transport/http/server_test.go
++++ b/transport/http/server_test.go
+@@ -22,7 +22,7 @@ func TestServerBadDecode(t *testing.T) {
+ 	server := httptest.NewServer(handler)
+ 	defer server.Close()
+ 	resp, _ := http.Get(server.URL)
+-	if want, have := http.StatusInternalServerError, resp.StatusCode; want != have {
++	if want, have := http.StatusBadRequest, resp.StatusCode; want != have {
+ 		t.Errorf("want %d, have %d", want, have)
+ 	}
+ }
+@@ -37,7 +37,7 @@ func TestServerBadEndpoint(t *testing.T) {
+ 	server := httptest.NewServer(handler)
+ 	defer server.Close()
+ 	resp, _ := http.Get(server.URL)
+-	if want, have := http.StatusInternalServerError, resp.StatusCode; want != have {
++	if want, have := http.StatusServiceUnavailable, resp.StatusCode; want != have {
+ 		t.Errorf("want %d, have %d", want, have)
+ 	}
+ }
+@@ -60,7 +60,7 @@ func TestServerBadEncode(t *testing.T) {
+ func TestServerErrorEncoder(t *testing.T) {
+ 	errTeapot := errors.New("teapot")
+ 	code := func(err error) int {
+-		if err == errTeapot {
++		if e, ok := err.(httptransport.Error); ok && e.Err == errTeapot {
+ 			return http.StatusTeapot
+ 		}
+ 		return http.StatusInternalServerError

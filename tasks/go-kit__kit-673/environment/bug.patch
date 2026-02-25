@@ -1,0 +1,182 @@
+diff --git a/examples/addsvc/pkg/addtransport/jsonrpc.go b/examples/addsvc/pkg/addtransport/jsonrpc.go
+index a23cead..9508e81 100644
+--- a/examples/addsvc/pkg/addtransport/jsonrpc.go
++++ b/examples/addsvc/pkg/addtransport/jsonrpc.go
+@@ -137,12 +137,9 @@ func encodeSumResponse(_ context.Context, obj interface{}) (json.RawMessage, err
+ 	return b, nil
+ }
+ 
+-func decodeSumResponse(_ context.Context, res jsonrpc.Response) (interface{}, error) {
+-	if res.Error != nil {
+-		return nil, *res.Error
+-	}
+-	var sumres addendpoint.SumResponse
+-	err := json.Unmarshal(res.Result, &sumres)
++func decodeSumResponse(_ context.Context, msg json.RawMessage) (interface{}, error) {
++	var res addendpoint.SumResponse
++	err := json.Unmarshal(msg, &res)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("couldn't unmarshal body to SumResponse: %s", err)
+ 	}
+@@ -188,12 +185,9 @@ func encodeConcatResponse(_ context.Context, obj interface{}) (json.RawMessage,
+ 	return b, nil
+ }
+ 
+-func decodeConcatResponse(_ context.Context, res jsonrpc.Response) (interface{}, error) {
+-	if res.Error != nil {
+-		return nil, *res.Error
+-	}
+-	var concatres addendpoint.ConcatResponse
+-	err := json.Unmarshal(res.Result, &concatres)
++func decodeConcatResponse(_ context.Context, msg json.RawMessage) (interface{}, error) {
++	var res addendpoint.ConcatResponse
++	err := json.Unmarshal(msg, &res)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("couldn't unmarshal body to ConcatResponse: %s", err)
+ 	}
+diff --git a/transport/http/jsonrpc/client.go b/transport/http/jsonrpc/client.go
+index de17fd5..ca57bbf 100644
+--- a/transport/http/jsonrpc/client.go
++++ b/transport/http/jsonrpc/client.go
+@@ -67,14 +67,10 @@ func DefaultRequestEncoder(_ context.Context, req interface{}) (json.RawMessage,
+ 	return json.Marshal(req)
+ }
+ 
+-// DefaultResponseDecoder unmarshals the result to interface{}, or returns an
+-// error, if found.
+-func DefaultResponseDecoder(_ context.Context, res Response) (interface{}, error) {
+-	if res.Error != nil {
+-		return nil, *res.Error
+-	}
++// DefaultResponseDecoder unmarshals the given JSON to interface{}.
++func DefaultResponseDecoder(_ context.Context, res json.RawMessage) (interface{}, error) {
+ 	var result interface{}
+-	err := json.Unmarshal(res.Result, &result)
++	err := json.Unmarshal(res, &result)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -207,7 +203,7 @@ func (c Client) Endpoint() endpoint.Endpoint {
+ 			ctx = f(ctx, resp)
+ 		}
+ 
+-		return c.dec(ctx, rpcRes)
++		return c.dec(ctx, rpcRes.Result)
+ 	}
+ }
+ 
+diff --git a/transport/http/jsonrpc/client_test.go b/transport/http/jsonrpc/client_test.go
+index 3b4f1ea..fe42f23 100644
+--- a/transport/http/jsonrpc/client_test.go
++++ b/transport/http/jsonrpc/client_test.go
+@@ -62,12 +62,12 @@ func TestClientHappyPath(t *testing.T) {
+ 		fin             = func(ctx context.Context, err error) {
+ 			finalizerCalled = true
+ 		}
+-		decode = func(ctx context.Context, res jsonrpc.Response) (interface{}, error) {
++		decode = func(ctx context.Context, res json.RawMessage) (interface{}, error) {
+ 			if ac := ctx.Value(afterCalledKey); ac == nil {
+ 				t.Fatal("after not called")
+ 			}
+ 			var result int
+-			err := json.Unmarshal(res.Result, &result)
++			err := json.Unmarshal(res, &result)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+@@ -206,51 +206,6 @@ func TestCanUseDefaults(t *testing.T) {
+ 	}
+ }
+ 
+-func TestClientCanHandleJSONRPCError(t *testing.T) {
+-	var testbody = `{
+-		"jsonrpc": "2.0",
+-		"error": {
+-			"code": -32603,
+-			"message": "Bad thing happened."
+-		}
+-	}`
+-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		w.WriteHeader(http.StatusOK)
+-		w.Write([]byte(testbody))
+-	}))
+-
+-	sut := jsonrpc.NewClient(mustParse(server.URL), "add")
+-
+-	_, err := sut.Endpoint()(context.Background(), 5)
+-	if err == nil {
+-		t.Fatal("Expected error, got none.")
+-	}
+-
+-	{
+-		want := "Bad thing happened."
+-		got := err.Error()
+-		if got != want {
+-			t.Fatalf("error message: want=%s, got=%s", want, got)
+-		}
+-	}
+-
+-	type errorCoder interface {
+-		ErrorCode() int
+-	}
+-	ec, ok := err.(errorCoder)
+-	if !ok {
+-		t.Fatal("Error is not errorCoder")
+-	}
+-
+-	{
+-		want := -32603
+-		got := ec.ErrorCode()
+-		if got != want {
+-			t.Fatalf("error code: want=%d, got=%d", want, got)
+-		}
+-	}
+-}
+-
+ func TestDefaultAutoIncrementer(t *testing.T) {
+ 	sut := jsonrpc.NewAutoIncrementID(0)
+ 	var want uint64
+diff --git a/transport/http/jsonrpc/encode_decode.go b/transport/http/jsonrpc/encode_decode.go
+index 1a02ec1..ab7612e 100644
+--- a/transport/http/jsonrpc/encode_decode.go
++++ b/transport/http/jsonrpc/encode_decode.go
+@@ -20,13 +20,13 @@ type EndpointCodec struct {
+ // EndpointCodecMap maps the Request.Method to the proper EndpointCodec
+ type EndpointCodecMap map[string]EndpointCodec
+ 
+-// DecodeRequestFunc extracts a user-domain request object from raw JSON
+-// It's designed to be used in JSON RPC servers, for server-side endpoints.
++// DecodeRequestFunc extracts a user-domain request object from an raw JSON
++// It's designed to be used in HTTP servers, for server-side endpoints.
+ // One straightforward DecodeRequestFunc could be something that unmarshals
+ // JSON from the request body to the concrete request type.
+ type DecodeRequestFunc func(context.Context, json.RawMessage) (request interface{}, err error)
+ 
+-// EncodeResponseFunc encodes the passed response object to a JSON RPC result.
++// EncodeResponseFunc encodes the passed response object to a JSON RPC response.
+ // It's designed to be used in HTTP servers, for server-side endpoints.
+ // One straightforward EncodeResponseFunc could be something that JSON encodes
+ // the object directly.
+@@ -34,15 +34,15 @@ type EncodeResponseFunc func(context.Context, interface{}) (response json.RawMes
+ 
+ // Client-Side Codec
+ 
+-// EncodeRequestFunc encodes the given request object to raw JSON.
++// EncodeRequestFunc encodes the passed request object to raw JSON.
+ // It's designed to be used in JSON RPC clients, for client-side
+ // endpoints. One straightforward EncodeResponseFunc could be something that
+ // JSON encodes the object directly.
+ type EncodeRequestFunc func(context.Context, interface{}) (request json.RawMessage, err error)
+ 
+-// DecodeResponseFunc extracts a user-domain response object from an JSON RPC
+-// response object. It's designed to be used in JSON RPC clients, for
+-// client-side endpoints. It is the responsibility of this function to decide
+-// whether any error present in the JSON RPC response should be surfaced to the
+-// client endpoint.
+-type DecodeResponseFunc func(context.Context, Response) (response interface{}, err error)
++// DecodeResponseFunc extracts a user-domain response object from an HTTP
++// request object. It's designed to be used in JSON RPC clients, for
++// client-side endpoints. One straightforward DecodeRequestFunc could be
++// something that JSON decodes from the request body to the concrete
++// response type.
++type DecodeResponseFunc func(context.Context, json.RawMessage) (response interface{}, err error)

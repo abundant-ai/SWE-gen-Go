@@ -1,0 +1,254 @@
+diff --git a/cmd/background-newdisks-heal-ops.go b/cmd/background-newdisks-heal-ops.go
+index 8cf612c1d..a9d5e55e0 100644
+--- a/cmd/background-newdisks-heal-ops.go
++++ b/cmd/background-newdisks-heal-ops.go
+@@ -365,7 +365,7 @@ func getLocalDisksToHeal() (disksToHeal Endpoints) {
+ 	localDrives := cloneDrives(globalLocalDrives)
+ 	globalLocalDrivesMu.RUnlock()
+ 	for _, disk := range localDrives {
+-		_, err := disk.DiskInfo(context.Background(), DiskInfoOptions{})
++		_, err := disk.GetDiskID()
+ 		if errors.Is(err, errUnformattedDisk) {
+ 			disksToHeal = append(disksToHeal, disk.Endpoint())
+ 			continue
+@@ -393,17 +393,6 @@ func healFreshDisk(ctx context.Context, z *erasureServerPools, endpoint Endpoint
+ 		return fmt.Errorf("Unexpected error disk must be initialized by now after formatting: %s", endpoint)
+ 	}
+ 
+-	_, err := disk.DiskInfo(ctx, DiskInfoOptions{})
+-	if err != nil {
+-		if errors.Is(err, errDriveIsRoot) {
+-			// This is a root drive, ignore and move on
+-			return nil
+-		}
+-		if !errors.Is(err, errUnformattedDisk) {
+-			return err
+-		}
+-	}
+-
+ 	// Prevent parallel erasure set healing
+ 	locker := z.NewNSLock(minioMetaBucket, fmt.Sprintf("new-drive-healing/%d/%d", poolIdx, setIdx))
+ 	lkctx, err := locker.GetLock(ctx, newDiskHealingTimeout)
+diff --git a/cmd/erasure-sets.go b/cmd/erasure-sets.go
+index 61856cfcf..bb2b7cedc 100644
+--- a/cmd/erasure-sets.go
++++ b/cmd/erasure-sets.go
+@@ -120,6 +120,13 @@ func connectEndpoint(endpoint Endpoint) (StorageAPI, *formatErasureV3, error) {
+ 
+ 	format, err := loadFormatErasure(disk, false)
+ 	if err != nil {
++		if errors.Is(err, errUnformattedDisk) {
++			info, derr := disk.DiskInfo(context.TODO(), DiskInfoOptions{})
++			if derr != nil && info.RootDisk {
++				disk.Close()
++				return nil, nil, fmt.Errorf("Drive: %s is a root drive", disk)
++			}
++		}
+ 		disk.Close()
+ 		return nil, nil, fmt.Errorf("Drive: %s returned %w", disk, err) // make sure to '%w' to wrap the error
+ 	}
+@@ -223,7 +230,7 @@ func (s *erasureSets) connectDisks() {
+ 			if err != nil {
+ 				if endpoint.IsLocal && errors.Is(err, errUnformattedDisk) {
+ 					globalBackgroundHealState.pushHealLocalDisks(endpoint)
+-				} else if !errors.Is(err, errDriveIsRoot) {
++				} else {
+ 					printEndpointError(endpoint, err, true)
+ 				}
+ 				return
+diff --git a/cmd/erasure.go b/cmd/erasure.go
+index cc851d625..08e26bd27 100644
+--- a/cmd/erasure.go
++++ b/cmd/erasure.go
+@@ -102,8 +102,6 @@ func diskErrToDriveState(err error) (state string) {
+ 		state = madmin.DriveStatePermission
+ 	case errors.Is(err, errFaultyDisk):
+ 		state = madmin.DriveStateFaulty
+-	case errors.Is(err, errDriveIsRoot):
+-		state = madmin.DriveStateRootMount
+ 	case err == nil:
+ 		state = madmin.DriveStateOk
+ 	default:
+diff --git a/cmd/update_test.go b/cmd/update_test.go
+index 3f6681aff..d36dcd696 100644
+--- a/cmd/update_test.go
++++ b/cmd/update_test.go
+@@ -98,6 +98,12 @@ func TestReleaseTagToNFromTimeConversion(t *testing.T) {
+ }
+ 
+ func TestDownloadURL(t *testing.T) {
++	sci := globalIsCICD
++	globalIsCICD = false
++	defer func() {
++		globalIsCICD = sci
++	}()
++
+ 	minioVersion1 := releaseTimeToReleaseTag(UTCNow())
+ 	durl := getDownloadURL(minioVersion1)
+ 	if IsDocker() {
+@@ -158,6 +164,9 @@ func TestUserAgent(t *testing.T) {
+ 	}
+ 
+ 	for i, testCase := range testCases {
++		sci := globalIsCICD
++		globalIsCICD = false
++
+ 		if testCase.envName != "" {
+ 			t.Setenv(testCase.envName, testCase.envValue)
+ 			if testCase.envName == "MESOS_CONTAINER_NAME" {
+@@ -173,6 +182,7 @@ func TestUserAgent(t *testing.T) {
+ 		if !strings.Contains(str, expectedStr) {
+ 			t.Errorf("Test %d: expected: %s, got: %s", i+1, expectedStr, str)
+ 		}
++		globalIsCICD = sci
+ 		os.Unsetenv("MARATHON_APP_LABEL_DCOS_PACKAGE_VERSION")
+ 		os.Unsetenv(testCase.envName)
+ 	}
+@@ -180,6 +190,12 @@ func TestUserAgent(t *testing.T) {
+ 
+ // Tests if the environment we are running is in DCOS.
+ func TestIsDCOS(t *testing.T) {
++	sci := globalIsCICD
++	globalIsCICD = false
++	defer func() {
++		globalIsCICD = sci
++	}()
++
+ 	t.Setenv("MESOS_CONTAINER_NAME", "mesos-1111")
+ 	dcos := IsDCOS()
+ 	if !dcos {
+@@ -194,6 +210,12 @@ func TestIsDCOS(t *testing.T) {
+ 
+ // Tests if the environment we are running is in kubernetes.
+ func TestIsKubernetes(t *testing.T) {
++	sci := globalIsCICD
++	globalIsCICD = false
++	defer func() {
++		globalIsCICD = sci
++	}()
++
+ 	t.Setenv("KUBERNETES_SERVICE_HOST", "10.11.148.5")
+ 	kubernetes := IsKubernetes()
+ 	if !kubernetes {
+diff --git a/cmd/xl-storage.go b/cmd/xl-storage.go
+index b6b8a1bcd..dab2bb622 100644
+--- a/cmd/xl-storage.go
++++ b/cmd/xl-storage.go
+@@ -236,17 +236,30 @@ func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
+ 		return s, err
+ 	}
+ 
+-	info, rootDrive, err := getDiskInfo(s.drivePath)
++	info, err := disk.GetInfo(s.drivePath, true)
+ 	if err != nil {
+ 		return s, err
+ 	}
+-
+ 	s.major = info.Major
+ 	s.minor = info.Minor
+ 	s.fsType = info.FSType
+ 
+-	if rootDrive {
+-		return s, errDriveIsRoot
++	if !globalIsCICD && !globalIsErasureSD {
++		var rootDrive bool
++		if globalRootDiskThreshold > 0 {
++			// Use MINIO_ROOTDISK_THRESHOLD_SIZE to figure out if
++			// this disk is a root disk. treat those disks with
++			// size less than or equal to the threshold as rootDrives.
++			rootDrive = info.Total <= globalRootDiskThreshold
++		} else {
++			rootDrive, err = disk.IsRootDisk(s.drivePath, SlashSeparator)
++			if err != nil {
++				return nil, err
++			}
++		}
++		if rootDrive {
++			return s, errDriveIsRoot
++		}
+ 	}
+ 
+ 	// Sanitize before setting it
+@@ -320,11 +333,10 @@ func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
+ 	s.diskInfoCache.InitOnce(time.Second, cachevalue.Opts{},
+ 		func(ctx context.Context) (DiskInfo, error) {
+ 			dcinfo := DiskInfo{}
+-			di, root, err := getDiskInfo(s.drivePath)
++			di, err := getDiskInfo(s.drivePath)
+ 			if err != nil {
+ 				return dcinfo, err
+ 			}
+-			dcinfo.RootDisk = root
+ 			dcinfo.Major = di.Major
+ 			dcinfo.Minor = di.Minor
+ 			dcinfo.Total = di.Total
+@@ -333,10 +345,6 @@ func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
+ 			dcinfo.UsedInodes = di.Files - di.Ffree
+ 			dcinfo.FreeInodes = di.Ffree
+ 			dcinfo.FSType = di.FSType
+-			if root {
+-				return dcinfo, errDriveIsRoot
+-			}
+-
+ 			diskID, err := s.GetDiskID()
+ 			// Healing is 'true' when
+ 			// - if we found an unformatted disk (no 'format.json')
+@@ -352,22 +360,10 @@ func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
+ }
+ 
+ // getDiskInfo returns given disk information.
+-func getDiskInfo(drivePath string) (di disk.Info, rootDrive bool, err error) {
++func getDiskInfo(drivePath string) (di disk.Info, err error) {
+ 	if err = checkPathLength(drivePath); err == nil {
+ 		di, err = disk.GetInfo(drivePath, false)
+-
+-		if !globalIsCICD && !globalIsErasureSD {
+-			if globalRootDiskThreshold > 0 {
+-				// Use MINIO_ROOTDISK_THRESHOLD_SIZE to figure out if
+-				// this disk is a root disk. treat those disks with
+-				// size less than or equal to the threshold as rootDrives.
+-				rootDrive = di.Total <= globalRootDiskThreshold
+-			} else {
+-				rootDrive, err = disk.IsRootDisk(drivePath, SlashSeparator)
+-			}
+-		}
+ 	}
+-
+ 	switch {
+ 	case osIsNotExist(err):
+ 		err = errDiskNotFound
+@@ -377,7 +373,7 @@ func getDiskInfo(drivePath string) (di disk.Info, rootDrive bool, err error) {
+ 		err = errFaultyDisk
+ 	}
+ 
+-	return
++	return di, err
+ }
+ 
+ // Implements stringer compatible interface.
+diff --git a/cmd/xl-storage_test.go b/cmd/xl-storage_test.go
+index bd03aadf7..d78768483 100644
+--- a/cmd/xl-storage_test.go
++++ b/cmd/xl-storage_test.go
+@@ -196,7 +196,7 @@ func TestXLStorageGetDiskInfo(t *testing.T) {
+ 
+ 	// Check test cases.
+ 	for _, testCase := range testCases {
+-		if _, _, err := getDiskInfo(testCase.diskPath); err != testCase.expectedErr {
++		if _, err := getDiskInfo(testCase.diskPath); err != testCase.expectedErr {
+ 			t.Fatalf("expected: %s, got: %s", testCase.expectedErr, err)
+ 		}
+ 	}
+diff --git a/go.sum b/go.sum
+index 9416f2064..f80e4307d 100644
+--- a/go.sum
++++ b/go.sum
+@@ -456,6 +456,8 @@ github.com/minio/kms-go/kes v0.3.0 h1:SU8VGVM/Hk9w1OiSby3OatkcojooUqIdDHl6dtM6Nk
+ github.com/minio/kms-go/kes v0.3.0/go.mod h1:w6DeVT878qEOU3nUrYVy1WOT5H1Ig9hbDIh698NYJKY=
+ github.com/minio/kms-go/kms v0.4.0 h1:cLPZceEp+05xHotVBaeFJrgL7JcXM4lBy6PU0idkE7I=
+ github.com/minio/kms-go/kms v0.4.0/go.mod h1:q12CehiIy2qgBnDKq6Q7wmPi2PHSyRVug5DKp0HAVeE=
++github.com/minio/madmin-go/v3 v3.0.57 h1:fXoOnYP8/k9x0MWWowXkAQWYu59hongieCcT3urUaAQ=
++github.com/minio/madmin-go/v3 v3.0.57/go.mod h1:IFAwr0XMrdsLovxAdCcuq/eoL4nRuMVQQv0iubJANQw=
+ github.com/minio/madmin-go/v3 v3.0.58-0.20240701162942-671010069ecb h1:6Hx1+R0GR79Vt4gOKgadH4OG8tkrq/UNyxfmR1C7C14=
+ github.com/minio/madmin-go/v3 v3.0.58-0.20240701162942-671010069ecb/go.mod h1:IFAwr0XMrdsLovxAdCcuq/eoL4nRuMVQQv0iubJANQw=
+ github.com/minio/mc v0.0.0-20240612143403-e7c9a733c680 h1:Ns5mhSm86qJx6a9GJ1kzHkZMjRMZrQGsptakVRmq4QA=

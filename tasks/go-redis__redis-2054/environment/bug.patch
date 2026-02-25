@@ -1,0 +1,333 @@
+diff --git a/internal/pool/conn_check.go b/internal/pool/conn_check.go
+deleted file mode 100644
+index 1afdd6fe..00000000
+--- a/internal/pool/conn_check.go
++++ /dev/null
+@@ -1,49 +0,0 @@
+-// +build linux darwin dragonfly freebsd netbsd openbsd solaris illumos
+-
+-package pool
+-
+-import (
+-	"errors"
+-	"io"
+-	"net"
+-	"syscall"
+-	"time"
+-)
+-
+-var errUnexpectedRead = errors.New("unexpected read from socket")
+-
+-func connCheck(conn net.Conn) error {
+-	// Reset previous timeout.
+-	_ = conn.SetDeadline(time.Time{})
+-
+-	sysConn, ok := conn.(syscall.Conn)
+-	if !ok {
+-		return nil
+-	}
+-	rawConn, err := sysConn.SyscallConn()
+-	if err != nil {
+-		return err
+-	}
+-
+-	var sysErr error
+-	err = rawConn.Read(func(fd uintptr) bool {
+-		var buf [1]byte
+-		n, err := syscall.Read(int(fd), buf[:])
+-		switch {
+-		case n == 0 && err == nil:
+-			sysErr = io.EOF
+-		case n > 0:
+-			sysErr = errUnexpectedRead
+-		case err == syscall.EAGAIN || err == syscall.EWOULDBLOCK:
+-			sysErr = nil
+-		default:
+-			sysErr = err
+-		}
+-		return true
+-	})
+-	if err != nil {
+-		return err
+-	}
+-
+-	return sysErr
+-}
+\ No newline at end of file
+diff --git a/internal/pool/conn_check_dummy.go b/internal/pool/conn_check_dummy.go
+deleted file mode 100644
+index e7d62808..00000000
+--- a/internal/pool/conn_check_dummy.go
++++ /dev/null
+@@ -1,9 +0,0 @@
+-// +build !linux,!darwin,!dragonfly,!freebsd,!netbsd,!openbsd,!solaris,!illumos
+-
+-package pool
+-
+-import "net"
+-
+-func connCheck(conn net.Conn) error {
+-	return nil
+-}
+\ No newline at end of file
+diff --git a/internal/pool/conn_check_test.go b/internal/pool/conn_check_test.go
+deleted file mode 100644
+index 6adfc3d0..00000000
+--- a/internal/pool/conn_check_test.go
++++ /dev/null
+@@ -1,48 +0,0 @@
+-//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd || solaris || illumos
+-// +build linux darwin dragonfly freebsd netbsd openbsd solaris illumos
+-
+-package pool
+-
+-import (
+-	"net"
+-	"net/http/httptest"
+-	"time"
+-
+-	. "github.com/onsi/ginkgo"
+-	. "github.com/onsi/gomega"
+-)
+-
+-var _ = Describe("tests conn_check with real conns", func() {
+-	var ts *httptest.Server
+-	var conn net.Conn
+-	var err error
+-
+-	BeforeEach(func() {
+-		ts = httptest.NewServer(nil)
+-		conn, err = net.DialTimeout(ts.Listener.Addr().Network(), ts.Listener.Addr().String(), time.Second)
+-		Expect(err).NotTo(HaveOccurred())
+-	})
+-
+-	AfterEach(func() {
+-		ts.Close()
+-	})
+-
+-	It("good conn check", func() {
+-		Expect(connCheck(conn)).NotTo(HaveOccurred())
+-
+-		Expect(conn.Close()).NotTo(HaveOccurred())
+-		Expect(connCheck(conn)).To(HaveOccurred())
+-	})
+-
+-	It("bad conn check", func() {
+-		Expect(conn.Close()).NotTo(HaveOccurred())
+-		Expect(connCheck(conn)).To(HaveOccurred())
+-	})
+-
+-	It("check conn deadline", func() {
+-		Expect(conn.SetDeadline(time.Now())).NotTo(HaveOccurred())
+-		time.Sleep(time.Millisecond * 10)
+-		Expect(connCheck(conn)).NotTo(HaveOccurred())
+-		Expect(conn.Close()).NotTo(HaveOccurred())
+-	})
+-})
+diff --git a/internal/pool/export_test.go b/internal/pool/export_test.go
+index 18c6bbd5..75dd4ad6 100644
+--- a/internal/pool/export_test.go
++++ b/internal/pool/export_test.go
+@@ -1,14 +1,9 @@
+ package pool
+ 
+ import (
+-	"net"
+ 	"time"
+ )
+ 
+ func (cn *Conn) SetCreatedAt(tm time.Time) {
+ 	cn.createdAt = tm
+ }
+-
+-func (cn *Conn) NetConn() net.Conn {
+-	return cn.netConn
+-}
+\ No newline at end of file
+diff --git a/internal/pool/main_test.go b/internal/pool/main_test.go
+index c54a38d5..2365dbc6 100644
+--- a/internal/pool/main_test.go
++++ b/internal/pool/main_test.go
+@@ -2,12 +2,9 @@ package pool_test
+ 
+ import (
+ 	"context"
+-	"fmt"
+ 	"net"
+ 	"sync"
+-	"syscall"
+ 	"testing"
+-	"time"
+ 
+ 	. "github.com/onsi/ginkgo"
+ 	. "github.com/onsi/gomega"
+@@ -35,87 +32,5 @@ func perform(n int, cbs ...func(int)) {
+ }
+ 
+ func dummyDialer(context.Context) (net.Conn, error) {
+-	// return &net.TCPConn{}, nil
+-	return newDummyConn(), nil
+-}
+-
+-func newDummyConn() net.Conn {
+-	return &dummyConn{
+-		rawConn: &dummyRawConn{},
+-	}
+-}
+-
+-var _ net.Conn = (*dummyConn)(nil)
+-var _ syscall.Conn = (*dummyConn)(nil)
+-
+-type dummyConn struct {
+-	rawConn *dummyRawConn
+-}
+-
+-func (d *dummyConn) SyscallConn() (syscall.RawConn, error) {
+-	return d.rawConn, nil
+-}
+-
+-var errDummy = fmt.Errorf("dummyConn err")
+-
+-func (d *dummyConn) Read(b []byte) (n int, err error) {
+-	return 0, errDummy
+-}
+-
+-func (d *dummyConn) Write(b []byte) (n int, err error) {
+-	return 0, errDummy
+-}
+-
+-func (d *dummyConn) Close() error {
+-	d.rawConn.Close()
+-	return nil
+-}
+-
+-func (d *dummyConn) LocalAddr() net.Addr {
+-	return &net.TCPAddr{}
+-}
+-
+-func (d *dummyConn) RemoteAddr() net.Addr {
+-	return &net.TCPAddr{}
+-}
+-
+-func (d *dummyConn) SetDeadline(t time.Time) error {
+-	return nil
+-}
+-
+-func (d *dummyConn) SetReadDeadline(t time.Time) error {
+-	return nil
+-}
+-
+-func (d *dummyConn) SetWriteDeadline(t time.Time) error {
+-	return nil
+-}
+-
+-var _ syscall.RawConn = (*dummyRawConn)(nil)
+-
+-type dummyRawConn struct {
+-	closed bool
+-	mux    sync.Mutex
+-}
+-
+-func (d *dummyRawConn) Control(f func(fd uintptr)) error {
+-	return nil
+-}
+-
+-func (d *dummyRawConn) Read(f func(fd uintptr) (done bool)) error {
+-	d.mux.Lock()
+-	defer d.mux.Unlock()
+-	if d.closed {
+-		return fmt.Errorf("dummyRawConn closed")
+-	}
+-	return nil
+-}
+-
+-func (d *dummyRawConn) Write(f func(fd uintptr) (done bool)) error {
+-	return nil
+-}
+-func (d *dummyRawConn) Close() {
+-	d.mux.Lock()
+-	d.closed = true
+-	d.mux.Unlock()
++	return &net.TCPConn{}, nil
+ }
+diff --git a/internal/pool/pool.go b/internal/pool/pool.go
+index 3a6ecb27..44a4e779 100644
+--- a/internal/pool/pool.go
++++ b/internal/pool/pool.go
+@@ -542,7 +542,7 @@ func (p *ConnPool) reapStaleConn() *Conn {
+ 
+ func (p *ConnPool) isStaleConn(cn *Conn) bool {
+ 	if p.opt.IdleTimeout == 0 && p.opt.MaxConnAge == 0 {
+-		return connCheck(cn.netConn) != nil
++		return false
+ 	}
+ 
+ 	now := time.Now()
+@@ -553,5 +553,5 @@ func (p *ConnPool) isStaleConn(cn *Conn) bool {
+ 		return true
+ 	}
+ 
+-	return connCheck(cn.netConn) != nil
++	return false
+ }
+diff --git a/internal/pool/pool_test.go b/internal/pool/pool_test.go
+index d0fbfe19..423a783c 100644
+--- a/internal/pool/pool_test.go
++++ b/internal/pool/pool_test.go
+@@ -323,8 +323,6 @@ var _ = Describe("conns reaper", func() {
+ 					cn.SetUsedAt(time.Now().Add(-2 * idleTimeout))
+ 				case "aged":
+ 					cn.SetCreatedAt(time.Now().Add(-2 * maxAge))
+-				case "connCheck":
+-					_ = cn.Close()
+ 				}
+ 				conns = append(conns, cn)
+ 				staleConns = append(staleConns, cn)
+@@ -411,7 +409,6 @@ var _ = Describe("conns reaper", func() {
+ 
+ 	assert("idle")
+ 	assert("aged")
+-	assert("connCheck")
+ })
+ 
+ var _ = Describe("race", func() {
+diff --git a/pool_test.go b/pool_test.go
+index 56d290ce..e297b010 100644
+--- a/pool_test.go
++++ b/pool_test.go
+@@ -87,7 +87,7 @@ var _ = Describe("pool", func() {
+ 		client.Pool().Put(ctx, cn)
+ 
+ 		err = client.Ping(ctx).Err()
+-		Expect(err).NotTo(HaveOccurred())
++		Expect(err).To(MatchError("bad connection"))
+ 
+ 		val, err := client.Ping(ctx).Result()
+ 		Expect(err).NotTo(HaveOccurred())
+diff --git a/sentinel_test.go b/sentinel_test.go
+index dae28fea..cc56cbab 100644
+--- a/sentinel_test.go
++++ b/sentinel_test.go
+@@ -192,7 +192,7 @@ var _ = Describe("NewFailoverClusterClient", func() {
+ 		err = master.Shutdown(ctx).Err()
+ 		Expect(err).NotTo(HaveOccurred())
+ 		Eventually(func() error {
+-			return master.Ping(ctx).Err()
++			return sentinelMaster.Ping(ctx).Err()
+ 		}, "15s", "100ms").Should(HaveOccurred())
+ 
+ 		// Check that client picked up new master.
+diff --git a/tx_test.go b/tx_test.go
+index 030a56cc..7deb2dfd 100644
+--- a/tx_test.go
++++ b/tx_test.go
+@@ -142,6 +142,9 @@ var _ = Describe("Tx", func() {
+ 			return err
+ 		}
+ 
++		err = do()
++		Expect(err).To(MatchError("bad connection"))
++
+ 		err = do()
+ 		Expect(err).NotTo(HaveOccurred())
+ 	})

@@ -1,0 +1,235 @@
+diff --git a/metrics/expvar/expvar.go b/metrics/expvar/expvar.go
+index 5ff6c13..371d103 100644
+--- a/metrics/expvar/expvar.go
++++ b/metrics/expvar/expvar.go
+@@ -19,6 +19,7 @@ package expvar
+ import (
+ 	"expvar"
+ 	"fmt"
++	"sort"
+ 	"strconv"
+ 	"sync"
+ 	"time"
+@@ -65,6 +66,7 @@ func (g *gauge) Name() string                     { return g.name }
+ func (g *gauge) With(metrics.Field) metrics.Gauge { return g }
+ func (g *gauge) Add(delta float64)                { g.v.Add(delta) }
+ func (g *gauge) Set(value float64)                { g.v.Set(value) }
++func (g *gauge) Get() float64                     { return mustParseFloat64(g.v.String()) }
+ 
+ // PublishCallbackGauge publishes a Gauge as an expvar with the given name,
+ // whose value is determined at collect time by the passed callback function.
+@@ -126,8 +128,8 @@ func (h *histogram) Observe(value int64) {
+ 	}
+ }
+ 
+-func (h *histogram) Distribution() []metrics.Bucket {
+-	bars := h.hist.Current.Distribution()
++func (h *histogram) Distribution() ([]metrics.Bucket, []metrics.Quantile) {
++	bars := h.hist.Merge().Distribution()
+ 	buckets := make([]metrics.Bucket, len(bars))
+ 	for i, bar := range bars {
+ 		buckets[i] = metrics.Bucket{
+@@ -136,7 +138,15 @@ func (h *histogram) Distribution() []metrics.Bucket {
+ 			Count: bar.Count,
+ 		}
+ 	}
+-	return buckets
++	quantiles := make([]metrics.Quantile, 0, len(h.gauges))
++	for quantile, gauge := range h.gauges {
++		quantiles = append(quantiles, metrics.Quantile{
++			Quantile: quantile,
++			Value:    int64(gauge.Get()),
++		})
++	}
++	sort.Sort(quantileSlice(quantiles))
++	return buckets, quantiles
+ }
+ 
+ func (h *histogram) rotateLoop(d time.Duration) {
+@@ -146,3 +156,17 @@ func (h *histogram) rotateLoop(d time.Duration) {
+ 		h.mu.Unlock()
+ 	}
+ }
++
++func mustParseFloat64(s string) float64 {
++	f, err := strconv.ParseFloat(s, 64)
++	if err != nil {
++		panic(err)
++	}
++	return f
++}
++
++type quantileSlice []metrics.Quantile
++
++func (a quantileSlice) Len() int           { return len(a) }
++func (a quantileSlice) Less(i, j int) bool { return a[i].Quantile < a[j].Quantile }
++func (a quantileSlice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+diff --git a/metrics/metrics.go b/metrics/metrics.go
+index f126925..3871dd6 100644
+--- a/metrics/metrics.go
++++ b/metrics/metrics.go
+@@ -21,6 +21,7 @@ type Gauge interface {
+ 	With(Field) Gauge
+ 	Set(value float64)
+ 	Add(delta float64)
++	Get() float64
+ }
+ 
+ // Histogram tracks the distribution of a stream of values (e.g. the number of
+@@ -30,7 +31,7 @@ type Histogram interface {
+ 	Name() string
+ 	With(Field) Histogram
+ 	Observe(value int64)
+-	Distribution() []Bucket
++	Distribution() ([]Bucket, []Quantile)
+ }
+ 
+ // Field is a key/value pair associated with an observation for a specific
+@@ -46,3 +47,9 @@ type Bucket struct {
+ 	To    int64
+ 	Count int64
+ }
++
++// Quantile is a pair of quantile (0..100) and its observed maximum value.
++type Quantile struct {
++	Quantile int // 0..100
++	Value    int64
++}
+diff --git a/metrics/multi.go b/metrics/multi.go
+index 42938ac..114d0c1 100644
+--- a/metrics/multi.go
++++ b/metrics/multi.go
+@@ -70,6 +70,10 @@ func (g multiGauge) Add(delta float64) {
+ 	}
+ }
+ 
++func (g multiGauge) Get() float64 {
++	panic("cannot call Get on a MultiGauge")
++}
++
+ type multiHistogram struct {
+ 	name string
+ 	a    []Histogram
+@@ -102,6 +106,7 @@ func (h multiHistogram) Observe(value int64) {
+ 	}
+ }
+ 
+-func (h multiHistogram) Distribution() []Bucket {
+-	return []Bucket{} // TODO(pb): can this be statistically valid?
++func (h multiHistogram) Distribution() ([]Bucket, []Quantile) {
++	// TODO(pb): there may be a way to do this
++	panic("cannot call Distribution on a MultiHistogram")
+ }
+diff --git a/metrics/print.go b/metrics/print.go
+index d22c426..d3feae7 100644
+--- a/metrics/print.go
++++ b/metrics/print.go
+@@ -13,8 +13,11 @@ const (
+ 
+ // PrintDistribution writes a human-readable graph of the distribution to the
+ // passed writer.
+-func PrintDistribution(w io.Writer, name string, buckets []Bucket) {
+-	fmt.Fprintf(w, "name: %v\n", name)
++func PrintDistribution(w io.Writer, h Histogram) {
++	buckets, quantiles := h.Distribution()
++
++	fmt.Fprintf(w, "name: %v\n", h.Name())
++	fmt.Fprintf(w, "quantiles: %v\n", quantiles)
+ 
+ 	var total float64
+ 	for _, bucket := range buckets {
+diff --git a/metrics/prometheus/prometheus.go b/metrics/prometheus/prometheus.go
+index 29968c4..920d4fa 100644
+--- a/metrics/prometheus/prometheus.go
++++ b/metrics/prometheus/prometheus.go
+@@ -86,6 +86,11 @@ func (g prometheusGauge) Add(delta float64) {
+ 	g.GaugeVec.With(prometheus.Labels(g.Pairs)).Add(delta)
+ }
+ 
++func (g prometheusGauge) Get() float64 {
++	// TODO(pb): see https://github.com/prometheus/client_golang/issues/58
++	return 0.0
++}
++
+ // RegisterCallbackGauge registers a Gauge with Prometheus whose value is
+ // determined at collect time by the passed callback function. The callback
+ // determines the value, and fields are ignored, so RegisterCallbackGauge
+@@ -129,9 +134,9 @@ func (s prometheusSummary) Observe(value int64) {
+ 	s.SummaryVec.With(prometheus.Labels(s.Pairs)).Observe(float64(value))
+ }
+ 
+-func (s prometheusSummary) Distribution() []metrics.Bucket {
++func (s prometheusSummary) Distribution() ([]metrics.Bucket, []metrics.Quantile) {
+ 	// TODO(pb): see https://github.com/prometheus/client_golang/issues/58
+-	return []metrics.Bucket{}
++	return []metrics.Bucket{}, []metrics.Quantile{}
+ }
+ 
+ type prometheusHistogram struct {
+@@ -169,9 +174,9 @@ func (h prometheusHistogram) Observe(value int64) {
+ 	h.HistogramVec.With(prometheus.Labels(h.Pairs)).Observe(float64(value))
+ }
+ 
+-func (h prometheusHistogram) Distribution() []metrics.Bucket {
++func (h prometheusHistogram) Distribution() ([]metrics.Bucket, []metrics.Quantile) {
+ 	// TODO(pb): see https://github.com/prometheus/client_golang/issues/58
+-	return []metrics.Bucket{}
++	return []metrics.Bucket{}, []metrics.Quantile{}
+ }
+ 
+ func pairsFrom(fieldKeys []string) map[string]string {
+diff --git a/metrics/statsd/statsd.go b/metrics/statsd/statsd.go
+index 7a02ded..c453857 100644
+--- a/metrics/statsd/statsd.go
++++ b/metrics/statsd/statsd.go
+@@ -17,8 +17,11 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"log"
++	"math"
+ 	"time"
+ 
++	"sync/atomic"
++
+ 	"github.com/go-kit/kit/metrics"
+ )
+ 
+@@ -54,8 +57,9 @@ func (c *statsdCounter) With(metrics.Field) metrics.Counter { return c }
+ func (c *statsdCounter) Add(delta uint64) { c.c <- fmt.Sprintf("%d|c", delta) }
+ 
+ type statsdGauge struct {
+-	key string
+-	g   chan string
++	key       string
++	lastValue uint64 // math.Float64frombits
++	g         chan string
+ }
+ 
+ // NewGauge returns a Gauge that emits values in the statsd protocol to the
+@@ -87,9 +91,14 @@ func (g *statsdGauge) Add(delta float64) {
+ }
+ 
+ func (g *statsdGauge) Set(value float64) {
++	atomic.StoreUint64(&g.lastValue, math.Float64bits(value))
+ 	g.g <- fmt.Sprintf("%f|g", value)
+ }
+ 
++func (g *statsdGauge) Get() float64 {
++	return math.Float64frombits(atomic.LoadUint64(&g.lastValue))
++}
++
+ // NewCallbackGauge emits values in the statsd protocol to the passed writer.
+ // It collects values every scrape interval from the callback. Values are
+ // buffered for the report interval or until the buffer exceeds a max packet
+@@ -149,9 +158,9 @@ func (h *statsdHistogram) Observe(value int64) {
+ 	h.h <- fmt.Sprintf("%d|ms", value)
+ }
+ 
+-func (h *statsdHistogram) Distribution() []metrics.Bucket {
++func (h *statsdHistogram) Distribution() ([]metrics.Bucket, []metrics.Quantile) {
+ 	// TODO(pb): no way to do this without introducing e.g. codahale/hdrhistogram
+-	return []metrics.Bucket{}
++	return []metrics.Bucket{}, []metrics.Quantile{}
+ }
+ 
+ var tick = time.Tick

@@ -1,0 +1,230 @@
+diff --git a/.golangci.yml b/.golangci.yml
+index 1549512..fbc6df7 100644
+--- a/.golangci.yml
++++ b/.golangci.yml
+@@ -9,7 +9,7 @@ linters:
+   disable-all: true
+   enable:
+     # golangci-lint defaults:
+-    # - errcheck TODO: enable errcheck
++    - errcheck
+     - gosimple
+     - govet
+     - ineffassign
+@@ -21,7 +21,7 @@ linters:
+     - nolintlint # lints nolint directives
+     - revive
+ 
+-linter-settings:
++linters-settings:
+   govet:
+     # These govet checks are disabled by default, but they're useful.
+     enable:
+@@ -30,6 +30,24 @@ linter-settings:
+       - sortslice
+       - unusedwrite
+ 
++  errcheck:
++    exclude-functions:
++      # These methods can not fail.
++      # They operate on an in-memory buffer.
++      - (*go.uber.org/zap/buffer.Buffer).Write
++      - (*go.uber.org/zap/buffer.Buffer).WriteByte
++      - (*go.uber.org/zap/buffer.Buffer).WriteString
++
++      - (*go.uber.org/zap/zapio.Writer).Close
++      - (*go.uber.org/zap/zapio.Writer).Sync
++      - (*go.uber.org/zap/zapio.Writer).Write
++      # Write to zapio.Writer cannot fail,
++      # so io.WriteString on it cannot fail.
++      - io.WriteString(*go.uber.org/zap/zapio.Writer)
++
++      # Writing a plain string to a fmt.State cannot fail.
++      - io.WriteString(fmt.State)
++
+ issues:
+   # Print all issues reported by all linters.
+   max-issues-per-linter: 0
+@@ -51,3 +69,9 @@ issues:
+     #   for foo() { }
+     - linters: [revive]
+       text: 'empty-block: this block is empty, you can remove it'
++
++    # Ignore logger.Sync() errcheck failures in example_test.go
++    # since those are intended to be uncomplicated examples.
++    - linters: [errcheck]
++      path: example_test.go
++      text: 'Error return value of `logger.Sync` is not checked'
+diff --git a/error.go b/error.go
+index 38cb768..45f7b83 100644
+--- a/error.go
++++ b/error.go
+@@ -61,9 +61,12 @@ func (errs errArray) MarshalLogArray(arr zapcore.ArrayEncoder) error {
+ 		// allocating, pool the wrapper type.
+ 		elem := _errArrayElemPool.Get()
+ 		elem.error = errs[i]
+-		arr.AppendObject(elem)
++		err := arr.AppendObject(elem)
+ 		elem.error = nil
+ 		_errArrayElemPool.Put(elem)
++		if err != nil {
++			return err
++		}
+ 	}
+ 	return nil
+ }
+diff --git a/http_handler.go b/http_handler.go
+index 632b683..2be8f65 100644
+--- a/http_handler.go
++++ b/http_handler.go
+@@ -69,6 +69,13 @@ import (
+ //
+ //	curl -X PUT localhost:8080/log/level -H "Content-Type: application/json" -d '{"level":"debug"}'
+ func (lvl AtomicLevel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	if err := lvl.serveHTTP(w, r); err != nil {
++		w.WriteHeader(http.StatusInternalServerError)
++		fmt.Fprintf(w, "internal error: %v", err)
++	}
++}
++
++func (lvl AtomicLevel) serveHTTP(w http.ResponseWriter, r *http.Request) error {
+ 	type errorResponse struct {
+ 		Error string `json:"error"`
+ 	}
+@@ -80,19 +87,20 @@ func (lvl AtomicLevel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 
+ 	switch r.Method {
+ 	case http.MethodGet:
+-		enc.Encode(payload{Level: lvl.Level()})
++		return enc.Encode(payload{Level: lvl.Level()})
++
+ 	case http.MethodPut:
+ 		requestedLvl, err := decodePutRequest(r.Header.Get("Content-Type"), r)
+ 		if err != nil {
+ 			w.WriteHeader(http.StatusBadRequest)
+-			enc.Encode(errorResponse{Error: err.Error()})
+-			return
++			return enc.Encode(errorResponse{Error: err.Error()})
+ 		}
+ 		lvl.SetLevel(requestedLvl)
+-		enc.Encode(payload{Level: lvl.Level()})
++		return enc.Encode(payload{Level: lvl.Level()})
++
+ 	default:
+ 		w.WriteHeader(http.StatusMethodNotAllowed)
+-		enc.Encode(errorResponse{
++		return enc.Encode(errorResponse{
+ 			Error: "Only GET and PUT are supported.",
+ 		})
+ 	}
+@@ -129,5 +137,4 @@ func decodePutJSON(body io.Reader) (zapcore.Level, error) {
+ 		return 0, errors.New("must specify logging level")
+ 	}
+ 	return *pld.Level, nil
+-
+ }
+diff --git a/logger.go b/logger.go
+index 32d7372..e9b49cc 100644
+--- a/logger.go
++++ b/logger.go
+@@ -374,7 +374,7 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
+ 	if stack.Count() == 0 {
+ 		if log.addCaller {
+ 			fmt.Fprintf(log.errorOutput, "%v Logger.check error: failed to get caller\n", ent.Time.UTC())
+-			log.errorOutput.Sync()
++			_ = log.errorOutput.Sync()
+ 		}
+ 		return ce
+ 	}
+diff --git a/sink.go b/sink.go
+index 478c9a1..499772a 100644
+--- a/sink.go
++++ b/sink.go
+@@ -66,7 +66,8 @@ func newSinkRegistry() *sinkRegistry {
+ 		factories: make(map[string]func(*url.URL) (Sink, error)),
+ 		openFile:  os.OpenFile,
+ 	}
+-	sr.RegisterSink(schemeFile, sr.newFileSinkFromURL)
++	// Infallible operation: the registry is empty, so we can't have a conflict.
++	_ = sr.RegisterSink(schemeFile, sr.newFileSinkFromURL)
+ 	return sr
+ }
+ 
+@@ -154,7 +155,7 @@ func (sr *sinkRegistry) newFileSinkFromPath(path string) (Sink, error) {
+ 	case "stderr":
+ 		return nopCloserSink{os.Stderr}, nil
+ 	}
+-	return sr.openFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
++	return sr.openFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o666)
+ }
+ 
+ func normalizeScheme(s string) (string, error) {
+diff --git a/writer.go b/writer.go
+index 625b067..06768c6 100644
+--- a/writer.go
++++ b/writer.go
+@@ -62,7 +62,7 @@ func open(paths []string) ([]zapcore.WriteSyncer, func(), error) {
+ 	closers := make([]io.Closer, 0, len(paths))
+ 	closeAll := func() {
+ 		for _, c := range closers {
+-			c.Close()
++			_ = c.Close()
+ 		}
+ 	}
+ 
+diff --git a/zapcore/core.go b/zapcore/core.go
+index 9dfd640..776e93f 100644
+--- a/zapcore/core.go
++++ b/zapcore/core.go
+@@ -102,9 +102,9 @@ func (c *ioCore) Write(ent Entry, fields []Field) error {
+ 		return err
+ 	}
+ 	if ent.Level > ErrorLevel {
+-		// Since we may be crashing the program, sync the output. Ignore Sync
+-		// errors, pending a clean solution to issue #370.
+-		c.Sync()
++		// Since we may be crashing the program, sync the output.
++		// Ignore Sync errors, pending a clean solution to issue #370.
++		_ = c.Sync()
+ 	}
+ 	return nil
+ }
+diff --git a/zapcore/entry.go b/zapcore/entry.go
+index 059844f..459a5d7 100644
+--- a/zapcore/entry.go
++++ b/zapcore/entry.go
+@@ -242,7 +242,7 @@ func (ce *CheckedEntry) Write(fields ...Field) {
+ 			// CheckedEntry is being used after it was returned to the pool,
+ 			// the message may be an amalgamation from multiple call sites.
+ 			fmt.Fprintf(ce.ErrorOutput, "%v Unsafe CheckedEntry re-use near Entry %+v.\n", ce.Time, ce.Entry)
+-			ce.ErrorOutput.Sync()
++			_ = ce.ErrorOutput.Sync() // ignore error
+ 		}
+ 		return
+ 	}
+@@ -254,7 +254,7 @@ func (ce *CheckedEntry) Write(fields ...Field) {
+ 	}
+ 	if err != nil && ce.ErrorOutput != nil {
+ 		fmt.Fprintf(ce.ErrorOutput, "%v write error: %v\n", ce.Time, err)
+-		ce.ErrorOutput.Sync()
++		_ = ce.ErrorOutput.Sync() // ignore error
+ 	}
+ 
+ 	hook := ce.after
+diff --git a/zapcore/error.go b/zapcore/error.go
+index c67dd71..c40df13 100644
+--- a/zapcore/error.go
++++ b/zapcore/error.go
+@@ -98,8 +98,11 @@ func (errs errArray) MarshalLogArray(arr ArrayEncoder) error {
+ 		}
+ 
+ 		el := newErrArrayElem(errs[i])
+-		arr.AppendObject(el)
++		err := arr.AppendObject(el)
+ 		el.Free()
++		if err != nil {
++			return err
++		}
+ 	}
+ 	return nil
+ }

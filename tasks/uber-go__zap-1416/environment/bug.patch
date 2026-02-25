@@ -1,0 +1,225 @@
+diff --git a/logger.go b/logger.go
+index c4d3003..6205fe4 100644
+--- a/logger.go
++++ b/logger.go
+@@ -43,7 +43,6 @@ type Logger struct {
+ 
+ 	development bool
+ 	addCaller   bool
+-	onPanic     zapcore.CheckWriteHook // default is WriteThenPanic
+ 	onFatal     zapcore.CheckWriteHook // default is WriteThenFatal
+ 
+ 	name        string
+@@ -346,12 +345,27 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
+ 	// Set up any required terminal behavior.
+ 	switch ent.Level {
+ 	case zapcore.PanicLevel:
+-		ce = ce.After(ent, terminalHookOverride(zapcore.WriteThenPanic, log.onPanic))
++		ce = ce.After(ent, zapcore.WriteThenPanic)
+ 	case zapcore.FatalLevel:
+-		ce = ce.After(ent, terminalHookOverride(zapcore.WriteThenFatal, log.onFatal))
++		onFatal := log.onFatal
++		// nil or WriteThenNoop will lead to continued execution after
++		// a Fatal log entry, which is unexpected. For example,
++		//
++		//   f, err := os.Open(..)
++		//   if err != nil {
++		//     log.Fatal("cannot open", zap.Error(err))
++		//   }
++		//   fmt.Println(f.Name())
++		//
++		// The f.Name() will panic if we continue execution after the
++		// log.Fatal.
++		if onFatal == nil || onFatal == zapcore.WriteThenNoop {
++			onFatal = zapcore.WriteThenFatal
++		}
++		ce = ce.After(ent, onFatal)
+ 	case zapcore.DPanicLevel:
+ 		if log.development {
+-			ce = ce.After(ent, terminalHookOverride(zapcore.WriteThenPanic, log.onPanic))
++			ce = ce.After(ent, zapcore.WriteThenPanic)
+ 		}
+ 	}
+ 
+@@ -416,20 +430,3 @@ func (log *Logger) check(lvl zapcore.Level, msg string) *zapcore.CheckedEntry {
+ 
+ 	return ce
+ }
+-
+-func terminalHookOverride(defaultHook, override zapcore.CheckWriteHook) zapcore.CheckWriteHook {
+-	// A nil or WriteThenNoop hook will lead to continued execution after
+-	// a Panic or Fatal log entry, which is unexpected. For example,
+-	//
+-	//   f, err := os.Open(..)
+-	//   if err != nil {
+-	//     log.Fatal("cannot open", zap.Error(err))
+-	//   }
+-	//   fmt.Println(f.Name())
+-	//
+-	// The f.Name() will panic if we continue execution after the log.Fatal.
+-	if override == nil || override == zapcore.WriteThenNoop {
+-		return defaultHook
+-	}
+-	return override
+-}
+diff --git a/logger_test.go b/logger_test.go
+index 4a953b6..739aa61 100644
+--- a/logger_test.go
++++ b/logger_test.go
+@@ -836,130 +836,6 @@ func TestLoggerFatalOnNoop(t *testing.T) {
+ 	assert.Equal(t, 1, exitStub.Code, "must exit with status 1 for WriteThenNoop")
+ }
+ 
+-func TestLoggerCustomOnPanic(t *testing.T) {
+-	tests := []struct {
+-		msg          string
+-		level        zapcore.Level
+-		opts         []Option
+-		finished     bool
+-		want         []observer.LoggedEntry
+-		recoverValue any
+-	}{
+-		{
+-			msg:      "panic with nil hook",
+-			level:    PanicLevel,
+-			opts:     opts(WithPanicHook(nil)),
+-			finished: false,
+-			want: []observer.LoggedEntry{
+-				{
+-					Entry:   zapcore.Entry{Level: PanicLevel, Message: "foobar"},
+-					Context: []Field{},
+-				},
+-			},
+-			recoverValue: "foobar",
+-		},
+-		{
+-			msg:      "panic with noop hook",
+-			level:    PanicLevel,
+-			opts:     opts(WithPanicHook(zapcore.WriteThenNoop)),
+-			finished: false,
+-			want: []observer.LoggedEntry{
+-				{
+-					Entry:   zapcore.Entry{Level: PanicLevel, Message: "foobar"},
+-					Context: []Field{},
+-				},
+-			},
+-			recoverValue: "foobar",
+-		},
+-		{
+-			msg:      "no panic with goexit hook",
+-			level:    PanicLevel,
+-			opts:     opts(WithPanicHook(zapcore.WriteThenGoexit)),
+-			finished: false,
+-			want: []observer.LoggedEntry{
+-				{
+-					Entry:   zapcore.Entry{Level: PanicLevel, Message: "foobar"},
+-					Context: []Field{},
+-				},
+-			},
+-			recoverValue: nil,
+-		},
+-		{
+-			msg:      "dpanic no panic in development mode with goexit hook",
+-			level:    DPanicLevel,
+-			opts:     opts(WithPanicHook(zapcore.WriteThenGoexit), Development()),
+-			finished: false,
+-			want: []observer.LoggedEntry{
+-				{
+-					Entry:   zapcore.Entry{Level: DPanicLevel, Message: "foobar"},
+-					Context: []Field{},
+-				},
+-			},
+-			recoverValue: nil,
+-		},
+-		{
+-			msg:      "dpanic panic in development mode with noop hook",
+-			level:    DPanicLevel,
+-			opts:     opts(WithPanicHook(zapcore.WriteThenNoop), Development()),
+-			finished: false,
+-			want: []observer.LoggedEntry{
+-				{
+-					Entry:   zapcore.Entry{Level: DPanicLevel, Message: "foobar"},
+-					Context: []Field{},
+-				},
+-			},
+-			recoverValue: "foobar",
+-		},
+-		{
+-			msg:      "dpanic no exit in production mode with goexit hook",
+-			level:    DPanicLevel,
+-			opts:     opts(WithPanicHook(zapcore.WriteThenPanic)),
+-			finished: true,
+-			want: []observer.LoggedEntry{
+-				{
+-					Entry:   zapcore.Entry{Level: DPanicLevel, Message: "foobar"},
+-					Context: []Field{},
+-				},
+-			},
+-			recoverValue: nil,
+-		},
+-		{
+-			msg:      "dpanic no panic in production mode with panic hook",
+-			level:    DPanicLevel,
+-			opts:     opts(WithPanicHook(zapcore.WriteThenPanic)),
+-			finished: true,
+-			want: []observer.LoggedEntry{
+-				{
+-					Entry:   zapcore.Entry{Level: DPanicLevel, Message: "foobar"},
+-					Context: []Field{},
+-				},
+-			},
+-			recoverValue: nil,
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		t.Run(tt.msg, func(t *testing.T) {
+-			withLogger(t, InfoLevel, tt.opts, func(logger *Logger, logs *observer.ObservedLogs) {
+-				var finished bool
+-				recovered := make(chan any)
+-				go func() {
+-					defer func() {
+-						recovered <- recover()
+-					}()
+-
+-					logger.Log(tt.level, "foobar")
+-					finished = true
+-				}()
+-
+-				assert.Equal(t, tt.recoverValue, <-recovered, "unexpected value from recover()")
+-				assert.Equal(t, tt.finished, finished, "expect goroutine finished state doesn't match")
+-				assert.Equal(t, tt.want, logs.AllUntimed(), "unexpected logs")
+-			})
+-		})
+-	}
+-}
+-
+ func TestLoggerCustomOnFatal(t *testing.T) {
+ 	tests := []struct {
+ 		msg          string
+diff --git a/options.go b/options.go
+index 43d357a..c4f3bca 100644
+--- a/options.go
++++ b/options.go
+@@ -132,21 +132,6 @@ func IncreaseLevel(lvl zapcore.LevelEnabler) Option {
+ 	})
+ }
+ 
+-// WithPanicHook sets a CheckWriteHook to run on Panic/DPanic logs.
+-// Zap will call this hook after writing a log statement with a Panic/DPanic level.
+-//
+-// For example, the following builds a logger that will exit the current
+-// goroutine after writing a Panic/DPanic log message, but it will not start a panic.
+-//
+-//	zap.New(core, zap.WithPanicHook(zapcore.WriteThenGoexit))
+-//
+-// This is useful for testing Panic/DPanic log output.
+-func WithPanicHook(hook zapcore.CheckWriteHook) Option {
+-	return optionFunc(func(log *Logger) {
+-		log.onPanic = hook
+-	})
+-}
+-
+ // OnFatal sets the action to take on fatal logs.
+ //
+ // Deprecated: Use [WithFatalHook] instead.

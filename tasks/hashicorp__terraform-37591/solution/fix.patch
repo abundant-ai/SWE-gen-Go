@@ -1,0 +1,73 @@
+diff --git a/internal/plans/changes_src.go b/internal/plans/changes_src.go
+index e4821e48b7..9d30946e33 100644
+--- a/internal/plans/changes_src.go
++++ b/internal/plans/changes_src.go
+@@ -617,16 +617,28 @@ func (acs *ActionInvocationInstanceSrc) Less(other *ActionInvocationInstanceSrc)
+ 	return acs.ActionTrigger.Less(other.ActionTrigger)
+ }
+ 
++// FilterLaterActionInvocations returns the list of action invocations that
++// should be triggered after this one. This function assumes the supplied list
++// of action invocations has already been filtered to invocations against the
++// same resource as the current invocation.
+ func (acs *ActionInvocationInstanceSrc) FilterLaterActionInvocations(actionInvocations []*ActionInvocationInstanceSrc) []*ActionInvocationInstanceSrc {
+ 	needleLat := acs.ActionTrigger.(*LifecycleActionTrigger)
+ 
+ 	var laterInvocations []*ActionInvocationInstanceSrc
+ 	for _, invocation := range actionInvocations {
+ 		if lat, ok := invocation.ActionTrigger.(*LifecycleActionTrigger); ok {
+-			if lat.TriggeringResourceAddr.Equal(needleLat.TriggeringResourceAddr) && (lat.ActionTriggerBlockIndex > needleLat.ActionTriggerBlockIndex || lat.ActionTriggerBlockIndex == needleLat.ActionTriggerBlockIndex && lat.ActionsListIndex > needleLat.ActionsListIndex) {
++			if sameTriggerEvent(lat, needleLat) && triggersLater(lat, needleLat) {
+ 				laterInvocations = append(laterInvocations, invocation)
+ 			}
+ 		}
+ 	}
+ 	return laterInvocations
+ }
++
++func sameTriggerEvent(one, two *LifecycleActionTrigger) bool {
++	return one.ActionTriggerEvent == two.ActionTriggerEvent
++}
++
++func triggersLater(one, two *LifecycleActionTrigger) bool {
++	return one.ActionTriggerBlockIndex > two.ActionTriggerBlockIndex || (one.ActionTriggerBlockIndex == two.ActionTriggerBlockIndex && one.ActionsListIndex > two.ActionsListIndex)
++}
+diff --git a/internal/terraform/transform_action_diff.go b/internal/terraform/transform_action_diff.go
+index 23a00ed79f..a4a1c2e481 100644
+--- a/internal/terraform/transform_action_diff.go
++++ b/internal/terraform/transform_action_diff.go
+@@ -31,6 +31,7 @@ func (t *ActionDiffTransformer) Transform(g *Graph) error {
+ 	}
+ 
+ 	invocationMap := map[*plans.ActionInvocationInstanceSrc]*nodeActionTriggerApply{}
++	triggerMap := addrs.MakeMap[addrs.AbsResourceInstance, []*plans.ActionInvocationInstanceSrc]()
+ 	for _, action := range t.Changes.ActionInvocations {
+ 		// Add nodes for each action invocation
+ 		node := &nodeActionTriggerApply{
+@@ -55,6 +56,8 @@ func (t *ActionDiffTransformer) Transform(g *Graph) error {
+ 				panic(fmt.Sprintf("Could not find action trigger block %d for resource %s in config", at.ActionTriggerBlockIndex, at.TriggeringResourceAddr.String()))
+ 			}
+ 
++			triggerMap.Put(at.TriggeringResourceAddr, append(triggerMap.Get(at.TriggeringResourceAddr), action))
++
+ 			act := triggerBlock.Actions[at.ActionsListIndex]
+ 			node.ActionTriggerRange = &act.Range
+ 			node.ConditionExpr = triggerBlock.Condition
+@@ -84,14 +87,15 @@ func (t *ActionDiffTransformer) Transform(g *Graph) error {
+ 
+ 	// Find all dependencies between action invocations
+ 	for _, action := range t.Changes.ActionInvocations {
+-		if _, ok := action.ActionTrigger.(*plans.LifecycleActionTrigger); !ok {
++		at, ok := action.ActionTrigger.(*plans.LifecycleActionTrigger)
++		if !ok {
+ 			// only add dependencies between lifecycle actions. invoke actions
+ 			// all act independently.
+ 			continue
+ 		}
+ 
+ 		node := invocationMap[action]
+-		others := action.FilterLaterActionInvocations(t.Changes.ActionInvocations)
++		others := action.FilterLaterActionInvocations(triggerMap.Get(at.TriggeringResourceAddr))
+ 		for _, other := range others {
+ 			otherNode := invocationMap[other]
+ 			g.Connect(dag.BasicEdge(otherNode, node))

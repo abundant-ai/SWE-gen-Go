@@ -1,0 +1,1329 @@
+diff --git a/.changelog/22604.txt b/.changelog/22604.txt
+deleted file mode 100644
+index ca6190add0..0000000000
+--- a/.changelog/22604.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-```release-note:feature
+-config: Add new parameter `max_request_headers_kb` to configure maximum header size for requests from downstream to upstream
+-```
+\ No newline at end of file
+diff --git a/agent/proxycfg/proxycfg.deepcopy.go b/agent/proxycfg/proxycfg.deepcopy.go
+index 636da04e0e..2caf1482ba 100644
+--- a/agent/proxycfg/proxycfg.deepcopy.go
++++ b/agent/proxycfg/proxycfg.deepcopy.go
+@@ -167,10 +167,6 @@ func (o *ConfigSnapshot) DeepCopy() *ConfigSnapshot {
+ 			cp.computedFields.proxyConfig.LocalIdleTimeoutMs = new(int)
+ 			*cp.computedFields.proxyConfig.LocalIdleTimeoutMs = *o.computedFields.proxyConfig.LocalIdleTimeoutMs
+ 		}
+-		if o.computedFields.proxyConfig.MaxRequestHeadersKB != nil {
+-			cp.computedFields.proxyConfig.MaxRequestHeadersKB = new(uint32)
+-			*cp.computedFields.proxyConfig.MaxRequestHeadersKB = *o.computedFields.proxyConfig.MaxRequestHeadersKB
+-		}
+ 	}
+ 	if o.computedFields.gatewayConfig != nil {
+ 		cp.computedFields.gatewayConfig = new(config.GatewayConfig)
+diff --git a/agent/xds/config/config.go b/agent/xds/config/config.go
+index c3339ac23f..ed7da3c61c 100644
+--- a/agent/xds/config/config.go
++++ b/agent/xds/config/config.go
+@@ -122,10 +122,6 @@ type ProxyConfig struct {
+ 	// BalanceInboundConnections indicates how the proxy should attempt to distribute
+ 	// connections across worker threads. Only used by envoy proxies.
+ 	BalanceInboundConnections string `json:",omitempty" alias:"balance_inbound_connections"`
+-
+-	// MaxRequestHeadersKB configures the maximum size in kilobytes for request headers
+-	// sent from downstream clients to upstream services. If not set, uses Envoy's default.
+-	MaxRequestHeadersKB *uint32 `json:",omitempty" mapstructure:"max_request_headers_kb"`
+ }
+ 
+ // ParseProxyConfig returns the ProxyConfig parsed from the an opaque map. If an
+diff --git a/agent/xds/config/config_test.go b/agent/xds/config/config_test.go
+index a1f5867465..79de29e4da 100644
+--- a/agent/xds/config/config_test.go
++++ b/agent/xds/config/config_test.go
+@@ -207,73 +207,6 @@ func TestParseProxyConfig(t *testing.T) {
+ 				BalanceInboundConnections: "exact_balance",
+ 			},
+ 		},
+-		{
+-			name: "max request headers KB override, int",
+-			input: map[string]interface{}{
+-				"max_request_headers_kb": 96,
+-			},
+-			want: ProxyConfig{
+-				LocalConnectTimeoutMs: 5000,
+-				Protocol:              "tcp",
+-				MaxRequestHeadersKB:   uintPointer(96),
+-			},
+-		},
+-		{
+-			name: "max request headers KB override, float",
+-			input: map[string]interface{}{
+-				"max_request_headers_kb": float64(128.0),
+-			},
+-			want: ProxyConfig{
+-				LocalConnectTimeoutMs: 5000,
+-				Protocol:              "tcp",
+-				MaxRequestHeadersKB:   uintPointer(128),
+-			},
+-		},
+-		{
+-			name: "max request headers KB override, string",
+-			input: map[string]interface{}{
+-				"max_request_headers_kb": "256",
+-			},
+-			want: ProxyConfig{
+-				LocalConnectTimeoutMs: 5000,
+-				Protocol:              "tcp",
+-				MaxRequestHeadersKB:   uintPointer(256),
+-			},
+-		},
+-		{
+-			name: "max request headers KB with zero value",
+-			input: map[string]interface{}{
+-				"max_request_headers_kb": 0,
+-			},
+-			want: ProxyConfig{
+-				LocalConnectTimeoutMs: 5000,
+-				Protocol:              "tcp",
+-				MaxRequestHeadersKB:   uintPointer(0),
+-			},
+-		},
+-		{
+-			name: "kitchen sink with max request headers",
+-			input: map[string]interface{}{
+-				"protocol":                    "http",
+-				"bind_address":                "127.0.0.2",
+-				"bind_port":                   8888,
+-				"local_connect_timeout_ms":    1000,
+-				"local_request_timeout_ms":    2000,
+-				"local_idle_timeout_ms":       3000,
+-				"balance_inbound_connections": "exact_balance",
+-				"max_request_headers_kb":      96,
+-			},
+-			want: ProxyConfig{
+-				LocalConnectTimeoutMs:     1000,
+-				LocalRequestTimeoutMs:     intPointer(2000),
+-				LocalIdleTimeoutMs:        intPointer(3000),
+-				Protocol:                  "http",
+-				BindAddress:               "127.0.0.2",
+-				BindPort:                  8888,
+-				BalanceInboundConnections: "exact_balance",
+-				MaxRequestHeadersKB:       uintPointer(96),
+-			},
+-		},
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+@@ -380,10 +313,6 @@ func intPointer(i int) *int {
+ 	return &i
+ }
+ 
+-func uintPointer(i uint32) *uint32 {
+-	return &i
+-}
+-
+ func Test_ProxyConfig_GetXDSFetchTimeout(t *testing.T) {
+ 	tests := map[string]struct {
+ 		conf      map[string]interface{}
+diff --git a/agent/xds/listeners.go b/agent/xds/listeners.go
+index 772ce967f6..f79cf6cedd 100644
+--- a/agent/xds/listeners.go
++++ b/agent/xds/listeners.go
+@@ -176,15 +176,14 @@ func (s *ResourceGenerator) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.
+ 		// Generate the upstream listeners for when they are explicitly set with a local bind port or socket path
+ 		if upstreamCfg != nil && upstreamCfg.HasLocalPortOrSocket() {
+ 			filterChain, err := s.makeUpstreamFilterChain(filterChainOpts{
+-				accessLogs:          &cfgSnap.Proxy.AccessLogs,
+-				routeName:           uid.EnvoyID(),
+-				clusterName:         clusterName,
+-				filterName:          filterName,
+-				protocol:            cfg.Protocol,
+-				useRDS:              useRDS,
+-				fetchTimeoutRDS:     cfgSnap.GetXDSCommonConfig(s.Logger).GetXDSFetchTimeout(),
+-				tracing:             tracing,
+-				maxRequestHeadersKb: proxyCfg.MaxRequestHeadersKB,
++				accessLogs:      &cfgSnap.Proxy.AccessLogs,
++				routeName:       uid.EnvoyID(),
++				clusterName:     clusterName,
++				filterName:      filterName,
++				protocol:        cfg.Protocol,
++				useRDS:          useRDS,
++				fetchTimeoutRDS: cfgSnap.GetXDSCommonConfig(s.Logger).GetXDSFetchTimeout(),
++				tracing:         tracing,
+ 			})
+ 			if err != nil {
+ 				return nil, err
+@@ -211,16 +210,16 @@ func (s *ResourceGenerator) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.
+ 		// The rest of this loop is used exclusively for transparent proxies.
+ 		// Below we create a filter chain per upstream, rather than a listener per upstream
+ 		// as we do for explicit upstreams above.
++
+ 		filterChain, err := s.makeUpstreamFilterChain(filterChainOpts{
+-			accessLogs:          &cfgSnap.Proxy.AccessLogs,
+-			routeName:           uid.EnvoyID(),
+-			clusterName:         clusterName,
+-			filterName:          filterName,
+-			protocol:            cfg.Protocol,
+-			useRDS:              useRDS,
+-			fetchTimeoutRDS:     cfgSnap.GetXDSCommonConfig(s.Logger).GetXDSFetchTimeout(),
+-			tracing:             tracing,
+-			maxRequestHeadersKb: proxyCfg.MaxRequestHeadersKB,
++			accessLogs:      &cfgSnap.Proxy.AccessLogs,
++			routeName:       uid.EnvoyID(),
++			clusterName:     clusterName,
++			filterName:      filterName,
++			protocol:        cfg.Protocol,
++			useRDS:          useRDS,
++			fetchTimeoutRDS: cfgSnap.GetXDSCommonConfig(s.Logger).GetXDSFetchTimeout(),
++			tracing:         tracing,
+ 		})
+ 		if err != nil {
+ 			return nil, err
+@@ -297,14 +296,13 @@ func (s *ResourceGenerator) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.
+ 			const name = "~http" // name used for the shared route name
+ 			routeName := clusterNameForDestination(cfgSnap, name, fmt.Sprintf("%d", svcConfig.Destination.Port), svcConfig.NamespaceOrDefault(), svcConfig.PartitionOrDefault())
+ 			filterChain, err := s.makeUpstreamFilterChain(filterChainOpts{
+-				accessLogs:          &cfgSnap.Proxy.AccessLogs,
+-				routeName:           routeName,
+-				filterName:          routeName,
+-				protocol:            svcConfig.Protocol,
+-				useRDS:              true,
+-				fetchTimeoutRDS:     cfgSnap.GetXDSCommonConfig(s.Logger).GetXDSFetchTimeout(),
+-				tracing:             tracing,
+-				maxRequestHeadersKb: proxyCfg.MaxRequestHeadersKB,
++				accessLogs:      &cfgSnap.Proxy.AccessLogs,
++				routeName:       routeName,
++				filterName:      routeName,
++				protocol:        svcConfig.Protocol,
++				useRDS:          true,
++				fetchTimeoutRDS: cfgSnap.GetXDSCommonConfig(s.Logger).GetXDSFetchTimeout(),
++				tracing:         tracing,
+ 			})
+ 			if err != nil {
+ 				return err
+@@ -317,13 +315,12 @@ func (s *ResourceGenerator) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.
+ 				clusterName := clusterNameForDestination(cfgSnap, uid.Name, address, uid.NamespaceOrDefault(), uid.PartitionOrDefault())
+ 
+ 				filterChain, err := s.makeUpstreamFilterChain(filterChainOpts{
+-					accessLogs:          &cfgSnap.Proxy.AccessLogs,
+-					routeName:           uid.EnvoyID(),
+-					clusterName:         clusterName,
+-					filterName:          clusterName,
+-					protocol:            svcConfig.Protocol,
+-					tracing:             tracing,
+-					maxRequestHeadersKb: proxyCfg.MaxRequestHeadersKB,
++					accessLogs:  &cfgSnap.Proxy.AccessLogs,
++					routeName:   uid.EnvoyID(),
++					clusterName: clusterName,
++					filterName:  clusterName,
++					protocol:    svcConfig.Protocol,
++					tracing:     tracing,
+ 				})
+ 				if err != nil {
+ 					return err
+@@ -403,11 +400,10 @@ func (s *ResourceGenerator) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.
+ 					upstreamCfg.DestinationName,
+ 					upstreamCfg.DestinationNamespace,
+ 					upstreamCfg.DestinationPeer),
+-				routeName:           uid.EnvoyID(),
+-				protocol:            cfg.Protocol,
+-				useRDS:              false,
+-				statPrefix:          "upstream_peered.",
+-				maxRequestHeadersKb: proxyCfg.MaxRequestHeadersKB,
++				routeName:  uid.EnvoyID(),
++				protocol:   cfg.Protocol,
++				useRDS:     false,
++				statPrefix: "upstream_peered.",
+ 			})
+ 			if err != nil {
+ 				return nil, err
+@@ -444,11 +440,10 @@ func (s *ResourceGenerator) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.
+ 				uid.Name,
+ 				uid.NamespaceOrDefault(),
+ 				uid.Peer),
+-			protocol:            cfg.Protocol,
+-			useRDS:              false,
+-			statPrefix:          "upstream_peered.",
+-			tracing:             tracing,
+-			maxRequestHeadersKb: proxyCfg.MaxRequestHeadersKB,
++			protocol:   cfg.Protocol,
++			useRDS:     false,
++			statPrefix: "upstream_peered.",
++			tracing:    tracing,
+ 		})
+ 		if err != nil {
+ 			return nil, err
+@@ -505,11 +500,10 @@ func (s *ResourceGenerator) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.
+ 				filterName := fmt.Sprintf("%s.%s.%s.%s", uid.Name, uid.NamespaceOrDefault(), uid.PartitionOrDefault(), cfgSnap.Datacenter)
+ 
+ 				filterChain, err := s.makeUpstreamFilterChain(filterChainOpts{
+-					accessLogs:          &cfgSnap.Proxy.AccessLogs,
+-					clusterName:         "passthrough~" + sni,
+-					filterName:          filterName,
+-					protocol:            "tcp",
+-					maxRequestHeadersKb: proxyCfg.MaxRequestHeadersKB,
++					accessLogs:  &cfgSnap.Proxy.AccessLogs,
++					clusterName: "passthrough~" + sni,
++					filterName:  filterName,
++					protocol:    "tcp",
+ 				})
+ 				if err != nil {
+ 					return nil, err
+@@ -556,12 +550,12 @@ func (s *ResourceGenerator) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.
+ 		// Add a catch-all filter chain that acts as a TCP proxy to destinations outside the mesh
+ 		if meshConf := cfgSnap.MeshConfig(); meshConf == nil ||
+ 			!meshConf.TransparentProxy.MeshDestinationsOnly {
++
+ 			filterChain, err := s.makeUpstreamFilterChain(filterChainOpts{
+-				accessLogs:          &cfgSnap.Proxy.AccessLogs,
+-				clusterName:         naming.OriginalDestinationClusterName,
+-				filterName:          naming.OriginalDestinationClusterName,
+-				protocol:            "tcp",
+-				maxRequestHeadersKb: proxyCfg.MaxRequestHeadersKB,
++				accessLogs:  &cfgSnap.Proxy.AccessLogs,
++				clusterName: naming.OriginalDestinationClusterName,
++				filterName:  naming.OriginalDestinationClusterName,
++				protocol:    "tcp",
+ 			})
+ 			if err != nil {
+ 				return nil, err
+@@ -613,13 +607,12 @@ func (s *ResourceGenerator) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.
+ 
+ 		filterChain, err := s.makeUpstreamFilterChain(filterChainOpts{
+ 			// TODO (SNI partition) add partition for upstream SNI
+-			accessLogs:          &cfgSnap.Proxy.AccessLogs,
+-			clusterName:         connect.UpstreamSNI(u, "", cfgSnap.Datacenter, cfgSnap.Roots.TrustDomain),
+-			filterName:          uid.EnvoyID(),
+-			routeName:           uid.EnvoyID(),
+-			protocol:            cfg.Protocol,
+-			tracing:             tracing,
+-			maxRequestHeadersKb: proxyCfg.MaxRequestHeadersKB,
++			accessLogs:  &cfgSnap.Proxy.AccessLogs,
++			clusterName: connect.UpstreamSNI(u, "", cfgSnap.Datacenter, cfgSnap.Roots.TrustDomain),
++			filterName:  uid.EnvoyID(),
++			routeName:   uid.EnvoyID(),
++			protocol:    cfg.Protocol,
++			tracing:     tracing,
+ 		})
+ 		if err != nil {
+ 			return nil, err
+@@ -1354,16 +1347,15 @@ func (s *ResourceGenerator) makeInboundListener(cfgSnap *proxycfg.ConfigSnapshot
+ 	}
+ 
+ 	filterOpts := listenerFilterOpts{
+-		protocol:            cfg.Protocol,
+-		filterName:          name,
+-		routeName:           name,
+-		cluster:             xdscommon.LocalAppClusterName,
+-		requestTimeoutMs:    cfg.LocalRequestTimeoutMs,
+-		idleTimeoutMs:       cfg.LocalIdleTimeoutMs,
+-		tracing:             tracing,
+-		accessLogs:          &cfgSnap.Proxy.AccessLogs,
+-		logger:              s.Logger,
+-		maxRequestHeadersKb: cfg.MaxRequestHeadersKB,
++		protocol:         cfg.Protocol,
++		filterName:       name,
++		routeName:        name,
++		cluster:          xdscommon.LocalAppClusterName,
++		requestTimeoutMs: cfg.LocalRequestTimeoutMs,
++		idleTimeoutMs:    cfg.LocalIdleTimeoutMs,
++		tracing:          tracing,
++		accessLogs:       &cfgSnap.Proxy.AccessLogs,
++		logger:           s.Logger,
+ 	}
+ 	if useHTTPFilter {
+ 		jwtFilter, err := makeJWTAuthFilter(cfgSnap.JWTProviders, cfgSnap.ConnectProxy.Intentions)
+@@ -1566,17 +1558,16 @@ func (s *ResourceGenerator) makeExposedCheckListener(cfgSnap *proxycfg.ConfigSna
+ 	filterName := fmt.Sprintf("exposed_path_filter_%s_%d", strippedPath, path.ListenerPort)
+ 
+ 	filterOpts := listenerFilterOpts{
+-		useRDS:              false,
+-		protocol:            path.Protocol,
+-		filterName:          filterName,
+-		routeName:           filterName,
+-		cluster:             cluster,
+-		statPrefix:          "",
+-		routePath:           path.Path,
+-		httpAuthzFilters:    nil,
+-		accessLogs:          &cfgSnap.Proxy.AccessLogs,
+-		logger:              s.Logger,
+-		maxRequestHeadersKb: cfg.MaxRequestHeadersKB,
++		useRDS:           false,
++		protocol:         path.Protocol,
++		filterName:       filterName,
++		routeName:        filterName,
++		cluster:          cluster,
++		statPrefix:       "",
++		routePath:        path.Path,
++		httpAuthzFilters: nil,
++		accessLogs:       &cfgSnap.Proxy.AccessLogs,
++		logger:           s.Logger,
+ 		// in the exposed check listener we don't set the tracing configuration
+ 	}
+ 	f, err := makeListenerFilter(filterOpts)
+@@ -1861,16 +1852,15 @@ func (s *ResourceGenerator) makeFilterChainTerminatingGateway(cfgSnap *proxycfg.
+ 	// tcp proxy. For L7 this is a very hands-off HTTP proxy just to inject an
+ 	// HTTP filter to do intention checks here instead.
+ 	opts := listenerFilterOpts{
+-		protocol:            tgtwyOpts.protocol,
+-		filterName:          fmt.Sprintf("%s.%s.%s.%s", tgtwyOpts.service.Name, tgtwyOpts.service.NamespaceOrDefault(), tgtwyOpts.service.PartitionOrDefault(), cfgSnap.Datacenter),
+-		routeName:           tgtwyOpts.cluster, // Set cluster name for route config since each will have its own
+-		cluster:             tgtwyOpts.cluster,
+-		statPrefix:          "upstream.",
+-		routePath:           "",
+-		tracing:             tracing,
+-		accessLogs:          &cfgSnap.Proxy.AccessLogs,
+-		logger:              s.Logger,
+-		maxRequestHeadersKb: proxyCfg.MaxRequestHeadersKB,
++		protocol:   tgtwyOpts.protocol,
++		filterName: fmt.Sprintf("%s.%s.%s.%s", tgtwyOpts.service.Name, tgtwyOpts.service.NamespaceOrDefault(), tgtwyOpts.service.PartitionOrDefault(), cfgSnap.Datacenter),
++		routeName:  tgtwyOpts.cluster, // Set cluster name for route config since each will have its own
++		cluster:    tgtwyOpts.cluster,
++		statPrefix: "upstream.",
++		routePath:  "",
++		tracing:    tracing,
++		accessLogs: &cfgSnap.Proxy.AccessLogs,
++		logger:     s.Logger,
+ 	}
+ 
+ 	if useHTTPFilter {
+@@ -2236,7 +2226,6 @@ type filterChainOpts struct {
+ 	forwardClientDetails bool
+ 	forwardClientPolicy  envoy_http_v3.HttpConnectionManager_ForwardClientCertDetails
+ 	tracing              *envoy_http_v3.HttpConnectionManager_Tracing
+-	maxRequestHeadersKb  *uint32
+ }
+ 
+ func (s *ResourceGenerator) makeUpstreamFilterChain(opts filterChainOpts) (*envoy_listener_v3.FilterChain, error) {
+@@ -2256,7 +2245,6 @@ func (s *ResourceGenerator) makeUpstreamFilterChain(opts filterChainOpts) (*envo
+ 		tracing:              opts.tracing,
+ 		accessLogs:           opts.accessLogs,
+ 		logger:               s.Logger,
+-		maxRequestHeadersKb:  opts.maxRequestHeadersKb,
+ 	})
+ 	if err != nil {
+ 		return nil, err
+@@ -2413,7 +2401,6 @@ type listenerFilterOpts struct {
+ 	headersWithUnderscoresAction envoy_core_v3.HttpProtocolOptions_HeadersWithUnderscoresAction
+ 	useRDS                       bool
+ 	fetchTimeoutRDS              *durationpb.Duration
+-	maxRequestHeadersKb          *uint32
+ }
+ 
+ func makeListenerFilter(opts listenerFilterOpts) (*envoy_listener_v3.Filter, error) {
+@@ -2542,11 +2529,6 @@ func makeHTTPFilter(opts listenerFilterOpts) (*envoy_listener_v3.Filter, error)
+ 		cfg.CommonHttpProtocolOptions.HeadersWithUnderscoresAction = opts.headersWithUnderscoresAction
+ 	}
+ 
+-	// Set max request headers size if configured
+-	if opts.maxRequestHeadersKb != nil {
+-		cfg.MaxRequestHeadersKb = &wrapperspb.UInt32Value{Value: *opts.maxRequestHeadersKb}
+-	}
+-
+ 	if opts.useRDS {
+ 		if opts.cluster != "" {
+ 			return nil, fmt.Errorf("cannot specify cluster name when using RDS")
+diff --git a/agent/xds/listeners_apigateway.go b/agent/xds/listeners_apigateway.go
+index a919d12659..3350f019b1 100644
+--- a/agent/xds/listeners_apigateway.go
++++ b/agent/xds/listeners_apigateway.go
+@@ -118,7 +118,8 @@ func (s *ResourceGenerator) makeAPIGatewayListeners(address string, cfgSnap *pro
+ 				l.FilterChains, err = s.makeInlineOverrideFilterChains(
+ 					cfgSnap,
+ 					cfgSnap.APIGateway.TLSConfig,
+-					listenerKey.Protocol, listenerFilterOpts{
++					listenerKey.Protocol,
++					listenerFilterOpts{
+ 						useRDS:          useRDS,
+ 						fetchTimeoutRDS: cfgSnap.GetXDSCommonConfig(s.Logger).GetXDSFetchTimeout(),
+ 						protocol:        listenerKey.Protocol,
+@@ -208,6 +209,7 @@ func (s *ResourceGenerator) makeAPIGatewayListeners(address string, cfgSnap *pro
+ 					return nil, err
+ 				}
+ 			}
++
+ 			filterOpts := listenerFilterOpts{
+ 				useRDS:           true,
+ 				fetchTimeoutRDS:  cfgSnap.GetXDSCommonConfig(s.Logger).GetXDSFetchTimeout(),
+diff --git a/agent/xds/listeners_test.go b/agent/xds/listeners_test.go
+index 6421b8685c..757310fc3c 100644
+--- a/agent/xds/listeners_test.go
++++ b/agent/xds/listeners_test.go
+@@ -10,7 +10,6 @@ import (
+ 
+ 	envoy_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+ 	envoy_http_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+-	"github.com/hashicorp/go-hclog"
+ 	testinf "github.com/mitchellh/go-testing-interface"
+ 	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+@@ -440,131 +439,3 @@ func Test_setNormalizationOptions(t *testing.T) {
+ 		})
+ 	}
+ }
+-
+-func Test_makeHTTPFilter_maxRequestHeadersKb(t *testing.T) {
+-	tests := map[string]struct {
+-		maxRequestHeadersKb *uint32
+-		wantPresent         bool
+-		wantValue           uint32
+-	}{
+-		"nil - not set": {
+-			maxRequestHeadersKb: nil,
+-			wantPresent:         false,
+-		},
+-		"96KB": {
+-			maxRequestHeadersKb: uintPointer(96),
+-			wantPresent:         true,
+-			wantValue:           96,
+-		},
+-	}
+-
+-	for name, tc := range tests {
+-		t.Run(name, func(t *testing.T) {
+-			opts := listenerFilterOpts{
+-				protocol:            "http",
+-				filterName:          "test",
+-				routeName:           "test",
+-				cluster:             "test",
+-				maxRequestHeadersKb: tc.maxRequestHeadersKb,
+-			}
+-
+-			filter, err := makeHTTPFilter(opts)
+-			require.NoError(t, err)
+-			require.NotNil(t, filter)
+-
+-			// Decode the typed config to check MaxRequestHeadersKb
+-			var httpConnMgr envoy_http_v3.HttpConnectionManager
+-			err = filter.GetTypedConfig().UnmarshalTo(&httpConnMgr)
+-			require.NoError(t, err)
+-
+-			if tc.wantPresent {
+-				require.NotNil(t, httpConnMgr.MaxRequestHeadersKb)
+-				require.Equal(t, tc.wantValue, httpConnMgr.MaxRequestHeadersKb.GetValue())
+-			} else {
+-				require.Nil(t, httpConnMgr.MaxRequestHeadersKb)
+-			}
+-		})
+-	}
+-}
+-
+-func Test_makeUpstreamFilterChain_maxRequestHeadersKb(t *testing.T) {
+-	tests := map[string]struct {
+-		maxRequestHeadersKb *uint32
+-		protocol            string
+-		wantPresent         bool
+-		wantValue           uint32
+-	}{
+-		"tcp protocol ignores header settings": {
+-			maxRequestHeadersKb: uintPointer(96),
+-			protocol:            "tcp",
+-			wantPresent:         false,
+-		},
+-		"http with nil header settings": {
+-			maxRequestHeadersKb: nil,
+-			protocol:            "http",
+-			wantPresent:         false,
+-		},
+-		"http with 96KB header limit": {
+-			maxRequestHeadersKb: uintPointer(96),
+-			protocol:            "http",
+-			wantPresent:         true,
+-			wantValue:           96,
+-		},
+-		"grpc with 128KB header limit": {
+-			maxRequestHeadersKb: uintPointer(128),
+-			protocol:            "grpc",
+-			wantPresent:         true,
+-			wantValue:           128,
+-		},
+-		"http2 with 256KB header limit": {
+-			maxRequestHeadersKb: uintPointer(256),
+-			protocol:            "http2",
+-			wantPresent:         true,
+-			wantValue:           256,
+-		},
+-	}
+-
+-	for name, tc := range tests {
+-		t.Run(name, func(t *testing.T) {
+-			s := &ResourceGenerator{
+-				Logger: hclog.NewNullLogger(),
+-			}
+-
+-			opts := filterChainOpts{
+-				protocol:            tc.protocol,
+-				filterName:          "test",
+-				clusterName:         "test-cluster",
+-				maxRequestHeadersKb: tc.maxRequestHeadersKb,
+-			}
+-
+-			filterChain, err := s.makeUpstreamFilterChain(opts)
+-			require.NoError(t, err)
+-			require.NotNil(t, filterChain)
+-			require.Len(t, filterChain.Filters, 1)
+-
+-			filter := filterChain.Filters[0]
+-
+-			if tc.protocol == "tcp" {
+-				// TCP proxy doesn't use HTTP connection manager
+-				return
+-			}
+-
+-			// For HTTP-like protocols, check the HTTP connection manager
+-			var httpConnMgr envoy_http_v3.HttpConnectionManager
+-			err = filter.GetTypedConfig().UnmarshalTo(&httpConnMgr)
+-			require.NoError(t, err)
+-
+-			if tc.wantPresent {
+-				require.NotNil(t, httpConnMgr.MaxRequestHeadersKb)
+-				require.Equal(t, tc.wantValue, httpConnMgr.MaxRequestHeadersKb.GetValue())
+-			} else {
+-				require.Nil(t, httpConnMgr.MaxRequestHeadersKb)
+-			}
+-		})
+-	}
+-}
+-
+-// Helper function for uint32 pointers
+-func uintPointer(i uint32) *uint32 {
+-	return &i
+-}
+diff --git a/agent/xds/resources_test.go b/agent/xds/resources_test.go
+index 7fe7f7b976..f681714752 100644
+--- a/agent/xds/resources_test.go
++++ b/agent/xds/resources_test.go
+@@ -630,17 +630,6 @@ func getConnectProxyDiscoChainTests(enterprise bool) []goldenTestCase {
+ 				)
+ 			},
+ 		},
+-		{
+-			name: "connect-proxy-with-http-max-request-headers",
+-			create: func(t testinf.T) *proxycfg.ConfigSnapshot {
+-				// Create a custom snapshot instead of using ProxyDefaults
+-				snap := proxycfg.TestConfigSnapshotDiscoveryChain(t, "simple", enterprise, func(ns *structs.NodeService) {
+-					ns.Proxy.Config["protocol"] = "http"
+-					ns.Proxy.Config["max_request_headers_kb"] = 96
+-				}, nil)
+-				return snap
+-			},
+-		},
+ 	}
+ 
+ 	if enterprise {
+diff --git a/agent/xds/testdata/clusters/connect-proxy-with-http-max-request-headers.latest.golden b/agent/xds/testdata/clusters/connect-proxy-with-http-max-request-headers.latest.golden
+deleted file mode 100644
+index 7920034940..0000000000
+--- a/agent/xds/testdata/clusters/connect-proxy-with-http-max-request-headers.latest.golden
++++ /dev/null
+@@ -1,136 +0,0 @@
+-{
+-  "nonce": "00000001",
+-  "resources": [
+-    {
+-      "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+-      "altStatName": "db.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "circuitBreakers": {},
+-      "commonLbConfig": {
+-        "healthyPanicThreshold": {}
+-      },
+-      "connectTimeout": "33s",
+-      "edsClusterConfig": {
+-        "edsConfig": {
+-          "ads": {},
+-          "resourceApiVersion": "V3"
+-        }
+-      },
+-      "name": "db.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "outlierDetection": {},
+-      "transportSocket": {
+-        "name": "tls",
+-        "typedConfig": {
+-          "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+-          "commonTlsContext": {
+-            "tlsCertificates": [
+-              {
+-                "certificateChain": {
+-                  "inlineString": "-----BEGIN CERTIFICATE-----\nMIICjDCCAjKgAwIBAgIIC5llxGV1gB8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowDjEMMAoG\nA1UEAxMDd2ViMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEADPv1RHVNRfa2VKR\nAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Favq5E0ivpNtv1QnFhxtPd7d5k4e+T7\nSkW1TaOCAXIwggFuMA4GA1UdDwEB/wQEAwIDuDAdBgNVHSUEFjAUBggrBgEFBQcD\nAgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADBoBgNVHQ4EYQRfN2Q6MDc6ODc6M2E6\nNDA6MTk6NDc6YzM6NWE6YzA6YmE6NjI6ZGY6YWY6NGI6ZDQ6MDU6MjU6NzY6M2Q6\nNWE6OGQ6MTY6OGQ6Njc6NWU6MmU6YTA6MzQ6N2Q6ZGM6ZmYwagYDVR0jBGMwYYBf\nZDE6MTE6MTE6YWM6MmE6YmE6OTc6YjI6M2Y6YWM6N2I6YmQ6ZGE6YmU6YjE6OGE6\nZmM6OWE6YmE6YjU6YmM6ODM6ZTc6NWU6NDE6NmY6ZjI6NzM6OTU6NTg6MGM6ZGIw\nWQYDVR0RBFIwUIZOc3BpZmZlOi8vMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1\nNTU1NTU1NTU1LmNvbnN1bC9ucy9kZWZhdWx0L2RjL2RjMS9zdmMvd2ViMAoGCCqG\nSM49BAMCA0gAMEUCIGC3TTvvjj76KMrguVyFf4tjOqaSCRie3nmHMRNNRav7AiEA\npY0heYeK9A6iOLrzqxSerkXXQyj5e9bE4VgUnxgPU6g=\n-----END CERTIFICATE-----\n"
+-                },
+-                "privateKey": {
+-                  "inlineString": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIMoTkpRggp3fqZzFKh82yS4LjtJI+XY+qX/7DefHFrtdoAoGCCqGSM49\nAwEHoUQDQgAEADPv1RHVNRfa2VKRAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Fav\nq5E0ivpNtv1QnFhxtPd7d5k4e+T7SkW1TQ==\n-----END EC PRIVATE KEY-----\n"
+-                }
+-              }
+-            ],
+-            "tlsParams": {},
+-            "validationContext": {
+-              "matchTypedSubjectAltNames": [
+-                {
+-                  "matcher": {
+-                    "exact": "spiffe://11111111-2222-3333-4444-555555555555.consul/ns/default/dc/dc1/svc/db"
+-                  },
+-                  "sanType": "URI"
+-                }
+-              ],
+-              "trustedCa": {
+-                "inlineString": "-----BEGIN CERTIFICATE-----\nMIICXDCCAgKgAwIBAgIICpZq70Z9LyUwCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowFDESMBAG\nA1UEAxMJVGVzdCBDQSAyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIhywH1gx\nAsMwuF3ukAI5YL2jFxH6Usnma1HFSfVyxbXX1/uoZEYrj8yCAtdU2yoHETyd+Zx2\nThhRLP79pYegCaOCATwwggE4MA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTAD\nAQH/MGgGA1UdDgRhBF9kMToxMToxMTphYzoyYTpiYTo5NzpiMjozZjphYzo3Yjpi\nZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1ZTo0MTo2ZjpmMjo3\nMzo5NTo1ODowYzpkYjBqBgNVHSMEYzBhgF9kMToxMToxMTphYzoyYTpiYTo5Nzpi\nMjozZjphYzo3YjpiZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1\nZTo0MTo2ZjpmMjo3Mzo5NTo1ODowYzpkYjA/BgNVHREEODA2hjRzcGlmZmU6Ly8x\nMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUuY29uc3VsMAoGCCqG\nSM49BAMCA0gAMEUCICOY0i246rQHJt8o8Oya0D5PLL1FnmsQmQqIGCi31RwnAiEA\noR5f6Ku+cig2Il8T8LJujOp2/2A72QcHZA57B13y+8o=\n-----END CERTIFICATE-----\n"
+-              }
+-            }
+-          },
+-          "sni": "db.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul"
+-        }
+-      },
+-      "type": "EDS"
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+-      "circuitBreakers": {},
+-      "connectTimeout": "5s",
+-      "edsClusterConfig": {
+-        "edsConfig": {
+-          "ads": {},
+-          "resourceApiVersion": "V3"
+-        }
+-      },
+-      "name": "geo-cache.default.dc1.query.11111111-2222-3333-4444-555555555555.consul",
+-      "outlierDetection": {},
+-      "transportSocket": {
+-        "name": "tls",
+-        "typedConfig": {
+-          "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+-          "commonTlsContext": {
+-            "tlsCertificates": [
+-              {
+-                "certificateChain": {
+-                  "inlineString": "-----BEGIN CERTIFICATE-----\nMIICjDCCAjKgAwIBAgIIC5llxGV1gB8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowDjEMMAoG\nA1UEAxMDd2ViMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEADPv1RHVNRfa2VKR\nAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Favq5E0ivpNtv1QnFhxtPd7d5k4e+T7\nSkW1TaOCAXIwggFuMA4GA1UdDwEB/wQEAwIDuDAdBgNVHSUEFjAUBggrBgEFBQcD\nAgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADBoBgNVHQ4EYQRfN2Q6MDc6ODc6M2E6\nNDA6MTk6NDc6YzM6NWE6YzA6YmE6NjI6ZGY6YWY6NGI6ZDQ6MDU6MjU6NzY6M2Q6\nNWE6OGQ6MTY6OGQ6Njc6NWU6MmU6YTA6MzQ6N2Q6ZGM6ZmYwagYDVR0jBGMwYYBf\nZDE6MTE6MTE6YWM6MmE6YmE6OTc6YjI6M2Y6YWM6N2I6YmQ6ZGE6YmU6YjE6OGE6\nZmM6OWE6YmE6YjU6YmM6ODM6ZTc6NWU6NDE6NmY6ZjI6NzM6OTU6NTg6MGM6ZGIw\nWQYDVR0RBFIwUIZOc3BpZmZlOi8vMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1\nNTU1NTU1NTU1LmNvbnN1bC9ucy9kZWZhdWx0L2RjL2RjMS9zdmMvd2ViMAoGCCqG\nSM49BAMCA0gAMEUCIGC3TTvvjj76KMrguVyFf4tjOqaSCRie3nmHMRNNRav7AiEA\npY0heYeK9A6iOLrzqxSerkXXQyj5e9bE4VgUnxgPU6g=\n-----END CERTIFICATE-----\n"
+-                },
+-                "privateKey": {
+-                  "inlineString": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIMoTkpRggp3fqZzFKh82yS4LjtJI+XY+qX/7DefHFrtdoAoGCCqGSM49\nAwEHoUQDQgAEADPv1RHVNRfa2VKRAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Fav\nq5E0ivpNtv1QnFhxtPd7d5k4e+T7SkW1TQ==\n-----END EC PRIVATE KEY-----\n"
+-                }
+-              }
+-            ],
+-            "tlsParams": {},
+-            "validationContext": {
+-              "matchTypedSubjectAltNames": [
+-                {
+-                  "matcher": {
+-                    "exact": "spiffe://11111111-2222-3333-4444-555555555555.consul/ns/default/dc/dc1/svc/geo-cache-target"
+-                  },
+-                  "sanType": "URI"
+-                },
+-                {
+-                  "matcher": {
+-                    "exact": "spiffe://11111111-2222-3333-4444-555555555555.consul/ns/default/dc/dc2/svc/geo-cache-target"
+-                  },
+-                  "sanType": "URI"
+-                }
+-              ],
+-              "trustedCa": {
+-                "inlineString": "-----BEGIN CERTIFICATE-----\nMIICXDCCAgKgAwIBAgIICpZq70Z9LyUwCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowFDESMBAG\nA1UEAxMJVGVzdCBDQSAyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIhywH1gx\nAsMwuF3ukAI5YL2jFxH6Usnma1HFSfVyxbXX1/uoZEYrj8yCAtdU2yoHETyd+Zx2\nThhRLP79pYegCaOCATwwggE4MA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTAD\nAQH/MGgGA1UdDgRhBF9kMToxMToxMTphYzoyYTpiYTo5NzpiMjozZjphYzo3Yjpi\nZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1ZTo0MTo2ZjpmMjo3\nMzo5NTo1ODowYzpkYjBqBgNVHSMEYzBhgF9kMToxMToxMTphYzoyYTpiYTo5Nzpi\nMjozZjphYzo3YjpiZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1\nZTo0MTo2ZjpmMjo3Mzo5NTo1ODowYzpkYjA/BgNVHREEODA2hjRzcGlmZmU6Ly8x\nMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUuY29uc3VsMAoGCCqG\nSM49BAMCA0gAMEUCICOY0i246rQHJt8o8Oya0D5PLL1FnmsQmQqIGCi31RwnAiEA\noR5f6Ku+cig2Il8T8LJujOp2/2A72QcHZA57B13y+8o=\n-----END CERTIFICATE-----\n"
+-              }
+-            }
+-          },
+-          "sni": "geo-cache.default.dc1.query.11111111-2222-3333-4444-555555555555.consul"
+-        }
+-      },
+-      "type": "EDS"
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+-      "connectTimeout": "5s",
+-      "loadAssignment": {
+-        "clusterName": "local_app",
+-        "endpoints": [
+-          {
+-            "lbEndpoints": [
+-              {
+-                "endpoint": {
+-                  "address": {
+-                    "socketAddress": {
+-                      "address": "127.0.0.1",
+-                      "portValue": 8080
+-                    }
+-                  }
+-                }
+-              }
+-            ]
+-          }
+-        ]
+-      },
+-      "name": "local_app",
+-      "type": "STATIC"
+-    }
+-  ],
+-  "typeUrl": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+-  "versionInfo": "00000001"
+-}
+\ No newline at end of file
+diff --git a/agent/xds/testdata/endpoints/connect-proxy-with-http-max-request-headers.latest.golden b/agent/xds/testdata/endpoints/connect-proxy-with-http-max-request-headers.latest.golden
+deleted file mode 100644
+index b4372a3439..0000000000
+--- a/agent/xds/testdata/endpoints/connect-proxy-with-http-max-request-headers.latest.golden
++++ /dev/null
+@@ -1,75 +0,0 @@
+-{
+-  "nonce": "00000001",
+-  "resources": [
+-    {
+-      "@type": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+-      "clusterName": "db.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "endpoints": [
+-        {
+-          "lbEndpoints": [
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.1",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            },
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.2",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            }
+-          ]
+-        }
+-      ]
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+-      "clusterName": "geo-cache.default.dc1.query.11111111-2222-3333-4444-555555555555.consul",
+-      "endpoints": [
+-        {
+-          "lbEndpoints": [
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.1",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            },
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.20.1.2",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            }
+-          ]
+-        }
+-      ]
+-    }
+-  ],
+-  "typeUrl": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+-  "versionInfo": "00000001"
+-}
+\ No newline at end of file
+diff --git a/agent/xds/testdata/listeners/connect-proxy-with-http-max-request-headers.latest.golden b/agent/xds/testdata/listeners/connect-proxy-with-http-max-request-headers.latest.golden
+deleted file mode 100644
+index 0b96f22676..0000000000
+--- a/agent/xds/testdata/listeners/connect-proxy-with-http-max-request-headers.latest.golden
++++ /dev/null
+@@ -1,236 +0,0 @@
+-{
+-  "nonce": "00000001",
+-  "resources": [
+-    {
+-      "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
+-      "address": {
+-        "socketAddress": {
+-          "address": "127.0.0.1",
+-          "portValue": 9191
+-        }
+-      },
+-      "filterChains": [
+-        {
+-          "filters": [
+-            {
+-              "name": "envoy.filters.network.tcp_proxy",
+-              "typedConfig": {
+-                "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+-                "cluster": "db.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-                "statPrefix": "upstream.db.default.default.dc1"
+-              }
+-            }
+-          ]
+-        }
+-      ],
+-      "name": "db:127.0.0.1:9191",
+-      "trafficDirection": "OUTBOUND"
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
+-      "address": {
+-        "socketAddress": {
+-          "address": "127.10.10.10",
+-          "portValue": 8181
+-        }
+-      },
+-      "filterChains": [
+-        {
+-          "filters": [
+-            {
+-              "name": "envoy.filters.network.tcp_proxy",
+-              "typedConfig": {
+-                "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+-                "cluster": "geo-cache.default.dc1.query.11111111-2222-3333-4444-555555555555.consul",
+-                "statPrefix": "upstream.prepared_query_geo-cache"
+-              }
+-            }
+-          ]
+-        }
+-      ],
+-      "name": "prepared_query:geo-cache:127.10.10.10:8181",
+-      "trafficDirection": "OUTBOUND"
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
+-      "address": {
+-        "socketAddress": {
+-          "address": "0.0.0.0",
+-          "portValue": 9999
+-        }
+-      },
+-      "filterChains": [
+-        {
+-          "filters": [
+-            {
+-              "name": "envoy.filters.network.http_connection_manager",
+-              "typedConfig": {
+-                "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+-                "forwardClientCertDetails": "APPEND_FORWARD",
+-                "httpFilters": [
+-                  {
+-                    "name": "envoy.filters.http.rbac",
+-                    "typedConfig": {
+-                      "@type": "type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC",
+-                      "rules": {}
+-                    }
+-                  },
+-                  {
+-                    "name": "envoy.filters.http.header_to_metadata",
+-                    "typedConfig": {
+-                      "@type": "type.googleapis.com/envoy.extensions.filters.http.header_to_metadata.v3.Config",
+-                      "requestRules": [
+-                        {
+-                          "header": "x-forwarded-client-cert",
+-                          "onHeaderPresent": {
+-                            "key": "trust-domain",
+-                            "metadataNamespace": "consul",
+-                            "regexValueRewrite": {
+-                              "pattern": {
+-                                "regex": ".*URI=spiffe://([^/]+.[^/]+)(?:/ap/([^/]+))?/ns/([^/]+)/dc/([^/]+)/svc/([^/;,]+).*"
+-                              },
+-                              "substitution": "\\1"
+-                            }
+-                          }
+-                        },
+-                        {
+-                          "header": "x-forwarded-client-cert",
+-                          "onHeaderPresent": {
+-                            "key": "partition",
+-                            "metadataNamespace": "consul",
+-                            "regexValueRewrite": {
+-                              "pattern": {
+-                                "regex": ".*URI=spiffe://([^/]+.[^/]+)(?:/ap/([^/]+))?/ns/([^/]+)/dc/([^/]+)/svc/([^/;,]+).*"
+-                              },
+-                              "substitution": "\\2"
+-                            }
+-                          }
+-                        },
+-                        {
+-                          "header": "x-forwarded-client-cert",
+-                          "onHeaderPresent": {
+-                            "key": "namespace",
+-                            "metadataNamespace": "consul",
+-                            "regexValueRewrite": {
+-                              "pattern": {
+-                                "regex": ".*URI=spiffe://([^/]+.[^/]+)(?:/ap/([^/]+))?/ns/([^/]+)/dc/([^/]+)/svc/([^/;,]+).*"
+-                              },
+-                              "substitution": "\\3"
+-                            }
+-                          }
+-                        },
+-                        {
+-                          "header": "x-forwarded-client-cert",
+-                          "onHeaderPresent": {
+-                            "key": "datacenter",
+-                            "metadataNamespace": "consul",
+-                            "regexValueRewrite": {
+-                              "pattern": {
+-                                "regex": ".*URI=spiffe://([^/]+.[^/]+)(?:/ap/([^/]+))?/ns/([^/]+)/dc/([^/]+)/svc/([^/;,]+).*"
+-                              },
+-                              "substitution": "\\4"
+-                            }
+-                          }
+-                        },
+-                        {
+-                          "header": "x-forwarded-client-cert",
+-                          "onHeaderPresent": {
+-                            "key": "service",
+-                            "metadataNamespace": "consul",
+-                            "regexValueRewrite": {
+-                              "pattern": {
+-                                "regex": ".*URI=spiffe://([^/]+.[^/]+)(?:/ap/([^/]+))?/ns/([^/]+)/dc/([^/]+)/svc/([^/;,]+).*"
+-                              },
+-                              "substitution": "\\5"
+-                            }
+-                          }
+-                        }
+-                      ]
+-                    }
+-                  },
+-                  {
+-                    "name": "envoy.filters.http.router",
+-                    "typedConfig": {
+-                      "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+-                    }
+-                  }
+-                ],
+-                "maxRequestHeadersKb": 96,
+-                "normalizePath": true,
+-                "routeConfig": {
+-                  "name": "public_listener",
+-                  "virtualHosts": [
+-                    {
+-                      "domains": [
+-                        "*"
+-                      ],
+-                      "name": "public_listener",
+-                      "routes": [
+-                        {
+-                          "match": {
+-                            "prefix": "/"
+-                          },
+-                          "route": {
+-                            "cluster": "local_app"
+-                          }
+-                        }
+-                      ]
+-                    }
+-                  ]
+-                },
+-                "setCurrentClientCertDetails": {
+-                  "cert": true,
+-                  "chain": true,
+-                  "dns": true,
+-                  "subject": true,
+-                  "uri": true
+-                },
+-                "statPrefix": "public_listener",
+-                "tracing": {
+-                  "randomSampling": {}
+-                },
+-                "upgradeConfigs": [
+-                  {
+-                    "upgradeType": "websocket"
+-                  }
+-                ]
+-              }
+-            }
+-          ],
+-          "transportSocket": {
+-            "name": "tls",
+-            "typedConfig": {
+-              "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+-              "commonTlsContext": {
+-                "alpnProtocols": [
+-                  "http/1.1"
+-                ],
+-                "tlsCertificates": [
+-                  {
+-                    "certificateChain": {
+-                      "inlineString": "-----BEGIN CERTIFICATE-----\nMIICjDCCAjKgAwIBAgIIC5llxGV1gB8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowDjEMMAoG\nA1UEAxMDd2ViMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEADPv1RHVNRfa2VKR\nAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Favq5E0ivpNtv1QnFhxtPd7d5k4e+T7\nSkW1TaOCAXIwggFuMA4GA1UdDwEB/wQEAwIDuDAdBgNVHSUEFjAUBggrBgEFBQcD\nAgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADBoBgNVHQ4EYQRfN2Q6MDc6ODc6M2E6\nNDA6MTk6NDc6YzM6NWE6YzA6YmE6NjI6ZGY6YWY6NGI6ZDQ6MDU6MjU6NzY6M2Q6\nNWE6OGQ6MTY6OGQ6Njc6NWU6MmU6YTA6MzQ6N2Q6ZGM6ZmYwagYDVR0jBGMwYYBf\nZDE6MTE6MTE6YWM6MmE6YmE6OTc6YjI6M2Y6YWM6N2I6YmQ6ZGE6YmU6YjE6OGE6\nZmM6OWE6YmE6YjU6YmM6ODM6ZTc6NWU6NDE6NmY6ZjI6NzM6OTU6NTg6MGM6ZGIw\nWQYDVR0RBFIwUIZOc3BpZmZlOi8vMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1\nNTU1NTU1NTU1LmNvbnN1bC9ucy9kZWZhdWx0L2RjL2RjMS9zdmMvd2ViMAoGCCqG\nSM49BAMCA0gAMEUCIGC3TTvvjj76KMrguVyFf4tjOqaSCRie3nmHMRNNRav7AiEA\npY0heYeK9A6iOLrzqxSerkXXQyj5e9bE4VgUnxgPU6g=\n-----END CERTIFICATE-----\n"
+-                    },
+-                    "privateKey": {
+-                      "inlineString": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIMoTkpRggp3fqZzFKh82yS4LjtJI+XY+qX/7DefHFrtdoAoGCCqGSM49\nAwEHoUQDQgAEADPv1RHVNRfa2VKRAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Fav\nq5E0ivpNtv1QnFhxtPd7d5k4e+T7SkW1TQ==\n-----END EC PRIVATE KEY-----\n"
+-                    }
+-                  }
+-                ],
+-                "tlsParams": {},
+-                "validationContext": {
+-                  "trustedCa": {
+-                    "inlineString": "-----BEGIN CERTIFICATE-----\nMIICXDCCAgKgAwIBAgIICpZq70Z9LyUwCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowFDESMBAG\nA1UEAxMJVGVzdCBDQSAyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIhywH1gx\nAsMwuF3ukAI5YL2jFxH6Usnma1HFSfVyxbXX1/uoZEYrj8yCAtdU2yoHETyd+Zx2\nThhRLP79pYegCaOCATwwggE4MA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTAD\nAQH/MGgGA1UdDgRhBF9kMToxMToxMTphYzoyYTpiYTo5NzpiMjozZjphYzo3Yjpi\nZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1ZTo0MTo2ZjpmMjo3\nMzo5NTo1ODowYzpkYjBqBgNVHSMEYzBhgF9kMToxMToxMTphYzoyYTpiYTo5Nzpi\nMjozZjphYzo3YjpiZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1\nZTo0MTo2ZjpmMjo3Mzo5NTo1ODowYzpkYjA/BgNVHREEODA2hjRzcGlmZmU6Ly8x\nMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUuY29uc3VsMAoGCCqG\nSM49BAMCA0gAMEUCICOY0i246rQHJt8o8Oya0D5PLL1FnmsQmQqIGCi31RwnAiEA\noR5f6Ku+cig2Il8T8LJujOp2/2A72QcHZA57B13y+8o=\n-----END CERTIFICATE-----\n"
+-                  }
+-                }
+-              },
+-              "requireClientCertificate": true
+-            }
+-          }
+-        }
+-      ],
+-      "name": "public_listener:0.0.0.0:9999",
+-      "trafficDirection": "INBOUND"
+-    }
+-  ],
+-  "typeUrl": "type.googleapis.com/envoy.config.listener.v3.Listener",
+-  "versionInfo": "00000001"
+-}
+\ No newline at end of file
+diff --git a/agent/xds/testdata/routes/connect-proxy-with-http-max-request-headers.latest.golden b/agent/xds/testdata/routes/connect-proxy-with-http-max-request-headers.latest.golden
+deleted file mode 100644
+index 8b919343d2..0000000000
+--- a/agent/xds/testdata/routes/connect-proxy-with-http-max-request-headers.latest.golden
++++ /dev/null
+@@ -1,5 +0,0 @@
+-{
+-  "nonce": "00000001",
+-  "typeUrl": "type.googleapis.com/envoy.config.route.v3.RouteConfiguration",
+-  "versionInfo": "00000001"
+-}
+\ No newline at end of file
+diff --git a/agent/xds/testdata/secrets/connect-proxy-with-http-max-request-headers.latest.golden b/agent/xds/testdata/secrets/connect-proxy-with-http-max-request-headers.latest.golden
+deleted file mode 100644
+index 82e4565065..0000000000
+--- a/agent/xds/testdata/secrets/connect-proxy-with-http-max-request-headers.latest.golden
++++ /dev/null
+@@ -1,5 +0,0 @@
+-{
+-  "nonce": "00000001",
+-  "typeUrl": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
+-  "versionInfo": "00000001"
+-}
+\ No newline at end of file
+diff --git a/test/integration/connect/envoy/case-max-request-headers/capture.sh b/test/integration/connect/envoy/case-max-request-headers/capture.sh
+deleted file mode 100755
+index 2e1eacdbe9..0000000000
+--- a/test/integration/connect/envoy/case-max-request-headers/capture.sh
++++ /dev/null
+@@ -1,6 +0,0 @@
+-#!/bin/bash
+-# Copyright (c) HashiCorp, Inc.
+-# SPDX-License-Identifier: BUSL-1.1
+-
+-snapshot_envoy_admin localhost:19000 s1 primary || true
+-snapshot_envoy_admin localhost:19001 s2 primary || true
+diff --git a/test/integration/connect/envoy/case-max-request-headers/service_s1.hcl b/test/integration/connect/envoy/case-max-request-headers/service_s1.hcl
+deleted file mode 100644
+index 0cc2ce9e4e..0000000000
+--- a/test/integration/connect/envoy/case-max-request-headers/service_s1.hcl
++++ /dev/null
+@@ -1,10 +0,0 @@
+-# Copyright (c) HashiCorp, Inc.
+-# SPDX-License-Identifier: BUSL-1.1
+-
+-services {
+-  name = "s1"
+-  port = 8080
+-  connect {
+-    sidecar_service {}
+-  }
+-}
+\ No newline at end of file
+diff --git a/test/integration/connect/envoy/case-max-request-headers/service_s2.hcl b/test/integration/connect/envoy/case-max-request-headers/service_s2.hcl
+deleted file mode 100644
+index 2ff01192b2..0000000000
+--- a/test/integration/connect/envoy/case-max-request-headers/service_s2.hcl
++++ /dev/null
+@@ -1,23 +0,0 @@
+-# Copyright (c) HashiCorp, Inc.
+-# SPDX-License-Identifier: BUSL-1.1
+-
+-services {
+-  name = "s2"
+-  port = 8181
+-  connect {
+-    sidecar_service {
+-      proxy {
+-        upstreams = [
+-          {
+-            destination_name = "s1"
+-            local_bind_port = 5000
+-          }
+-        ]
+-        config {
+-          protocol = "http"
+-          max_request_headers_kb = 96
+-        }
+-      }
+-    }
+-  }
+-}
+\ No newline at end of file
+diff --git a/test/integration/connect/envoy/case-max-request-headers/setup.sh b/test/integration/connect/envoy/case-max-request-headers/setup.sh
+deleted file mode 100755
+index 6c043f06a2..0000000000
+--- a/test/integration/connect/envoy/case-max-request-headers/setup.sh
++++ /dev/null
+@@ -1,34 +0,0 @@
+-#!/bin/bash
+-# Copyright (c) HashiCorp, Inc.
+-# SPDX-License-Identifier: BUSL-1.1
+-
+-set -eEuo pipefail
+-
+-# Configure proxy-defaults with max_request_headers_kb setting
+-upsert_config_entry primary '
+-kind = "proxy-defaults"
+-name = "global"
+-config {
+-  max_request_headers_kb = 96
+-}
+-'
+-
+-# Configure service defaults for HTTP protocol
+-upsert_config_entry primary '
+-kind = "service-defaults"
+-name = "s1"
+-protocol = "http"
+-'
+-
+-upsert_config_entry primary '
+-kind = "service-defaults" 
+-name = "s2"
+-protocol = "http"
+-'
+-
+-# Register services
+-register_services primary
+-
+-# Generate Envoy bootstrap configs
+-gen_envoy_bootstrap s1 19000 primary
+-gen_envoy_bootstrap s2 19001 primary
+diff --git a/test/integration/connect/envoy/case-max-request-headers/verify.bats b/test/integration/connect/envoy/case-max-request-headers/verify.bats
+deleted file mode 100644
+index 6162911884..0000000000
+--- a/test/integration/connect/envoy/case-max-request-headers/verify.bats
++++ /dev/null
+@@ -1,62 +0,0 @@
+-#!/usr/bin/env bats
+-
+-load helpers
+-
+-@test "s1 proxy is running correct version" {
+-  assert_envoy_version 19000
+-}
+-
+-@test "s1 proxy admin is up on :19000" {
+-  retry_default curl -f -s localhost:19000/stats -o /dev/null
+-}
+-
+-@test "s2 proxy admin is up on :19001" {
+-  retry_default curl -f -s localhost:19001/stats -o /dev/null
+-}
+-
+-@test "s1 proxy listener should be up and have right cert" {
+-  assert_proxy_presents_cert_uri localhost:21000 s1
+-}
+-
+-@test "s2 proxy listener should be up and have right cert" {
+-  assert_proxy_presents_cert_uri localhost:21001 s2
+-}
+-
+-@test "s2 proxy should be healthy" {
+-  assert_service_has_healthy_instances s2 1
+-}
+-
+-
+-@test "s1 proxy should have max_request_headers_kb set to 96" {
+-  assert_envoy_max_request_headers_kb 127.0.0.1:19000 96
+-}
+-
+-@test "s2 proxy should have max_request_headers_kb set to 96" {
+-  assert_envoy_max_request_headers_kb 127.0.0.1:19001 96
+-}
+-
+-@test "s1 upstream should work with normal headers" {
+-  run retry_default curl -s -f -d hello 127.0.0.1:5000
+-  [ "$status" -eq 0 ]
+-  [[ "$output" == *"hello"* ]]
+-}
+-
+-@test "s2 should accept requests with headers under 96KB limit (95KB test)" {
+-  # Create a header with 95KB of data (under the limit)
+-  large_header=$(head -c 95000 < /dev/zero | tr '\0' 'a')
+-  
+-  run retry_default curl -s -f -H "X-Custom-Header: $large_header" -d "test-payload" 127.0.0.1:5000/
+-  [ "$status" -eq 0 ]
+-  [[ "$output" == *"test-payload"* ]]
+-}
+-
+-@test "s2 should reject requests with headers over 96KB limit (99KB test)" {
+-  # Create a header with 99KB of data (over the limit)
+-  large_header=$(head -c 99000 < /dev/zero | tr '\0' 'a')
+-  
+-  # Test should return error response for headers exceeding limit
+-  run curl -s -w "%{http_code}" -H "X-Custom-Header: $large_header" -d "test-payload" 127.0.0.1:5000/ -o /dev/null
+-  [ "$status" -eq 0 ]
+-  # Should get HTTP 431 (Request Header Fields Too Large) or similar error code
+-  [[ "$output" == *"431"* ]]
+-}
+\ No newline at end of file
+diff --git a/test/integration/connect/envoy/helpers.bash b/test/integration/connect/envoy/helpers.bash
+index 6635aa880d..8aae0f9ff5 100755
+--- a/test/integration/connect/envoy/helpers.bash
++++ b/test/integration/connect/envoy/helpers.bash
+@@ -1187,49 +1187,3 @@ function assert_url_header {
+   [ "$status" == 0 ]
+   [ "$VALUE" = "$output" ]
+ }
+-
+-function assert_envoy_max_request_headers_kb {
+-  local HOSTPORT=$1
+-  local EXPECT_SIZE_KB=$2
+-  
+-  echo "Checking Envoy max_request_headers_kb at $HOSTPORT, expecting $EXPECT_SIZE_KB KB"
+-  
+-  # Use existing retry_default pattern like get_envoy_http_filter and others
+-  run retry_default curl -s -f $HOSTPORT/config_dump
+-  [ "$status" -eq 0 ]
+-  
+-  # Extract all max_request_headers_kb values (handles multiple values like your example)
+-  local VALUES=$(echo "$output" | jq -r '
+-    .configs[]
+-    | select(."@type"=="type.googleapis.com/envoy.admin.v3.ListenersConfigDump")
+-    | (.dynamic_listeners[]? | .active_state.listener)
+-    | .filter_chains[]?
+-    | .filters[]?
+-    | select(.name=="envoy.filters.network.http_connection_manager")
+-    | .typed_config.max_request_headers_kb // empty
+-  ')
+-  
+-  echo "Found max_request_headers_kb values: $VALUES"
+-  
+-  # Check that we found at least one value
+-  [ -n "$VALUES" ]
+-  
+-  # Check that all values match the expected value
+-  # Convert values to an array and verify each one
+-  local all_match=true
+-  while IFS= read -r value; do
+-    if [ -n "$value" ] && [ "$value" != "$EXPECT_SIZE_KB" ]; then
+-      echo "ERROR: Found value $value, expected $EXPECT_SIZE_KB"
+-      all_match=false
+-    fi
+-  done <<< "$VALUES"
+-  
+-  # Ensure at least one value was found and all matched
+-  if [ "$all_match" = "true" ]; then
+-    echo "SUCCESS: All max_request_headers_kb values match expected $EXPECT_SIZE_KB KB"
+-    return 0
+-  else
+-    echo "FAILURE: Not all max_request_headers_kb values match expected $EXPECT_SIZE_KB KB"
+-    return 1
+-  fi
+-}

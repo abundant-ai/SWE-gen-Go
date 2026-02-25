@@ -1,0 +1,410 @@
+diff --git a/cmd/batch-expire.go b/cmd/batch-expire.go
+index ac0fac773..3a39f473c 100644
+--- a/cmd/batch-expire.go
++++ b/cmd/batch-expire.go
+@@ -27,6 +27,7 @@ import (
+ 	"net/http"
+ 	"runtime"
+ 	"strconv"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/minio/minio-go/v7/pkg/tags"
+@@ -281,7 +282,7 @@ type BatchJobExpire struct {
+ 	line, col       int
+ 	APIVersion      string                 `yaml:"apiVersion" json:"apiVersion"`
+ 	Bucket          string                 `yaml:"bucket" json:"bucket"`
+-	Prefix          string                 `yaml:"prefix" json:"prefix"`
++	Prefix          BatchJobPrefix         `yaml:"prefix" json:"prefix"`
+ 	NotificationCfg BatchJobNotification   `yaml:"notify" json:"notify"`
+ 	Retry           BatchJobRetry          `yaml:"retry" json:"retry"`
+ 	Rules           []BatchJobExpireFilter `yaml:"rules" json:"rules"`
+@@ -535,18 +536,29 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
+ 		return err
+ 	}
+ 
+-	ctx, cancel := context.WithCancel(ctx)
+-	defer cancel()
++	ctx, cancelCause := context.WithCancelCause(ctx)
++	defer cancelCause(nil)
+ 
+ 	results := make(chan itemOrErr[ObjectInfo], workerSize)
+-	if err := api.Walk(ctx, r.Bucket, r.Prefix, results, WalkOptions{
+-		Marker:       lastObject,
+-		LatestOnly:   false, // we need to visit all versions of the object to implement purge: retainVersions
+-		VersionsSort: WalkVersionsSortDesc,
+-	}); err != nil {
+-		// Do not need to retry if we can't list objects on source.
+-		return err
+-	}
++	go func() {
++		for _, prefix := range r.Prefix.F() {
++			prefixResultCh := make(chan itemOrErr[ObjectInfo], workerSize)
++			err := api.Walk(ctx, r.Bucket, strings.TrimSpace(prefix), prefixResultCh, WalkOptions{
++				Marker:       lastObject,
++				LatestOnly:   false, // we need to visit all versions of the object to implement purge: retainVersions
++				VersionsSort: WalkVersionsSortDesc,
++			})
++			if err != nil {
++				cancelCause(err)
++				xioutil.SafeClose(results)
++				return
++			}
++			for result := range prefixResultCh {
++				results <- result
++			}
++		}
++		xioutil.SafeClose(results)
++	}()
+ 
+ 	// Goroutine to periodically save batch-expire job's in-memory state
+ 	saverQuitCh := make(chan struct{})
+@@ -657,6 +669,10 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
+ 			ObjectInfo: result.Item,
+ 		})
+ 	}
++	if context.Cause(ctx) != nil {
++		xioutil.SafeClose(expireCh)
++		return context.Cause(ctx)
++	}
+ 	// Send any remaining objects downstream
+ 	if len(toDel) > 0 {
+ 		select {
+diff --git a/cmd/batch-expire_gen.go b/cmd/batch-expire_gen.go
+index ccfb6b29e..3bdac35ba 100644
+--- a/cmd/batch-expire_gen.go
++++ b/cmd/batch-expire_gen.go
+@@ -39,7 +39,7 @@ func (z *BatchJobExpire) DecodeMsg(dc *msgp.Reader) (err error) {
+ 				return
+ 			}
+ 		case "Prefix":
+-			z.Prefix, err = dc.ReadString()
++			err = z.Prefix.DecodeMsg(dc)
+ 			if err != nil {
+ 				err = msgp.WrapError(err, "Prefix")
+ 				return
+@@ -114,7 +114,7 @@ func (z *BatchJobExpire) EncodeMsg(en *msgp.Writer) (err error) {
+ 	if err != nil {
+ 		return
+ 	}
+-	err = en.WriteString(z.Prefix)
++	err = z.Prefix.EncodeMsg(en)
+ 	if err != nil {
+ 		err = msgp.WrapError(err, "Prefix")
+ 		return
+@@ -171,7 +171,11 @@ func (z *BatchJobExpire) MarshalMsg(b []byte) (o []byte, err error) {
+ 	o = msgp.AppendString(o, z.Bucket)
+ 	// string "Prefix"
+ 	o = append(o, 0xa6, 0x50, 0x72, 0x65, 0x66, 0x69, 0x78)
+-	o = msgp.AppendString(o, z.Prefix)
++	o, err = z.Prefix.MarshalMsg(o)
++	if err != nil {
++		err = msgp.WrapError(err, "Prefix")
++		return
++	}
+ 	// string "NotificationCfg"
+ 	o = append(o, 0xaf, 0x4e, 0x6f, 0x74, 0x69, 0x66, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x43, 0x66, 0x67)
+ 	o, err = z.NotificationCfg.MarshalMsg(o)
+@@ -230,7 +234,7 @@ func (z *BatchJobExpire) UnmarshalMsg(bts []byte) (o []byte, err error) {
+ 				return
+ 			}
+ 		case "Prefix":
+-			z.Prefix, bts, err = msgp.ReadStringBytes(bts)
++			bts, err = z.Prefix.UnmarshalMsg(bts)
+ 			if err != nil {
+ 				err = msgp.WrapError(err, "Prefix")
+ 				return
+@@ -280,7 +284,7 @@ func (z *BatchJobExpire) UnmarshalMsg(bts []byte) (o []byte, err error) {
+ 
+ // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
+ func (z *BatchJobExpire) Msgsize() (s int) {
+-	s = 1 + 11 + msgp.StringPrefixSize + len(z.APIVersion) + 7 + msgp.StringPrefixSize + len(z.Bucket) + 7 + msgp.StringPrefixSize + len(z.Prefix) + 16 + z.NotificationCfg.Msgsize() + 6 + z.Retry.Msgsize() + 6 + msgp.ArrayHeaderSize
++	s = 1 + 11 + msgp.StringPrefixSize + len(z.APIVersion) + 7 + msgp.StringPrefixSize + len(z.Bucket) + 7 + z.Prefix.Msgsize() + 16 + z.NotificationCfg.Msgsize() + 6 + z.Retry.Msgsize() + 6 + msgp.ArrayHeaderSize
+ 	for za0001 := range z.Rules {
+ 		s += z.Rules[za0001].Msgsize()
+ 	}
+diff --git a/cmd/batch-handlers.go b/cmd/batch-handlers.go
+index a313784a2..d8dcb27b3 100644
+--- a/cmd/batch-handlers.go
++++ b/cmd/batch-handlers.go
+@@ -385,12 +385,23 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
+ 		s3Type := r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3
+ 		minioSrc := r.Source.Type == BatchJobReplicateResourceMinIO
+ 		ctx, cancel := context.WithCancel(ctx)
+-		objInfoCh := c.ListObjects(ctx, r.Source.Bucket, miniogo.ListObjectsOptions{
+-			Prefix:       r.Source.Prefix,
+-			WithVersions: minioSrc,
+-			Recursive:    true,
+-			WithMetadata: true,
+-		})
++
++		objInfoCh := make(chan miniogo.ObjectInfo, 1)
++		go func() {
++			for _, prefix := range r.Source.Prefix.F() {
++				prefixObjInfoCh := c.ListObjects(ctx, r.Source.Bucket, miniogo.ListObjectsOptions{
++					Prefix:       strings.TrimSpace(prefix),
++					WithVersions: minioSrc,
++					Recursive:    true,
++					WithMetadata: true,
++				})
++				for obj := range prefixObjInfoCh {
++					objInfoCh <- obj
++				}
++			}
++			xioutil.SafeClose(objInfoCh)
++		}()
++
+ 		prevObj := ""
+ 		skipReplicate := false
+ 
+@@ -1188,19 +1199,28 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
+ 		if walkQuorum == "" {
+ 			walkQuorum = "strict"
+ 		}
+-		ctx, cancel := context.WithCancel(ctx)
++		ctx, cancelCause := context.WithCancelCause(ctx)
+ 		// one of source/target is s3, skip delete marker and all versions under the same object name.
+ 		s3Type := r.Target.Type == BatchJobReplicateResourceS3 || r.Source.Type == BatchJobReplicateResourceS3
+ 
+-		if err := api.Walk(ctx, r.Source.Bucket, r.Source.Prefix, walkCh, WalkOptions{
+-			Marker:   lastObject,
+-			Filter:   selectObj,
+-			AskDisks: walkQuorum,
+-		}); err != nil {
+-			cancel()
+-			// Do not need to retry if we can't list objects on source.
+-			return err
+-		}
++		go func() {
++			for _, prefix := range r.Source.Prefix.F() {
++				prefixWalkCh := make(chan itemOrErr[ObjectInfo], 100)
++				if err := api.Walk(ctx, r.Source.Bucket, strings.TrimSpace(prefix), prefixWalkCh, WalkOptions{
++					Marker:   lastObject,
++					Filter:   selectObj,
++					AskDisks: walkQuorum,
++				}); err != nil {
++					cancelCause(err)
++					xioutil.SafeClose(walkCh)
++					return
++				}
++				for obj := range prefixWalkCh {
++					walkCh <- obj
++				}
++			}
++			xioutil.SafeClose(walkCh)
++		}()
+ 
+ 		prevObj := ""
+ 
+@@ -1251,7 +1271,10 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
+ 			}()
+ 		}
+ 		wk.Wait()
+-
++		// Do not need to retry if we can't list objects on source.
++		if context.Cause(ctx) != nil {
++			return context.Cause(ctx)
++		}
+ 		ri.RetryAttempts = attempts
+ 		ri.Complete = ri.ObjectsFailed == 0
+ 		ri.Failed = ri.ObjectsFailed > 0
+@@ -1264,7 +1287,7 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
+ 			batchLogOnceIf(ctx, fmt.Errorf("unable to notify %v", err), job.ID+"notify")
+ 		}
+ 
+-		cancel()
++		cancelCause(nil)
+ 		if ri.Failed {
+ 			ri.ObjectsFailed = 0
+ 			ri.Bucket = ""
+@@ -2232,3 +2255,30 @@ func lookupStyle(s string) miniogo.BucketLookupType {
+ 	}
+ 	return lookup
+ }
++
++// BatchJobPrefix - to support prefix field yaml unmarshalling with string or slice of strings
++type BatchJobPrefix []string
++
++var _ yaml.Unmarshaler = &BatchJobPrefix{}
++
++// UnmarshalYAML - to support prefix field yaml unmarshalling with string or slice of strings
++func (b *BatchJobPrefix) UnmarshalYAML(value *yaml.Node) error {
++	// try slice first
++	tmpSlice := []string{}
++	if err := value.Decode(&tmpSlice); err == nil {
++		*b = tmpSlice
++		return nil
++	}
++	// try string
++	tmpStr := ""
++	if err := value.Decode(&tmpStr); err == nil {
++		*b = []string{tmpStr}
++		return nil
++	}
++	return fmt.Errorf("unable to decode %s", value.Value)
++}
++
++// F - return prefix(es) as slice
++func (b *BatchJobPrefix) F() []string {
++	return *b
++}
+diff --git a/cmd/batch-handlers_gen.go b/cmd/batch-handlers_gen.go
+index 4cae65173..5dd0bf047 100644
+--- a/cmd/batch-handlers_gen.go
++++ b/cmd/batch-handlers_gen.go
+@@ -6,6 +6,89 @@ import (
+ 	"github.com/tinylib/msgp/msgp"
+ )
+ 
++// DecodeMsg implements msgp.Decodable
++func (z *BatchJobPrefix) DecodeMsg(dc *msgp.Reader) (err error) {
++	var zb0002 uint32
++	zb0002, err = dc.ReadArrayHeader()
++	if err != nil {
++		err = msgp.WrapError(err)
++		return
++	}
++	if cap((*z)) >= int(zb0002) {
++		(*z) = (*z)[:zb0002]
++	} else {
++		(*z) = make(BatchJobPrefix, zb0002)
++	}
++	for zb0001 := range *z {
++		(*z)[zb0001], err = dc.ReadString()
++		if err != nil {
++			err = msgp.WrapError(err, zb0001)
++			return
++		}
++	}
++	return
++}
++
++// EncodeMsg implements msgp.Encodable
++func (z BatchJobPrefix) EncodeMsg(en *msgp.Writer) (err error) {
++	err = en.WriteArrayHeader(uint32(len(z)))
++	if err != nil {
++		err = msgp.WrapError(err)
++		return
++	}
++	for zb0003 := range z {
++		err = en.WriteString(z[zb0003])
++		if err != nil {
++			err = msgp.WrapError(err, zb0003)
++			return
++		}
++	}
++	return
++}
++
++// MarshalMsg implements msgp.Marshaler
++func (z BatchJobPrefix) MarshalMsg(b []byte) (o []byte, err error) {
++	o = msgp.Require(b, z.Msgsize())
++	o = msgp.AppendArrayHeader(o, uint32(len(z)))
++	for zb0003 := range z {
++		o = msgp.AppendString(o, z[zb0003])
++	}
++	return
++}
++
++// UnmarshalMsg implements msgp.Unmarshaler
++func (z *BatchJobPrefix) UnmarshalMsg(bts []byte) (o []byte, err error) {
++	var zb0002 uint32
++	zb0002, bts, err = msgp.ReadArrayHeaderBytes(bts)
++	if err != nil {
++		err = msgp.WrapError(err)
++		return
++	}
++	if cap((*z)) >= int(zb0002) {
++		(*z) = (*z)[:zb0002]
++	} else {
++		(*z) = make(BatchJobPrefix, zb0002)
++	}
++	for zb0001 := range *z {
++		(*z)[zb0001], bts, err = msgp.ReadStringBytes(bts)
++		if err != nil {
++			err = msgp.WrapError(err, zb0001)
++			return
++		}
++	}
++	o = bts
++	return
++}
++
++// Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
++func (z BatchJobPrefix) Msgsize() (s int) {
++	s = msgp.ArrayHeaderSize
++	for zb0003 := range z {
++		s += msgp.StringPrefixSize + len(z[zb0003])
++	}
++	return
++}
++
+ // DecodeMsg implements msgp.Decodable
+ func (z *BatchJobRequest) DecodeMsg(dc *msgp.Reader) (err error) {
+ 	var field []byte
+diff --git a/cmd/batch-replicate.go b/cmd/batch-replicate.go
+index b3d6f3da8..37a1834d4 100644
+--- a/cmd/batch-replicate.go
++++ b/cmd/batch-replicate.go
+@@ -151,7 +151,7 @@ func (t BatchJobReplicateTarget) ValidPath() bool {
+ type BatchJobReplicateSource struct {
+ 	Type     BatchJobReplicateResourceType `yaml:"type" json:"type"`
+ 	Bucket   string                        `yaml:"bucket" json:"bucket"`
+-	Prefix   string                        `yaml:"prefix" json:"prefix"`
++	Prefix   BatchJobPrefix                `yaml:"prefix" json:"prefix"`
+ 	Endpoint string                        `yaml:"endpoint" json:"endpoint"`
+ 	Path     string                        `yaml:"path" json:"path"`
+ 	Creds    BatchJobReplicateCredentials  `yaml:"credentials" json:"credentials"`
+diff --git a/cmd/batch-replicate_gen.go b/cmd/batch-replicate_gen.go
+index 6392829e2..ea5fe5b27 100644
+--- a/cmd/batch-replicate_gen.go
++++ b/cmd/batch-replicate_gen.go
+@@ -411,7 +411,7 @@ func (z *BatchJobReplicateSource) DecodeMsg(dc *msgp.Reader) (err error) {
+ 				return
+ 			}
+ 		case "Prefix":
+-			z.Prefix, err = dc.ReadString()
++			err = z.Prefix.DecodeMsg(dc)
+ 			if err != nil {
+ 				err = msgp.WrapError(err, "Prefix")
+ 				return
+@@ -514,7 +514,7 @@ func (z *BatchJobReplicateSource) EncodeMsg(en *msgp.Writer) (err error) {
+ 	if err != nil {
+ 		return
+ 	}
+-	err = en.WriteString(z.Prefix)
++	err = z.Prefix.EncodeMsg(en)
+ 	if err != nil {
+ 		err = msgp.WrapError(err, "Prefix")
+ 		return
+@@ -600,7 +600,11 @@ func (z *BatchJobReplicateSource) MarshalMsg(b []byte) (o []byte, err error) {
+ 	o = msgp.AppendString(o, z.Bucket)
+ 	// string "Prefix"
+ 	o = append(o, 0xa6, 0x50, 0x72, 0x65, 0x66, 0x69, 0x78)
+-	o = msgp.AppendString(o, z.Prefix)
++	o, err = z.Prefix.MarshalMsg(o)
++	if err != nil {
++		err = msgp.WrapError(err, "Prefix")
++		return
++	}
+ 	// string "Endpoint"
+ 	o = append(o, 0xa8, 0x45, 0x6e, 0x64, 0x70, 0x6f, 0x69, 0x6e, 0x74)
+ 	o = msgp.AppendString(o, z.Endpoint)
+@@ -664,7 +668,7 @@ func (z *BatchJobReplicateSource) UnmarshalMsg(bts []byte) (o []byte, err error)
+ 				return
+ 			}
+ 		case "Prefix":
+-			z.Prefix, bts, err = msgp.ReadStringBytes(bts)
++			bts, err = z.Prefix.UnmarshalMsg(bts)
+ 			if err != nil {
+ 				err = msgp.WrapError(err, "Prefix")
+ 				return
+@@ -742,7 +746,7 @@ func (z *BatchJobReplicateSource) UnmarshalMsg(bts []byte) (o []byte, err error)
+ 
+ // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
+ func (z *BatchJobReplicateSource) Msgsize() (s int) {
+-	s = 1 + 5 + msgp.StringPrefixSize + len(string(z.Type)) + 7 + msgp.StringPrefixSize + len(z.Bucket) + 7 + msgp.StringPrefixSize + len(z.Prefix) + 9 + msgp.StringPrefixSize + len(z.Endpoint) + 5 + msgp.StringPrefixSize + len(z.Path) + 6 + 1 + 10 + msgp.StringPrefixSize + len(z.Creds.AccessKey) + 10 + msgp.StringPrefixSize + len(z.Creds.SecretKey) + 13 + msgp.StringPrefixSize + len(z.Creds.SessionToken) + 9 + z.Snowball.Msgsize()
++	s = 1 + 5 + msgp.StringPrefixSize + len(string(z.Type)) + 7 + msgp.StringPrefixSize + len(z.Bucket) + 7 + z.Prefix.Msgsize() + 9 + msgp.StringPrefixSize + len(z.Endpoint) + 5 + msgp.StringPrefixSize + len(z.Path) + 6 + 1 + 10 + msgp.StringPrefixSize + len(z.Creds.AccessKey) + 10 + msgp.StringPrefixSize + len(z.Creds.SecretKey) + 13 + msgp.StringPrefixSize + len(z.Creds.SessionToken) + 9 + z.Snowball.Msgsize()
+ 	return
+ }
+ 

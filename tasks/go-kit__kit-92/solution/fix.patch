@@ -1,0 +1,173 @@
+diff --git a/log/json_logger.go b/log/json_logger.go
+index 8907c8f..8950460 100644
+--- a/log/json_logger.go
++++ b/log/json_logger.go
+@@ -4,6 +4,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
++	"reflect"
+ )
+ 
+ type jsonLogger struct {
+@@ -17,29 +18,59 @@ func NewJSONLogger(w io.Writer) Logger {
+ }
+ 
+ func (l *jsonLogger) Log(keyvals ...interface{}) error {
+-	if len(keyvals)%2 == 1 {
+-		panic("odd number of keyvals")
+-	}
+-	m := make(map[string]interface{}, len(keyvals)/2)
++	n := (len(keyvals) + 1) / 2 // +1 to handle case when len is odd
++	m := make(map[string]interface{}, n)
+ 	for i := 0; i < len(keyvals); i += 2 {
+-		merge(m, keyvals[i], keyvals[i+1])
++		k := keyvals[i]
++		var v interface{} = ErrMissingValue
++		if i+1 < len(keyvals) {
++			v = keyvals[i+1]
++		}
++		merge(m, k, v)
+ 	}
+ 	return json.NewEncoder(l.Writer).Encode(m)
+ }
+ 
+-func merge(dst map[string]interface{}, k, v interface{}) map[string]interface{} {
++func merge(dst map[string]interface{}, k, v interface{}) {
+ 	var key string
+ 	switch x := k.(type) {
+ 	case string:
+ 		key = x
+ 	case fmt.Stringer:
+-		key = x.String()
++		key = safeString(x)
+ 	default:
+-		key = fmt.Sprintf("%v", x)
++		key = fmt.Sprint(x)
+ 	}
+ 	if x, ok := v.(error); ok {
+-		v = x.Error()
++		v = safeError(x)
+ 	}
+ 	dst[key] = v
+-	return dst
++}
++
++func safeString(str fmt.Stringer) (s string) {
++	defer func() {
++		if panicVal := recover(); panicVal != nil {
++			if v := reflect.ValueOf(str); v.Kind() == reflect.Ptr && v.IsNil() {
++				s = "NULL"
++			} else {
++				panic(panicVal)
++			}
++		}
++	}()
++	s = str.String()
++	return
++}
++
++func safeError(err error) (s interface{}) {
++	defer func() {
++		if panicVal := recover(); panicVal != nil {
++			if v := reflect.ValueOf(err); v.Kind() == reflect.Ptr && v.IsNil() {
++				s = nil
++			} else {
++				panic(panicVal)
++			}
++		}
++	}()
++	s = err.Error()
++	return
+ }
+diff --git a/log/log.go b/log/log.go
+index fe7fa5a..0b16a8f 100644
+--- a/log/log.go
++++ b/log/log.go
+@@ -4,7 +4,10 @@
+ // key/value data.
+ package log
+ 
+-import "sync/atomic"
++import (
++	"errors"
++	"sync/atomic"
++)
+ 
+ // Logger is the fundamental interface for all log operations. Log creates a
+ // log event from keyvals, a variadic sequence of alternating keys and values.
+@@ -15,6 +18,10 @@ type Logger interface {
+ 	Log(keyvals ...interface{}) error
+ }
+ 
++// ErrMissingValue is appended to keyvals slices with odd length to substitute
++// the missing value.
++var ErrMissingValue = errors.New("(MISSING)")
++
+ // NewContext returns a new Context that logs to logger.
+ func NewContext(logger Logger) Context {
+ 	if c, ok := logger.(Context); ok {
+@@ -37,10 +44,10 @@ type Context struct {
+ // stored context with their generated value, appends keyvals, and passes the
+ // result to the wrapped Logger.
+ func (l Context) Log(keyvals ...interface{}) error {
+-	if len(keyvals)%2 != 0 {
+-		panic("bad keyvals")
+-	}
+ 	kvs := append(l.keyvals, keyvals...)
++	if len(kvs)%2 != 0 {
++		kvs = append(kvs, ErrMissingValue)
++	}
+ 	if l.hasValuer {
+ 		// If no keyvals were appended above then we must copy l.keyvals so
+ 		// that future log events will reevaluate the stored Valuers.
+@@ -57,17 +64,17 @@ func (l Context) With(keyvals ...interface{}) Context {
+ 	if len(keyvals) == 0 {
+ 		return l
+ 	}
+-	if len(keyvals)%2 != 0 {
+-		panic("bad keyvals")
++	kvs := append(l.keyvals, keyvals...)
++	if len(kvs)%2 != 0 {
++		kvs = append(kvs, ErrMissingValue)
+ 	}
+-	// Limiting the capacity of the stored keyvals ensures that a new
+-	// backing array is created if the slice must grow in Log or With.
+-	// Using the extra capacity without copying risks a data race that
+-	// would violate the Logger interface contract.
+-	n := len(l.keyvals) + len(keyvals)
+ 	return Context{
+-		logger:    l.logger,
+-		keyvals:   append(l.keyvals, keyvals...)[:n:n],
++		logger: l.logger,
++		// Limiting the capacity of the stored keyvals ensures that a new
++		// backing array is created if the slice must grow in Log or With.
++		// Using the extra capacity without copying risks a data race that
++		// would violate the Logger interface contract.
++		keyvals:   kvs[:len(kvs):len(kvs)],
+ 		hasValuer: l.hasValuer || containsValuer(keyvals),
+ 	}
+ }
+@@ -78,16 +85,19 @@ func (l Context) WithPrefix(keyvals ...interface{}) Context {
+ 	if len(keyvals) == 0 {
+ 		return l
+ 	}
+-	if len(keyvals)%2 != 0 {
+-		panic("bad keyvals")
+-	}
+ 	// Limiting the capacity of the stored keyvals ensures that a new
+ 	// backing array is created if the slice must grow in Log or With.
+ 	// Using the extra capacity without copying risks a data race that
+ 	// would violate the Logger interface contract.
+ 	n := len(l.keyvals) + len(keyvals)
++	if len(keyvals)%2 != 0 {
++		n++
++	}
+ 	kvs := make([]interface{}, 0, n)
+ 	kvs = append(kvs, keyvals...)
++	if len(kvs)%2 != 0 {
++		kvs = append(kvs, ErrMissingValue)
++	}
+ 	kvs = append(kvs, l.keyvals...)
+ 	return Context{
+ 		logger:    l.logger,

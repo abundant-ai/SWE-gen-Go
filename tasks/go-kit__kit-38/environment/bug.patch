@@ -1,0 +1,318 @@
+diff --git a/addsvc/http_binding.go b/addsvc/http_binding.go
+index 7400909..0d5dff3 100644
+--- a/addsvc/http_binding.go
++++ b/addsvc/http_binding.go
+@@ -1,14 +1,37 @@
+ package main
+ 
+ import (
++	"encoding/json"
++	"io"
+ 	"net/http"
+ 	"time"
+ 
++	"golang.org/x/net/context"
++
+ 	"github.com/peterbourgon/gokit/metrics"
++	"github.com/peterbourgon/gokit/server"
+ )
+ 
+-// HTTP bindings require no service-specific declarations, and so are defined
+-// in transport/http.
++// jsonCodec implements transport/codec, decoding and encoding requests and
++// responses respectively as JSON. It requires that the concrete request and
++// response types support JSON de/serialization.
++//
++// This type is mostly boiler-plate; in theory, it could be generated.
++type jsonCodec struct{}
++
++func (jsonCodec) Decode(ctx context.Context, r io.Reader) (server.Request, context.Context, error) {
++	var req request
++	err := json.NewDecoder(r).Decode(&req)
++	return &req, ctx, err
++}
++
++func (jsonCodec) Encode(w io.Writer, resp server.Response) error {
++	return json.NewEncoder(w).Encode(resp)
++}
++
++// The HTTP binding exists in the HTTP transport package, because it uses the
++// codec to deserialize and serialize requests and responses, and therefore
++// doesn't need to have access to the concrete request and response types.
+ 
+ func httpInstrument(requests metrics.Counter, duration metrics.Histogram) func(http.Handler) http.Handler {
+ 	return func(next http.Handler) http.Handler {
+diff --git a/addsvc/main.go b/addsvc/main.go
+index a0c7f60..19235f2 100644
+--- a/addsvc/main.go
++++ b/addsvc/main.go
+@@ -9,7 +9,6 @@ import (
+ 	"net/http"
+ 	"os"
+ 	"os/signal"
+-	"reflect"
+ 	"syscall"
+ 	"time"
+ 
+@@ -27,8 +26,7 @@ import (
+ 	"github.com/peterbourgon/gokit/metrics/statsd"
+ 	"github.com/peterbourgon/gokit/server"
+ 	"github.com/peterbourgon/gokit/tracing/zipkin"
+-	jsoncodec "github.com/peterbourgon/gokit/transport/codec/json"
+-	httptransport "github.com/peterbourgon/gokit/transport/http"
++	kithttp "github.com/peterbourgon/gokit/transport/http"
+ )
+ 
+ func main() {
+@@ -53,9 +51,9 @@ func main() {
+ 	)
+ 
+ 	// `package tracing` domain
+-	zipkinHost := "some-host"             // TODO
+-	zipkinCollector := loggingCollector{} // TODO
+-	zipkinAddName := "ADD"                // is that right?
++	zipkinHost := "some-host"                // TODO
++	zipkinCollector := zipkin.NopCollector{} // TODO
++	zipkinAddName := "ADD"                   // is that right?
+ 	zipkinAddSpanFunc := zipkin.NewSpanFunc(zipkinHost, zipkinAddName)
+ 
+ 	// `package log` domain
+@@ -110,11 +108,11 @@ func main() {
+ 		defer cancel()
+ 
+ 		field := metrics.Field{Key: "transport", Value: "http"}
+-		before := httptransport.Before(zipkin.ToContext(zipkin.FromHTTP(zipkinAddSpanFunc)))
+-		after := httptransport.After(httptransport.SetContentType("application/json"))
++		before := kithttp.Before(zipkin.ToContext(zipkin.FromHTTP(zipkinAddSpanFunc)))
++		after := kithttp.After(kithttp.SetContentType("application/json"))
+ 
+ 		var handler http.Handler
+-		handler = httptransport.NewBinding(ctx, reflect.TypeOf(request{}), jsoncodec.New(), e, before, after)
++		handler = kithttp.NewBinding(ctx, jsonCodec{}, e, before, after)
+ 		handler = encoding.Gzip(handler)
+ 		handler = cors.Middleware(cors.Config{})(handler)
+ 		handler = httpInstrument(requests.With(field), duration.With(field))(handler)
+@@ -185,14 +183,3 @@ func interrupt() error {
+ 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+ 	return fmt.Errorf("%s", <-c)
+ }
+-
+-type loggingCollector struct{}
+-
+-func (loggingCollector) Collect(s *zipkin.Span) error {
+-	kitlog.With(kitlog.DefaultLogger, "caller", kitlog.DefaultCaller).Log(
+-		"trace_id", s.TraceID(),
+-		"span_id", s.SpanID(),
+-		"parent_span_id", s.ParentSpanID(),
+-	)
+-	return nil
+-}
+diff --git a/transport/codec/codec.go b/transport/codec/codec.go
+index 749a12b..6df0175 100644
+--- a/transport/codec/codec.go
++++ b/transport/codec/codec.go
+@@ -12,6 +12,6 @@ import (
+ // and returns a context because the request may be accompanied by information
+ // that needs to be applied there.
+ type Codec interface {
+-	Decode(context.Context, io.Reader, server.Request) (context.Context, error)
++	Decode(context.Context, io.Reader) (server.Request, context.Context, error)
+ 	Encode(io.Writer, server.Response) error
+ }
+diff --git a/transport/codec/json/json.go b/transport/codec/json/json.go
+deleted file mode 100644
+index 08169c6..0000000
+--- a/transport/codec/json/json.go
++++ /dev/null
+@@ -1,25 +0,0 @@
+-package json
+-
+-import (
+-	"encoding/json"
+-	"io"
+-
+-	"golang.org/x/net/context"
+-
+-	"github.com/peterbourgon/gokit/server"
+-	"github.com/peterbourgon/gokit/transport/codec"
+-)
+-
+-type jsonCodec struct{}
+-
+-// New returns a JSON codec. Request and response structures should have
+-// properly-tagged fields.
+-func New() codec.Codec { return jsonCodec{} }
+-
+-func (jsonCodec) Decode(ctx context.Context, r io.Reader, req server.Request) (context.Context, error) {
+-	return ctx, json.NewDecoder(r).Decode(req)
+-}
+-
+-func (jsonCodec) Encode(w io.Writer, resp server.Response) error {
+-	return json.NewEncoder(w).Encode(resp)
+-}
+diff --git a/transport/codec/json/json_test.go b/transport/codec/json/json_test.go
+deleted file mode 100644
+index 1f0ff0b..0000000
+--- a/transport/codec/json/json_test.go
++++ /dev/null
+@@ -1,40 +0,0 @@
+-package json_test
+-
+-import (
+-	"bytes"
+-	"testing"
+-
+-	"golang.org/x/net/context"
+-
+-	jsoncodec "github.com/peterbourgon/gokit/transport/codec/json"
+-)
+-
+-type request struct {
+-	A int    `json:"a"`
+-	B string `json:"b"`
+-}
+-
+-type response struct {
+-	Values []string `json:"values"`
+-}
+-
+-func TestDecode(t *testing.T) {
+-	buf := bytes.NewBufferString(`{"a":1,"b":"2"}`)
+-	var req request
+-	if _, err := jsoncodec.New().Decode(context.Background(), buf, &req); err != nil {
+-		t.Fatal(err)
+-	}
+-	if want, have := (request{A: 1, B: "2"}), req; want != have {
+-		t.Errorf("want %v, have %v", want, have)
+-	}
+-}
+-
+-func TestEncode(t *testing.T) {
+-	buf := &bytes.Buffer{}
+-	if err := jsoncodec.New().Encode(buf, response{Values: []string{"a", "b", "c"}}); err != nil {
+-		t.Fatal(err)
+-	}
+-	if want, have := `{"values":["a","b","c"]}`+"\n", buf.String(); want != have {
+-		t.Errorf("want %q, have %q", want, have)
+-	}
+-}
+diff --git a/transport/http/binding.go b/transport/http/binding.go
+index ac21c8a..c5c9991 100644
+--- a/transport/http/binding.go
++++ b/transport/http/binding.go
+@@ -2,7 +2,6 @@ package http
+ 
+ import (
+ 	"net/http"
+-	"reflect"
+ 
+ 	"golang.org/x/net/context"
+ 
+@@ -25,7 +24,6 @@ func After(funcs ...AfterFunc) BindingOption {
+ 
+ type binding struct {
+ 	context.Context
+-	requestType reflect.Type
+ 	codec.Codec
+ 	server.Endpoint
+ 	before []BeforeFunc
+@@ -33,12 +31,11 @@ type binding struct {
+ }
+ 
+ // NewBinding returns an HTTP handler that wraps the given endpoint.
+-func NewBinding(ctx context.Context, requestType reflect.Type, cdc codec.Codec, endpoint server.Endpoint, options ...BindingOption) http.Handler {
++func NewBinding(ctx context.Context, cdc codec.Codec, endpoint server.Endpoint, options ...BindingOption) http.Handler {
+ 	b := &binding{
+-		Context:     ctx,
+-		requestType: requestType,
+-		Codec:       cdc,
+-		Endpoint:    endpoint,
++		Context:  ctx,
++		Codec:    cdc,
++		Endpoint: endpoint,
+ 	}
+ 	for _, option := range options {
+ 		option(b)
+@@ -57,8 +54,7 @@ func (b *binding) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	// Decode request.
+-	req := reflect.New(b.requestType).Interface()
+-	ctx, err := b.Codec.Decode(ctx, r.Body, req)
++	req, ctx, err := b.Codec.Decode(ctx, r.Body)
+ 	if err != nil {
+ 		http.Error(w, err.Error(), http.StatusBadRequest)
+ 		return
+diff --git a/transport/http/binding_test.go b/transport/http/binding_test.go
+deleted file mode 100644
+index fe6c8d4..0000000
+--- a/transport/http/binding_test.go
++++ /dev/null
+@@ -1,67 +0,0 @@
+-package http_test
+-
+-import (
+-	"bytes"
+-	"encoding/json"
+-	"fmt"
+-	"net/http"
+-	"net/http/httptest"
+-	"reflect"
+-	"testing"
+-
+-	"golang.org/x/net/context"
+-
+-	"github.com/peterbourgon/gokit/server"
+-	jsoncodec "github.com/peterbourgon/gokit/transport/codec/json"
+-	httptransport "github.com/peterbourgon/gokit/transport/http"
+-)
+-
+-func TestBinding(t *testing.T) {
+-	type myRequest struct {
+-		In int `json:"in"`
+-	}
+-
+-	type myResponse struct {
+-		Out int `json:"out"`
+-	}
+-
+-	transform := func(i int) int {
+-		return 3 * i // doesn't matter, just do something
+-	}
+-
+-	endpoint := func(_ context.Context, req server.Request) (server.Response, error) {
+-		r, ok := req.(*myRequest)
+-		if !ok {
+-			return nil, fmt.Errorf("not myRequest (%s)", reflect.TypeOf(req))
+-		}
+-		return myResponse{transform(r.In)}, nil
+-	}
+-
+-	ctx := context.Background()
+-	requestType := reflect.TypeOf(myRequest{})
+-	codec := jsoncodec.New()
+-	binding := httptransport.NewBinding(ctx, requestType, codec, endpoint)
+-	server := httptest.NewServer(binding)
+-	defer server.Close()
+-
+-	n := 123
+-	requestBody, err := json.Marshal(myRequest{n})
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	resp, err := http.Post(server.URL, "application/json", bytes.NewBuffer(requestBody))
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	defer resp.Body.Close()
+-
+-	var r myResponse
+-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+-		t.Fatal(err)
+-	}
+-
+-	if want, have := transform(n), r.Out; want != have {
+-		t.Errorf("want %d, have %d", want, have)
+-	}
+-}

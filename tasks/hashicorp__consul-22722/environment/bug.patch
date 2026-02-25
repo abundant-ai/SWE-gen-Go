@@ -1,0 +1,1107 @@
+diff --git a/.changelog/22722.txt b/.changelog/22722.txt
+deleted file mode 100644
+index 0a1fd2d5c8..0000000000
+--- a/.changelog/22722.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-```release-note:feature
+-config: Handle a new parameter `max_request_headers_kb` to configure maximum header size for requests from downstream to upstream in Mesh Gateway via service-defaults and proxy-defaults
+-```
+\ No newline at end of file
+diff --git a/agent/xds/listeners.go b/agent/xds/listeners.go
+index 5150be61f5..a2cae89c0d 100644
+--- a/agent/xds/listeners.go
++++ b/agent/xds/listeners.go
+@@ -2187,23 +2187,6 @@ func (s *ResourceGenerator) makeMeshGatewayPeerFilterChain(
+ 
+ 	filterName := fmt.Sprintf("%s.%s.%s.%s", chain.ServiceName, chain.Namespace, chain.Partition, chain.Datacenter)
+ 
+-	// The priority order is service defaults and then the proxy config
+-	// the value set in the proxy defaults is considered to be a default, that can be updated by the value from the service-default
+-	proxyCfg := cfgSnap.GetProxyConfig(s.Logger)
+-	maxRequestHeadersKb := proxyCfg.MaxRequestHeadersKB
+-
+-	serviceProxyConfig, found := cfgSnap.MeshGateway.ServiceGroups[svc]
+-	if found && len(serviceProxyConfig) > 0 {
+-		val, found := serviceProxyConfig[0].Service.Proxy.Config["max_request_headers_kb"]
+-		if found {
+-			value, ok := val.(int64)
+-			if ok {
+-				v := uint32(value)
+-				maxRequestHeadersKb = &v
+-			}
+-		}
+-	}
+-
+ 	filterChain, err := s.makeUpstreamFilterChain(filterChainOpts{
+ 		accessLogs:           &cfgSnap.Proxy.AccessLogs,
+ 		routeName:            uid.EnvoyID(),
+@@ -2215,7 +2198,6 @@ func (s *ResourceGenerator) makeMeshGatewayPeerFilterChain(
+ 		statPrefix:           "mesh_gateway_local_peered.",
+ 		forwardClientDetails: true,
+ 		forwardClientPolicy:  envoy_http_v3.HttpConnectionManager_SANITIZE_SET,
+-		maxRequestHeadersKb:  maxRequestHeadersKb,
+ 	})
+ 	if err != nil {
+ 		return nil, err
+diff --git a/agent/xds/listeners_ingress.go b/agent/xds/listeners_ingress.go
+index 9c2c513a2b..76659b87d7 100644
+--- a/agent/xds/listeners_ingress.go
++++ b/agent/xds/listeners_ingress.go
+@@ -108,22 +108,18 @@ func (s *ResourceGenerator) makeIngressGatewayListeners(address string, cfgSnap
+ 
+ 			listener := makeListener(listenerOpts)
+ 
+-			proxyCfg := cfgSnap.GetProxyConfig(s.Logger)
+-			maxRequestHeadersKb := proxyCfg.MaxRequestHeadersKB
+-
+ 			filterOpts := listenerFilterOpts{
+-				useRDS:              true,
+-				fetchTimeoutRDS:     cfgSnap.GetXDSCommonConfig(s.Logger).GetXDSFetchTimeout(),
+-				protocol:            listenerKey.Protocol,
+-				filterName:          listenerKey.RouteName(),
+-				routeName:           listenerKey.RouteName(),
+-				cluster:             "",
+-				statPrefix:          "ingress_upstream_",
+-				routePath:           "",
+-				httpAuthzFilters:    nil,
+-				accessLogs:          &cfgSnap.Proxy.AccessLogs,
+-				logger:              s.Logger,
+-				maxRequestHeadersKb: maxRequestHeadersKb,
++				useRDS:           true,
++				fetchTimeoutRDS:  cfgSnap.GetXDSCommonConfig(s.Logger).GetXDSFetchTimeout(),
++				protocol:         listenerKey.Protocol,
++				filterName:       listenerKey.RouteName(),
++				routeName:        listenerKey.RouteName(),
++				cluster:          "",
++				statPrefix:       "ingress_upstream_",
++				routePath:        "",
++				httpAuthzFilters: nil,
++				accessLogs:       &cfgSnap.Proxy.AccessLogs,
++				logger:           s.Logger,
+ 			}
+ 
+ 			// Generate any filter chains needed for services with custom TLS certs
+diff --git a/agent/xds/listeners_test.go b/agent/xds/listeners_test.go
+index 03152734fe..932f2926b5 100644
+--- a/agent/xds/listeners_test.go
++++ b/agent/xds/listeners_test.go
+@@ -634,161 +634,6 @@ func Test_makeAPIGatewayListeners_maxRequestHeadersKb(t *testing.T) {
+ 	}
+ }
+ 
+-func Test_makeMeshGatewayPeerFilterChain_maxRequestHeadersKb(t *testing.T) {
+-	tests := map[string]struct {
+-		proxyConfig        map[string]interface{}
+-		serviceProxyConfig map[string]interface{}
+-		protocol           string
+-		wantPresent        bool
+-		wantValue          uint32
+-	}{
+-		"defaults to proxy config when no service override": {
+-			proxyConfig: map[string]interface{}{
+-				"max_request_headers_kb": int64(128),
+-			},
+-			serviceProxyConfig: map[string]interface{}{},
+-			protocol:           "http",
+-			wantPresent:        true,
+-			wantValue:          128,
+-		},
+-		"service override takes precedence over proxy config": {
+-			proxyConfig: map[string]interface{}{
+-				"max_request_headers_kb": int64(128),
+-			},
+-			serviceProxyConfig: map[string]interface{}{
+-				"max_request_headers_kb": int64(256),
+-			},
+-			protocol:    "http",
+-			wantPresent: true,
+-			wantValue:   256,
+-		},
+-		"no proxy config and no service override": {
+-			proxyConfig:        map[string]interface{}{},
+-			serviceProxyConfig: map[string]interface{}{},
+-			protocol:           "http",
+-			wantPresent:        false,
+-		},
+-		"service override with nil proxy config": {
+-			proxyConfig: nil,
+-			serviceProxyConfig: map[string]interface{}{
+-				"max_request_headers_kb": int64(64),
+-			},
+-			protocol:    "http",
+-			wantPresent: true,
+-			wantValue:   64,
+-		},
+-		"tcp protocol ignores header settings": {
+-			proxyConfig: map[string]interface{}{
+-				"max_request_headers_kb": int64(128),
+-			},
+-			serviceProxyConfig: map[string]interface{}{
+-				"max_request_headers_kb": int64(256),
+-			},
+-			protocol:    "tcp",
+-			wantPresent: false,
+-		},
+-		"grpc protocol uses service override": {
+-			proxyConfig: map[string]interface{}{
+-				"max_request_headers_kb": int64(128),
+-			},
+-			serviceProxyConfig: map[string]interface{}{
+-				"max_request_headers_kb": int64(512),
+-			},
+-			protocol:    "grpc",
+-			wantPresent: true,
+-			wantValue:   512,
+-		},
+-	}
+-
+-	for name, tc := range tests {
+-		t.Run(name, func(t *testing.T) {
+-			// Create test service name
+-			svc := structs.NewServiceName("test-service", structs.DefaultEnterpriseMetaInDefaultPartition())
+-
+-			// Create mock config snapshot using the test helper
+-			snap := proxycfg.TestConfigSnapshotPeeredMeshGateway(t, "default-services-http", func(ns *structs.NodeService) {
+-				ns.Proxy.Config = tc.proxyConfig
+-			}, nil)
+-
+-			// Add service group with proxy config if provided
+-			if tc.serviceProxyConfig != nil {
+-				snap.MeshGateway.ServiceGroups[svc] = structs.CheckServiceNodes{
+-					{
+-						Service: &structs.NodeService{
+-							Proxy: structs.ConnectProxyConfig{
+-								Config: tc.serviceProxyConfig,
+-							},
+-						},
+-					},
+-				}
+-			}
+-
+-			// Create mock discovery chain with a first node
+-			chain := &structs.CompiledDiscoveryChain{
+-				ServiceName: svc.Name,
+-				Namespace:   svc.NamespaceOrDefault(),
+-				Partition:   svc.PartitionOrDefault(),
+-				Datacenter:  "dc1",
+-				Protocol:    tc.protocol,
+-				StartNode:   "test-node",
+-				Nodes: map[string]*structs.DiscoveryGraphNode{
+-					"test-node": {
+-						Type: structs.DiscoveryGraphNodeTypeResolver,
+-						Name: "test-service.default.default.dc1",
+-						Resolver: &structs.DiscoveryResolver{
+-							Target: "test-service.default.default.dc1",
+-						},
+-					},
+-				},
+-				Targets: map[string]*structs.DiscoveryTarget{
+-					"test-service.default.default.dc1": {
+-						ID:         "test-service.default.default.dc1",
+-						Service:    svc.Name,
+-						Namespace:  svc.NamespaceOrDefault(),
+-						Partition:  svc.PartitionOrDefault(),
+-						Datacenter: "dc1",
+-						SNI:        "test-service.default.default.dc1.internal.test-domain.consul",
+-						Name:       "test-service.default.default.dc1.internal.test-domain.consul",
+-					},
+-				},
+-			}
+-
+-			// Create resource generator
+-			s := &ResourceGenerator{
+-				Logger: hclog.NewNullLogger(),
+-			}
+-
+-			// Call the function under test
+-			filterChain, err := s.makeMeshGatewayPeerFilterChain(snap, svc, []string{"test-peer"}, chain)
+-
+-			require.NoError(t, err)
+-			require.NotNil(t, filterChain)
+-			require.Len(t, filterChain.Filters, 1)
+-
+-			filter := filterChain.Filters[0]
+-
+-			if tc.protocol == "tcp" {
+-				// For TCP, verify we don't have HTTP connection manager
+-				require.Contains(t, filter.Name, "tcp_proxy")
+-				return
+-			}
+-
+-			// For HTTP-like protocols, check the HTTP connection manager
+-			require.Contains(t, filter.Name, "http_connection_manager")
+-			var httpConnMgr envoy_http_v3.HttpConnectionManager
+-			err = filter.GetTypedConfig().UnmarshalTo(&httpConnMgr)
+-			require.NoError(t, err)
+-
+-			if tc.wantPresent {
+-				require.NotNil(t, httpConnMgr.MaxRequestHeadersKb, "expected MaxRequestHeadersKb to be set but it was nil")
+-				require.Equal(t, tc.wantValue, httpConnMgr.MaxRequestHeadersKb.GetValue())
+-			} else {
+-				require.Nil(t, httpConnMgr.MaxRequestHeadersKb, "expected MaxRequestHeadersKb to be nil but it was set")
+-			}
+-		})
+-	}
+-}
+-
+ // Helper function for uint32 pointers
+ func uintPointer(i uint32) *uint32 {
+ 	return &i
+diff --git a/agent/xds/resources_test.go b/agent/xds/resources_test.go
+index 58a2768dab..b14a9f9e92 100644
+--- a/agent/xds/resources_test.go
++++ b/agent/xds/resources_test.go
+@@ -828,38 +828,6 @@ func getMeshGatewayPeeringGoldenTestCases() []goldenTestCase {
+ 				return proxycfg.TestConfigSnapshotPeeredMeshGateway(t, "peer-through-mesh-gateway", nil, nil)
+ 			},
+ 		},
+-		{
+-			name: "mesh-gateway-peering-service-max-request-headers",
+-			create: func(t testinf.T) *proxycfg.ConfigSnapshot {
+-				// Start with the standard HTTP snapshot
+-				snap := proxycfg.TestConfigSnapshotPeeredMeshGateway(t, "default-services-http", func(ns *structs.NodeService) {
+-					// Set mesh gateway proxy config for default max_request_headers_kb
+-					ns.Proxy.Config = map[string]interface{}{
+-						"max_request_headers_kb": int64(128),
+-					}
+-				}, nil)
+-
+-				// Modify the "foo" service to have a service-specific max_request_headers_kb override
+-				fooSN := structs.NewServiceName("foo", nil)
+-				if serviceGroup, exists := snap.MeshGateway.ServiceGroups[fooSN]; exists && len(serviceGroup) > 0 {
+-					// Create a new service node with proxy config containing max_request_headers_kb
+-					modifiedService := *serviceGroup[0].Service // Copy the service
+-					modifiedService.Proxy.Config = map[string]interface{}{
+-						"max_request_headers_kb": int64(256), // Service-specific override
+-						"protocol":               "http",
+-					}
+-
+-					// Create a new service group with the modified service
+-					modifiedNode := serviceGroup[0] // Copy the node
+-					modifiedNode.Service = &modifiedService
+-
+-					// Replace the service group
+-					snap.MeshGateway.ServiceGroups[fooSN] = structs.CheckServiceNodes{modifiedNode}
+-				}
+-
+-				return snap
+-			},
+-		},
+ 	}
+ }
+ 
+diff --git a/agent/xds/testdata/clusters/mesh-gateway-peering-service-max-request-headers.latest.golden b/agent/xds/testdata/clusters/mesh-gateway-peering-service-max-request-headers.latest.golden
+deleted file mode 100644
+index 608443d633..0000000000
+--- a/agent/xds/testdata/clusters/mesh-gateway-peering-service-max-request-headers.latest.golden
++++ /dev/null
+@@ -1,199 +0,0 @@
+-{
+-  "nonce": "00000001",
+-  "resources": [
+-    {
+-      "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+-      "connectTimeout": "5s",
+-      "edsClusterConfig": {
+-        "edsConfig": {
+-          "ads": {},
+-          "resourceApiVersion": "V3"
+-        }
+-      },
+-      "name": "bar.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "outlierDetection": {},
+-      "type": "EDS"
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+-      "altStatName": "exported~bar.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "circuitBreakers": {},
+-      "commonLbConfig": {
+-        "healthyPanicThreshold": {}
+-      },
+-      "connectTimeout": "5s",
+-      "edsClusterConfig": {
+-        "edsConfig": {
+-          "ads": {},
+-          "resourceApiVersion": "V3"
+-        }
+-      },
+-      "name": "exported~bar.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "outlierDetection": {},
+-      "transportSocket": {
+-        "name": "tls",
+-        "typedConfig": {
+-          "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+-          "commonTlsContext": {
+-            "tlsCertificates": [
+-              {
+-                "certificateChain": {
+-                  "inlineString": "-----BEGIN CERTIFICATE-----\nMIICjDCCAjKgAwIBAgIIC5llxGV1gB8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowDjEMMAoG\nA1UEAxMDd2ViMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEADPv1RHVNRfa2VKR\nAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Favq5E0ivpNtv1QnFhxtPd7d5k4e+T7\nSkW1TaOCAXIwggFuMA4GA1UdDwEB/wQEAwIDuDAdBgNVHSUEFjAUBggrBgEFBQcD\nAgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADBoBgNVHQ4EYQRfN2Q6MDc6ODc6M2E6\nNDA6MTk6NDc6YzM6NWE6YzA6YmE6NjI6ZGY6YWY6NGI6ZDQ6MDU6MjU6NzY6M2Q6\nNWE6OGQ6MTY6OGQ6Njc6NWU6MmU6YTA6MzQ6N2Q6ZGM6ZmYwagYDVR0jBGMwYYBf\nZDE6MTE6MTE6YWM6MmE6YmE6OTc6YjI6M2Y6YWM6N2I6YmQ6ZGE6YmU6YjE6OGE6\nZmM6OWE6YmE6YjU6YmM6ODM6ZTc6NWU6NDE6NmY6ZjI6NzM6OTU6NTg6MGM6ZGIw\nWQYDVR0RBFIwUIZOc3BpZmZlOi8vMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1\nNTU1NTU1NTU1LmNvbnN1bC9ucy9kZWZhdWx0L2RjL2RjMS9zdmMvd2ViMAoGCCqG\nSM49BAMCA0gAMEUCIGC3TTvvjj76KMrguVyFf4tjOqaSCRie3nmHMRNNRav7AiEA\npY0heYeK9A6iOLrzqxSerkXXQyj5e9bE4VgUnxgPU6g=\n-----END CERTIFICATE-----\n"
+-                },
+-                "privateKey": {
+-                  "inlineString": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIMoTkpRggp3fqZzFKh82yS4LjtJI+XY+qX/7DefHFrtdoAoGCCqGSM49\nAwEHoUQDQgAEADPv1RHVNRfa2VKRAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Fav\nq5E0ivpNtv1QnFhxtPd7d5k4e+T7SkW1TQ==\n-----END EC PRIVATE KEY-----\n"
+-                }
+-              }
+-            ],
+-            "tlsParams": {},
+-            "validationContext": {
+-              "matchTypedSubjectAltNames": [
+-                {
+-                  "matcher": {
+-                    "exact": "spiffe://11111111-2222-3333-4444-555555555555.consul/ns/default/dc/dc1/svc/bar"
+-                  },
+-                  "sanType": "URI"
+-                }
+-              ],
+-              "trustedCa": {
+-                "inlineString": "-----BEGIN CERTIFICATE-----\nMIICXDCCAgKgAwIBAgIICpZq70Z9LyUwCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowFDESMBAG\nA1UEAxMJVGVzdCBDQSAyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIhywH1gx\nAsMwuF3ukAI5YL2jFxH6Usnma1HFSfVyxbXX1/uoZEYrj8yCAtdU2yoHETyd+Zx2\nThhRLP79pYegCaOCATwwggE4MA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTAD\nAQH/MGgGA1UdDgRhBF9kMToxMToxMTphYzoyYTpiYTo5NzpiMjozZjphYzo3Yjpi\nZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1ZTo0MTo2ZjpmMjo3\nMzo5NTo1ODowYzpkYjBqBgNVHSMEYzBhgF9kMToxMToxMTphYzoyYTpiYTo5Nzpi\nMjozZjphYzo3YjpiZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1\nZTo0MTo2ZjpmMjo3Mzo5NTo1ODowYzpkYjA/BgNVHREEODA2hjRzcGlmZmU6Ly8x\nMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUuY29uc3VsMAoGCCqG\nSM49BAMCA0gAMEUCICOY0i246rQHJt8o8Oya0D5PLL1FnmsQmQqIGCi31RwnAiEA\noR5f6Ku+cig2Il8T8LJujOp2/2A72QcHZA57B13y+8o=\n-----END CERTIFICATE-----\n"
+-              }
+-            }
+-          },
+-          "sni": "bar.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul"
+-        }
+-      },
+-      "type": "EDS"
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+-      "altStatName": "exported~foo.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "circuitBreakers": {},
+-      "commonLbConfig": {
+-        "healthyPanicThreshold": {}
+-      },
+-      "connectTimeout": "5s",
+-      "edsClusterConfig": {
+-        "edsConfig": {
+-          "ads": {},
+-          "resourceApiVersion": "V3"
+-        }
+-      },
+-      "name": "exported~foo.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "outlierDetection": {},
+-      "transportSocket": {
+-        "name": "tls",
+-        "typedConfig": {
+-          "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+-          "commonTlsContext": {
+-            "tlsCertificates": [
+-              {
+-                "certificateChain": {
+-                  "inlineString": "-----BEGIN CERTIFICATE-----\nMIICjDCCAjKgAwIBAgIIC5llxGV1gB8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowDjEMMAoG\nA1UEAxMDd2ViMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEADPv1RHVNRfa2VKR\nAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Favq5E0ivpNtv1QnFhxtPd7d5k4e+T7\nSkW1TaOCAXIwggFuMA4GA1UdDwEB/wQEAwIDuDAdBgNVHSUEFjAUBggrBgEFBQcD\nAgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADBoBgNVHQ4EYQRfN2Q6MDc6ODc6M2E6\nNDA6MTk6NDc6YzM6NWE6YzA6YmE6NjI6ZGY6YWY6NGI6ZDQ6MDU6MjU6NzY6M2Q6\nNWE6OGQ6MTY6OGQ6Njc6NWU6MmU6YTA6MzQ6N2Q6ZGM6ZmYwagYDVR0jBGMwYYBf\nZDE6MTE6MTE6YWM6MmE6YmE6OTc6YjI6M2Y6YWM6N2I6YmQ6ZGE6YmU6YjE6OGE6\nZmM6OWE6YmE6YjU6YmM6ODM6ZTc6NWU6NDE6NmY6ZjI6NzM6OTU6NTg6MGM6ZGIw\nWQYDVR0RBFIwUIZOc3BpZmZlOi8vMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1\nNTU1NTU1NTU1LmNvbnN1bC9ucy9kZWZhdWx0L2RjL2RjMS9zdmMvd2ViMAoGCCqG\nSM49BAMCA0gAMEUCIGC3TTvvjj76KMrguVyFf4tjOqaSCRie3nmHMRNNRav7AiEA\npY0heYeK9A6iOLrzqxSerkXXQyj5e9bE4VgUnxgPU6g=\n-----END CERTIFICATE-----\n"
+-                },
+-                "privateKey": {
+-                  "inlineString": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIMoTkpRggp3fqZzFKh82yS4LjtJI+XY+qX/7DefHFrtdoAoGCCqGSM49\nAwEHoUQDQgAEADPv1RHVNRfa2VKRAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Fav\nq5E0ivpNtv1QnFhxtPd7d5k4e+T7SkW1TQ==\n-----END EC PRIVATE KEY-----\n"
+-                }
+-              }
+-            ],
+-            "tlsParams": {},
+-            "validationContext": {
+-              "matchTypedSubjectAltNames": [
+-                {
+-                  "matcher": {
+-                    "exact": "spiffe://11111111-2222-3333-4444-555555555555.consul/ns/default/dc/dc1/svc/foo"
+-                  },
+-                  "sanType": "URI"
+-                }
+-              ],
+-              "trustedCa": {
+-                "inlineString": "-----BEGIN CERTIFICATE-----\nMIICXDCCAgKgAwIBAgIICpZq70Z9LyUwCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowFDESMBAG\nA1UEAxMJVGVzdCBDQSAyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIhywH1gx\nAsMwuF3ukAI5YL2jFxH6Usnma1HFSfVyxbXX1/uoZEYrj8yCAtdU2yoHETyd+Zx2\nThhRLP79pYegCaOCATwwggE4MA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTAD\nAQH/MGgGA1UdDgRhBF9kMToxMToxMTphYzoyYTpiYTo5NzpiMjozZjphYzo3Yjpi\nZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1ZTo0MTo2ZjpmMjo3\nMzo5NTo1ODowYzpkYjBqBgNVHSMEYzBhgF9kMToxMToxMTphYzoyYTpiYTo5Nzpi\nMjozZjphYzo3YjpiZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1\nZTo0MTo2ZjpmMjo3Mzo5NTo1ODowYzpkYjA/BgNVHREEODA2hjRzcGlmZmU6Ly8x\nMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUuY29uc3VsMAoGCCqG\nSM49BAMCA0gAMEUCICOY0i246rQHJt8o8Oya0D5PLL1FnmsQmQqIGCi31RwnAiEA\noR5f6Ku+cig2Il8T8LJujOp2/2A72QcHZA57B13y+8o=\n-----END CERTIFICATE-----\n"
+-              }
+-            }
+-          },
+-          "sni": "foo.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul"
+-        }
+-      },
+-      "type": "EDS"
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+-      "altStatName": "exported~gir.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "circuitBreakers": {},
+-      "commonLbConfig": {
+-        "healthyPanicThreshold": {}
+-      },
+-      "connectTimeout": "5s",
+-      "edsClusterConfig": {
+-        "edsConfig": {
+-          "ads": {},
+-          "resourceApiVersion": "V3"
+-        }
+-      },
+-      "name": "exported~gir.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "outlierDetection": {},
+-      "transportSocket": {
+-        "name": "tls",
+-        "typedConfig": {
+-          "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+-          "commonTlsContext": {
+-            "tlsCertificates": [
+-              {
+-                "certificateChain": {
+-                  "inlineString": "-----BEGIN CERTIFICATE-----\nMIICjDCCAjKgAwIBAgIIC5llxGV1gB8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowDjEMMAoG\nA1UEAxMDd2ViMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEADPv1RHVNRfa2VKR\nAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Favq5E0ivpNtv1QnFhxtPd7d5k4e+T7\nSkW1TaOCAXIwggFuMA4GA1UdDwEB/wQEAwIDuDAdBgNVHSUEFjAUBggrBgEFBQcD\nAgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADBoBgNVHQ4EYQRfN2Q6MDc6ODc6M2E6\nNDA6MTk6NDc6YzM6NWE6YzA6YmE6NjI6ZGY6YWY6NGI6ZDQ6MDU6MjU6NzY6M2Q6\nNWE6OGQ6MTY6OGQ6Njc6NWU6MmU6YTA6MzQ6N2Q6ZGM6ZmYwagYDVR0jBGMwYYBf\nZDE6MTE6MTE6YWM6MmE6YmE6OTc6YjI6M2Y6YWM6N2I6YmQ6ZGE6YmU6YjE6OGE6\nZmM6OWE6YmE6YjU6YmM6ODM6ZTc6NWU6NDE6NmY6ZjI6NzM6OTU6NTg6MGM6ZGIw\nWQYDVR0RBFIwUIZOc3BpZmZlOi8vMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1\nNTU1NTU1NTU1LmNvbnN1bC9ucy9kZWZhdWx0L2RjL2RjMS9zdmMvd2ViMAoGCCqG\nSM49BAMCA0gAMEUCIGC3TTvvjj76KMrguVyFf4tjOqaSCRie3nmHMRNNRav7AiEA\npY0heYeK9A6iOLrzqxSerkXXQyj5e9bE4VgUnxgPU6g=\n-----END CERTIFICATE-----\n"
+-                },
+-                "privateKey": {
+-                  "inlineString": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIMoTkpRggp3fqZzFKh82yS4LjtJI+XY+qX/7DefHFrtdoAoGCCqGSM49\nAwEHoUQDQgAEADPv1RHVNRfa2VKRAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Fav\nq5E0ivpNtv1QnFhxtPd7d5k4e+T7SkW1TQ==\n-----END EC PRIVATE KEY-----\n"
+-                }
+-              }
+-            ],
+-            "tlsParams": {},
+-            "validationContext": {
+-              "matchTypedSubjectAltNames": [
+-                {
+-                  "matcher": {
+-                    "exact": "spiffe://11111111-2222-3333-4444-555555555555.consul/ns/default/dc/dc1/svc/gir"
+-                  },
+-                  "sanType": "URI"
+-                }
+-              ],
+-              "trustedCa": {
+-                "inlineString": "-----BEGIN CERTIFICATE-----\nMIICXDCCAgKgAwIBAgIICpZq70Z9LyUwCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowFDESMBAG\nA1UEAxMJVGVzdCBDQSAyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIhywH1gx\nAsMwuF3ukAI5YL2jFxH6Usnma1HFSfVyxbXX1/uoZEYrj8yCAtdU2yoHETyd+Zx2\nThhRLP79pYegCaOCATwwggE4MA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTAD\nAQH/MGgGA1UdDgRhBF9kMToxMToxMTphYzoyYTpiYTo5NzpiMjozZjphYzo3Yjpi\nZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1ZTo0MTo2ZjpmMjo3\nMzo5NTo1ODowYzpkYjBqBgNVHSMEYzBhgF9kMToxMToxMTphYzoyYTpiYTo5Nzpi\nMjozZjphYzo3YjpiZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1\nZTo0MTo2ZjpmMjo3Mzo5NTo1ODowYzpkYjA/BgNVHREEODA2hjRzcGlmZmU6Ly8x\nMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUuY29uc3VsMAoGCCqG\nSM49BAMCA0gAMEUCICOY0i246rQHJt8o8Oya0D5PLL1FnmsQmQqIGCi31RwnAiEA\noR5f6Ku+cig2Il8T8LJujOp2/2A72QcHZA57B13y+8o=\n-----END CERTIFICATE-----\n"
+-              }
+-            }
+-          },
+-          "sni": "gir.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul"
+-        }
+-      },
+-      "type": "EDS"
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+-      "connectTimeout": "5s",
+-      "edsClusterConfig": {
+-        "edsConfig": {
+-          "ads": {},
+-          "resourceApiVersion": "V3"
+-        }
+-      },
+-      "name": "foo.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "outlierDetection": {},
+-      "type": "EDS"
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+-      "connectTimeout": "5s",
+-      "edsClusterConfig": {
+-        "edsConfig": {
+-          "ads": {},
+-          "resourceApiVersion": "V3"
+-        }
+-      },
+-      "name": "gir.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "outlierDetection": {},
+-      "type": "EDS"
+-    }
+-  ],
+-  "typeUrl": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+-  "versionInfo": "00000001"
+-}
+\ No newline at end of file
+diff --git a/agent/xds/testdata/endpoints/mesh-gateway-peering-service-max-request-headers.latest.golden b/agent/xds/testdata/endpoints/mesh-gateway-peering-service-max-request-headers.latest.golden
+deleted file mode 100644
+index b74de428ac..0000000000
+--- a/agent/xds/testdata/endpoints/mesh-gateway-peering-service-max-request-headers.latest.golden
++++ /dev/null
+@@ -1,187 +0,0 @@
+-{
+-  "nonce": "00000001",
+-  "resources": [
+-    {
+-      "@type": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+-      "clusterName": "bar.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "endpoints": [
+-        {
+-          "lbEndpoints": [
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.1",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            },
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.2",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            }
+-          ]
+-        }
+-      ]
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+-      "clusterName": "exported~bar.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "endpoints": [
+-        {
+-          "lbEndpoints": [
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.1",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            },
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.2",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            }
+-          ]
+-        }
+-      ]
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+-      "clusterName": "exported~foo.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "endpoints": [
+-        {
+-          "lbEndpoints": [
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.1",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            }
+-          ]
+-        }
+-      ]
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+-      "clusterName": "exported~gir.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "endpoints": [
+-        {
+-          "lbEndpoints": [
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.1",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            },
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.2",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            }
+-          ]
+-        }
+-      ]
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+-      "clusterName": "foo.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "endpoints": [
+-        {
+-          "lbEndpoints": [
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.1",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            }
+-          ]
+-        }
+-      ]
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+-      "clusterName": "gir.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+-      "endpoints": [
+-        {
+-          "lbEndpoints": [
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.1",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            },
+-            {
+-              "endpoint": {
+-                "address": {
+-                  "socketAddress": {
+-                    "address": "10.10.1.2",
+-                    "portValue": 8080
+-                  }
+-                }
+-              },
+-              "healthStatus": "HEALTHY",
+-              "loadBalancingWeight": 1
+-            }
+-          ]
+-        }
+-      ]
+-    }
+-  ],
+-  "typeUrl": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment",
+-  "versionInfo": "00000001"
+-}
+\ No newline at end of file
+diff --git a/agent/xds/testdata/listeners/mesh-gateway-peering-service-max-request-headers.latest.golden b/agent/xds/testdata/listeners/mesh-gateway-peering-service-max-request-headers.latest.golden
+deleted file mode 100644
+index 685bd740aa..0000000000
+--- a/agent/xds/testdata/listeners/mesh-gateway-peering-service-max-request-headers.latest.golden
++++ /dev/null
+@@ -1,315 +0,0 @@
+-{
+-  "nonce": "00000001",
+-  "resources": [
+-    {
+-      "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
+-      "address": {
+-        "socketAddress": {
+-          "address": "1.2.3.4",
+-          "portValue": 8443
+-        }
+-      },
+-      "filterChains": [
+-        {
+-          "filterChainMatch": {
+-            "serverNames": [
+-              "bar.default.default.peer-a.external.11111111-2222-3333-4444-555555555555.consul"
+-            ]
+-          },
+-          "filters": [
+-            {
+-              "name": "envoy.filters.network.http_connection_manager",
+-              "typedConfig": {
+-                "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+-                "forwardClientCertDetails": "SANITIZE_SET",
+-                "httpFilters": [
+-                  {
+-                    "name": "envoy.filters.http.router",
+-                    "typedConfig": {
+-                      "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+-                    }
+-                  }
+-                ],
+-                "maxRequestHeadersKb": 128,
+-                "rds": {
+-                  "configSource": {
+-                    "ads": {},
+-                    "resourceApiVersion": "V3"
+-                  },
+-                  "routeConfigName": "bar"
+-                },
+-                "setCurrentClientCertDetails": {
+-                  "cert": true,
+-                  "chain": true,
+-                  "dns": true,
+-                  "subject": true,
+-                  "uri": true
+-                },
+-                "statPrefix": "mesh_gateway_local_peered.bar.default.default.dc1",
+-                "tracing": {
+-                  "randomSampling": {}
+-                },
+-                "upgradeConfigs": [
+-                  {
+-                    "upgradeType": "websocket"
+-                  }
+-                ]
+-              }
+-            }
+-          ],
+-          "transportSocket": {
+-            "name": "tls",
+-            "typedConfig": {
+-              "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+-              "commonTlsContext": {
+-                "tlsCertificates": [
+-                  {
+-                    "certificateChain": {
+-                      "inlineString": "-----BEGIN CERTIFICATE-----\nMIICjDCCAjKgAwIBAgIIC5llxGV1gB8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowDjEMMAoG\nA1UEAxMDd2ViMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEADPv1RHVNRfa2VKR\nAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Favq5E0ivpNtv1QnFhxtPd7d5k4e+T7\nSkW1TaOCAXIwggFuMA4GA1UdDwEB/wQEAwIDuDAdBgNVHSUEFjAUBggrBgEFBQcD\nAgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADBoBgNVHQ4EYQRfN2Q6MDc6ODc6M2E6\nNDA6MTk6NDc6YzM6NWE6YzA6YmE6NjI6ZGY6YWY6NGI6ZDQ6MDU6MjU6NzY6M2Q6\nNWE6OGQ6MTY6OGQ6Njc6NWU6MmU6YTA6MzQ6N2Q6ZGM6ZmYwagYDVR0jBGMwYYBf\nZDE6MTE6MTE6YWM6MmE6YmE6OTc6YjI6M2Y6YWM6N2I6YmQ6ZGE6YmU6YjE6OGE6\nZmM6OWE6YmE6YjU6YmM6ODM6ZTc6NWU6NDE6NmY6ZjI6NzM6OTU6NTg6MGM6ZGIw\nWQYDVR0RBFIwUIZOc3BpZmZlOi8vMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1\nNTU1NTU1NTU1LmNvbnN1bC9ucy9kZWZhdWx0L2RjL2RjMS9zdmMvd2ViMAoGCCqG\nSM49BAMCA0gAMEUCIGC3TTvvjj76KMrguVyFf4tjOqaSCRie3nmHMRNNRav7AiEA\npY0heYeK9A6iOLrzqxSerkXXQyj5e9bE4VgUnxgPU6g=\n-----END CERTIFICATE-----\n"
+-                    },
+-                    "privateKey": {
+-                      "inlineString": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIMoTkpRggp3fqZzFKh82yS4LjtJI+XY+qX/7DefHFrtdoAoGCCqGSM49\nAwEHoUQDQgAEADPv1RHVNRfa2VKRAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Fav\nq5E0ivpNtv1QnFhxtPd7d5k4e+T7SkW1TQ==\n-----END EC PRIVATE KEY-----\n"
+-                    }
+-                  }
+-                ],
+-                "tlsParams": {},
+-                "validationContext": {
+-                  "customValidatorConfig": {
+-                    "name": "envoy.tls.cert_validator.spiffe",
+-                    "typedConfig": {
+-                      "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.SPIFFECertValidatorConfig",
+-                      "trustDomains": [
+-                        {
+-                          "name": "11111111-2222-3333-4444-555555555555.consul",
+-                          "trustBundle": {
+-                            "inlineString": "-----BEGIN CERTIFICATE-----\nMIICXDCCAgKgAwIBAgIICpZq70Z9LyUwCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowFDESMBAG\nA1UEAxMJVGVzdCBDQSAyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIhywH1gx\nAsMwuF3ukAI5YL2jFxH6Usnma1HFSfVyxbXX1/uoZEYrj8yCAtdU2yoHETyd+Zx2\nThhRLP79pYegCaOCATwwggE4MA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTAD\nAQH/MGgGA1UdDgRhBF9kMToxMToxMTphYzoyYTpiYTo5NzpiMjozZjphYzo3Yjpi\nZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1ZTo0MTo2ZjpmMjo3\nMzo5NTo1ODowYzpkYjBqBgNVHSMEYzBhgF9kMToxMToxMTphYzoyYTpiYTo5Nzpi\nMjozZjphYzo3YjpiZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1\nZTo0MTo2ZjpmMjo3Mzo5NTo1ODowYzpkYjA/BgNVHREEODA2hjRzcGlmZmU6Ly8x\nMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUuY29uc3VsMAoGCCqG\nSM49BAMCA0gAMEUCICOY0i246rQHJt8o8Oya0D5PLL1FnmsQmQqIGCi31RwnAiEA\noR5f6Ku+cig2Il8T8LJujOp2/2A72QcHZA57B13y+8o=\n-----END CERTIFICATE-----\n"
+-                          }
+-                        },
+-                        {
+-                          "name": "1c053652-8512-4373-90cf-5a7f6263a994.consul",
+-                          "trustBundle": {
+-                            "inlineString": "-----BEGIN CERTIFICATE-----\nMIICczCCAdwCCQC3BLnEmLCrSjANBgkqhkiG9w0BAQsFADB+MQswCQYDVQQGEwJV\nUzELMAkGA1UECAwCQVoxEjAQBgNVBAcMCUZsYWdzdGFmZjEMMAoGA1UECgwDRm9v\nMRAwDgYDVQQLDAdleGFtcGxlMQ8wDQYDVQQDDAZwZWVyLWExHTAbBgkqhkiG9w0B\nCQEWDmZvb0BwZWVyLWEuY29tMB4XDTIyMDUyNjAxMDQ0NFoXDTIzMDUyNjAxMDQ0\nNFowfjELMAkGA1UEBhMCVVMxCzAJBgNVBAgMAkFaMRIwEAYDVQQHDAlGbGFnc3Rh\nZmYxDDAKBgNVBAoMA0ZvbzEQMA4GA1UECwwHZXhhbXBsZTEPMA0GA1UEAwwGcGVl\nci1hMR0wGwYJKoZIhvcNAQkBFg5mb29AcGVlci1hLmNvbTCBnzANBgkqhkiG9w0B\nAQEFAAOBjQAwgYkCgYEA2zFYGTbXDAntT5pLTpZ2+VTiqx4J63VRJH1kdu11f0FV\nc2jl1pqCuYDbQXknDU0Pv1Q5y0+nSAihD2KqGS571r+vHQiPtKYPYRqPEe9FzAhR\n2KhWH6v/tk5DG1HqOjV9/zWRKB12gdFNZZqnw/e7NjLNq3wZ2UAwxXip5uJ8uwMC\nAwEAATANBgkqhkiG9w0BAQsFAAOBgQC/CJ9Syf4aL91wZizKTejwouRYoWv4gRAk\nyto45ZcNMHfJ0G2z+XAMl9ZbQsLgXmzAx4IM6y5Jckq8pKC4PEijCjlKTktLHlEy\n0ggmFxtNB1tid2NC8dOzcQ3l45+gDjDqdILhAvLDjlAIebdkqVqb2CfFNW/I2CQH\nZAuKN1aoKA==\n-----END CERTIFICATE-----\n"
+-                          }
+-                        }
+-                      ]
+-                    }
+-                  }
+-                }
+-              },
+-              "requireClientCertificate": true
+-            }
+-          }
+-        },
+-        {
+-          "filterChainMatch": {
+-            "serverNames": [
+-              "foo.default.default.peer-a.external.11111111-2222-3333-4444-555555555555.consul"
+-            ]
+-          },
+-          "filters": [
+-            {
+-              "name": "envoy.filters.network.http_connection_manager",
+-              "typedConfig": {
+-                "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+-                "forwardClientCertDetails": "SANITIZE_SET",
+-                "httpFilters": [
+-                  {
+-                    "name": "envoy.filters.http.router",
+-                    "typedConfig": {
+-                      "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+-                    }
+-                  }
+-                ],
+-                "maxRequestHeadersKb": 256,
+-                "rds": {
+-                  "configSource": {
+-                    "ads": {},
+-                    "resourceApiVersion": "V3"
+-                  },
+-                  "routeConfigName": "foo"
+-                },
+-                "setCurrentClientCertDetails": {
+-                  "cert": true,
+-                  "chain": true,
+-                  "dns": true,
+-                  "subject": true,
+-                  "uri": true
+-                },
+-                "statPrefix": "mesh_gateway_local_peered.foo.default.default.dc1",
+-                "tracing": {
+-                  "randomSampling": {}
+-                },
+-                "upgradeConfigs": [
+-                  {
+-                    "upgradeType": "websocket"
+-                  }
+-                ]
+-              }
+-            }
+-          ],
+-          "transportSocket": {
+-            "name": "tls",
+-            "typedConfig": {
+-              "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+-              "commonTlsContext": {
+-                "tlsCertificates": [
+-                  {
+-                    "certificateChain": {
+-                      "inlineString": "-----BEGIN CERTIFICATE-----\nMIICjDCCAjKgAwIBAgIIC5llxGV1gB8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowDjEMMAoG\nA1UEAxMDd2ViMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEADPv1RHVNRfa2VKR\nAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Favq5E0ivpNtv1QnFhxtPd7d5k4e+T7\nSkW1TaOCAXIwggFuMA4GA1UdDwEB/wQEAwIDuDAdBgNVHSUEFjAUBggrBgEFBQcD\nAgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADBoBgNVHQ4EYQRfN2Q6MDc6ODc6M2E6\nNDA6MTk6NDc6YzM6NWE6YzA6YmE6NjI6ZGY6YWY6NGI6ZDQ6MDU6MjU6NzY6M2Q6\nNWE6OGQ6MTY6OGQ6Njc6NWU6MmU6YTA6MzQ6N2Q6ZGM6ZmYwagYDVR0jBGMwYYBf\nZDE6MTE6MTE6YWM6MmE6YmE6OTc6YjI6M2Y6YWM6N2I6YmQ6ZGE6YmU6YjE6OGE6\nZmM6OWE6YmE6YjU6YmM6ODM6ZTc6NWU6NDE6NmY6ZjI6NzM6OTU6NTg6MGM6ZGIw\nWQYDVR0RBFIwUIZOc3BpZmZlOi8vMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1\nNTU1NTU1NTU1LmNvbnN1bC9ucy9kZWZhdWx0L2RjL2RjMS9zdmMvd2ViMAoGCCqG\nSM49BAMCA0gAMEUCIGC3TTvvjj76KMrguVyFf4tjOqaSCRie3nmHMRNNRav7AiEA\npY0heYeK9A6iOLrzqxSerkXXQyj5e9bE4VgUnxgPU6g=\n-----END CERTIFICATE-----\n"
+-                    },
+-                    "privateKey": {
+-                      "inlineString": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIMoTkpRggp3fqZzFKh82yS4LjtJI+XY+qX/7DefHFrtdoAoGCCqGSM49\nAwEHoUQDQgAEADPv1RHVNRfa2VKRAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Fav\nq5E0ivpNtv1QnFhxtPd7d5k4e+T7SkW1TQ==\n-----END EC PRIVATE KEY-----\n"
+-                    }
+-                  }
+-                ],
+-                "tlsParams": {},
+-                "validationContext": {
+-                  "customValidatorConfig": {
+-                    "name": "envoy.tls.cert_validator.spiffe",
+-                    "typedConfig": {
+-                      "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.SPIFFECertValidatorConfig",
+-                      "trustDomains": [
+-                        {
+-                          "name": "11111111-2222-3333-4444-555555555555.consul",
+-                          "trustBundle": {
+-                            "inlineString": "-----BEGIN CERTIFICATE-----\nMIICXDCCAgKgAwIBAgIICpZq70Z9LyUwCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowFDESMBAG\nA1UEAxMJVGVzdCBDQSAyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIhywH1gx\nAsMwuF3ukAI5YL2jFxH6Usnma1HFSfVyxbXX1/uoZEYrj8yCAtdU2yoHETyd+Zx2\nThhRLP79pYegCaOCATwwggE4MA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTAD\nAQH/MGgGA1UdDgRhBF9kMToxMToxMTphYzoyYTpiYTo5NzpiMjozZjphYzo3Yjpi\nZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1ZTo0MTo2ZjpmMjo3\nMzo5NTo1ODowYzpkYjBqBgNVHSMEYzBhgF9kMToxMToxMTphYzoyYTpiYTo5Nzpi\nMjozZjphYzo3YjpiZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1\nZTo0MTo2ZjpmMjo3Mzo5NTo1ODowYzpkYjA/BgNVHREEODA2hjRzcGlmZmU6Ly8x\nMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUuY29uc3VsMAoGCCqG\nSM49BAMCA0gAMEUCICOY0i246rQHJt8o8Oya0D5PLL1FnmsQmQqIGCi31RwnAiEA\noR5f6Ku+cig2Il8T8LJujOp2/2A72QcHZA57B13y+8o=\n-----END CERTIFICATE-----\n"
+-                          }
+-                        },
+-                        {
+-                          "name": "1c053652-8512-4373-90cf-5a7f6263a994.consul",
+-                          "trustBundle": {
+-                            "inlineString": "-----BEGIN CERTIFICATE-----\nMIICczCCAdwCCQC3BLnEmLCrSjANBgkqhkiG9w0BAQsFADB+MQswCQYDVQQGEwJV\nUzELMAkGA1UECAwCQVoxEjAQBgNVBAcMCUZsYWdzdGFmZjEMMAoGA1UECgwDRm9v\nMRAwDgYDVQQLDAdleGFtcGxlMQ8wDQYDVQQDDAZwZWVyLWExHTAbBgkqhkiG9w0B\nCQEWDmZvb0BwZWVyLWEuY29tMB4XDTIyMDUyNjAxMDQ0NFoXDTIzMDUyNjAxMDQ0\nNFowfjELMAkGA1UEBhMCVVMxCzAJBgNVBAgMAkFaMRIwEAYDVQQHDAlGbGFnc3Rh\nZmYxDDAKBgNVBAoMA0ZvbzEQMA4GA1UECwwHZXhhbXBsZTEPMA0GA1UEAwwGcGVl\nci1hMR0wGwYJKoZIhvcNAQkBFg5mb29AcGVlci1hLmNvbTCBnzANBgkqhkiG9w0B\nAQEFAAOBjQAwgYkCgYEA2zFYGTbXDAntT5pLTpZ2+VTiqx4J63VRJH1kdu11f0FV\nc2jl1pqCuYDbQXknDU0Pv1Q5y0+nSAihD2KqGS571r+vHQiPtKYPYRqPEe9FzAhR\n2KhWH6v/tk5DG1HqOjV9/zWRKB12gdFNZZqnw/e7NjLNq3wZ2UAwxXip5uJ8uwMC\nAwEAATANBgkqhkiG9w0BAQsFAAOBgQC/CJ9Syf4aL91wZizKTejwouRYoWv4gRAk\nyto45ZcNMHfJ0G2z+XAMl9ZbQsLgXmzAx4IM6y5Jckq8pKC4PEijCjlKTktLHlEy\n0ggmFxtNB1tid2NC8dOzcQ3l45+gDjDqdILhAvLDjlAIebdkqVqb2CfFNW/I2CQH\nZAuKN1aoKA==\n-----END CERTIFICATE-----\n"
+-                          }
+-                        }
+-                      ]
+-                    }
+-                  }
+-                }
+-              },
+-              "requireClientCertificate": true
+-            }
+-          }
+-        },
+-        {
+-          "filterChainMatch": {
+-            "serverNames": [
+-              "gir.default.default.peer-b.external.11111111-2222-3333-4444-555555555555.consul"
+-            ]
+-          },
+-          "filters": [
+-            {
+-              "name": "envoy.filters.network.http_connection_manager",
+-              "typedConfig": {
+-                "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+-                "forwardClientCertDetails": "SANITIZE_SET",
+-                "httpFilters": [
+-                  {
+-                    "name": "envoy.filters.http.router",
+-                    "typedConfig": {
+-                      "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+-                    }
+-                  }
+-                ],
+-                "maxRequestHeadersKb": 128,
+-                "rds": {
+-                  "configSource": {
+-                    "ads": {},
+-                    "resourceApiVersion": "V3"
+-                  },
+-                  "routeConfigName": "gir"
+-                },
+-                "setCurrentClientCertDetails": {
+-                  "cert": true,
+-                  "chain": true,
+-                  "dns": true,
+-                  "subject": true,
+-                  "uri": true
+-                },
+-                "statPrefix": "mesh_gateway_local_peered.gir.default.default.dc1",
+-                "tracing": {
+-                  "randomSampling": {}
+-                },
+-                "upgradeConfigs": [
+-                  {
+-                    "upgradeType": "websocket"
+-                  }
+-                ]
+-              }
+-            }
+-          ],
+-          "transportSocket": {
+-            "name": "tls",
+-            "typedConfig": {
+-              "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+-              "commonTlsContext": {
+-                "tlsCertificates": [
+-                  {
+-                    "certificateChain": {
+-                      "inlineString": "-----BEGIN CERTIFICATE-----\nMIICjDCCAjKgAwIBAgIIC5llxGV1gB8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowDjEMMAoG\nA1UEAxMDd2ViMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEADPv1RHVNRfa2VKR\nAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Favq5E0ivpNtv1QnFhxtPd7d5k4e+T7\nSkW1TaOCAXIwggFuMA4GA1UdDwEB/wQEAwIDuDAdBgNVHSUEFjAUBggrBgEFBQcD\nAgYIKwYBBQUHAwEwDAYDVR0TAQH/BAIwADBoBgNVHQ4EYQRfN2Q6MDc6ODc6M2E6\nNDA6MTk6NDc6YzM6NWE6YzA6YmE6NjI6ZGY6YWY6NGI6ZDQ6MDU6MjU6NzY6M2Q6\nNWE6OGQ6MTY6OGQ6Njc6NWU6MmU6YTA6MzQ6N2Q6ZGM6ZmYwagYDVR0jBGMwYYBf\nZDE6MTE6MTE6YWM6MmE6YmE6OTc6YjI6M2Y6YWM6N2I6YmQ6ZGE6YmU6YjE6OGE6\nZmM6OWE6YmE6YjU6YmM6ODM6ZTc6NWU6NDE6NmY6ZjI6NzM6OTU6NTg6MGM6ZGIw\nWQYDVR0RBFIwUIZOc3BpZmZlOi8vMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1\nNTU1NTU1NTU1LmNvbnN1bC9ucy9kZWZhdWx0L2RjL2RjMS9zdmMvd2ViMAoGCCqG\nSM49BAMCA0gAMEUCIGC3TTvvjj76KMrguVyFf4tjOqaSCRie3nmHMRNNRav7AiEA\npY0heYeK9A6iOLrzqxSerkXXQyj5e9bE4VgUnxgPU6g=\n-----END CERTIFICATE-----\n"
+-                    },
+-                    "privateKey": {
+-                      "inlineString": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIMoTkpRggp3fqZzFKh82yS4LjtJI+XY+qX/7DefHFrtdoAoGCCqGSM49\nAwEHoUQDQgAEADPv1RHVNRfa2VKRAB16b6rZnEt7tuhaxCFpQXPj7M2omb0B9Fav\nq5E0ivpNtv1QnFhxtPd7d5k4e+T7SkW1TQ==\n-----END EC PRIVATE KEY-----\n"
+-                    }
+-                  }
+-                ],
+-                "tlsParams": {},
+-                "validationContext": {
+-                  "customValidatorConfig": {
+-                    "name": "envoy.tls.cert_validator.spiffe",
+-                    "typedConfig": {
+-                      "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.SPIFFECertValidatorConfig",
+-                      "trustDomains": [
+-                        {
+-                          "name": "11111111-2222-3333-4444-555555555555.consul",
+-                          "trustBundle": {
+-                            "inlineString": "-----BEGIN CERTIFICATE-----\nMIICXDCCAgKgAwIBAgIICpZq70Z9LyUwCgYIKoZIzj0EAwIwFDESMBAGA1UEAxMJ\nVGVzdCBDQSAyMB4XDTE5MDMyMjEzNTgyNloXDTI5MDMyMjEzNTgyNlowFDESMBAG\nA1UEAxMJVGVzdCBDQSAyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIhywH1gx\nAsMwuF3ukAI5YL2jFxH6Usnma1HFSfVyxbXX1/uoZEYrj8yCAtdU2yoHETyd+Zx2\nThhRLP79pYegCaOCATwwggE4MA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTAD\nAQH/MGgGA1UdDgRhBF9kMToxMToxMTphYzoyYTpiYTo5NzpiMjozZjphYzo3Yjpi\nZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1ZTo0MTo2ZjpmMjo3\nMzo5NTo1ODowYzpkYjBqBgNVHSMEYzBhgF9kMToxMToxMTphYzoyYTpiYTo5Nzpi\nMjozZjphYzo3YjpiZDpkYTpiZTpiMTo4YTpmYzo5YTpiYTpiNTpiYzo4MzplNzo1\nZTo0MTo2ZjpmMjo3Mzo5NTo1ODowYzpkYjA/BgNVHREEODA2hjRzcGlmZmU6Ly8x\nMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUuY29uc3VsMAoGCCqG\nSM49BAMCA0gAMEUCICOY0i246rQHJt8o8Oya0D5PLL1FnmsQmQqIGCi31RwnAiEA\noR5f6Ku+cig2Il8T8LJujOp2/2A72QcHZA57B13y+8o=\n-----END CERTIFICATE-----\n"
+-                          }
+-                        },
+-                        {
+-                          "name": "d89ac423-e95a-475d-94f2-1c557c57bf31.consul",
+-                          "trustBundle": {
+-                            "inlineString": "-----BEGIN CERTIFICATE-----\nMIICcTCCAdoCCQDyGxC08cD0BDANBgkqhkiG9w0BAQsFADB9MQswCQYDVQQGEwJV\nUzELMAkGA1UECAwCQ0ExETAPBgNVBAcMCENhcmxzYmFkMQwwCgYDVQQKDANGb28x\nEDAOBgNVBAsMB2V4YW1wbGUxDzANBgNVBAMMBnBlZXItYjEdMBsGCSqGSIb3DQEJ\nARYOZm9vQHBlZXItYi5jb20wHhcNMjIwNTI2MDExNjE2WhcNMjMwNTI2MDExNjE2\nWjB9MQswCQYDVQQGEwJVUzELMAkGA1UECAwCQ0ExETAPBgNVBAcMCENhcmxzYmFk\nMQwwCgYDVQQKDANGb28xEDAOBgNVBAsMB2V4YW1wbGUxDzANBgNVBAMMBnBlZXIt\nYjEdMBsGCSqGSIb3DQEJARYOZm9vQHBlZXItYi5jb20wgZ8wDQYJKoZIhvcNAQEB\nBQADgY0AMIGJAoGBAL4i5erdZ5vKk3mzW9Qt6Wvw/WN/IpMDlL0a28wz9oDCtMLN\ncD/XQB9yT5jUwb2s4mD1lCDZtee8MHeD8zygICozufWVB+u2KvMaoA50T9GMQD0E\nz/0nz/Z703I4q13VHeTpltmEpYcfxw/7nJ3leKA34+Nj3zteJ70iqvD/TNBBAgMB\nAAEwDQYJKoZIhvcNAQELBQADgYEAbL04gicH+EIznDNhZJEb1guMBtBBJ8kujPyU\nao8xhlUuorDTLwhLpkKsOhD8619oSS8KynjEBichidQRkwxIaze0a2mrGT+tGBMf\npVz6UeCkqpde6bSJ/ozEe/2seQzKqYvRT1oUjLwYvY7OIh2DzYibOAxh6fewYAmU\n5j5qNLc=\n-----END CERTIFICATE-----\n"
+-                          }
+-                        }
+-                      ]
+-                    }
+-                  }
+-                }
+-              },
+-              "requireClientCertificate": true
+-            }
+-          }
+-        },
+-        {
+-          "filters": [
+-            {
+-              "name": "envoy.filters.network.sni_cluster",
+-              "typedConfig": {
+-                "@type": "type.googleapis.com/envoy.extensions.filters.network.sni_cluster.v3.SniCluster"
+-              }
+-            },
+-            {
+-              "name": "envoy.filters.network.tcp_proxy",
+-              "typedConfig": {
+-                "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
+-                "cluster": "",
+-                "statPrefix": "mesh_gateway_local.default"
+-              }
+-            }
+-          ]
+-        }
+-      ],
+-      "listenerFilters": [
+-        {
+-          "name": "envoy.filters.listener.tls_inspector",
+-          "typedConfig": {
+-            "@type": "type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector"
+-          }
+-        }
+-      ],
+-      "name": "default:1.2.3.4:8443"
+-    }
+-  ],
+-  "typeUrl": "type.googleapis.com/envoy.config.listener.v3.Listener",
+-  "versionInfo": "00000001"
+-}
+\ No newline at end of file
+diff --git a/agent/xds/testdata/routes/mesh-gateway-peering-service-max-request-headers.latest.golden b/agent/xds/testdata/routes/mesh-gateway-peering-service-max-request-headers.latest.golden
+deleted file mode 100644
+index 96bd040bf9..0000000000
+--- a/agent/xds/testdata/routes/mesh-gateway-peering-service-max-request-headers.latest.golden
++++ /dev/null
+@@ -1,73 +0,0 @@
+-{
+-  "nonce": "00000001",
+-  "resources": [
+-    {
+-      "@type": "type.googleapis.com/envoy.config.route.v3.RouteConfiguration",
+-      "name": "bar",
+-      "virtualHosts": [
+-        {
+-          "domains": [
+-            "*"
+-          ],
+-          "name": "bar",
+-          "routes": [
+-            {
+-              "match": {
+-                "prefix": "/"
+-              },
+-              "route": {
+-                "cluster": "exported~bar.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul"
+-              }
+-            }
+-          ]
+-        }
+-      ]
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.route.v3.RouteConfiguration",
+-      "name": "foo",
+-      "virtualHosts": [
+-        {
+-          "domains": [
+-            "*"
+-          ],
+-          "name": "foo",
+-          "routes": [
+-            {
+-              "match": {
+-                "prefix": "/"
+-              },
+-              "route": {
+-                "cluster": "exported~foo.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul"
+-              }
+-            }
+-          ]
+-        }
+-      ]
+-    },
+-    {
+-      "@type": "type.googleapis.com/envoy.config.route.v3.RouteConfiguration",
+-      "name": "gir",
+-      "virtualHosts": [
+-        {
+-          "domains": [
+-            "*"
+-          ],
+-          "name": "gir",
+-          "routes": [
+-            {
+-              "match": {
+-                "prefix": "/"
+-              },
+-              "route": {
+-                "cluster": "exported~gir.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul"
+-              }
+-            }
+-          ]
+-        }
+-      ]
+-    }
+-  ],
+-  "typeUrl": "type.googleapis.com/envoy.config.route.v3.RouteConfiguration",
+-  "versionInfo": "00000001"
+-}
+\ No newline at end of file
+diff --git a/agent/xds/testdata/secrets/mesh-gateway-peering-service-max-request-headers.latest.golden b/agent/xds/testdata/secrets/mesh-gateway-peering-service-max-request-headers.latest.golden
+deleted file mode 100644
+index 82e4565065..0000000000
+--- a/agent/xds/testdata/secrets/mesh-gateway-peering-service-max-request-headers.latest.golden
++++ /dev/null
+@@ -1,5 +0,0 @@
+-{
+-  "nonce": "00000001",
+-  "typeUrl": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
+-  "versionInfo": "00000001"
+-}
+\ No newline at end of file

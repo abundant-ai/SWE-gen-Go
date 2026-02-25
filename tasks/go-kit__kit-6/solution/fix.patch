@@ -1,0 +1,741 @@
+diff --git a/README.md b/README.md
+index 84f4d78..1da7392 100644
+--- a/README.md
++++ b/README.md
+@@ -24,6 +24,28 @@ See [the motivating blog post](http://peter.bourgon.org/go-kit) and, eventually,
+ - Having opinions on configuration passing -- flags vs. env vars vs. files vs. ...
+ - _more TODO_
+ 
++## Contributing
++
++At this stage, we're still developing the initial drafts of all of the
++packages, using an
++[RFC workflow](https://github.com/peterbourgon/gokit/tree/master/rfc). 
++Before submitting major changes, please write to
++ [the mailing list](groups.google.com/forum/#!forum/go-kit)
++to register your interest, and check the 
++ [open issues](https://github.com/peterbourgon/gokit/issues) and 
++ [pull requests](https://github.com/peterbourgon/gokit/pulls)
++for existing discussions.
++
++### Dependency management
++
++Users who import gokit into their `package main` are responsible to organize
++and maintain all of their dependencies to ensure code compatibility and build
++reproducibility. Gokit makes no direct use of dependency management tools like
++[Godep](https://github.com/tools/godep).
++
++We will use a variety of continuous integration providers to find and fix
++compatibility problems as soon as they occur.
++
+ ## Related projects
+ 
+ Projects with a ★ have had particular influence on gokit's design.
+diff --git a/metrics/expvar/expvar.go b/metrics/expvar/expvar.go
+new file mode 100644
+index 0000000..ba8624b
+--- /dev/null
++++ b/metrics/expvar/expvar.go
+@@ -0,0 +1,113 @@
++// Package expvar implements an expvar backend for package metrics.
++//
++// The current implementation ignores fields. In the future, it would be good
++// to have an implementation that accepted a set of predeclared field names at
++// construction time, and used field values to produce delimiter-separated
++// bucket (key) names. That is,
++//
++//    c := NewFieldedCounter(..., "path", "status")
++//    c.Add(1) // "myprefix_unknown_unknown" += 1
++//    c2 := c.With("path", "foo").With("status": "200")
++//    c2.Add(1) // "myprefix_foo_status" += 1
++//
++// It would also be possible to have an implementation that generated more
++// sophisticated expvar.Values. For example, a Counter could be implemented as
++// a map, representing a tree of key/value pairs whose leaves were the actual
++// expvar.Ints.
++package expvar
++
++import (
++	"expvar"
++	"fmt"
++	"sync"
++	"time"
++
++	"github.com/peterbourgon/gokit/metrics"
++
++	"github.com/codahale/hdrhistogram"
++)
++
++type counter struct {
++	v *expvar.Int
++}
++
++// NewCounter returns a new Counter backed by an expvar with the given name.
++// Fields are ignored.
++func NewCounter(name string) metrics.Counter {
++	return &counter{expvar.NewInt(name)}
++}
++
++func (c *counter) With(metrics.Field) metrics.Counter { return c }
++
++func (c *counter) Add(delta uint64) { c.v.Add(int64(delta)) }
++
++type gauge struct {
++	v *expvar.Int
++}
++
++// NewGauge returns a new Gauge backed by an expvar with the given name.
++// Fields are ignored.
++func NewGauge(name string) metrics.Gauge {
++	return &gauge{expvar.NewInt(name)}
++}
++
++func (g *gauge) With(metrics.Field) metrics.Gauge { return g }
++
++func (g *gauge) Add(delta int64) { g.v.Add(delta) }
++
++func (g *gauge) Set(value int64) { g.v.Set(value) }
++
++type histogram struct {
++	mu   sync.Mutex
++	hist *hdrhistogram.WindowedHistogram
++
++	name   string
++	gauges map[int]metrics.Gauge
++}
++
++// NewHistogram is taken from http://github.com/codahale/metrics. It returns a
++// windowed HDR histogram which drops data older than five minutes.
++//
++// The histogram exposes metrics for each passed quantile as gauges. Quantiles
++// should be integers in the range 1..99. The gauge names are assigned by
++// using the passed name as a prefix and appending "_pNN" e.g. "_p50".
++func NewHistogram(name string, minValue, maxValue int64, sigfigs int, quantiles ...int) metrics.Histogram {
++	gauges := map[int]metrics.Gauge{}
++	for _, quantile := range quantiles {
++		if quantile <= 0 || quantile >= 100 {
++			panic(fmt.Sprintf("invalid quantile %d", quantile))
++		}
++		gauges[quantile] = NewGauge(fmt.Sprintf("%s_p%02d", name, quantile))
++	}
++	h := &histogram{
++		hist:   hdrhistogram.NewWindowed(5, minValue, maxValue, sigfigs),
++		name:   name,
++		gauges: gauges,
++	}
++	go h.rotateLoop(1 * time.Minute)
++	return h
++}
++
++func (h *histogram) With(metrics.Field) metrics.Histogram { return h }
++
++func (h *histogram) Observe(value int64) {
++	h.mu.Lock()
++	err := h.hist.Current.RecordValue(value)
++	h.mu.Unlock()
++
++	if err != nil {
++		panic(err.Error())
++	}
++
++	for q, gauge := range h.gauges {
++		gauge.Set(h.hist.Current.ValueAtQuantile(float64(q)))
++	}
++}
++
++func (h *histogram) rotateLoop(d time.Duration) {
++	for _ = range time.Tick(d) {
++		h.mu.Lock()
++		h.hist.Rotate()
++		h.mu.Unlock()
++	}
++}
+diff --git a/metrics/metrics.go b/metrics/metrics.go
+new file mode 100644
+index 0000000..e76660f
+--- /dev/null
++++ b/metrics/metrics.go
+@@ -0,0 +1,37 @@
++// Package metrics provides an extensible framework to instrument your
++// application. All metrics are safe for concurrent use. Considerable design
++// influence has been taken from https://github.com/codahale/metrics and
++// https://prometheus.io.
++package metrics
++
++// Counter is a monotonically-increasing, unsigned, 64-bit integer used to
++// capture the number of times an event has occurred. By tracking the deltas
++// between measurements of a counter over intervals of time, an aggregation
++// layer can derive rates, acceleration, etc.
++type Counter interface {
++	With(Field) Counter
++	Add(delta uint64)
++}
++
++// Gauge captures instantaneous measurements of something using signed, 64-bit
++// integers. The value does not need to be monotonic.
++type Gauge interface {
++	With(Field) Gauge
++	Set(value int64)
++	Add(delta int64)
++}
++
++// Histogram tracks the distribution of a stream of values (e.g. the number of
++// milliseconds it takes to handle requests). Implementations may choose to
++// add gauges for values at meaningful quantiles.
++type Histogram interface {
++	With(Field) Histogram
++	Observe(value int64)
++}
++
++// Field is a key/value pair associated with an observation for a specific
++// metric. Fields may be ignored by implementations.
++type Field struct {
++	Key   string
++	Value string
++}
+diff --git a/metrics/multi.go b/metrics/multi.go
+new file mode 100644
+index 0000000..66c8074
+--- /dev/null
++++ b/metrics/multi.go
+@@ -0,0 +1,82 @@
++package metrics
++
++type multiCounter []Counter
++
++// NewMultiCounter returns a wrapper around multiple Counters.
++func NewMultiCounter(counters ...Counter) Counter {
++	c := make(multiCounter, 0, len(counters))
++	for _, counter := range counters {
++		c = append(c, counter)
++	}
++	return c
++}
++
++func (c multiCounter) With(f Field) Counter {
++	next := make(multiCounter, len(c))
++	for i, counter := range c {
++		next[i] = counter.With(f)
++	}
++	return next
++}
++
++func (c multiCounter) Add(delta uint64) {
++	for _, counter := range c {
++		counter.Add(delta)
++	}
++}
++
++type multiGauge []Gauge
++
++// NewMultiGauge returns a wrapper around multiple Gauges.
++func NewMultiGauge(gauges ...Gauge) Gauge {
++	g := make(multiGauge, 0, len(gauges))
++	for _, gauge := range gauges {
++		g = append(g, gauge)
++	}
++	return g
++}
++
++func (g multiGauge) With(f Field) Gauge {
++	next := make(multiGauge, len(g))
++	for i, gauge := range g {
++		next[i] = gauge.With(f)
++	}
++	return next
++}
++
++func (g multiGauge) Set(value int64) {
++	for _, gauge := range g {
++		gauge.Set(value)
++	}
++}
++
++func (g multiGauge) Add(delta int64) {
++	for _, gauge := range g {
++		gauge.Add(delta)
++	}
++}
++
++type multiHistogram []Histogram
++
++// NewMultiHistogram returns a wrapper around multiple Histograms.
++func NewMultiHistogram(histograms ...Histogram) Histogram {
++	h := make(multiHistogram, 0, len(histograms))
++	for _, histogram := range histograms {
++		h = append(h, histogram)
++	}
++	return h
++}
++
++func (h multiHistogram) With(f Field) Histogram {
++	next := make(multiHistogram, len(h))
++	for i, histogram := range h {
++		next[i] = histogram.With(f)
++	}
++	return next
++}
++
++func (h multiHistogram) Observe(value int64) {
++	for _, histogram := range h {
++		histogram.Observe(value)
++	}
++}
+diff --git a/metrics/prometheus/prometheus.go b/metrics/prometheus/prometheus.go
+new file mode 100644
+index 0000000..7187413
+--- /dev/null
++++ b/metrics/prometheus/prometheus.go
+@@ -0,0 +1,179 @@
++// Package prometheus implements a Prometheus backend for package metrics.
++package prometheus
++
++import (
++	"time"
++
++	"github.com/prometheus/client_golang/prometheus"
++
++	"github.com/peterbourgon/gokit/metrics"
++)
++
++// Prometheus has strong opinions about the dimensionality of fields. Users
++// must predeclare every field key they intend to use. On every observation,
++// fields with keys that haven't been predeclared will be silently dropped,
++// and predeclared field keys without values will receive the value
++// PrometheusLabelValueUnknown.
++var PrometheusLabelValueUnknown = "unknown"
++
++type prometheusCounter struct {
++	*prometheus.CounterVec
++	Pairs map[string]string
++}
++
++// NewCounter returns a new Counter backed by a Prometheus metric. The counter
++// is automatically registered via prometheus.Register.
++func NewCounter(namespace, subsystem, name, help string, fieldKeys []string) metrics.Counter {
++	return NewCounterWithLabels(namespace, subsystem, name, help, fieldKeys, prometheus.Labels{})
++}
++
++// NewCounterWithLabels is the same as NewCounter, but attaches a set of const
++// label pairs to the metric.
++func NewCounterWithLabels(namespace, subsystem, name, help string, fieldKeys []string, constLabels prometheus.Labels) metrics.Counter {
++	m := prometheus.NewCounterVec(
++		prometheus.CounterOpts{
++			Namespace:   namespace,
++			Subsystem:   subsystem,
++			Name:        name,
++			Help:        help,
++			ConstLabels: constLabels,
++		},
++		fieldKeys,
++	)
++	prometheus.MustRegister(m)
++
++	p := map[string]string{}
++	for _, fieldName := range fieldKeys {
++		p[fieldName] = PrometheusLabelValueUnknown
++	}
++
++	return prometheusCounter{
++		CounterVec: m,
++		Pairs:      p,
++	}
++}
++
++func (c prometheusCounter) With(f metrics.Field) metrics.Counter {
++	return prometheusCounter{
++		CounterVec: c.CounterVec,
++		Pairs:      merge(c.Pairs, f),
++	}
++}
++
++func (c prometheusCounter) Add(delta uint64) {
++	c.CounterVec.With(prometheus.Labels(c.Pairs)).Add(float64(delta))
++}
++
++type prometheusGauge struct {
++	*prometheus.GaugeVec
++	Pairs map[string]string
++}
++
++// NewGauge returns a new Gauge backed by a Prometheus metric. The gauge is
++// automatically registered via prometheus.Register.
++func NewGauge(namespace, subsystem, name, help string, fieldKeys []string) metrics.Gauge {
++	return NewGaugeWithLabels(namespace, subsystem, name, help, fieldKeys, prometheus.Labels{})
++}
++
++// NewGaugeWithLabels is the same as NewGauge, but attaches a set of const
++// label pairs to the metric.
++func NewGaugeWithLabels(namespace, subsystem, name, help string, fieldKeys []string, constLabels prometheus.Labels) metrics.Gauge {
++	m := prometheus.NewGaugeVec(
++		prometheus.GaugeOpts{
++			Namespace:   namespace,
++			Subsystem:   subsystem,
++			Name:        name,
++			Help:        help,
++			ConstLabels: constLabels,
++		},
++		fieldKeys,
++	)
++	prometheus.MustRegister(m)
++
++	return prometheusGauge{
++		GaugeVec: m,
++		Pairs:    pairsFrom(fieldKeys),
++	}
++}
++
++func (g prometheusGauge) With(f metrics.Field) metrics.Gauge {
++	return prometheusGauge{
++		GaugeVec: g.GaugeVec,
++		Pairs:    merge(g.Pairs, f),
++	}
++}
++
++func (g prometheusGauge) Set(value int64) {
++	g.GaugeVec.With(prometheus.Labels(g.Pairs)).Set(float64(value))
++}
++
++func (g prometheusGauge) Add(delta int64) {
++	g.GaugeVec.With(prometheus.Labels(g.Pairs)).Add(float64(delta))
++}
++
++type prometheusHistogram struct {
++	*prometheus.SummaryVec
++	Pairs map[string]string
++}
++
++// NewHistogram returns a new Histogram backed by a Prometheus summary. It
++// uses a 10-second max age for bucketing. The histogram is automatically
++// registered via prometheus.Register.
++func NewHistogram(namespace, subsystem, name, help string, fieldKeys []string) metrics.Histogram {
++	return NewHistogramWithLabels(namespace, subsystem, name, help, fieldKeys, prometheus.Labels{})
++}
++
++// NewHistogramWithLabels is the same as NewHistogram, but attaches a set of
++// const label pairs to the metric.
++func NewHistogramWithLabels(namespace, subsystem, name, help string, fieldKeys []string, constLabels prometheus.Labels) metrics.Histogram {
++	m := prometheus.NewSummaryVec(
++		prometheus.SummaryOpts{
++			Namespace:   namespace,
++			Subsystem:   subsystem,
++			Name:        name,
++			Help:        help,
++			ConstLabels: constLabels,
++			MaxAge:      10 * time.Second,
++		},
++		fieldKeys,
++	)
++	prometheus.MustRegister(m)
++
++	return prometheusHistogram{
++		SummaryVec: m,
++		Pairs:      pairsFrom(fieldKeys),
++	}
++}
++
++func (h prometheusHistogram) With(f metrics.Field) metrics.Histogram {
++	return prometheusHistogram{
++		SummaryVec: h.SummaryVec,
++		Pairs:      merge(h.Pairs, f),
++	}
++}
++
++func (h prometheusHistogram) Observe(value int64) {
++	h.SummaryVec.With(prometheus.Labels(h.Pairs)).Observe(float64(value))
++}
++
++func pairsFrom(fieldKeys []string) map[string]string {
++	p := map[string]string{}
++	for _, fieldName := range fieldKeys {
++		p[fieldName] = PrometheusLabelValueUnknown
++	}
++	return p
++}
++
++func merge(orig map[string]string, f metrics.Field) map[string]string {
++	if _, ok := orig[f.Key]; !ok {
++		return orig
++	}
++
++	newPairs := make(map[string]string, len(orig))
++	for k, v := range orig {
++		newPairs[k] = v
++	}
++
++	newPairs[f.Key] = f.Value
++	return newPairs
++}
+diff --git a/metrics/scaled_histogram.go b/metrics/scaled_histogram.go
+new file mode 100644
+index 0000000..d63bb97
+--- /dev/null
++++ b/metrics/scaled_histogram.go
+@@ -0,0 +1,23 @@
++package metrics
++
++type scaledHistogram struct {
++	Histogram
++	scale int64
++}
++
++// NewScaledHistogram returns a Histogram whose observed values are downscaled
++// (divided) by scale.
++func NewScaledHistogram(h Histogram, scale int64) Histogram {
++	return scaledHistogram{h, scale}
++}
++
++func (h scaledHistogram) With(f Field) Histogram {
++	return scaledHistogram{
++		Histogram: h.Histogram.With(f),
++		scale:     h.scale,
++	}
++}
++
++func (h scaledHistogram) Observe(value int64) {
++	h.Histogram.Observe(value / h.scale)
++}
+diff --git a/metrics/statsd/statsd.go b/metrics/statsd/statsd.go
+new file mode 100644
+index 0000000..5f091fa
+--- /dev/null
++++ b/metrics/statsd/statsd.go
+@@ -0,0 +1,135 @@
++// Package statsd implements a statsd backend for package metrics.
++//
++// The current implementation ignores fields. In the future, it would be good
++// to have an implementation that accepted a set of predeclared field names at
++// construction time, and used field values to produce delimiter-separated
++// bucket (key) names. That is,
++//
++//    c := NewFieldedCounter(..., "path", "status")
++//    c.Add(1) // "myprefix.unknown.unknown:1|c\n"
++//    c2 := c.With("path", "foo").With("status": "200")
++//    c2.Add(1) // "myprefix.foo.status:1|c\n"
++//
++package statsd
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"log"
++	"time"
++
++	"github.com/peterbourgon/gokit/metrics"
++)
++
++// statsd metrics take considerable influence from
++// https://github.com/streadway/handy package statsd.
++
++const maxBufferSize = 1400 // bytes
++
++type statsdCounter chan string
++
++// NewCounter returns a Counter that emits observations in the statsd protocol
++// to the passed writer. Observations are buffered for the reporting interval
++// or until the buffer exceeds a max packet size, whichever comes first.
++// Fields are ignored.
++//
++// TODO: support for sampling.
++func NewCounter(w io.Writer, key string, interval time.Duration) metrics.Counter {
++	c := make(chan string)
++	go fwd(w, key, interval, c)
++	return statsdCounter(c)
++}
++
++func (c statsdCounter) With(metrics.Field) metrics.Counter { return c }
++
++func (c statsdCounter) Add(delta uint64) { c <- fmt.Sprintf("%d|c", delta) }
++
++type statsdGauge chan string
++
++// NewGauge returns a Gauge that emits values in the statsd protocol to the
++// passed writer. Values are buffered for the reporting interval or until the
++// buffer exceeds a max packet size, whichever comes first. Fields are
++// ignored.
++//
++// TODO: support for sampling.
++func NewGauge(w io.Writer, key string, interval time.Duration) metrics.Gauge {
++	g := make(chan string)
++	go fwd(w, key, interval, g)
++	return statsdGauge(g)
++}
++
++func (g statsdGauge) With(metrics.Field) metrics.Gauge { return g }
++
++func (g statsdGauge) Add(delta int64) {
++	// https://github.com/etsy/statsd/blob/master/docs/metric_types.md#gauges
++	sign := "+"
++	if delta < 0 {
++		sign, delta = "-", -delta
++	}
++	g <- fmt.Sprintf("%s%d|g", sign, delta)
++}
++
++func (g statsdGauge) Set(value int64) {
++	g <- fmt.Sprintf("%d|g", value)
++}
++
++type statsdHistogram chan string
++
++// NewHistogram returns a Histogram that emits observations in the statsd
++// protocol to the passed writer. Observations are buffered for the reporting
++// interval or until the buffer exceeds a max packet size, whichever comes
++// first. Fields are ignored.
++//
++// NewHistogram is mapped to a statsd Timing, so observations should represent
++// milliseconds. If you observe in units of nanoseconds, you can make the
++// translation with a ScaledHistogram:
++//
++//    NewScaledHistogram(statsdHistogram, time.Millisecond)
++//
++// You can also enforce the constraint in a typesafe way with a millisecond
++// TimeHistogram:
++//
++//    NewTimeHistogram(statsdHistogram, time.Millisecond)
++//
++// TODO: support for sampling.
++func NewHistogram(w io.Writer, key string, interval time.Duration) metrics.Histogram {
++	h := make(chan string)
++	go fwd(w, key, interval, h)
++	return statsdHistogram(h)
++}
++
++func (h statsdHistogram) With(metrics.Field) metrics.Histogram { return h }
++
++func (h statsdHistogram) Observe(value int64) {
++	h <- fmt.Sprintf("%d|ms", value)
++}
++
++var tick = time.Tick
++
++func fwd(w io.Writer, key string, interval time.Duration, c chan string) {
++	buf := &bytes.Buffer{}
++	tick := tick(interval)
++	for {
++		select {
++		case s := <-c:
++			fmt.Fprintf(buf, "%s:%s\n", key, s)
++			if buf.Len() > maxBufferSize {
++				flush(w, buf)
++			}
++
++		case <-tick:
++			flush(w, buf)
++		}
++	}
++}
++
++func flush(w io.Writer, buf *bytes.Buffer) {
++	if buf.Len() <= 0 {
++		return
++	}
++	if _, err := w.Write(buf.Bytes()); err != nil {
++		log.Printf("error: could not write to statsd: %v", err)
++	}
++	buf.Reset()
++}
+diff --git a/metrics/time_histogram.go b/metrics/time_histogram.go
+new file mode 100644
+index 0000000..0a8de89
+--- /dev/null
++++ b/metrics/time_histogram.go
+@@ -0,0 +1,34 @@
++package metrics
++
++import "time"
++
++// TimeHistogram is a convenience wrapper for a Histogram of time.Durations.
++type TimeHistogram interface {
++	With(Field) TimeHistogram
++	Observe(time.Duration)
++}
++
++type timeHistogram struct {
++	Histogram
++	unit time.Duration
++}
++
++// NewTimeHistogram returns a TimeHistogram wrapper around the passed
++// Histogram, in units of unit.
++func NewTimeHistogram(h Histogram, unit time.Duration) TimeHistogram {
++	return &timeHistogram{
++		Histogram: h,
++		unit:      unit,
++	}
++}
++
++func (h *timeHistogram) With(f Field) TimeHistogram {
++	return &timeHistogram{
++		Histogram: h.Histogram.With(f),
++		unit:      h.unit,
++	}
++}
++
++func (h *timeHistogram) Observe(d time.Duration) {
++	h.Histogram.Observe(int64(d / h.unit))
++}
+diff --git a/rfc/rfc003-package-metrics.md b/rfc/rfc003-package-metrics.md
+index 4c0e452..bc5f7c4 100644
+--- a/rfc/rfc003-package-metrics.md
++++ b/rfc/rfc003-package-metrics.md
+@@ -12,8 +12,55 @@ http://peter.bourgon.org/go-kit/#package-metrics
+ 
+ ## Scope
+ 
+-To be defined.
++- Package metrics SHALL implement Gauges, Counters, and Histograms.
++
++- Each metric type SHALL allow observations with an unlimited number of key/value field pairs,
++  similar to [package log](https://github.com/peterbourgon/gokit/blob/master/rfc/rfc004-package-log.md).
++
++- Counter SHALL be an increment-only counter of type uint64.
++
++- Gauge SHALL be an arbitrarily-settable register of type int64.
++
++- Histogram SHALL collect observations of type int64.
++
++- These interfaces SHALL be the primary and exclusive API for metrics.
++
++- We SHALL provide a variety of implementations of each interface that act as a
++  bridge to different backends: expvar, Graphite, statsd, Prometheus, etc.
++
++- Each metric backend MAY provide additional value-add behaviors. For example,
++  a backend for Histogram may bucket observations according to quantile and
++  calculate additional, derived statistics.
++
+ 
+ ## Implementation
+ 
+-To be defined.
+\ No newline at end of file
++https://github.com/peterbourgon/gokit/tree/master/metrics
++
++### Gauge
++
++```go
++type Gauge interface {
++	With(Field) Gauge
++	Set(value int64)
++	Add(delta int64)
++}
++```
++
++### Counter
++
++```go
++type Counter interface {
++	With(Field) Counter
++	Add(delta uint64)
++}
++```
++
++### Histogram
++
++```go
++type Histogram interface {
++	With(Field) Histogram
++	Observe(int64)
++}
++```

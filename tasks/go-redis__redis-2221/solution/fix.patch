@@ -1,0 +1,112 @@
+diff --git a/command.go b/command.go
+index d4fc91de..59cd8a6c 100644
+--- a/command.go
++++ b/command.go
+@@ -65,7 +65,7 @@ func cmdFirstKeyPos(cmd Cmder, info *CommandInfo) int {
+ 	}
+ 
+ 	switch cmd.Name() {
+-	case "eval", "evalsha":
++	case "eval", "evalsha", "eval_ro", "evalsha_ro":
+ 		if cmd.stringArg(2) != "0" {
+ 			return 3
+ 		}
+diff --git a/commands.go b/commands.go
+index 57de25b0..01f3e616 100644
+--- a/commands.go
++++ b/commands.go
+@@ -339,6 +339,8 @@ type Cmdable interface {
+ 
+ 	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *Cmd
+ 	EvalSha(ctx context.Context, sha1 string, keys []string, args ...interface{}) *Cmd
++	EvalRO(ctx context.Context, script string, keys []string, args ...interface{}) *Cmd
++	EvalShaRO(ctx context.Context, sha1 string, keys []string, args ...interface{}) *Cmd
+ 	ScriptExists(ctx context.Context, hashes ...string) *BoolSliceCmd
+ 	ScriptFlush(ctx context.Context) *StatusCmd
+ 	ScriptKill(ctx context.Context) *StatusCmd
+@@ -3010,24 +3012,25 @@ func (c cmdable) MemoryUsage(ctx context.Context, key string, samples ...int) *I
+ //------------------------------------------------------------------------------
+ 
+ func (c cmdable) Eval(ctx context.Context, script string, keys []string, args ...interface{}) *Cmd {
+-	cmdArgs := make([]interface{}, 3+len(keys), 3+len(keys)+len(args))
+-	cmdArgs[0] = "eval"
+-	cmdArgs[1] = script
+-	cmdArgs[2] = len(keys)
+-	for i, key := range keys {
+-		cmdArgs[3+i] = key
+-	}
+-	cmdArgs = appendArgs(cmdArgs, args)
+-	cmd := NewCmd(ctx, cmdArgs...)
+-	cmd.SetFirstKeyPos(3)
+-	_ = c(ctx, cmd)
+-	return cmd
++	return c.eval(ctx, "eval", script, keys, args...)
++}
++
++func (c cmdable) EvalRO(ctx context.Context, script string, keys []string, args ...interface{}) *Cmd {
++	return c.eval(ctx, "eval_ro", script, keys, args...)
+ }
+ 
+ func (c cmdable) EvalSha(ctx context.Context, sha1 string, keys []string, args ...interface{}) *Cmd {
++	return c.eval(ctx, "evalsha", sha1, keys, args...)
++}
++
++func (c cmdable) EvalShaRO(ctx context.Context, sha1 string, keys []string, args ...interface{}) *Cmd {
++	return c.eval(ctx, "evalsha_ro", sha1, keys, args...)
++}
++
++func (c cmdable) eval(ctx context.Context, name, payload string, keys []string, args ...interface{}) *Cmd {
+ 	cmdArgs := make([]interface{}, 3+len(keys), 3+len(keys)+len(args))
+-	cmdArgs[0] = "evalsha"
+-	cmdArgs[1] = sha1
++	cmdArgs[0] = name
++	cmdArgs[1] = payload
+ 	cmdArgs[2] = len(keys)
+ 	for i, key := range keys {
+ 		cmdArgs[3+i] = key
+diff --git a/script.go b/script.go
+index 5cab18d6..b0425b76 100644
+--- a/script.go
++++ b/script.go
+@@ -11,6 +11,8 @@ import (
+ type Scripter interface {
+ 	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *Cmd
+ 	EvalSha(ctx context.Context, sha1 string, keys []string, args ...interface{}) *Cmd
++	EvalRO(ctx context.Context, script string, keys []string, args ...interface{}) *Cmd
++	EvalShaRO(ctx context.Context, sha1 string, keys []string, args ...interface{}) *Cmd
+ 	ScriptExists(ctx context.Context, hashes ...string) *BoolSliceCmd
+ 	ScriptLoad(ctx context.Context, script string) *StringCmd
+ }
+@@ -50,10 +52,18 @@ func (s *Script) Eval(ctx context.Context, c Scripter, keys []string, args ...in
+ 	return c.Eval(ctx, s.src, keys, args...)
+ }
+ 
++func (s *Script) EvalRO(ctx context.Context, c Scripter, keys []string, args ...interface{}) *Cmd {
++	return c.EvalRO(ctx, s.src, keys, args...)
++}
++
+ func (s *Script) EvalSha(ctx context.Context, c Scripter, keys []string, args ...interface{}) *Cmd {
+ 	return c.EvalSha(ctx, s.hash, keys, args...)
+ }
+ 
++func (s *Script) EvalShaRO(ctx context.Context, c Scripter, keys []string, args ...interface{}) *Cmd {
++	return c.EvalShaRO(ctx, s.hash, keys, args...)
++}
++
+ // Run optimistically uses EVALSHA to run the script. If script does not exist
+ // it is retried using EVAL.
+ func (s *Script) Run(ctx context.Context, c Scripter, keys []string, args ...interface{}) *Cmd {
+@@ -63,3 +73,13 @@ func (s *Script) Run(ctx context.Context, c Scripter, keys []string, args ...int
+ 	}
+ 	return r
+ }
++
++// RunRO optimistically uses EVALSHA_RO to run the script. If script does not exist
++// it is retried using EVAL_RO.
++func (s *Script) RunRO(ctx context.Context, c Scripter, keys []string, args ...interface{}) *Cmd {
++	r := s.EvalShaRO(ctx, c, keys, args...)
++	if err := r.Err(); err != nil && strings.HasPrefix(err.Error(), "NOSCRIPT ") {
++		return s.EvalRO(ctx, c, keys, args...)
++	}
++	return r
++}

@@ -1,0 +1,232 @@
+diff --git a/addsvc/main.go b/addsvc/main.go
+index 0c910d6..a699514 100644
+--- a/addsvc/main.go
++++ b/addsvc/main.go
+@@ -61,7 +61,7 @@ func main() {
+ 
+ 	// `package log` domain
+ 	var logger kitlog.Logger
+-	logger = kitlog.NewLogfmtLogger(os.Stderr)
++	logger = kitlog.NewPrefixLogger(os.Stderr)
+ 	logger = kitlog.With(logger, "ts", kitlog.DefaultTimestampUTC, "caller", kitlog.DefaultCaller)
+ 	stdlog.SetOutput(kitlog.NewStdlibAdapter(logger)) // redirect stdlib logging to us
+ 	stdlog.SetFlags(0)                                // flags are handled in our logger
+diff --git a/log/levels_test.go b/log/levels_test.go
+index 9533310..5cfbf55 100644
+--- a/log/levels_test.go
++++ b/log/levels_test.go
+@@ -9,7 +9,7 @@ import (
+ 
+ func TestDefaultLevels(t *testing.T) {
+ 	buf := bytes.Buffer{}
+-	levels := log.NewLevels(log.NewLogfmtLogger(&buf))
++	levels := log.NewLevels(log.NewPrefixLogger(&buf))
+ 
+ 	levels.Debug.Log("msg", "👨") // of course you'd want to do this
+ 	if want, have := "level=DEBUG msg=👨\n", buf.String(); want != have {
+diff --git a/log/log_test.go b/log/log_test.go
+index 978289a..52fd7ee 100644
+--- a/log/log_test.go
++++ b/log/log_test.go
+@@ -133,7 +133,7 @@ func TestSwapLogger(t *testing.T) {
+ 	}
+ 
+ 	buf.Reset()
+-	prefix := log.NewLogfmtLogger(buf)
++	prefix := log.NewPrefixLogger(buf)
+ 	logger.Swap(prefix)
+ 
+ 	if err := logger.Log("k", "v"); err != nil {
+diff --git a/log/logfmt_logger.go b/log/logfmt_logger.go
+deleted file mode 100644
+index c3405cf..0000000
+--- a/log/logfmt_logger.go
++++ /dev/null
+@@ -1,34 +0,0 @@
+-package log
+-
+-import (
+-	"io"
+-
+-	"gopkg.in/logfmt.v0"
+-)
+-
+-type logfmtLogger struct {
+-	w io.Writer
+-}
+-
+-// NewLogfmtLogger returns a logger that encodes keyvals to the Writer in
+-// logfmt format. The passed Writer must be safe for concurrent use by
+-// multiple goroutines if the returned Logger will be used concurrently.
+-func NewLogfmtLogger(w io.Writer) Logger {
+-	return &logfmtLogger{w}
+-}
+-
+-func (l logfmtLogger) Log(keyvals ...interface{}) error {
+-	// The Logger interface requires implementations to be safe for concurrent
+-	// use by multiple goroutines. For this implementation that means making
+-	// only one call to l.w.Write() for each call to Log. We first collect all
+-	// of the bytes into b, and then call l.w.Write(b).
+-	b, err := logfmt.MarshalKeyvals(keyvals...)
+-	if err != nil {
+-		return err
+-	}
+-	b = append(b, '\n')
+-	if _, err := l.w.Write(b); err != nil {
+-		return err
+-	}
+-	return nil
+-}
+diff --git a/log/prefix_logger.go b/log/prefix_logger.go
+new file mode 100644
+index 0000000..8fbfa5f
+--- /dev/null
++++ b/log/prefix_logger.go
+@@ -0,0 +1,38 @@
++package log
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++)
++
++type prefixLogger struct {
++	io.Writer
++}
++
++// NewPrefixLogger returns a basic logger that encodes keyvals as simple "k=v"
++// pairs to the Writer.
++func NewPrefixLogger(w io.Writer) Logger {
++	return &prefixLogger{w}
++}
++
++func (l prefixLogger) Log(keyvals ...interface{}) error {
++	if len(keyvals)%2 == 1 {
++		panic("odd number of keyvals")
++	}
++	buf := &bytes.Buffer{}
++	for i := 0; i < len(keyvals); i += 2 {
++		if i != 0 {
++			if _, err := fmt.Fprint(buf, " "); err != nil {
++				return err
++			}
++		}
++		if _, err := fmt.Fprintf(buf, "%s=%v", keyvals[i], keyvals[i+1]); err != nil {
++			return err
++		}
++	}
++	if _, err := fmt.Fprintln(l.Writer, buf.String()); err != nil {
++		return err
++	}
++	return nil
++}
+diff --git a/log/logfmt_logger_test.go b/log/prefix_logger_test.go
+similarity index 58%
+rename from log/logfmt_logger_test.go
+rename to log/prefix_logger_test.go
+index 9f32d01..7a13a4a 100644
+--- a/log/logfmt_logger_test.go
++++ b/log/prefix_logger_test.go
+@@ -7,12 +7,11 @@ import (
+ 	"testing"
+ 
+ 	"github.com/go-kit/kit/log"
+-	"gopkg.in/logfmt.v0"
+ )
+ 
+-func TestLogfmtLogger(t *testing.T) {
++func TestPrefixLogger(t *testing.T) {
+ 	buf := &bytes.Buffer{}
+-	logger := log.NewLogfmtLogger(buf)
++	logger := log.NewPrefixLogger(buf)
+ 
+ 	if err := logger.Log("hello", "world"); err != nil {
+ 		t.Fatal(err)
+@@ -33,21 +32,21 @@ func TestLogfmtLogger(t *testing.T) {
+ 	if err := logger.Log("std_map", map[int]int{1: 2}, "my_map", mymap{0: 0}); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if want, have := "std_map=\""+logfmt.ErrUnsupportedValueType.Error()+"\" my_map=special_behavior\n", buf.String(); want != have {
++	if want, have := "std_map=map[1:2] my_map=special_behavior\n", buf.String(); want != have {
+ 		t.Errorf("want %#v, have %#v", want, have)
+ 	}
+ }
+ 
+-func BenchmarkLogfmtLoggerSimple(b *testing.B) {
+-	benchmarkRunner(b, log.NewLogfmtLogger(ioutil.Discard), baseMessage)
++func BenchmarkPrefixLoggerSimple(b *testing.B) {
++	benchmarkRunner(b, log.NewPrefixLogger(ioutil.Discard), baseMessage)
+ }
+ 
+-func BenchmarkLogfmtLoggerContextual(b *testing.B) {
+-	benchmarkRunner(b, log.NewLogfmtLogger(ioutil.Discard), withMessage)
++func BenchmarkPrefixLoggerContextual(b *testing.B) {
++	benchmarkRunner(b, log.NewPrefixLogger(ioutil.Discard), withMessage)
+ }
+ 
+-func TestLogfmtLoggerConcurrency(t *testing.T) {
+-	testConcurrency(t, log.NewLogfmtLogger(ioutil.Discard))
++func TestPrefixLoggerConcurrency(t *testing.T) {
++	testConcurrency(t, log.NewPrefixLogger(ioutil.Discard))
+ }
+ 
+ type mymap map[int]int
+diff --git a/log/stdlib_test.go b/log/stdlib_test.go
+index 40cf4f4..6dbc069 100644
+--- a/log/stdlib_test.go
++++ b/log/stdlib_test.go
+@@ -12,7 +12,7 @@ func TestStdlibWriter(t *testing.T) {
+ 	buf := &bytes.Buffer{}
+ 	log.SetOutput(buf)
+ 	log.SetFlags(log.LstdFlags)
+-	logger := NewLogfmtLogger(StdlibWriter{})
++	logger := NewPrefixLogger(StdlibWriter{})
+ 	logger.Log("key", "val")
+ 	timestamp := time.Now().Format("2006/01/02 15:04:05")
+ 	if want, have := timestamp+" key=val\n", buf.String(); want != have {
+@@ -22,7 +22,7 @@ func TestStdlibWriter(t *testing.T) {
+ 
+ func TestStdlibAdapterUsage(t *testing.T) {
+ 	buf := &bytes.Buffer{}
+-	logger := NewLogfmtLogger(buf)
++	logger := NewPrefixLogger(buf)
+ 	writer := NewStdlibAdapter(logger)
+ 	stdlog := log.New(writer, "", 0)
+ 
+@@ -34,10 +34,10 @@ func TestStdlibAdapterUsage(t *testing.T) {
+ 		0:                                      "msg=hello\n",
+ 		log.Ldate:                              "ts=" + date + " msg=hello\n",
+ 		log.Ltime:                              "ts=" + time + " msg=hello\n",
+-		log.Ldate | log.Ltime:                  "ts=\"" + date + " " + time + "\" msg=hello\n",
++		log.Ldate | log.Ltime:                  "ts=" + date + " " + time + " msg=hello\n",
+ 		log.Lshortfile:                         "file=stdlib_test.go:44 msg=hello\n",
+ 		log.Lshortfile | log.Ldate:             "ts=" + date + " file=stdlib_test.go:44 msg=hello\n",
+-		log.Lshortfile | log.Ldate | log.Ltime: "ts=\"" + date + " " + time + "\" file=stdlib_test.go:44 msg=hello\n",
++		log.Lshortfile | log.Ldate | log.Ltime: "ts=" + date + " " + time + " file=stdlib_test.go:44 msg=hello\n",
+ 	} {
+ 		buf.Reset()
+ 		stdlog.SetFlags(flag)
+@@ -50,17 +50,17 @@ func TestStdlibAdapterUsage(t *testing.T) {
+ 
+ func TestStdLibAdapterExtraction(t *testing.T) {
+ 	buf := &bytes.Buffer{}
+-	logger := NewLogfmtLogger(buf)
++	logger := NewPrefixLogger(buf)
+ 	writer := NewStdlibAdapter(logger)
+ 	for input, want := range map[string]string{
+ 		"hello":                                            "msg=hello\n",
+ 		"2009/01/23: hello":                                "ts=2009/01/23 msg=hello\n",
+-		"2009/01/23 01:23:23: hello":                       "ts=\"2009/01/23 01:23:23\" msg=hello\n",
++		"2009/01/23 01:23:23: hello":                       "ts=2009/01/23 01:23:23 msg=hello\n",
+ 		"01:23:23: hello":                                  "ts=01:23:23 msg=hello\n",
+-		"2009/01/23 01:23:23.123123: hello":                "ts=\"2009/01/23 01:23:23.123123\" msg=hello\n",
+-		"2009/01/23 01:23:23.123123 /a/b/c/d.go:23: hello": "ts=\"2009/01/23 01:23:23.123123\" file=/a/b/c/d.go:23 msg=hello\n",
++		"2009/01/23 01:23:23.123123: hello":                "ts=2009/01/23 01:23:23.123123 msg=hello\n",
++		"2009/01/23 01:23:23.123123 /a/b/c/d.go:23: hello": "ts=2009/01/23 01:23:23.123123 file=/a/b/c/d.go:23 msg=hello\n",
+ 		"01:23:23.123123 /a/b/c/d.go:23: hello":            "ts=01:23:23.123123 file=/a/b/c/d.go:23 msg=hello\n",
+-		"2009/01/23 01:23:23 /a/b/c/d.go:23: hello":        "ts=\"2009/01/23 01:23:23\" file=/a/b/c/d.go:23 msg=hello\n",
++		"2009/01/23 01:23:23 /a/b/c/d.go:23: hello":        "ts=2009/01/23 01:23:23 file=/a/b/c/d.go:23 msg=hello\n",
+ 		"2009/01/23 /a/b/c/d.go:23: hello":                 "ts=2009/01/23 file=/a/b/c/d.go:23 msg=hello\n",
+ 		"/a/b/c/d.go:23: hello":                            "file=/a/b/c/d.go:23 msg=hello\n",
+ 	} {

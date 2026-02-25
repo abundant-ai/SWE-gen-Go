@@ -1,0 +1,143 @@
+diff --git a/transport/http/request_response_funcs.go b/transport/http/request_response_funcs.go
+index 78ad61e..7622375 100644
+--- a/transport/http/request_response_funcs.go
++++ b/transport/http/request_response_funcs.go
+@@ -116,13 +116,4 @@ const (
+ 	// ContextKeyRequestXRequestID is populated in the context by
+ 	// PopulateRequestContext. Its value is r.Header.Get("X-Request-Id").
+ 	ContextKeyRequestXRequestID
+-
+-	// ContextKeyResponseHeaders is populated in the context whenever a
+-	// ServerFinalizerFunc is specified. Its value is of type http.Header, and
+-	// is captured only once the entire response has been written.
+-	ContextKeyResponseHeaders
+-
+-	// ContextKeyResponseSize is populated in the context whenever a
+-	// ServerFinalizerFunc is specified. Its value is of type int64.
+-	ContextKeyResponseSize
+ )
+diff --git a/transport/http/server.go b/transport/http/server.go
+index ab2b22e..5241328 100644
+--- a/transport/http/server.go
++++ b/transport/http/server.go
+@@ -88,12 +88,8 @@ func (s Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	ctx := s.ctx
+ 
+ 	if s.finalizer != nil {
+-		iw := &interceptingWriter{w, http.StatusOK, 0}
+-		defer func() {
+-			ctx = context.WithValue(ctx, ContextKeyResponseHeaders, iw.Header())
+-			ctx = context.WithValue(ctx, ContextKeyResponseSize, iw.written)
+-			s.finalizer(ctx, iw.code, r)
+-		}()
++		iw := &interceptingWriter{w, http.StatusOK}
++		defer func() { s.finalizer(ctx, iw.code, r) }()
+ 		w = iw
+ 	}
+ 
+@@ -134,9 +130,7 @@ type ErrorEncoder func(ctx context.Context, err error, w http.ResponseWriter)
+ 
+ // ServerFinalizerFunc can be used to perform work at the end of an HTTP
+ // request, after the response has been written to the client. The principal
+-// intended use is for request logging. In addition to the response code
+-// provided in the function signature, additional response parameters are
+-// provided in the context under keys with the ContextKeyResponse prefix.
++// intended use is for request logging.
+ type ServerFinalizerFunc func(ctx context.Context, code int, r *http.Request)
+ 
+ // EncodeJSONResponse is a EncodeResponseFunc that serializes the response as a
+@@ -206,8 +200,7 @@ type Headerer interface {
+ 
+ type interceptingWriter struct {
+ 	http.ResponseWriter
+-	code    int
+-	written int64
++	code int
+ }
+ 
+ // WriteHeader may not be explicitly called, so care must be taken to
+@@ -216,9 +209,3 @@ func (w *interceptingWriter) WriteHeader(code int) {
+ 	w.code = code
+ 	w.ResponseWriter.WriteHeader(code)
+ }
+-
+-func (w *interceptingWriter) Write(p []byte) (int, error) {
+-	n, err := w.ResponseWriter.Write(p)
+-	w.written += int64(n)
+-	return n, err
+-}
+diff --git a/transport/http/server_test.go b/transport/http/server_test.go
+index 654fbec..8c112da 100644
+--- a/transport/http/server_test.go
++++ b/transport/http/server_test.go
+@@ -8,7 +8,6 @@ import (
+ 	"net/http/httptest"
+ 	"strings"
+ 	"testing"
+-	"time"
+ 
+ 	"github.com/go-kit/kit/endpoint"
+ 	httptransport "github.com/go-kit/kit/transport/http"
+@@ -94,13 +93,7 @@ func TestServerHappyPath(t *testing.T) {
+ }
+ 
+ func TestServerFinalizer(t *testing.T) {
+-	var (
+-		headerKey    = "X-Henlo-Lizer"
+-		headerVal    = "Helllo you stinky lizard"
+-		statusCode   = http.StatusTeapot
+-		responseBody = "go eat a fly ugly\n"
+-		done         = make(chan struct{})
+-	)
++	c := make(chan int)
+ 	handler := httptransport.NewServer(
+ 		context.Background(),
+ 		endpoint.Nop,
+@@ -108,27 +101,11 @@ func TestServerFinalizer(t *testing.T) {
+ 			return struct{}{}, nil
+ 		},
+ 		func(_ context.Context, w http.ResponseWriter, _ interface{}) error {
+-			w.Header().Set(headerKey, headerVal)
+-			w.WriteHeader(statusCode)
+-			w.Write([]byte(responseBody))
++			w.WriteHeader(<-c)
+ 			return nil
+ 		},
+-		httptransport.ServerFinalizer(func(ctx context.Context, code int, _ *http.Request) {
+-			if want, have := statusCode, code; want != have {
+-				t.Errorf("StatusCode: want %d, have %d", want, have)
+-			}
+-
+-			responseHeader := ctx.Value(httptransport.ContextKeyResponseHeaders).(http.Header)
+-			if want, have := headerVal, responseHeader.Get(headerKey); want != have {
+-				t.Errorf("%s: want %q, have %q", headerKey, want, have)
+-			}
+-
+-			responseSize := ctx.Value(httptransport.ContextKeyResponseSize).(int64)
+-			if want, have := int64(len(responseBody)), responseSize; want != have {
+-				t.Errorf("response size: want %d, have %d", want, have)
+-			}
+-
+-			close(done)
++		httptransport.ServerFinalizer(func(_ context.Context, code int, _ *http.Request) {
++			c <- code
+ 		}),
+ 	)
+ 
+@@ -136,10 +113,12 @@ func TestServerFinalizer(t *testing.T) {
+ 	defer server.Close()
+ 	go http.Get(server.URL)
+ 
+-	select {
+-	case <-done:
+-	case <-time.After(time.Second):
+-		t.Fatal("timeout waiting for finalizer")
++	want := http.StatusTeapot
++	c <- want   // give status code to response encoder
++	have := <-c // take status code from finalizer
++
++	if want != have {
++		t.Errorf("want %d, have %d", want, have)
+ 	}
+ }
+ 

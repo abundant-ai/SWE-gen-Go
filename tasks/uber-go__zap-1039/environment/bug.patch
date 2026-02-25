@@ -1,0 +1,208 @@
+diff --git a/zapcore/encoder.go b/zapcore/encoder.go
+index 6e5fd56..ad8712a 100644
+--- a/zapcore/encoder.go
++++ b/zapcore/encoder.go
+@@ -22,7 +22,6 @@ package zapcore
+ 
+ import (
+ 	"encoding/json"
+-	"io"
+ 	"time"
+ 
+ 	"go.uber.org/zap/buffer"
+@@ -332,9 +331,6 @@ type EncoderConfig struct {
+ 	// Unlike the other primitive type encoders, EncodeName is optional. The
+ 	// zero value falls back to FullNameEncoder.
+ 	EncodeName NameEncoder `json:"nameEncoder" yaml:"nameEncoder"`
+-	// Configure the encoder for interface{} type objects.
+-	// If not provided, objects are encoded using json.Encoder
+-	NewReflectedEncoder func(io.Writer) ReflectedEncoder `json:"-" yaml:"-"`
+ 	// Configures the field separator used by the console encoder. Defaults
+ 	// to tab.
+ 	ConsoleSeparator string `json:"consoleSeparator" yaml:"consoleSeparator"`
+diff --git a/zapcore/json_encoder.go b/zapcore/json_encoder.go
+index 505c714..3e00a6b 100644
+--- a/zapcore/json_encoder.go
++++ b/zapcore/json_encoder.go
+@@ -22,6 +22,7 @@ package zapcore
+ 
+ import (
+ 	"encoding/base64"
++	"encoding/json"
+ 	"math"
+ 	"sync"
+ 	"time"
+@@ -63,7 +64,7 @@ type jsonEncoder struct {
+ 
+ 	// for encoding generic values by reflection
+ 	reflectBuf *buffer.Buffer
+-	reflectEnc ReflectedEncoder
++	reflectEnc *json.Encoder
+ }
+ 
+ // NewJSONEncoder creates a fast, low-allocation JSON encoder. The encoder
+@@ -87,11 +88,6 @@ func newJSONEncoder(cfg EncoderConfig, spaced bool) *jsonEncoder {
+ 		cfg.LineEnding = DefaultLineEnding
+ 	}
+ 
+-	// If no EncoderConfig.NewReflectedEncoder is provided by the user, then use default
+-	if cfg.NewReflectedEncoder == nil {
+-		cfg.NewReflectedEncoder = defaultReflectedEncoder
+-	}
+-
+ 	return &jsonEncoder{
+ 		EncoderConfig: &cfg,
+ 		buf:           bufferpool.Get(),
+@@ -156,7 +152,10 @@ func (enc *jsonEncoder) AddInt64(key string, val int64) {
+ func (enc *jsonEncoder) resetReflectBuf() {
+ 	if enc.reflectBuf == nil {
+ 		enc.reflectBuf = bufferpool.Get()
+-		enc.reflectEnc = enc.NewReflectedEncoder(enc.reflectBuf)
++		enc.reflectEnc = json.NewEncoder(enc.reflectBuf)
++
++		// For consistency with our custom JSON encoder.
++		enc.reflectEnc.SetEscapeHTML(false)
+ 	} else {
+ 		enc.reflectBuf.Reset()
+ 	}
+diff --git a/zapcore/json_encoder_impl_test.go b/zapcore/json_encoder_impl_test.go
+index fde241f..c1c4c62 100644
+--- a/zapcore/json_encoder_impl_test.go
++++ b/zapcore/json_encoder_impl_test.go
+@@ -508,7 +508,7 @@ func assertJSON(t *testing.T, expected string, enc *jsonEncoder) {
+ }
+ 
+ func assertOutput(t testing.TB, cfg EncoderConfig, expected string, f func(Encoder)) {
+-	enc := NewJSONEncoder(cfg).(*jsonEncoder)
++	enc := &jsonEncoder{buf: bufferpool.Get(), EncoderConfig: &cfg}
+ 	f(enc)
+ 	assert.Equal(t, expected, enc.buf.String(), "Unexpected encoder output after adding.")
+ 
+diff --git a/zapcore/json_encoder_test.go b/zapcore/json_encoder_test.go
+index 944f23a..8e82c1a 100644
+--- a/zapcore/json_encoder_test.go
++++ b/zapcore/json_encoder_test.go
+@@ -21,7 +21,6 @@
+ package zapcore_test
+ 
+ import (
+-	"io"
+ 	"testing"
+ 	"time"
+ 
+@@ -172,68 +171,3 @@ func TestJSONEmptyConfig(t *testing.T) {
+ 		})
+ 	}
+ }
+-
+-// Encodes any object into empty json '{}'
+-type emptyReflectedEncoder struct {
+-	writer io.Writer
+-}
+-
+-func (enc *emptyReflectedEncoder) Encode(obj interface{}) error {
+-	_, err := enc.writer.Write([]byte("{}"))
+-	return err
+-}
+-
+-func TestJSONCustomReflectedEncoder(t *testing.T) {
+-	tests := []struct {
+-		name     string
+-		field    zapcore.Field
+-		expected string
+-	}{
+-		{
+-			name: "encode custom map object",
+-			field: zapcore.Field{
+-				Key:  "data",
+-				Type: zapcore.ReflectType,
+-				Interface: map[string]interface{}{
+-					"foo": "hello",
+-					"bar": 1111,
+-				},
+-			},
+-			expected: `{"data":{}}`,
+-		},
+-		{
+-			name: "encode nil object",
+-			field: zapcore.Field{
+-				Key:  "data",
+-				Type: zapcore.ReflectType,
+-			},
+-			expected: `{"data":null}`,
+-		},
+-	}
+-
+-	for _, tt := range tests {
+-		tt := tt
+-		t.Run(tt.name, func(t *testing.T) {
+-			t.Parallel()
+-
+-			enc := zapcore.NewJSONEncoder(zapcore.EncoderConfig{
+-				NewReflectedEncoder: func(writer io.Writer) zapcore.ReflectedEncoder {
+-					return &emptyReflectedEncoder{
+-						writer: writer,
+-					}
+-				},
+-			})
+-
+-			buf, err := enc.EncodeEntry(zapcore.Entry{
+-				Level:      zapcore.DebugLevel,
+-				Time:       time.Now(),
+-				LoggerName: "logger",
+-				Message:    "things happened",
+-			}, []zapcore.Field{tt.field})
+-			if assert.NoError(t, err, "Unexpected JSON encoding error.") {
+-				assert.JSONEq(t, tt.expected, buf.String(), "Incorrect encoded JSON entry.")
+-			}
+-			buf.Free()
+-		})
+-	}
+-}
+diff --git a/zapcore/reflected_encoder.go b/zapcore/reflected_encoder.go
+deleted file mode 100644
+index 8746360..0000000
+--- a/zapcore/reflected_encoder.go
++++ /dev/null
+@@ -1,41 +0,0 @@
+-// Copyright (c) 2016 Uber Technologies, Inc.
+-//
+-// Permission is hereby granted, free of charge, to any person obtaining a copy
+-// of this software and associated documentation files (the "Software"), to deal
+-// in the Software without restriction, including without limitation the rights
+-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+-// copies of the Software, and to permit persons to whom the Software is
+-// furnished to do so, subject to the following conditions:
+-//
+-// The above copyright notice and this permission notice shall be included in
+-// all copies or substantial portions of the Software.
+-//
+-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+-// THE SOFTWARE.
+-
+-package zapcore
+-
+-import (
+-	"encoding/json"
+-	"io"
+-)
+-
+-// ReflectedEncoder serializes log fields that can't be serialized with Zap's
+-// JSON encoder. These have the ReflectType field type.
+-// Use EncoderConfig.NewReflectedEncoder to set this.
+-type ReflectedEncoder interface {
+-	// Encode encodes and writes to the underlying data stream.
+-	Encode(interface{}) error
+-}
+-
+-func defaultReflectedEncoder(w io.Writer) ReflectedEncoder {
+-	enc := json.NewEncoder(w)
+-	// For consistency with our custom JSON encoder.
+-	enc.SetEscapeHTML(false)
+-	return enc
+-}

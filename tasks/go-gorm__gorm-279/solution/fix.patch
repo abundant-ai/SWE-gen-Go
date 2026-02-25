@@ -1,0 +1,144 @@
+diff --git a/README.md b/README.md
+index 41ee9c4..6dbe98f 100644
+--- a/README.md
++++ b/README.md
+@@ -974,7 +974,8 @@ If you have an existing database schema, and the primary key field is different
+ ```go
+ type Animal struct {
+ 	AnimalId     int64 `gorm:"primary_key:yes"`
+-	Birthday     time.Time
++	Birthday     time.Time `sql:"DEFAULT:NOW()"`
++    Name         string `sql:"default:'galeone'"`
+ 	Age          int64
+ }
+ ```
+@@ -989,6 +990,46 @@ type Animal struct {
+ }
+ ```
+ 
++## Default values
++
++If you have defined a default value in the `sql` tag (see the struct Animal above) the generated queries will not contains the value for these fields if is not set.
++
++Eg.
++
++```go
++db.Save(&Animal{Age: 99})
++```
++
++The generated query will be:
++
++```sql
++INSERT INTO animals("birthday","age","name") values(NOW(), '99', 'galeone')
++```
++
++The same thing occurs in update statements.
++
++You should fetch the value again to get the default updated values in the struct.
++
++We can't do the same thing of the primary key (that is always filled with the right value) because default SQL values can be expressions and thus be different from the fields' type (eg. a time.Time fiels has a default value of "NOW()")
++
++So the right way to do an update/insert statement and be sure to get the default values in the struct is
++
++```go
++//Insert
++var animal Animal
++animal.Age = 99
++db.Save(&animal)
++db.First(&animal, animal.AnimalId)
++// Now wo have the animal struct with:
++// Birthday: the insert time
++// Name: the string galeone
++// Age: the setted one -> 99
++
++// For the update statements is the same
++// First save the struct
++// Than fetch it back again
++```
++
+ ## More examples with query chain
+ 
+ ```go
+@@ -1032,7 +1073,7 @@ db.Where("email = ?", "x@example.org").Attrs(User{RegisteredIp: "111.111.111.111
+ * db.RegisterFuncation("Search", func() {})
+   db.Model(&[]User{}).Limit(10).Do("Search", "search func's argument")
+   db.Mode(&User{}).Do("EditForm").Get("edit_form_html")
+-  DefaultValue, DefaultTimeZone, R/W Splitting, Validation
++  DefaultTimeZone, R/W Splitting, Validation
+ * Github Pages
+ * Includes
+ * AlertColumn, DropColumn
+diff --git a/callback_create.go b/callback_create.go
+index 1e22831..73d1088 100644
+--- a/callback_create.go
++++ b/callback_create.go
+@@ -2,6 +2,7 @@ package gorm
+ 
+ import (
+ 	"fmt"
++	"reflect"
+ 	"strings"
+ )
+ 
+@@ -24,9 +25,11 @@ func Create(scope *Scope) {
+ 	if !scope.HasError() {
+ 		// set create sql
+ 		var sqls, columns []string
+-
+ 		for _, field := range scope.Fields() {
+ 			if field.IsNormal && (!field.IsPrimaryKey || !scope.PrimaryKeyZero()) {
++				if field.DefaultValue != nil && reflect.DeepEqual(field.Field.Interface(), reflect.Zero(field.Field.Type()).Interface()) {
++					continue
++				}
+ 				columns = append(columns, scope.Quote(field.DBName))
+ 				sqls = append(sqls, scope.AddToVars(field.Field.Interface()))
+ 			}
+diff --git a/callback_update.go b/callback_update.go
+index c59bcf1..04fa516 100644
+--- a/callback_update.go
++++ b/callback_update.go
+@@ -2,6 +2,7 @@ package gorm
+ 
+ import (
+ 	"fmt"
++	"reflect"
+ 	"strings"
+ )
+ 
+@@ -49,6 +50,9 @@ func Update(scope *Scope) {
+ 		} else {
+ 			for _, field := range scope.Fields() {
+ 				if !field.IsPrimaryKey && field.IsNormal && !field.IsIgnored {
++					if field.DefaultValue != nil && reflect.DeepEqual(field.Field.Interface(), reflect.Zero(field.Field.Type()).Interface()) {
++						continue
++					}
+ 					sqls = append(sqls, fmt.Sprintf("%v = %v", scope.Quote(field.DBName), scope.AddToVars(field.Field.Interface())))
+ 				}
+ 			}
+diff --git a/field.go b/field.go
+index 452b7ba..f00c6b8 100644
+--- a/field.go
++++ b/field.go
+@@ -24,6 +24,7 @@ type Field struct {
+ 	IsBlank      bool
+ 	IsIgnored    bool
+ 	IsPrimaryKey bool
++	DefaultValue interface{}
+ }
+ 
+ func (field *Field) IsScanner() bool {
+diff --git a/scope.go b/scope.go
+index 87405a6..0af4dc8 100644
+--- a/scope.go
++++ b/scope.go
+@@ -299,6 +299,10 @@ func (scope *Scope) fieldFromStruct(fieldStruct reflect.StructField, withRelatio
+ 		field.IsPrimaryKey = true
+ 	}
+ 
++	if def, ok := parseTagSetting(fieldStruct.Tag.Get("sql"))["DEFAULT"]; ok {
++		field.DefaultValue = def
++	}
++
+ 	field.Tag = fieldStruct.Tag
+ 
+ 	if value, ok := settings["COLUMN"]; ok {

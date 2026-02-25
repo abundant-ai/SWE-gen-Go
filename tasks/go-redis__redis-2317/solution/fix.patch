@@ -1,0 +1,71 @@
+diff --git a/internal/hscan/hscan.go b/internal/hscan/hscan.go
+index 852c8bd5..203ec4aa 100644
+--- a/internal/hscan/hscan.go
++++ b/internal/hscan/hscan.go
+@@ -10,6 +10,12 @@ import (
+ // decoderFunc represents decoding functions for default built-in types.
+ type decoderFunc func(reflect.Value, string) error
+ 
++// Scanner is the interface implemented by themselves,
++// which will override the decoding behavior of decoderFunc.
++type Scanner interface {
++	ScanRedis(s string) error
++}
++
+ var (
+ 	// List of built-in decoders indexed by their numeric constant values (eg: reflect.Bool = 1).
+ 	decoders = []decoderFunc{
+diff --git a/internal/hscan/structmap.go b/internal/hscan/structmap.go
+index 6839412b..9befd987 100644
+--- a/internal/hscan/structmap.go
++++ b/internal/hscan/structmap.go
+@@ -84,7 +84,29 @@ func (s StructValue) Scan(key string, value string) error {
+ 	if !ok {
+ 		return nil
+ 	}
+-	if err := field.fn(s.value.Field(field.index), value); err != nil {
++
++	v := s.value.Field(field.index)
++	isPtr := v.Kind() == reflect.Pointer
++
++	if isPtr && v.IsNil() {
++		v.Set(reflect.New(v.Type().Elem()))
++	}
++	if !isPtr && v.Type().Name() != "" && v.CanAddr() {
++		v = v.Addr()
++		isPtr = true
++	}
++
++	if isPtr && v.Type().NumMethod() > 0 && v.CanInterface() {
++		if scan, ok := v.Interface().(Scanner); ok {
++			return scan.ScanRedis(value)
++		}
++	}
++
++	if isPtr {
++		v = v.Elem()
++	}
++
++	if err := field.fn(v, value); err != nil {
+ 		t := s.value.Type()
+ 		return fmt.Errorf("cannot scan redis.result %s into struct field %s.%s of type %s, error-%s",
+ 			value, t.Name(), t.Field(field.index).Name, t.Field(field.index).Type, err.Error())
+diff --git a/redis.go b/redis.go
+index ee6c9bdb..83e9d404 100644
+--- a/redis.go
++++ b/redis.go
+@@ -10,10 +10,14 @@ import (
+ 	"time"
+ 
+ 	"github.com/go-redis/redis/v9/internal"
++	"github.com/go-redis/redis/v9/internal/hscan"
+ 	"github.com/go-redis/redis/v9/internal/pool"
+ 	"github.com/go-redis/redis/v9/internal/proto"
+ )
+ 
++// Scanner internal/hscan.Scanner exposed interface.
++type Scanner = hscan.Scanner
++
+ // Nil reply returned by Redis when key does not exist.
+ const Nil = proto.Nil
+ 
